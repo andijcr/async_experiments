@@ -254,6 +254,30 @@ was never meant to describe. Configuring without a preset (as this
 session's own local smoke-testing does, lacking libc++) falls back to
 CMake's normal compiler search, unaffected by the toolchain file.
 
+### First real toolchain build (Clang 22.1.8 + libc++ - it works)
+
+The `ci.yml` run for the toolchain-file commit was the first to actually
+reach the pinned Clang/libc++ combination: `apt.llvm.org`'s IPv4 fix, the
+`libc++-<N>-dev` install, and `-stdlib=libc++` from the new toolchain file
+all worked together as intended - `est`'s module/partition build succeeded
+end to end (`-- The CXX compiler identification is Clang 22.1.8`), which
+is the first real confirmation any of this toolchain pinning was correct,
+not just plausible.
+
+One new failure surfaced, caused by this session's own `-Werror` fix
+(adversarial review finding #3, above): combined with `-Wpedantic`, it
+flagged Catch2's own use of `__COUNTER__` inside its `TEST_CASE` macro -
+`-Wc2y-extensions`, a diagnostic new enough that it doesn't exist in the
+Clang 18 this session used for local verification, so this couldn't have
+been caught locally. `__COUNTER__` is long-standing and widely supported
+but not yet standard, and Catch2's headers were reaching the compiler via
+a plain `-I` rather than as system headers, so `est_tests`' own warning
+flags applied to macro expansions from inside them too. Fixed by adding
+`SYSTEM` to `FetchContent_Declare(Catch2 ...)` (CMake >= 3.25): Catch2's
+include directories are now treated as system headers, so diagnostics
+rooted inside them are suppressed the same way they would be for any
+other third-party dependency.
+
 ### Known open items
 
 This session could not reach `apt.llvm.org` or `cmake.org` (network egress
