@@ -15,8 +15,6 @@ struct fake_platform {
   static inline time_point current{};
 
   static auto now() noexcept -> time_point { return current; }
-  static void enter_critical_section() noexcept {}
-  static void leave_critical_section() noexcept {}
 };
 
 } // namespace
