@@ -1,0 +1,44 @@
+name: ci
+
+# Gates PRs: clang-format, clang-tidy, build, and unit tests, all run
+# inside the pinned devenv image (docker/Dockerfile via devenv-image.yml)
+# so CI and local dev share exactly the same toolchain. See docs/PLAN.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/async-experiments-devenv:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: clang-format check
+        run: |
+          find est examples -type f \( -name "*.cpp" -o -name "*.cppm" -o -name "*.h" \) \
+            -print0 | xargs -0 clang-format --dry-run --Werror
+
+      - name: configure
+        run: cmake --preset ci
+
+      - name: clang-tidy check
+        run: |
+          find est examples -type f \( -name "*.cpp" -o -name "*.cppm" \) \
+            -print0 | xargs -0 -n1 clang-tidy -p build/ci
+
+      - name: build
+        run: cmake --build --preset ci
+
+      - name: test
+        run: ctest --preset ci
