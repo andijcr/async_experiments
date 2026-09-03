@@ -16,5 +16,6 @@ function(est_set_warnings target)
       -Woverloaded-virtual
       -Wnull-dereference
       -Wdouble-promotion
+      -Werror
   )
 endfunction()

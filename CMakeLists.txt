@@ -29,6 +29,18 @@ set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "est links statically by default" FORCE)
 
+# Clang defaults to libstdc++ (or whatever GCC is on PATH) unless told
+# otherwise, and `import std;`/<print> support needs libc++ specifically.
+# The devenv Dockerfile installs libc++'s dev packages for exactly this.
+# Opt-out (not a hardcoded flag) so this CMakeLists.txt still configures
+# on a Clang toolchain that only has libstdc++ available, e.g. for
+# structural smoke-testing outside the pinned devenv image.
+option(EST_USE_LIBCXX "Link against libc++ when compiling with Clang" ON)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND EST_USE_LIBCXX)
+  add_compile_options(-stdlib=libc++)
+  add_link_options(-stdlib=libc++)
+endif()
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
 

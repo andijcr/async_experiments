@@ -4,14 +4,33 @@ name: ci
 # inside the pinned devenv image (docker/Dockerfile) so CI and local dev
 # share exactly the same toolchain. See docs/PLAN.md.
 #
-# build-image always (re)builds and pushes that image first, tagged by
-# commit SHA, and gate depends on it and pulls that exact tag. This avoids
-# a bootstrap problem: a separate "only builds on push to main" image
-# workflow can never produce an image for the PR that first introduces it
-# (main doesn't have the Dockerfile yet, and workflow_dispatch requires
-# the workflow file to already exist on the default branch). With Docker
-# layer caching (cache-from/to: gha) this costs a few seconds once the
-# Dockerfile itself hasn't changed, not a full LLVM reinstall per run.
+# The devenv image is built and `load`ed into the runner's local Docker
+# daemon (not pushed to a registry) and driven with plain `docker run`,
+# rather than the job-level `container:` directive pulling a pre-pushed
+# image. Two reasons, both found by adversarial review of the first
+# version of this workflow (see docs/PLAN.md, "Revised after..."):
+#   1. `container:` needs an image already sitting in a registry before
+#      the job's steps run, which either re-introduces the bootstrap
+#      problem or requires push (packages: write) permission — and a
+#      pull_request run triggered from a fork always gets a read-only
+#      GITHUB_TOKEN, so a push-based design silently breaks CI for
+#      exactly the external contributors it needs to work for.
+#   2. Building locally with layer caching (cache-from/to: gha) is just
+#      as cheap once the Dockerfile is unchanged, without ever needing
+#      write access to the package registry from a PR run.
+#
+# clang-tidy runs AFTER the build, not before: analyzing a TU that
+# `import`s a module needs that module's already-compiled BMI, which only
+# exists once `cmake --build` has produced it. Running clang-tidy first
+# (the original version of this workflow did) fails on every PR with
+# "module 'est' not found" — also found by adversarial review, and
+# reproduced locally before this fix.
+#
+# Each `docker run` below runs as the runner's own UID:GID (not the
+# image's baked-in `est` user, UID 1000) so files written into the
+# bind-mounted workspace are never owned by a UID the runner can't touch,
+# whatever UID actions/checkout happens to run as. HOME=/tmp avoids tools
+# choking on a UID with no passwd entry / home directory in the image.
 
 on:
   pull_request:
@@ -20,60 +39,60 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 env:
-  IMAGE: ghcr.io/${{ github.repository_owner }}/async-experiments-devenv
+  DEVENV_IMAGE: est-devenv:ci
 
 jobs:
-  build-image:
+  gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: docker/setup-buildx-action@v3
 
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - uses: docker/build-push-action@v6
+      - name: build devenv image (local only, not pushed)
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile
-          push: true
-          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          push: false
+          load: true
+          tags: ${{ env.DEVENV_IMAGE }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  gate:
-    needs: build-image
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/async-experiments-devenv:${{ github.sha }}
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
       - name: clang-format check
-        run: |
-          find est examples -type f \( -name "*.cpp" -o -name "*.cppm" -o -name "*.h" \) \
-            -print0 | xargs -0 clang-format --dry-run --Werror
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          bash -c 'find est examples -type f \( -name "*.cpp" -o -name "*.cppm" -o -name "*.h" \) -print0 | xargs -0 clang-format --dry-run --Werror'
 
       - name: configure
-        run: cmake --preset ci
-
-      - name: clang-tidy check
-        run: |
-          find est examples -type f \( -name "*.cpp" -o -name "*.cppm" \) \
-            -print0 | xargs -0 -n1 clang-tidy -p build/ci
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          cmake --preset ci
 
       - name: build
-        run: cmake --build --preset ci
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          cmake --build --preset ci
+
+      - name: clang-tidy check
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          bash -c 'find est examples -type f \( -name "*.cpp" -o -name "*.cppm" \) -print0 | xargs -0 -n1 clang-tidy -p build/ci'
 
       - name: test
-        run: ctest --preset ci
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          ctest --preset ci
