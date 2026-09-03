@@ -21,6 +21,14 @@ ARG USER_GID=1000
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# apt.llvm.org resolves to an AAAA (IPv6) record, and GitHub-hosted Actions
+# runners have no IPv6 route out of the Docker build - wget/apt then hang
+# on "Network is unreachable" instead of falling back to IPv4. Force IPv4
+# for both apt itself and the wget below. (Found by the first real CI run
+# on this Dockerfile - see docs/PLAN.md "Revised after the first real CI
+# run".)
+RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
+
 # --- Base tooling needed to fetch the pinned Clang/CMake ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -38,7 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # llvm.sh is apt.llvm.org's own installer script: it adds the matching apt
 # repo for the running Debian/Ubuntu release and installs the requested
 # major version. `all` also pulls in clang-format, clang-tidy, lld, lldb.
-RUN wget -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+RUN wget --inet4-only -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
     && chmod +x /tmp/llvm.sh \
     && /tmp/llvm.sh "${LLVM_VERSION}" all \
     && rm -f /tmp/llvm.sh \
@@ -56,7 +64,7 @@ RUN for tool in clang clang++ clang-format clang-tidy clang-scan-deps lld lldb; 
 # The distro package is generally far behind the C++20/23-modules-support
 # curve, so install a specific upstream release instead.
 RUN arch="$(uname -m)" \
-    && wget -O /tmp/cmake-install.sh \
+    && wget --inet4-only -O /tmp/cmake-install.sh \
         "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${arch}.sh" \
     && chmod +x /tmp/cmake-install.sh \
     && /tmp/cmake-install.sh --skip-license --prefix=/usr/local \
