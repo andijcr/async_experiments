@@ -131,8 +131,8 @@ async_experiments/
 ├── .clang-tidy
 └── .github/
     └── workflows/
-        ├── devenv-image.yml      # builds & pushes the Docker image to GHCR
-        └── ci.yml                # pulls that image, runs format+tidy check + build + tests
+        ├── devenv-image.yml      # refreshes the ":latest" image tag for local dev
+        └── ci.yml                # builds its own SHA-tagged image, then gates on it
 ```
 
 Component granularity grows as milestones land (e.g. `est/src/timer.cppm`,
@@ -147,8 +147,11 @@ M4). This tree is the M0 starting point, not a frozen contract.
 One image, `ghcr.io/andijcr/async-experiments-devenv`, used for:
 - Local development (mount the repo, get a shell with the exact compiler/
   CMake/Ninja/clang-format/clang-tidy versions CI uses).
-- CI (`ci.yml` pulls the pre-built image instead of reinstalling LLVM on
-  every PR run).
+- CI: `ci.yml` builds and pushes this image itself, tagged by commit SHA,
+  as its first job (`build-image`), and the actual gate job (`gate`)
+  `needs:` that job and pulls that exact tag. This was **not** the original
+  design — see "Revised after the first real CI run" below — but it's
+  what makes the workflow self-sufficient for the PR that introduces it.
 
 Built from `docker/Dockerfile`:
 1. Slim Debian/Ubuntu base.
@@ -163,9 +166,33 @@ Built from `docker/Dockerfile`:
 5. A non-root user matching a configurable UID/GID for local bind-mount
    ergonomics.
 
-A separate `devenv-image.yml` workflow rebuilds and pushes this image to
-GHCR when `docker/Dockerfile` changes (or on manual dispatch), so `ci.yml`
-stays fast and doesn't pay LLVM-install cost per PR.
+A separate `devenv-image.yml` workflow refreshes the `:latest` tag in GHCR
+(for local `docker pull`ers) once changes have landed on `main`, or on
+manual dispatch. It is **not** a dependency of `ci.yml` — see below.
+
+### Revised after the first real CI run
+
+The original design had `ci.yml` only ever `docker pull` a pre-built image,
+with a separate `devenv-image.yml` responsible for building and pushing it
+on push-to-`main` or manual dispatch. The first real PR (#1, this M0
+scaffolding itself) immediately hit the obvious flaw in that split: a
+workflow that only builds on push-to-`main` can't produce an image for the
+PR that first introduces `docker/Dockerfile` and that workflow, since
+neither has landed on `main` yet — and `workflow_dispatch` can't be
+triggered for a workflow file that doesn't yet exist on the default branch
+either. `ci.yml`'s `docker pull` failed with `manifest unknown`.
+
+Fixed by making `ci.yml` self-sufficient: it now has a `build-image` job
+that always builds and pushes the image (tagged by commit SHA, with
+`cache-from`/`cache-to: gha` so this is a cache hit — a few seconds, not a
+full LLVM reinstall — once the Dockerfile itself is unchanged), and the
+`gate` job `needs: build-image` and pulls that exact SHA-tagged image. This
+also fixes a subtler correctness gap the original split had: if a PR
+changed `docker/Dockerfile` itself, `ci.yml` would have gated against
+whatever `:latest` happened to already be in the registry, not the PR's
+own Dockerfile changes. `devenv-image.yml` still exists, now purely to keep
+`:latest` fresh for local `docker pull` convenience — it is not load-bearing
+for CI correctness.
 
 ### Known open items
 
@@ -189,6 +216,33 @@ APIs, and it's the correct target-toolchain choice, but it could not be
 locally build-verified in this environment (its GCC 13 / libstdc++ predates
 `<print>`, which landed in GCC 14; Clang's own libc++ support is newer
 still). Verify it compiles once the pinned Docker toolchain exists.
+
+---
+
+## CI (`ci.yml`)
+
+Triggers on pull requests (and pushes to `main`). Two jobs:
+1. **`build-image`**: builds `docker/Dockerfile` and pushes it to GHCR
+   tagged by commit SHA (see "Revised after the first real CI run" above
+   for why image-building lives here rather than only in
+   `devenv-image.yml`).
+2. **`gate`** (`needs: build-image`, runs inside that exact SHA-tagged
+   image):
+   1. **Format gate**: `clang-format --dry-run --Werror` over all tracked
+      `.cpp`/`.cppm`/`.h` files. Any diff fails the check.
+   2. **Configure with compile-commands**: `cmake --preset ci` (module
+      builds need a generated `compile_commands.json`/module map for tidy
+      to work against).
+   3. **Lint gate**: `clang-tidy` over the same file set, driven off that
+      configure step. A gate from the very first CI workflow, not
+      deferred — findings fail the check same as a format diff.
+   4. **Build**: `cmake --build --preset ci` using Ninja, building `est`,
+      its tests, and the `hello_world` example.
+   5. **Test**: `ctest --preset ci`, all Catch2 tests must pass.
+
+Both jobs are required status checks for merging into the default branch
+(branch protection is a repo-settings change, not something this plan's
+file changes can configure).
 
 ---
 
