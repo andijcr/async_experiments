@@ -468,6 +468,42 @@ analysis is exactly the kind of thing that could plausibly differ on the
 real pinned toolchain, so re-confirm this is still needed (and still the
 right fix) once M1 runs through real CI.
 
+#### What real CI (and review) actually found, once M1 ran through it
+
+PR #2 was M1's first run through the real pinned toolchain (M0's PR only
+ever exercised the placeholder walking skeleton). Two new,
+toolchain-specific findings, both fixed and neither reproducible against
+this session's local Clang 18 (confirmed: `clang-tidy --list-checks
+--checks='*'` on Clang 18 doesn't even know either check by name):
+- `readability-redundant-typename` on `est/src/timer.cppm`'s
+  `using clock = typename Platform::clock;` (and its two siblings, plus
+  the `entry_allocator` alias) — C++20 relaxed where `typename` is
+  required in an unambiguously-a-type context like a `using` alias
+  declaration (P0634R3), so these were always redundant once the project
+  targeted C++23; Clang 18's clang-tidy simply doesn't have the check
+  that catches it yet. Fixed by dropping the four now-unnecessary
+  `typename` keywords (kept the `template` disambiguator on
+  `entry_allocator`'s `rebind_alloc` — clang-tidy didn't flag it, so
+  removing it too would be an unverified guess, not a fix).
+- `bugprone-throwing-static-initialization` on
+  `est/tests/timer_tests.cpp`'s `static inline time_point current{};` —
+  libc++'s `steady_clock::time_point` default constructor isn't
+  contractually `noexcept` (even though it can't actually throw for an
+  arithmetic `Rep`), so a static-storage-duration default-construction of
+  one is conservatively flagged as fatal-if-it-threw. Isolated to this
+  one line (unlike `readability-redundant-declaration` above, this
+  doesn't recur elsewhere), so fixed with a scoped
+  `NOLINTNEXTLINE(bugprone-throwing-static-initialization)` rather than a
+  project-wide `.clang-tidy` suppression.
+
+Separately, a `code-review` pass caught a real cleanup miss: the
+"critical sections removed" commit purged the dead
+`enter_critical_section()`/`leave_critical_section()` stubs from
+`mutex.cppm`, `platform.cppm`, and `mutex_tests.cpp`'s fake, but missed
+the equivalent stubs in `timer_tests.cpp`'s `fake_platform` — `timer_queue`
+only ever calls `Platform::now()`, so they were dead, misleading code.
+Removed.
+
 ### M2 — future / promise / continuation core
 - `shared_state<T, Allocator>`: the single owned object behind both
   handles. Holds value-or-exception storage, a waiter/continuation list

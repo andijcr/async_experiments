@@ -12,6 +12,11 @@ struct fake_platform {
   using time_point = clock::time_point;
   using duration = clock::duration;
 
+  // steady_clock::time_point's default constructor isn't contractually
+  // noexcept in libc++'s declaration (it just can't actually throw for
+  // an arithmetic Rep), so clang-tidy conservatively flags default-
+  // constructing one at static storage duration as fatal-if-it-threw.
+  // NOLINTNEXTLINE(bugprone-throwing-static-initialization)
   static inline time_point current{};
 
   static auto now() noexcept -> time_point { return current; }

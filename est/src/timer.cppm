@@ -21,9 +21,9 @@ export namespace est {
 template <class Platform = platform::hosted_linux, class Allocator = std::allocator<std::byte>>
 class timer_queue {
 public:
-  using clock = typename Platform::clock;
-  using time_point = typename Platform::time_point;
-  using duration = typename Platform::duration;
+  using clock = Platform::clock;
+  using time_point = Platform::time_point;
+  using duration = Platform::duration;
   using id = std::size_t;
 
   explicit timer_queue(const Allocator& allocator = Allocator()) : entries_(allocator) {}
@@ -84,7 +84,7 @@ private:
     return lhs.deadline > rhs.deadline;
   }
 
-  using entry_allocator = typename std::allocator_traits<Allocator>::template rebind_alloc<entry>;
+  using entry_allocator = std::allocator_traits<Allocator>::template rebind_alloc<entry>;
   std::vector<entry, entry_allocator> entries_;
   id next_id_ = 0;
 };
