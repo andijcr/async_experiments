@@ -129,13 +129,16 @@ async_experiments/
 │   │   ├── placeholder.cppm      # est:placeholder — M0 walking-skeleton partition
 │   │   ├── platform/platform.cppm  # est:platform — hosted-Linux HAL backend
 │   │   ├── sync/mutex.cppm       # est:sync.mutex
-│   │   └── timer.cppm            # est:timer
+│   │   ├── timer.cppm            # est:timer
+│   │   ├── future.cppm           # est:future — shared_state<T>, future<T>
+│   │   └── promise.cppm          # est:promise — promise<T>, make_promise_future()
 │   └── tests/
 │       ├── CMakeLists.txt
 │       ├── skeleton_tests.cpp
 │       ├── platform_tests.cpp
 │       ├── mutex_tests.cpp
-│       └── timer_tests.cpp
+│       ├── timer_tests.cpp
+│       └── future_tests.cpp
 ├── examples/
 │   └── hello_world/
 │       ├── CMakeLists.txt
@@ -150,9 +153,8 @@ async_experiments/
         └── ci.yml                # builds its own SHA-tagged image, then gates on it
 ```
 
-Component granularity grows as milestones land (`future.cppm`/
-`promise.cppm` in M2; `loop.cppm` in M3; `coroutine.cppm` in M4). This
-tree is not a frozen contract.
+Component granularity grows as milestones land (`loop.cppm` in M3;
+`coroutine.cppm` in M4). This tree is not a frozen contract.
 
 ---
 
@@ -359,6 +361,22 @@ This job is a required status check for merging into the default branch
 (branch protection is a repo-settings change, not something this plan's
 file changes can configure).
 
+### Candidate: gate CI on new-code coverage (not yet decided)
+
+Currently no coverage measurement exists at all — no instrumentation, no
+report, nothing. Raised mid-M2: gate CI on *patch/diff* coverage (are the
+lines a PR adds actually exercised by a test?), not overall repository
+percentage. Leading option: Clang's built-in source-based coverage
+(`-fprofile-instr-generate -fcoverage-mapping` + `llvm-cov`, already in
+the devenv image via LLVM's `all` install) to produce an lcov report,
+intersected with the PR diff via a tool like `diff-cover` to gate on just
+the changed lines — keeps everything inside the same self-contained
+toolchain this project has otherwise stuck to, at the cost of more setup
+than piping to a hosted service like Codecov (which does the diff
+intersection and PR annotations for you, but adds an external dependency
+this project hasn't otherwise taken on). Not implemented yet — pending a
+decision on which way to go.
+
 ---
 
 ## `.clang-format` / `.clang-tidy`
@@ -504,28 +522,62 @@ the equivalent stubs in `timer_tests.cpp`'s `fake_platform` — `timer_queue`
 only ever calls `Platform::now()`, so they were dead, misleading code.
 Removed.
 
-### M2 — future / promise / continuation core
-- `shared_state<T, Allocator>`: the single owned object behind both
-  handles. Holds value-or-exception storage, a waiter/continuation list
-  guarded by the M1 `est::mutex`, and a plain (non-atomic — no OS threads
-  to race with, only the interrupt/mainline reentrancy `est::mutex` already
-  handles) reference count. Allocated through the caller-supplied
-  allocator.
-- `est::promise<T>`: producer handle — move-only, `set_value`/`set_exception`.
-- `est::future<T>`: consumer handle — move-only, `.then(continuation)`,
-  later `co_await`-able once M4 lands.
-- **View semantics**: both handles are thin (state pointer + small control
-  logic); destroying a `future` does not destroy the `shared_state` if
-  something else — initially, "something else" is the loop — still
-  references it.
-- **Abandoned-future semantics**: when a `future` is created it registers
-  its `shared_state` with the owning loop's task registry (a strong
-  reference independent of the user's handle). If the user drops the
-  `future`, the loop's reference keeps the state alive and the async work
-  keeps running; on completion with no consumer left, the result/exception
-  is simply discarded (dropped, not silently swallowed without a hook —
-  exact "unobserved exception" policy, e.g. a debug-mode assert or logged
-  warning, is a detail to settle in M2/M3, not now).
+### M2 — future / promise / continuation core (done)
+- `shared_state<T>`, in `est/src/future.cppm` (`est:future`) — the single
+  owned object behind both handles. Holds value-or-exception storage
+  (`std::variant<std::monostate, T, std::exception_ptr>`), a continuation
+  list built directly on the M1 `est::mutex`'s waiter list, and a plain
+  (non-atomic — single-threaded, see `est::mutex`'s own docs) reference
+  count. Always heap-allocated via `std::pmr::polymorphic_allocator<std::
+  byte>` — see `make_promise_future()` below — never constructed
+  directly by a caller. Not templated on a generic `Allocator` the way
+  `est::timer_queue` is: `shared_state`/`future`/`promise` cross an API
+  boundary (many call sites, needs a uniform, non-template-parameterized
+  type), which is exactly the case docs/PLAN.md's "Allocator support"
+  section already called out for `std::pmr::polymorphic_allocator`-style
+  erasure — `est::timer_queue` stays a generic `Allocator` template
+  parameter because it doesn't cross such a boundary (one component, one
+  concrete instantiation).
+- Continuations are `shared_state<T>::continuation_node`, a small virtual
+  base (`invoke(shared_state&)`) deriving from `est::mutex_waiter` —
+  exactly what `mutex_waiter`'s "payload-free at this layer" doc comment
+  in M1 anticipated: no second allocation for the list node itself.
+  `future<T>::then(fn)` allocates a concrete `continuation_node` wrapping
+  `fn` (via the `shared_state`'s own allocator, using C++20's
+  `polymorphic_allocator::new_object`/`delete_object`) and hands it to
+  the `shared_state`; completion (`set_value`/`set_exception`) drains
+  *every* queued continuation (LIFO, same order `est::mutex`'s waiter
+  list is documented to use) rather than assuming at most one — nothing
+  stops a caller registering more than one `then()`, and the underlying
+  list already supports it.
+- `est::promise<T>`, in `est/src/promise.cppm` (`est:promise`) — producer
+  handle: move-only, `set_value`/`set_exception`.
+- `est::future<T>`, in `est/src/future.cppm` — consumer handle: move-only,
+  `.then(fn)` where `fn` is called as `fn(shared_state<T>&)` so it can
+  `get()` (rethrowing any stored exception) or `ready()`. Runs
+  synchronously, on whichever call stack completes the `shared_state` —
+  there's no loop yet to defer onto (M3 will change that).
+- `make_promise_future<T>(allocator)`, in `est/src/promise.cppm` —
+  constructs a fresh `shared_state<T>` and returns the `{promise, future}`
+  pair sharing it; the only way a `shared_state` is created.
+- **View semantics**: both handles are thin (state pointer + move-only
+  ownership via `add_ref()`/`release()`); destroying a `future` does not
+  destroy the `shared_state` if something else — a still-live
+  `est::promise`, and eventually (M3) the loop's own keep-alive
+  registration — still references it. Verified directly: dropping a
+  `future` while its `promise` is still alive leaves the `shared_state`
+  intact and the `promise` can still complete it.
+- **Abandoned-future semantics — deferred to M3, not a scope cut.** The
+  full version (a dropped `future`'s `shared_state` is kept alive by the
+  *loop's* own reference, not the user's, so the async work keeps
+  running in the background) needs `est::loop` to exist to do the
+  registering — M2 has no loop yet. What M2 *does* build is the
+  ref-counted view mechanics that M3 will hook into: `shared_state` isn't
+  destroyed while any reference (promise, future, or later the loop's)
+  still holds it. The exact "unobserved exception" policy (result/
+  exception simply discarded vs. a debug-mode assert or logged warning)
+  is still a detail to settle when M3's loop actually implements the
+  registration, not now.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

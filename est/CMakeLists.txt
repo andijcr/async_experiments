@@ -11,6 +11,8 @@ target_sources(est
       src/platform/platform.cppm
       src/sync/mutex.cppm
       src/timer.cppm
+      src/future.cppm
+      src/promise.cppm
 )
 
 target_compile_features(est PUBLIC cxx_std_23)
