@@ -272,11 +272,18 @@ Clang 18 this session used for local verification, so this couldn't have
 been caught locally. `__COUNTER__` is long-standing and widely supported
 but not yet standard, and Catch2's headers were reaching the compiler via
 a plain `-I` rather than as system headers, so `est_tests`' own warning
-flags applied to macro expansions from inside them too. Fixed by adding
-`SYSTEM` to `FetchContent_Declare(Catch2 ...)` (CMake >= 3.25): Catch2's
-include directories are now treated as system headers, so diagnostics
-rooted inside them are suppressed the same way they would be for any
-other third-party dependency.
+flags applied to macro expansions from inside them too. Adding `SYSTEM` to `FetchContent_Declare(Catch2 ...)` (CMake >= 3.25)
+switched Catch2's include directories to `-isystem` (confirmed in the
+next CI run's compile command) but did **not** actually suppress the
+diagnostic — Clang still attributed `-Wc2y-extensions` to our translation
+unit even with Catch2's headers marked as system. Fixed for real by
+disabling the specific diagnostic directly on `est_tests`:
+`-Wno-unknown-warning-option -Wno-c2y-extensions` (the first flag first,
+so an older/other Clang that doesn't know `-Wc2y-extensions` yet doesn't
+turn "unknown warning option" itself into a `-Werror` failure — verified
+locally, since this session's Clang 18 is exactly such a case). `SYSTEM`
+is kept anyway; it still suppresses every *other* warning class Catch2's
+internals would otherwise trip.
 
 ### Known open items
 
