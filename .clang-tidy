@@ -16,12 +16,25 @@ Checks: >
   readability-*,
   -readability-identifier-length,
   -readability-magic-numbers,
-  -cppcoreguidelines-avoid-magic-numbers
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-redundant-declaration
 
 # cppcoreguidelines-avoid-do-while is dropped above rather than NOLINT'd
 # per call site: Catch2's REQUIRE/CHECK macros expand to a do-while, and
 # the diagnostic attributes to the (user-code) call site, not the header,
 # so header filtering alone can't suppress it.
+#
+# readability-redundant-declaration is dropped for a module-specific
+# false positive, reproduced in isolation: when partition B `import`s
+# partition A (which pulled in e.g. <chrono> via its own global module
+# fragment) and B *also* independently #includes overlapping standard
+# headers (e.g. <memory>/<vector>, which transitively reach <new> too),
+# this Clang generation's module-aware analysis sees operator new/delete
+# declared via two global-module-fragment paths and flags it as
+# "redundant" - which is normal, expected behavior for how C++ modules
+# work, not a real duplicate declaration. Any two interdependent
+# partitions that both use enough of the standard library to reach <new>
+# hit this, so it isn't a one-off NOLINT candidate.
 
 WarningsAsErrors: '*'
 # Anchored so it only matches an actual est/ or examples/ path component

@@ -32,12 +32,16 @@ Design constraints, settled up front:
   target includes bare-metal embedded, where there are no threads, no
   syscalls, and no OS-provided mutex/futex — only interrupts that can
   preempt mainline code on the *same* core. This is also what resolves the
-  apparent tension between "single-core, no shared memory" and "optimized
-  mutex": the mutex isn't for cross-thread contention, it's a minimal
-  critical-section primitive guarding a shared_state's waiter list against
-  reentrancy from an interrupt/signal context — deliberately just an `int`
-  (lock word) plus a pointer to an intrusive list of waiting parties, not an
-  OS-backed lock.
+  apparent tension between "single-core, no shared memory" and "a mutex at
+  all": the mutex isn't for cross-thread contention, it's deliberately just
+  an `int` (lock word) plus a pointer to an intrusive list of waiting
+  parties — not an OS-backed lock — and its eventual job is guarding a
+  `shared_state`'s waiter list against reentrancy from an interrupt/signal
+  context. **Revised after M1 first landed** (see that section): the
+  hosted-Linux backend has no real interrupts to guard against today, so
+  `lock()`/`unlock()` are bookkeeping only for now rather than routed
+  through a speculative platform-provided critical section — real
+  protection is added when a backend that actually needs it exists.
 
 ---
 
@@ -75,14 +79,18 @@ Design constraints, settled up front:
     deferred). This is a build-system escape hatch, not a design change.
 - **Platform abstraction (HAL)**: nothing in the public or internal API may
   hardcode a hosted-OS assumption (POSIX threads, syscalls, an OS-provided
-  mutex/futex). A small `est::platform` interface abstracts the two things
-  the framework actually needs from its environment: a monotonic time
-  source (for `est::timer`) and a critical-section primitive (disable/
-  restore interrupts on bare metal; a trivial no-op or a simple spin on a
-  hosted single-threaded build). Everything else is written against that
-  interface, not against `<chrono>`'s `steady_clock` or POSIX directly. The
-  only implementation shipped now is the hosted-Linux one (used by the dev
-  container and CI); a bare-metal implementation is a stretch goal (see
+  mutex/futex). A small `est::platform` interface abstracts what the
+  framework actually needs from its environment — currently just a
+  monotonic time source (for `est::timer_queue`) — rather than writing
+  against `<chrono>`'s `steady_clock` directly. A critical-section
+  primitive (disable/restore interrupts on bare metal) was in this
+  interface during M1's first implementation and was removed: the
+  hosted-Linux backend had nothing to guard with it (see M1 section), and
+  building it speculatively ahead of a backend that actually needs it was
+  premature. It comes back — on `est::platform` or elsewhere — when such
+  a backend exists. The only implementation shipped now is the
+  hosted-Linux one (used by the dev container and CI); a bare-metal
+  implementation is a stretch goal (see
   Roadmap), but designing the seam now is what makes that port later
   realistic instead of a rewrite.
 - **Test framework**: Catch2 v3, pulled via `FetchContent` pinned to a
@@ -118,10 +126,16 @@ async_experiments/
 │   ├── CMakeLists.txt
 │   ├── src/
 │   │   ├── est.cppm              # primary module interface (re-exports partitions)
-│   │   └── placeholder.cppm      # est:placeholder — M0 walking-skeleton partition
+│   │   ├── placeholder.cppm      # est:placeholder — M0 walking-skeleton partition
+│   │   ├── platform/platform.cppm  # est:platform — hosted-Linux HAL backend
+│   │   ├── sync/mutex.cppm       # est:sync.mutex
+│   │   └── timer.cppm            # est:timer
 │   └── tests/
 │       ├── CMakeLists.txt
-│       └── skeleton_tests.cpp
+│       ├── skeleton_tests.cpp
+│       ├── platform_tests.cpp
+│       ├── mutex_tests.cpp
+│       └── timer_tests.cpp
 ├── examples/
 │   └── hello_world/
 │       ├── CMakeLists.txt
@@ -136,10 +150,9 @@ async_experiments/
         └── ci.yml                # builds its own SHA-tagged image, then gates on it
 ```
 
-Component granularity grows as milestones land (e.g. `est/src/timer.cppm`,
-`est/src/sync/mutex.cppm`, `est/src/platform/platform.cppm` arrive in M1;
-`future.cppm`/`promise.cppm` in M2; `loop.cppm` in M3; `coroutine.cppm` in
-M4). This tree is the M0 starting point, not a frozen contract.
+Component granularity grows as milestones land (`future.cppm`/
+`promise.cppm` in M2; `loop.cppm` in M3; `coroutine.cppm` in M4). This
+tree is not a frozen contract.
 
 ---
 
@@ -386,31 +399,110 @@ exists to run it against.
 - `docs/PLAN.md` (this document).
 - No LICENSE file (per requester: skip for now).
 
-### M1 — Foundations: platform seam, timer, mutex
-- `est::platform`: the HAL seam described above — a monotonic clock source
-  and a critical-section primitive (enter/leave), with the only concrete
-  implementation being the hosted-Linux one. Everything below is written
-  against this interface, not against `<chrono>`/POSIX directly, so a
-  bare-metal implementation later is a new backend, not a redesign.
-- `est::timer`: a deadline/duration abstraction over `est::platform`'s
-  clock, backed by a min-heap of pending deadlines, templated on the
-  allocator used for heap storage. One-shot first; periodic timers once the
-  loop exists to drive them (M3) — designed for it now, exercised later.
-- `est::mutex`: deliberately minimal — one `int` lock word plus a pointer to
-  an intrusive singly-linked list of the parties (futures/continuations)
-  currently waiting on it. No OS object, no syscall, no allocation:
-  `lock()`/`unlock()` are built on `est::platform`'s critical-section
-  primitive (interrupt mask on bare metal; a trivial spin/no-op on the
-  hosted single-threaded build). Its actual job, established here in M1 and
-  consumed in M2, is guarding a `shared_state`'s waiter list against
-  reentrancy — e.g. a timer or I/O completion arriving from an interrupt/
-  signal context while mainline code is enqueueing or draining that same
-  list. It is not a general-purpose thread mutex and isn't trying to be
-  one.
-- Unit tests for both under `est/tests/`, including a fake `est::platform`
-  backend (simulated clock + a way to trigger a "reentrant" critical-section
-  call) so the mutex's waiter-list handling can be exercised deterministically
-  without real interrupts.
+### M1 — Foundations: platform seam, timer, mutex (done)
+- `est::platform::hosted_linux`: the HAL seam described above, in
+  `est/src/platform/platform.cppm` (`est:platform`) — a stateless policy
+  type with a single static member, `now()`, not a runtime-polymorphic
+  interface. `est::timer_queue` is templated on it (defaulted to
+  `hosted_linux`), so tests can substitute a fake and a future bare-metal
+  backend is a new template argument, not a redesign.
+- `est::timer_queue<Platform, Allocator>`, in `est/src/timer.cppm`
+  (`est:timer`) — a `std::vector`-backed binary min-heap of one-shot
+  deadlines (`schedule_at`/`schedule_after`, `cancel` — O(n) linear-scan
+  cancel, deliberately simple for M1 — `next_deadline`, `pop_ready`),
+  templated on the allocator per docs/PLAN.md's allocator-first design.
+  No callbacks/continuations yet — that's `est::loop`'s job in M3; this
+  is only the scheduling structure a future loop will own and drive.
+- `est::mutex`, in `est/src/sync/mutex.cppm` (`est:sync.mutex`) — exactly
+  the `int` lock word (`state_`) plus intrusive singly-linked waiter list
+  (`mutex_waiter* waiters_`, LIFO push/pop) the plan called for.
+  `lock()`/`unlock()` are bookkeeping-only right now (just toggle
+  `state_`, no platform call, no template parameter) — see "Revised:
+  critical sections removed" below for why. `mutex_waiter` is
+  deliberately payload-free; `est::future`'s `shared_state` (M2) will
+  embed one to link into a mutex's waiter list without the mutex needing
+  to know what a future is.
+- Unit tests under `est/tests/` (`platform_tests.cpp`, `mutex_tests.cpp`,
+  `timer_tests.cpp`): a fake platform with a controllable clock for
+  deterministic timer-ordering tests; `mutex`'s tests need no fake
+  platform at all now.
+
+#### Revised: critical sections removed from `est::platform`
+
+M1's first implementation gave `hosted_linux` `enter_critical_section()`/
+`leave_critical_section()` (no-ops), and `est::basic_mutex<Platform>`
+routed `lock()`/`unlock()` through them, with a test-only fake platform
+whose `enter_critical_section()` could be hooked to simulate a timer/IO
+"interrupt" enqueueing its own waiter mid-`lock()`.
+
+The user's call: the design is single-threaded with no shared memory, and
+`hosted_linux` had nothing for that critical section to actually protect
+— so `est::platform` shouldn't carry that surface area yet. This isn't a
+walk-back of the mutex's eventual purpose (still guarding a `shared_state`
+waiter list against reentrancy once a backend that can actually be
+reentered exists — bare-metal interrupts, or a future multi-loop), just a
+deferral of building the protection mechanism before anything needs it
+(YAGNI). Resolved via `AskUserQuestion`: kept `lock()`/`unlock()`'s API
+shape (so M2 doesn't need to redesign against it later) but dropped the
+`Platform` template parameter entirely — `basic_mutex<Platform>` became
+plain `est::mutex`, `hosted_linux` lost both critical-section methods, and
+the fake-platform-based reentrancy test was deleted (its premise no
+longer exists). `est::timer_queue` was unaffected — it only ever used
+`Platform::now()`.
+
+**Found while implementing** (all fixed before this landed): `.clang-tidy`
+needed one more suppression, `readability-redundant-declaration`,
+reproduced in an isolated minimal case — when partition B `import`s
+partition A (which pulled in e.g. `<chrono>`) and B *also* independently
+`#include`s overlapping standard headers (`<memory>`/`<vector>`, which
+transitively reach `<new>` too), this Clang generation's module-aware
+analysis sees `operator new`/`delete` declared via two global-module-
+fragment paths and flags it as "redundant" — normal, expected behavior
+for how C++ modules actually work, not a real duplicate declaration. Any
+two interdependent partitions that both reach far enough into the
+standard library hit this, so (like `cppcoreguidelines-avoid-do-while`
+for Catch2's macros) it's a project-wide suppression with a documented
+reason, not a one-off `NOLINT`. Verified locally against Clang 18 (this
+sandbox's toolchain, not the pinned Clang 22) — module-aware clang-tidy
+analysis is exactly the kind of thing that could plausibly differ on the
+real pinned toolchain, so re-confirm this is still needed (and still the
+right fix) once M1 runs through real CI.
+
+#### What real CI (and review) actually found, once M1 ran through it
+
+PR #2 was M1's first run through the real pinned toolchain (M0's PR only
+ever exercised the placeholder walking skeleton). Two new,
+toolchain-specific findings, both fixed and neither reproducible against
+this session's local Clang 18 (confirmed: `clang-tidy --list-checks
+--checks='*'` on Clang 18 doesn't even know either check by name):
+- `readability-redundant-typename` on `est/src/timer.cppm`'s
+  `using clock = typename Platform::clock;` (and its two siblings, plus
+  the `entry_allocator` alias) — C++20 relaxed where `typename` is
+  required in an unambiguously-a-type context like a `using` alias
+  declaration (P0634R3), so these were always redundant once the project
+  targeted C++23; Clang 18's clang-tidy simply doesn't have the check
+  that catches it yet. Fixed by dropping the four now-unnecessary
+  `typename` keywords (kept the `template` disambiguator on
+  `entry_allocator`'s `rebind_alloc` — clang-tidy didn't flag it, so
+  removing it too would be an unverified guess, not a fix).
+- `bugprone-throwing-static-initialization` on
+  `est/tests/timer_tests.cpp`'s `static inline time_point current{};` —
+  libc++'s `steady_clock::time_point` default constructor isn't
+  contractually `noexcept` (even though it can't actually throw for an
+  arithmetic `Rep`), so a static-storage-duration default-construction of
+  one is conservatively flagged as fatal-if-it-threw. Isolated to this
+  one line (unlike `readability-redundant-declaration` above, this
+  doesn't recur elsewhere), so fixed with a scoped
+  `NOLINTNEXTLINE(bugprone-throwing-static-initialization)` rather than a
+  project-wide `.clang-tidy` suppression.
+
+Separately, a `code-review` pass caught a real cleanup miss: the
+"critical sections removed" commit purged the dead
+`enter_critical_section()`/`leave_critical_section()` stubs from
+`mutex.cppm`, `platform.cppm`, and `mutex_tests.cpp`'s fake, but missed
+the equivalent stubs in `timer_tests.cpp`'s `fake_platform` — `timer_queue`
+only ever calls `Platform::now()`, so they were dead, misleading code.
+Removed.
 
 ### M2 — future / promise / continuation core
 - `shared_state<T, Allocator>`: the single owned object behind both
@@ -446,6 +538,15 @@ exists to run it against.
 - I/O (sockets, files, epoll/io_uring) is explicitly **out of scope** for
   this initial milestone set — timers are the only external wakeup source
   for now.
+- **Long-running-callback detection.** Single-threaded means one
+  continuation running too long blocks everything else the loop owns —
+  timers, other ready work, all of it — with nothing to preempt it.
+  `run()` times each continuation/callback it invokes (`Platform::now()`
+  before and after — the clock M1 already built) and logs a warning if it
+  ran longer than some threshold, so a runaway handler shows up as a
+  clear diagnostic instead of "the whole program mysteriously stalled."
+  Threshold value/configurability and exact log destination are details
+  to settle when this is actually implemented, not now.
 
 ### M4 — coroutine adapters
 - `est::task<T>` coroutine type with a `promise_type` that binds to
@@ -456,6 +557,18 @@ exists to run it against.
 - Coroutine frame allocation wired through the same allocator convention
   established in M1/M2 (`allocator_arg_t` + allocator as the coroutine's
   first two parameters, so `promise_type::operator new` can use it).
+- **`est::mutex::lock()` becomes awaitable.** A mutex is useful even
+  single-threaded: two coroutines writing the same structure across
+  multiple steps (e.g. a global registry), with suspension points in
+  between, can still interleave and corrupt it — a cooperative-scheduling
+  race, not the interrupt-context reentrancy M1's platform seam was
+  originally (and no longer is — see M1's "Revised" note) about. The
+  `int state_` + intrusive waiter list built in M1 already fits this: the
+  gap is that `lock()` today is a synchronous unconditional toggle rather
+  than checking `state_` and, if already held, enqueueing the caller's
+  `mutex_waiter` and suspending — resumed from `unlock()` like any other
+  waiter. Needs coroutine machinery to suspend/resume, so it lands here
+  rather than in M1.
 
 ### M5 — polish + hello-world
 - Flesh out `examples/hello_world` into something that actually exercises
@@ -469,17 +582,19 @@ exists to run it against.
 
 ### Stretch / explicitly deferred (not part of the milestones above)
 - **Bare-metal embedded port**: a second `est::platform` backend (no OS,
-  interrupt-driven clock tick, real interrupt-mask critical sections) plus
-  whatever build-system work a freestanding/cross toolchain needs (a
-  separate CMake toolchain file, `-ffreestanding`, no `import std;`
-  reliance on parts of the standard library an embedded target can't
-  provide). The M1 platform seam and the int+pointer `est::mutex` are
-  designed now specifically so this is a new backend later, not a
-  framework rewrite — but the actual port (and picking a target chip/
-  board) is out of scope until the hosted build is solid.
-- Multi-loop / multi-shard execution on hosted platforms (a second, distinct
-  use of the same `est::mutex` primitive: cross-loop handoff instead of
-  interrupt/mainline handoff).
+  interrupt-driven clock tick, and — reintroduced at that point, since M1
+  removed it as premature for hosted-Linux (see M1's "Revised" note) —
+  real interrupt-mask critical sections) plus whatever build-system work
+  a freestanding/cross toolchain needs (a separate CMake toolchain file,
+  `-ffreestanding`, no `import std;` reliance on parts of the standard
+  library an embedded target can't provide). The M1 platform seam and the
+  int+pointer `est::mutex` are designed now specifically so this is a new
+  backend later, not a framework rewrite — but the actual port (and
+  picking a target chip/board) is out of scope until the hosted build is
+  solid.
+- Multi-loop / multi-shard execution on hosted platforms (a second,
+  distinct reason `est::mutex` would need real protection again: cross-loop
+  handoff instead of interrupt/mainline handoff).
 - Real I/O reactor (epoll/io_uring on hosted; interrupt-driven peripheral
   I/O on bare metal) integration into the loop.
 
