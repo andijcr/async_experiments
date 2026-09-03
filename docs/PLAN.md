@@ -614,6 +614,62 @@ Removed.
   is still a detail to settle when M3's loop actually implements the
   registration, not now.
 
+#### Found by code review, before real CI ever saw it
+
+A `code-review` pass on M2 (before its PR's first CI run) found four real
+issues, all fixed:
+1. **Wrong-type deallocation (real memory corruption risk).**
+   `run()` called `allocator_.delete_object(&node)` on a
+   `continuation_node&` — template deduction picks the *base* type, so
+   `delete_object` deallocated with `continuation_node`'s size/alignment
+   instead of the actual, larger `concrete_continuation<Fn>` that was
+   allocated. Silently "worked" with the default new/delete resource
+   (sized deallocation isn't always enforced in practice) but is
+   undefined behavior per `memory_resource::deallocate`'s contract, and a
+   real, visible corruption risk with a pool-style resource —
+   `make_promise_future`'s allocator parameter explicitly allows passing
+   one. Fixed by giving `continuation_node` a pure-virtual `destroy()`
+   that each `concrete_continuation<Fn>` override calls
+   `allocator.delete_object(this)` from — `this` is the derived type
+   *there*, so the deduction is correct.
+2. **Leaked node if a continuation throws.** `run()` had no
+   exception-safety around `invoke()`; a throwing continuation skipped
+   `delete_object` entirely. Fixed with an RAII guard so `destroy()`
+   always runs. The exception still aborts `complete()`'s drain loop
+   before any later-queued continuations run — an accepted M2-scope
+   limitation (documented in the code), not fixed now: revisit once M3's
+   loop dispatches continuations independently instead of inline on the
+   completer's call stack.
+3. **Value corruption for more than one reader.** `shared_state::get()`
+   moved the value out of the `variant` on every call — correct for
+   exactly one reader, silently wrong for a second: `ready()` still
+   reports true, but the second caller reads a moved-from value. Directly
+   contradicts the class's own documented support for multiple `then()`
+   registrations. Fixed by making `get()` non-consuming (`const T&`
+   instead of `T`); `future<T>::get()` (the single-external-consumer path)
+   now copy-constructs its return value instead of moving.
+4. **Double-completion guard is debug-only, undocumented as such.** Not a
+   bug — `assert(!ready())` matches this project's "validate at
+   boundaries, trust internal guarantees" philosophy — but the original
+   comment didn't say so. Comment clarified; behavior unchanged (revisit
+   only if this turns out to matter in practice, per the project's stated
+   philosophy of not adding validation for scenarios speculatively).
+
+While fixing #1/#2, a related leak was found by inspection (not by the
+review) and fixed the same way: `~shared_state()` didn't drain its
+waiter list, so a continuation registered on a future whose promise is
+dropped without ever completing (a "broken promise", or any continuation
+still queued when #2's throw aborts the drain) leaked permanently — the
+node becomes unreachable once nothing references the `shared_state`
+holding its own waiter list. Fixed by draining (destroying, not
+invoking) any remaining queued nodes in the destructor.
+
+All four are now regression-tested with a `counting_resource`
+(`std::pmr::memory_resource` wrapping the default one, counting
+allocate/deallocate calls) — the only practical way to catch a leaked or
+wrongly-sized allocation in a unit test without a sanitizer. 19/19 tests
+pass locally.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until
