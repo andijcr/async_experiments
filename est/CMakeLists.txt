@@ -8,6 +8,9 @@ target_sources(est
     FILES
       src/est.cppm
       src/placeholder.cppm
+      src/platform/platform.cppm
+      src/sync/mutex.cppm
+      src/timer.cppm
 )
 
 target_compile_features(est PUBLIC cxx_std_23)

@@ -17,6 +17,9 @@ FetchContent_MakeAvailable(Catch2)
 
 add_executable(est_tests
   skeleton_tests.cpp
+  platform_tests.cpp
+  mutex_tests.cpp
+  timer_tests.cpp
 )
 target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2WithMain)
 est_set_warnings(est_tests)

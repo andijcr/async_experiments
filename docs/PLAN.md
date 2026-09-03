@@ -118,10 +118,16 @@ async_experiments/
 │   ├── CMakeLists.txt
 │   ├── src/
 │   │   ├── est.cppm              # primary module interface (re-exports partitions)
-│   │   └── placeholder.cppm      # est:placeholder — M0 walking-skeleton partition
+│   │   ├── placeholder.cppm      # est:placeholder — M0 walking-skeleton partition
+│   │   ├── platform/platform.cppm  # est:platform — hosted-Linux HAL backend
+│   │   ├── sync/mutex.cppm       # est:sync.mutex
+│   │   └── timer.cppm            # est:timer
 │   └── tests/
 │       ├── CMakeLists.txt
-│       └── skeleton_tests.cpp
+│       ├── skeleton_tests.cpp
+│       ├── platform_tests.cpp
+│       ├── mutex_tests.cpp
+│       └── timer_tests.cpp
 ├── examples/
 │   └── hello_world/
 │       ├── CMakeLists.txt
@@ -136,10 +142,9 @@ async_experiments/
         └── ci.yml                # builds its own SHA-tagged image, then gates on it
 ```
 
-Component granularity grows as milestones land (e.g. `est/src/timer.cppm`,
-`est/src/sync/mutex.cppm`, `est/src/platform/platform.cppm` arrive in M1;
-`future.cppm`/`promise.cppm` in M2; `loop.cppm` in M3; `coroutine.cppm` in
-M4). This tree is the M0 starting point, not a frozen contract.
+Component granularity grows as milestones land (`future.cppm`/
+`promise.cppm` in M2; `loop.cppm` in M3; `coroutine.cppm` in M4). This
+tree is not a frozen contract.
 
 ---
 
@@ -386,31 +391,59 @@ exists to run it against.
 - `docs/PLAN.md` (this document).
 - No LICENSE file (per requester: skip for now).
 
-### M1 — Foundations: platform seam, timer, mutex
-- `est::platform`: the HAL seam described above — a monotonic clock source
-  and a critical-section primitive (enter/leave), with the only concrete
-  implementation being the hosted-Linux one. Everything below is written
-  against this interface, not against `<chrono>`/POSIX directly, so a
-  bare-metal implementation later is a new backend, not a redesign.
-- `est::timer`: a deadline/duration abstraction over `est::platform`'s
-  clock, backed by a min-heap of pending deadlines, templated on the
-  allocator used for heap storage. One-shot first; periodic timers once the
-  loop exists to drive them (M3) — designed for it now, exercised later.
-- `est::mutex`: deliberately minimal — one `int` lock word plus a pointer to
-  an intrusive singly-linked list of the parties (futures/continuations)
-  currently waiting on it. No OS object, no syscall, no allocation:
-  `lock()`/`unlock()` are built on `est::platform`'s critical-section
-  primitive (interrupt mask on bare metal; a trivial spin/no-op on the
-  hosted single-threaded build). Its actual job, established here in M1 and
-  consumed in M2, is guarding a `shared_state`'s waiter list against
-  reentrancy — e.g. a timer or I/O completion arriving from an interrupt/
-  signal context while mainline code is enqueueing or draining that same
-  list. It is not a general-purpose thread mutex and isn't trying to be
-  one.
-- Unit tests for both under `est/tests/`, including a fake `est::platform`
-  backend (simulated clock + a way to trigger a "reentrant" critical-section
-  call) so the mutex's waiter-list handling can be exercised deterministically
-  without real interrupts.
+### M1 — Foundations: platform seam, timer, mutex (done)
+- `est::platform::hosted_linux`: the HAL seam described above, in
+  `est/src/platform/platform.cppm` (`est:platform`) — a stateless policy
+  type (static members only: `now()`, `enter_critical_section()`,
+  `leave_critical_section()`), not a runtime-polymorphic interface.
+  `est::basic_mutex`/`est::timer_queue` are templated on it (defaulted to
+  `hosted_linux`), so tests can substitute a fake and a future bare-metal
+  backend is a new template argument, not a redesign. `enter`/`leave` are
+  no-ops on hosted Linux — it doesn't model interrupt/signal reentrancy
+  yet, which is explicitly M1 scope, not an oversight.
+- `est::timer_queue<Platform, Allocator>`, in `est/src/timer.cppm`
+  (`est:timer`) — a `std::vector`-backed binary min-heap of one-shot
+  deadlines (`schedule_at`/`schedule_after`, `cancel` — O(n) linear-scan
+  cancel, deliberately simple for M1 — `next_deadline`, `pop_ready`),
+  templated on the allocator per docs/PLAN.md's allocator-first design.
+  No callbacks/continuations yet — that's `est::loop`'s job in M3; this
+  is only the scheduling structure a future loop will own and drive.
+- `est::basic_mutex<Platform>` (alias `est::mutex` = `basic_mutex<>`), in
+  `est/src/sync/mutex.cppm` (`est:sync.mutex`) — exactly the `int` lock
+  word (`state_`) plus intrusive singly-linked waiter list
+  (`mutex_waiter* waiters_`, LIFO push/pop) the plan called for.
+  `lock()`/`unlock()` go through `Platform::enter_critical_section()`/
+  `leave_critical_section()` — that call, not `state_`, is the actual
+  protection; `state_` only backs the `locked()` debug/test observer.
+  `mutex_waiter` is deliberately payload-free; `est::future`'s
+  `shared_state` (M2) will embed one to link into a mutex's waiter list
+  without the mutex needing to know what a future is.
+- Unit tests under `est/tests/` (`platform_tests.cpp`, `mutex_tests.cpp`,
+  `timer_tests.cpp`): a fake platform with a controllable clock for
+  deterministic timer-ordering tests, and a fake platform whose
+  `enter_critical_section()` can be hooked with a callback to simulate a
+  timer/IO "interrupt" enqueueing its own waiter mid-`lock()` — proving
+  the waiter list stays consistent under that interleaving, and that the
+  `Platform` seam is genuinely swappable/test-hookable, not just
+  swappable in principle.
+
+**Found while implementing** (all fixed before this landed): `.clang-tidy`
+needed one more suppression, `readability-redundant-declaration`,
+reproduced in an isolated minimal case — when partition B `import`s
+partition A (which pulled in e.g. `<chrono>`) and B *also* independently
+`#include`s overlapping standard headers (`<memory>`/`<vector>`, which
+transitively reach `<new>` too), this Clang generation's module-aware
+analysis sees `operator new`/`delete` declared via two global-module-
+fragment paths and flags it as "redundant" — normal, expected behavior
+for how C++ modules actually work, not a real duplicate declaration. Any
+two interdependent partitions that both reach far enough into the
+standard library hit this, so (like `cppcoreguidelines-avoid-do-while`
+for Catch2's macros) it's a project-wide suppression with a documented
+reason, not a one-off `NOLINT`. Verified locally against Clang 18 (this
+sandbox's toolchain, not the pinned Clang 22) — module-aware clang-tidy
+analysis is exactly the kind of thing that could plausibly differ on the
+real pinned toolchain, so re-confirm this is still needed (and still the
+right fix) once M1 runs through real CI.
 
 ### M2 — future / promise / continuation core
 - `shared_state<T, Allocator>`: the single owned object behind both
