@@ -502,6 +502,15 @@ right fix) once M1 runs through real CI.
 - I/O (sockets, files, epoll/io_uring) is explicitly **out of scope** for
   this initial milestone set — timers are the only external wakeup source
   for now.
+- **Long-running-callback detection.** Single-threaded means one
+  continuation running too long blocks everything else the loop owns —
+  timers, other ready work, all of it — with nothing to preempt it.
+  `run()` times each continuation/callback it invokes (`Platform::now()`
+  before and after — the clock M1 already built) and logs a warning if it
+  ran longer than some threshold, so a runaway handler shows up as a
+  clear diagnostic instead of "the whole program mysteriously stalled."
+  Threshold value/configurability and exact log destination are details
+  to settle when this is actually implemented, not now.
 
 ### M4 — coroutine adapters
 - `est::task<T>` coroutine type with a `promise_type` that binds to
@@ -512,6 +521,18 @@ right fix) once M1 runs through real CI.
 - Coroutine frame allocation wired through the same allocator convention
   established in M1/M2 (`allocator_arg_t` + allocator as the coroutine's
   first two parameters, so `promise_type::operator new` can use it).
+- **`est::mutex::lock()` becomes awaitable.** A mutex is useful even
+  single-threaded: two coroutines writing the same structure across
+  multiple steps (e.g. a global registry), with suspension points in
+  between, can still interleave and corrupt it — a cooperative-scheduling
+  race, not the interrupt-context reentrancy M1's platform seam was
+  originally (and no longer is — see M1's "Revised" note) about. The
+  `int state_` + intrusive waiter list built in M1 already fits this: the
+  gap is that `lock()` today is a synchronous unconditional toggle rather
+  than checking `state_` and, if already held, enqueueing the caller's
+  `mutex_waiter` and suspending — resumed from `unlock()` like any other
+  waiter. Needs coroutine machinery to suspend/resume, so it lands here
+  rather than in M1.
 
 ### M5 — polish + hello-world
 - Flesh out `examples/hello_world` into something that actually exercises
