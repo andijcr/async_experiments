@@ -670,6 +670,22 @@ allocate/deallocate calls) — the only practical way to catch a leaked or
 wrongly-sized allocation in a unit test without a sanitizer. 19/19 tests
 pass locally.
 
+**Found by real CI, not locally reproducible.** PR #3's `clang-format
+--dry-run --Werror` step (pinned Clang 22) flagged two spots in
+`est/tests/future_tests.cpp` that local Clang 18's `clang-format` accepts
+as already-clean — the first confirmed version drift in `clang-format`
+itself (previously only `clang-tidy`'s check set and libc++/libstdc++
+pairing had shown this kind of gap between the sandbox's Clang 18 and the
+pinned Clang 22). Both spots involved a signature/statement sitting right
+at the 100-column wrap boundary, where the two versions' line-breaking
+heuristics disagree on where (or whether) to break. Rather than guessing
+at CI's exact spacing with no way to verify it locally, both were rewritten
+to be unambiguous instead: `do_is_equal`'s override shortened well under
+the column limit via a local `using std::pmr::memory_resource;` (so
+`[[nodiscard]]`, which `clang-tidy` requires, no longer forces a wrap at
+all), and a single-line `{ ... }` block with a trailing comment expanded to
+the canonical always-multi-line form.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until

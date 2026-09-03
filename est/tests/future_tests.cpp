@@ -8,11 +8,13 @@ import est;
 
 namespace {
 
+using std::pmr::memory_resource;
+
 // Wraps the default resource, counting allocate()/deallocate() calls so
 // tests can assert every allocation was balanced by a deallocation - the
 // only practical way to catch a leaked (or wrongly-sized) continuation
 // node in a unit test without a sanitizer.
-class counting_resource : public std::pmr::memory_resource {
+class counting_resource : public memory_resource {
 public:
   int allocations = 0;
   int deallocations = 0;
@@ -28,8 +30,12 @@ private:
     std::pmr::new_delete_resource()->deallocate(ptr, bytes, alignment);
   }
 
-  [[nodiscard]] auto
-  do_is_equal(const std::pmr::memory_resource& other) const noexcept -> bool override {
+  // Unqualified memory_resource (via the using-declaration above) keeps this
+  // signature under the column limit with [[nodiscard]] kept, rather than
+  // relying on a return-type line-wrap: clang-format 18 (local) and 22 (CI)
+  // disagree on how to wrap this signature when written with the fully
+  // qualified std::pmr::memory_resource name.
+  [[nodiscard]] auto do_is_equal(const memory_resource& other) const noexcept -> bool override {
     return this == &other;
   }
 };
@@ -131,7 +137,9 @@ TEST_CASE("promise/future are move-only and moving transfers ownership", "[futur
 
 TEST_CASE("dropping the future doesn't prevent the promise from completing", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
-  { auto dropped = std::move(future); } // destroyed here, releases its reference
+  {
+    auto dropped = std::move(future); // destroyed at the end of this scope
+  }
 
   promise.set_value(1); // shared_state stays alive via the promise's own reference
   SUCCEED("no crash");
