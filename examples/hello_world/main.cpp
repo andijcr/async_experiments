@@ -1,8 +1,13 @@
 import est;
 
+#include <cstdlib>
 #include <print>
 
 auto main() -> int {
-  std::println("{}", est::placeholder_message());
-  return 0;
+  try {
+    std::println("{}", est::placeholder_message());
+  } catch (...) {
+    return EXIT_FAILURE;
+  }
+  return EXIT_SUCCESS;
 }

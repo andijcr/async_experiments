@@ -285,6 +285,18 @@ locally, since this session's Clang 18 is exactly such a case). `SYSTEM`
 is kept anyway; it still suppresses every *other* warning class Catch2's
 internals would otherwise trip.
 
+That fix got the build all the way through — `est`, `est_tests`, and
+`hello_world` all linked successfully, confirming `<print>`/
+`std::println` genuinely works against the real Clang 22 + libc++ (the
+"Known open items" caveat about this is resolved). One clang-tidy finding
+remained: `bugprone-exception-escape` on `hello_world`'s `main()`, since
+`std::println` can throw `std::format_error` and nothing caught it.
+Fixed with a `try`/`catch (...)` around `main()`'s body — verified the
+pattern locally against a stand-in throwing call first (this sandbox's
+Clang/libstdc++ has no `<print>` to test the real call directly), and
+confirmed a `try`-less version does trigger the same clang-tidy warning
+so the test was meaningful.
+
 ### Known open items
 
 This session could not reach `apt.llvm.org` or `cmake.org` (network egress
@@ -300,13 +312,13 @@ whoever has current documentation open), followed by an actual
 `docker build` + in-container configure/build/test to confirm the pin works
 before relying on it in CI.
 
-A third, smaller item found the same way: `examples/hello_world/main.cpp`
-uses `std::println` (`<print>`, C++23) rather than `printf`/`puts` — `.clang-tidy`'s
-`modernize-use-std-print` catches exactly this if you reach for the older
-APIs, and it's the correct target-toolchain choice, but it could not be
-locally build-verified in this environment (its GCC 13 / libstdc++ predates
-`<print>`, which landed in GCC 14; Clang's own libc++ support is newer
-still). Verify it compiles once the pinned Docker toolchain exists.
+A third, smaller item was flagged the same way and has since been
+resolved: `examples/hello_world/main.cpp` uses `std::println` (`<print>`,
+C++23) rather than `printf`/`puts`, which could not be locally
+build-verified in this environment (its GCC 13 / libstdc++ predates
+`<print>`). The real pinned toolchain (Clang 22.1.8 + libc++) has since
+confirmed it compiles and links fine — see "First real toolchain build"
+above.
 
 ---
 
