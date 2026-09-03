@@ -31,6 +31,15 @@ name: ci
 # bind-mounted workspace are never owned by a UID the runner can't touch,
 # whatever UID actions/checkout happens to run as. HOME=/tmp avoids tools
 # choking on a UID with no passwd entry / home directory in the image.
+#
+# The last two steps gate on *new-code* (diff/patch) coverage, not overall
+# repository coverage: a separate build with Clang's source-based coverage
+# instrumentation (-fprofile-instr-generate -fcoverage-mapping, the
+# "coverage" CMake preset - see docs/PLAN.md), exported to lcov via
+# llvm-cov, then intersected with the PR's diff via diff-cover so only the
+# lines a PR actually touches are held to the threshold. Needs full git
+# history (fetch-depth: 0) for diff-cover to compute the diff against
+# origin/main.
 
 on:
   pull_request:
@@ -48,6 +57,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: docker/setup-buildx-action@v3
 
@@ -96,3 +107,21 @@ jobs:
           -v ${{ github.workspace }}:/workspace -w /workspace
           ${{ env.DEVENV_IMAGE }}
           ctest --preset ci
+
+      - name: configure + build + test (coverage instrumentation)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          bash -c 'cmake --preset coverage && cmake --build --preset coverage && ctest --preset coverage'
+
+      - name: new-code coverage gate
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          bash -c '
+            llvm-profdata merge -sparse build/coverage/profraw/*.profraw -o build/coverage/coverage.profdata &&
+            llvm-cov export --format=lcov --instr-profile=build/coverage/coverage.profdata build/coverage/est/tests/est_tests --object=build/coverage/est/tests/est_tests > build/coverage/coverage.lcov &&
+            diff-cover build/coverage/coverage.lcov --compare-branch=origin/main --fail-under=80
+          '

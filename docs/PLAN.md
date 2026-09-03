@@ -361,21 +361,56 @@ This job is a required status check for merging into the default branch
 (branch protection is a repo-settings change, not something this plan's
 file changes can configure).
 
-### Candidate: gate CI on new-code coverage (not yet decided)
+### New-code coverage gate (done)
 
-Currently no coverage measurement exists at all — no instrumentation, no
-report, nothing. Raised mid-M2: gate CI on *patch/diff* coverage (are the
-lines a PR adds actually exercised by a test?), not overall repository
-percentage. Leading option: Clang's built-in source-based coverage
-(`-fprofile-instr-generate -fcoverage-mapping` + `llvm-cov`, already in
-the devenv image via LLVM's `all` install) to produce an lcov report,
-intersected with the PR diff via a tool like `diff-cover` to gate on just
-the changed lines — keeps everything inside the same self-contained
-toolchain this project has otherwise stuck to, at the cost of more setup
-than piping to a hosted service like Codecov (which does the diff
-intersection and PR annotations for you, but adds an external dependency
-this project hasn't otherwise taken on). Not implemented yet — pending a
-decision on which way to go.
+Raised mid-M2: gate CI on *patch/diff* coverage (are the lines a PR adds
+actually exercised by a test?), not overall repository percentage.
+Implemented self-hosted rather than via a service like Codecov, to keep
+everything inside the same self-contained toolchain this project has
+otherwise stuck to:
+- `cmake/Coverage.cmake`: `EST_ENABLE_COVERAGE` option (default `OFF`,
+  so normal builds pay no instrumentation cost) and an
+  `est_enable_coverage(target)` helper adding Clang's source-based
+  coverage flags (`-fprofile-instr-generate -fcoverage-mapping`) to a
+  target's compile and link options. Applied to `est` and `est_tests`.
+  When on, also creates `<binaryDir>/profraw/` at configure time —
+  `LLVM_PROFILE_FILE` doesn't create its own parent directory and just
+  silently fails to write otherwise.
+- A new `coverage` CMake preset (`CMakePresets.json`, inherits `ci`,
+  `EST_ENABLE_COVERAGE=ON`, `EST_BUILD_EXAMPLES=OFF` — coverage of
+  `hello_world` isn't the point), with a matching `coverage` test preset
+  that sets `LLVM_PROFILE_FILE` to `<binaryDir>/profraw/%p.profraw` so
+  `ctest --preset coverage` (one process per Catch2-discovered test case)
+  writes one profile per process without collisions.
+- `docker/Dockerfile`: added `libclang-rt-<N>-dev` (compiler-rt's profile
+  runtime — what `-fprofile-instr-generate` links against; not reliably
+  pulled by `llvm.sh`'s `all`, same situation as libc++), `llvm-cov`/
+  `llvm-profdata` added to the unversioned-name `update-alternatives`
+  loop, and `diff-cover` (pinned `10.5.1`) via `pip install
+  --break-system-packages` — a throwaway container image, not a shared
+  system, so overriding Debian's PEP 668 guard is the right call, not a
+  workaround.
+- `ci.yml`: two new steps in `gate`, after `test` — configure+build+test
+  with the `coverage` preset, then merge the resulting `.profraw` files
+  (`llvm-profdata merge`), export to lcov (`llvm-cov export`), and gate
+  with `diff-cover ... --compare-branch=origin/main --fail-under=80`
+  (threshold picked as a reasonable starting point, not derived from
+  anything — adjust freely). Needed `fetch-depth: 0` on `actions/
+  checkout` (previously the default shallow depth) so `origin/main`'s
+  history is actually present for `diff-cover` to diff against.
+
+Verified end-to-end locally (this sandbox's Clang 18 has stable,
+long-standing coverage tooling, not a newer-Clang-only feature): every
+command in the two new CI steps, run against the exact `coverage` preset
+CI uses (temporarily stripping the toolchain file's `-stdlib=libc++`
+locally, same workaround used throughout this session for local
+verification), correctly produced per-test-case `.profraw` files, merged
+and exported to a real lcov report mapping to `future.cppm`/
+`promise.cppm`, and `diff-cover` correctly reported 100% coverage of
+M2's new code against `origin/main`. `libclang-rt-18-dev` (this
+sandbox's equivalent of the pinned image's `libclang-rt-<N>-dev`) had to
+be installed to link successfully — confirms that dependency is real,
+not just plausible.
 
 ---
 
