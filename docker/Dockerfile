@@ -1,8 +1,11 @@
 # Dev/CI image for `est`: one image used both for local development and as
-# the container GitHub Actions builds/lints/tests inside. See
-# docs/PLAN.md ("Docker strategy" / "Known open items") for why the
-# version pins below are TODOs rather than filled-in values: this
-# scaffolding was written from a session whose network egress policy
+# the container GitHub Actions builds/lints/tests inside. This Dockerfile
+# only installs the toolchain (Clang, libc++, CMake, Ninja) - selecting
+# clang/clang++ and -stdlib=libc++ is cmake/toolchain-hosted-linux.cmake's
+# job, applied via the "default"/"ci" CMake presets, not this image's
+# environment. See docs/PLAN.md ("Docker strategy" / "Known open items")
+# for why the version pins below are TODOs rather than filled-in values:
+# this scaffolding was written from a session whose network egress policy
 # blocked apt.llvm.org and cmake.org, so the exact snapshot/version numbers
 # below could not be looked up or validated by a real `docker build`.
 #
@@ -88,13 +91,6 @@ RUN arch="$(uname -m)" \
 # --- Non-root user for local bind-mount ergonomics ---
 RUN groupadd --gid "${USER_GID}" est \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash est
-
-# Explicit rather than relying on CMake's implicit compiler search order:
-# this image has no gcc/g++ at all (only clang is installed above), so an
-# implicit search would likely still land on clang, but "likely" isn't
-# good enough for what every CI run depends on.
-ENV CC=clang
-ENV CXX=clang++
 
 USER est
 WORKDIR /workspace

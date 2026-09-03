@@ -59,11 +59,11 @@ Design constraints, settled up front:
   - `import std;` is used inside the framework instead of classic headers,
     gated via CMake's `CXX_MODULE_STD` / `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`.
     This experimental gate's value is tied to the exact CMake version, so
-    the Dockerfile pins an exact CMake version too, and the top-level
-    `CMakeLists.txt` records which CMake version that experimental value was
-    validated against. Bumping CMake in the image requires re-validating
-    this in the same commit. **Not yet pinned** — see "Known open items"
-    below.
+    the Dockerfile pins an exact CMake version too, and
+    `cmake/toolchain-hosted-linux.cmake` records which CMake version that
+    experimental value was validated against. Bumping CMake in the image
+    requires re-validating this in the same commit. **Not yet pinned** —
+    see "Known open items" below.
   - Ninja is required (module dependency scanning is Ninja-only in CMake
     today) — the Docker image installs Ninja and CMake is configured to use
     it as the default/only generator for this project.
@@ -110,7 +110,8 @@ async_experiments/
 ├── CMakeLists.txt                # top-level: options, subdirs, toolchain checks
 ├── CMakePresets.json              # "default" (local/dev) and "ci" configure presets
 ├── cmake/
-│   └── CompilerWarnings.cmake    # shared warning flags for est targets
+│   ├── CompilerWarnings.cmake    # shared warning flags for est targets
+│   └── toolchain-hosted-linux.cmake  # compiler/stdlib pin, used by the presets
 ├── docker/
 │   └── Dockerfile                # the one image for local dev + CI
 ├── est/                          # the platform-agnostic framework library
@@ -237,13 +238,21 @@ packages or told Clang to use libc++ over whatever `libstdc++` happens to
 be on the system — and this image has no `libstdc++-dev`/`gcc` at all, so
 even `<string_view>` could plausibly have failed to resolve, not just
 `<print>`. Fixed by installing `libc++-<N>-dev`/`libc++abi-<N>-dev`
-alongside Clang and adding `-stdlib=libc++` (opt-out via a new
-`EST_USE_LIBCXX` CMake option, default `ON`, so this CMakeLists.txt can
-still be smoke-tested against a Clang-plus-libstdc++ setup like this
-session's local sandbox). The exact libc++ package names follow
-apt.llvm.org's usual convention but, like the Clang/CMake version pins
-below, could not be confirmed against a real package listing from this
-session — verify when the image is first actually built.
+alongside Clang. The exact libc++ package names follow apt.llvm.org's
+usual convention but, like the Clang/CMake version pins below, could not
+be confirmed against a real package listing from this session — verify
+when the image is first actually built.
+
+Compiler and stdlib selection (`clang`/`clang++`, `-stdlib=libc++`) was
+originally set as CMakeLists.txt logic gated by a CMake option, but moved
+into a proper toolchain file, `cmake/toolchain-hosted-linux.cmake`,
+applied via the `default`/`ci` presets in `CMakePresets.json` — the
+standard CMake mechanism for "which compiler and how", and named
+`hosted-linux` so a future bare-metal backend (see Roadmap) gets its own
+sibling file instead of this one growing conditionals for a target it
+was never meant to describe. Configuring without a preset (as this
+session's own local smoke-testing does, lacking libc++) falls back to
+CMake's normal compiler search, unaffected by the toolchain file.
 
 ### Known open items
 
@@ -252,7 +261,7 @@ policy for this environment blocks them), so two things are deliberately
 left as marked placeholders rather than guessed:
 - The exact Clang snapshot version/package name to pin in `docker/Dockerfile`.
 - The exact `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` gate value and the minimum
-  CMake version it corresponds to, in the top-level `CMakeLists.txt`.
+  CMake version it corresponds to, in `cmake/toolchain-hosted-linux.cmake`.
 
 Both are marked `TODO` at their definition site. Filling them in requires a
 session/environment with access to those hosts (or the values supplied by

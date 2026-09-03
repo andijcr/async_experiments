@@ -18,28 +18,15 @@ if(NOT CMAKE_GENERATOR MATCHES "Ninja")
 endif()
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 
-# TODO(M0 follow-up): pin the exact CMAKE_EXPERIMENTAL_CXX_IMPORT_STD gate
-# value once the Docker image's CMake version is pinned (see
-# docs/PLAN.md, "Known open items" — apt.llvm.org/cmake.org were
-# unreachable from the session that wrote this scaffolding). Until then,
-# `import std;` support is opt-in and silently unavailable rather than a
-# hard requirement, so the walking skeleton avoids it.
-#
-# set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "<gate-value-for-pinned-cmake-version>")
+# Compiler, standard library (libc++), and the import-std experimental
+# gate are pinned in cmake/toolchain-hosted-linux.cmake, applied via the
+# "default"/"ci" CMake presets (CMakePresets.json) rather than set here -
+# see that file for why. Configuring without a preset (or a different
+# -DCMAKE_TOOLCHAIN_FILE=) falls back to CMake's normal compiler search,
+# useful for structural smoke-testing against whatever toolchain happens
+# to be on hand.
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "est links statically by default" FORCE)
-
-# Clang defaults to libstdc++ (or whatever GCC is on PATH) unless told
-# otherwise, and `import std;`/<print> support needs libc++ specifically.
-# The devenv Dockerfile installs libc++'s dev packages for exactly this.
-# Opt-out (not a hardcoded flag) so this CMakeLists.txt still configures
-# on a Clang toolchain that only has libstdc++ available, e.g. for
-# structural smoke-testing outside the pinned devenv image.
-option(EST_USE_LIBCXX "Link against libc++ when compiling with Clang" ON)
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND EST_USE_LIBCXX)
-  add_compile_options(-stdlib=libc++)
-  add_link_options(-stdlib=libc++)
-endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
