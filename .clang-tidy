@@ -1,0 +1,49 @@
+---
+# Starting rule set for `est`. Tuned to gate CI without fighting this
+# project's deliberate patterns (allocator-heavy code, intrusive
+# waiter-list pointers owned outside a smart pointer). See docs/PLAN.md.
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  cppcoreguidelines-*,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-type-union-access,
+  -cppcoreguidelines-avoid-non-const-global-variables,
+  -cppcoreguidelines-avoid-do-while,
+  readability-*,
+  -readability-identifier-length,
+  -readability-magic-numbers,
+  -cppcoreguidelines-avoid-magic-numbers
+
+# cppcoreguidelines-avoid-do-while is dropped above rather than NOLINT'd
+# per call site: Catch2's REQUIRE/CHECK macros expand to a do-while, and
+# the diagnostic attributes to the (user-code) call site, not the header,
+# so header filtering alone can't suppress it.
+
+WarningsAsErrors: '*'
+# Anchored so it only matches an actual est/ or examples/ path component
+# (unanchored 'est/' would also match e.g. a build directory named
+# "build-test/" containing "est/" as a substring).
+HeaderFilterRegex: '(^|/)(est|examples)/'
+FormatStyle: file
+
+CheckOptions:
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassCase
+    value: lower_case
+  - key: readability-identifier-naming.StructCase
+    value: lower_case
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: '_'
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.TemplateParameterCase
+    value: CamelCase

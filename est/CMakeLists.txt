@@ -1,0 +1,18 @@
+add_library(est STATIC)
+add_library(est::est ALIAS est)
+
+target_sources(est
+  PUBLIC
+    FILE_SET CXX_MODULES
+    BASE_DIRS src
+    FILES
+      src/est.cppm
+      src/placeholder.cppm
+)
+
+target_compile_features(est PUBLIC cxx_std_23)
+est_set_warnings(est)
+
+if(EST_BUILD_TESTS)
+  add_subdirectory(tests)
+endif()
