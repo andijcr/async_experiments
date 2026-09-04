@@ -1,13 +1,3 @@
-module;
-
-// stderr is an ordinary extern global (glibc), not a macro - but like
-// EXIT_SUCCESS/<cstdlib> and assert/<cassert> elsewhere in this codebase,
-// `import std;` still doesn't make it visible: confirmed directly (Clang:
-// "missing '#include <stdio.h>'; 'stderr' must be declared before it is
-// used") when this file first tried std::print(stderr, ...) with only
-// `import std;` in scope.
-#include <cstdio>
-
 export module est:platform;
 
 import std;
@@ -55,30 +45,28 @@ public:
     return std::chrono::steady_clock::now();
   }
 
-  // Builds assert_failure()'s diagnostic text - split out from
-  // assert_failure() itself specifically so this (the only part with any
-  // real logic - the "is message empty" branch) is unit-testable.
-  // assert_failure()'s own remaining body (format + print + abort) isn't:
-  // it's a [[noreturn]] function that calls std::abort(), same
-  // not-practically-unit-testable situation as est::check()'s failure
-  // path (est/tests/check_tests.cpp).
-  [[nodiscard]] static auto format_assertion_message(std::string_view message,
-                                                     std::source_location location) -> std::string {
-    std::string result =
-        std::format("{}:{}: assertion failed", location.file_name(), location.line());
-    if (!message.empty()) {
-      result += std::format(": {}", message);
-    }
-    result += std::format(" (in {})", location.function_name());
-    return result;
-  }
-
-  // std::println(stderr, ...), not std::cerr <<: this is the one place
-  // in the framework that actually performs I/O, so it's also the one
-  // place that should reach for std::print/println directly - everywhere
-  // else, string formatting (std::format) without printing is the right
-  // tool, since *whether* and *how* to emit text is a platform concern,
-  // not a framework one.
+  // One std::println call, not several - a reviewer comment on an
+  // earlier, multi-call version pointed out there's no reason to split
+  // this into 2-3 separate writes when a single format string says the
+  // same thing; always including `message` (even when empty, giving
+  // "assertion failed:  (in func)" with a blank between the colons) is a
+  // deliberate simplification, not an oversight - the empty case is rare
+  // enough (every current est::check() call site either always or never
+  // passes one) that a special-cased branch to avoid a stray blank isn't
+  // worth the extra code on a path that only exists to report a bug.
+  // Directly to std::cerr, not building an intermediate std::string
+  // first: the whole point of std::print's format_string overload is
+  // writing straight into the destination.
+  //
+  // std::cerr (an ostream), not stderr (a FILE*): unlike stderr, std::cerr
+  // is a proper namespace-std entity, so it needs nothing beyond
+  // `import std;` to reach - no #include, unlike the FILE*-based stderr
+  // this replaced (see docs/PLAN.md). Confirmed with a standalone
+  // `import std;`-only program that actually triggers this path (not
+  // just compiles it) that std::cerr writes correctly with no <iostream>
+  // #include anywhere in the TU - the standard library's own static
+  // initialization for the standard streams isn't skipped just because
+  // the include was replaced by an import.
   [[noreturn]] void assert_failure(std::string_view message,
                                    std::source_location location) const noexcept override {
     // std::println can throw (std::format_error, or an I/O failure) -
@@ -89,7 +77,12 @@ public:
     // examples/hello_world/main.cpp already needs around its own
     // std::println call, for the same reason.
     try {
-      std::println(stderr, "{}", format_assertion_message(message, location));
+      std::println(std::cerr,
+                   "{}:{}: assertion failed: {} (in {})",
+                   location.file_name(),
+                   location.line(),
+                   message,
+                   location.function_name());
       // Deliberately empty: std::abort() unconditionally follows below
       // regardless of whether the diagnostic above printed successfully,
       // so there's nothing to handle or re-throw here.

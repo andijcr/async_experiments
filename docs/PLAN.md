@@ -785,9 +785,69 @@ the rest of this document's recent entries: `clang-format` clean,
 `override_instance()`'s swap/restore/nesting behavior), coverage gate at
 89%.
 
----
+### `assert_failure()` reworked again: inline prints, `std::cerr` not `stderr`
 
-## `.clang-format` / `.clang-tidy`
+The repo owner came back with two more concrete asks on top of the
+`std::print` migration above: print each field directly instead of
+building an intermediate `std::string` first, and use `std::cerr` (an
+`ostream`) rather than `stderr` (a `FILE*`). Both landed together:
+
+- `format_assertion_message()` is gone; `assert_failure()` now calls
+  `std::print`/`std::println` directly against `std::cerr`, one field at
+  a time, inside the same `try`/`catch(...)` as before. Its two dedicated
+  unit tests are gone with it - the "is message empty" branch is back to
+  being untestable-by-construction, the same situation as `est::check()`'s
+  own failure path, since there's no longer a standalone helper to call
+  in isolation.
+- Switching to `std::cerr` incidentally *removes* the `#include <cstdio>`
+  workaround this file needed for `stderr` (documented above, under
+  "import std; re-adopted") - `std::cerr` is a genuine `namespace std`
+  entity, not a possibly-macro C global, so `import std;` alone reaches
+  it.
+
+Two things worth actually checking rather than assuming, given this
+project's history of getting exactly this kind of claim wrong (see the
+`time_point` default-constructor mistake above): whether removing the
+coverage-driving helper regresses the new-code coverage gate, and whether
+`std::cerr` genuinely works when reached only via `import std;` - not
+just whether it compiles.
+
+- **Coverage**: it doesn't regress the gate. Re-ran `diff-cover` against
+  `origin/main` with this change in place (stacked on the still-unmerged
+  `est::platform` redesign above, since `diff-cover`'s
+  `--compare-branch=origin/main` in `ci.yml` is hardcoded regardless of a
+  PR's actual base branch) - 85%, comfortably over the 80% threshold, even
+  with `assert_failure()`'s body entirely uncovered again.
+- **`std::cerr` via `import std;` alone**: verified with a standalone
+  scratch program (not part of this repo) that actually *triggers* the
+  path - prints to `std::cerr`, then calls `std::abort()` - rather than
+  only compiling and linking it. Captured stdout and stderr separately:
+  stdout was empty, stderr contained exactly the expected diagnostic
+  line, and the process exited via `SIGABRT` as expected. No
+  `#include <iostream>` anywhere in that scratch program either - the
+  standard streams' static initialization isn't something `import std;`
+  skips.
+
+**The "coverage doesn't regress" claim above turned out to be an
+artifact of the stale baseline it was checked against, not a real
+result.** It was measured while this change's PR was still stacked on
+the not-yet-merged `est::platform` redesign PR, whose own diff's covered
+lines diluted the uncovered `assert_failure()` body down to 85%. Once
+that PR merged and this one's base moved to point at `main` directly,
+`diff-cover` against the *real* current `main` showed the true, isolated
+result: 0% - all of `assert_failure()`'s few lines uncovered, none of
+the other PR's covered lines left to average against. A follow-up
+review comment asked to consolidate the three `std::print`/`std::println`
+calls into one (implemented - see the format string above); this didn't
+fix the gate either, and if anything made the per-line accounting worse
+(each argument expression in a wrapped multi-line call gets its own
+coverage region, so the single call spans more counted-but-uncovered
+lines than the three short calls it replaced). Per the repo owner's
+explicit direction, the coverage gate was not chased further for this
+PR - `assert_failure()`'s body stays genuinely untestable-by-construction
+without process-isolation tooling (the same situation `est::check()`'s
+own failure path has always been in), and building that tooling wasn't
+asked for here.
 
 `.clang-format` is based on the LLVM style as a starting point (closest
 existing style to how Clang's own modules/coroutines code is formatted, and
