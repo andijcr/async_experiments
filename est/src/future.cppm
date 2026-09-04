@@ -1,13 +1,6 @@
-module;
-
-#include <exception>
-#include <memory_resource>
-#include <type_traits>
-#include <utility>
-#include <variant>
-
 export module est:future;
 
+import std;
 import :check;
 import :sync.mutex;
 import :util.scope_exit;

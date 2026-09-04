@@ -66,8 +66,10 @@ Design constraints, settled up front:
     the Dockerfile pins an exact CMake version too, and
     `cmake/toolchain-hosted-linux.cmake` records which CMake version that
     experimental value was validated against. Bumping CMake in the image
-    requires re-validating this in the same commit. **Not yet pinned** —
-    see "Known open items" below.
+    requires re-validating this in the same commit. **Pinned and verified
+    end-to-end** (gate value, Dockerfile packaging fix, and
+    `CMAKE_CXX_EXTENSIONS` ordering) — see "import std; re-adopted,
+    project-wide" below.
   - Ninja is required (module dependency scanning is Ninja-only in CMake
     today) — the Docker image installs Ninja and CMake is configured to use
     it as the default/only generator for this project.
@@ -336,6 +338,146 @@ session/environment with access to those hosts (or the values supplied by
 whoever has current documentation open), followed by an actual
 `docker build` + in-container configure/build/test to confirm the pin works
 before relying on it in CI.
+
+### Docker build verified end-to-end (network-enabled sandbox, post-M2)
+
+A later session's sandbox had real, if unusual, network access: `apt.llvm.org`,
+GitHub release downloads (`cmake.org`'s distribution point), and Docker Hub
+were all reachable directly (not just from real GitHub Actions), unlike
+every prior session recorded in this document. `dockerd` itself needed
+starting by hand (`nohup dockerd &`; the packaged `/etc/init.d/docker`
+script's `ulimit -Hn`/`ulimit -u unlimited` calls fail under this sandbox's
+restrictions, so it has to be invoked directly rather than via `service
+docker start`).
+
+`docker build -f docker/Dockerfile .` hit one sandbox-specific snag:
+this environment transparently MITMs all outbound TLS (including from
+containers, regardless of proxy env vars) through an internal egress
+gateway, so `wget`'s fetch of `apt.llvm.org/llvm.sh` failed cert
+validation inside the build. This is purely an artifact of the sandbox,
+not of the image or of real CI, so it was **not** fixed in the committed
+Dockerfile; instead a throwaway local copy added a `COPY`-the-sandbox's-CA
++ `update-ca-certificates` step ahead of the network `RUN`s, verified with
+that copy, then discarded.
+
+With that sandbox-only trust issue worked around, the real, repo-relevant
+result: `docker build` succeeded outright with the existing pins
+(`LLVM_VERSION=22`, `CMAKE_VERSION=3.31.0`) - `Debian clang version
+22.1.8`, `cmake version 3.31.0`, and `libc++-22-dev`/`libc++abi-22-dev`/
+`libclang-rt-22-dev` all installed clean, matching what real CI had
+already found (see "First real toolchain build" above) but now confirmed
+independently, from a cold image build rather than relying on a prior
+CI run. Running the full CI sequence in a container from that image,
+mounted against this repo's actual tree (`--user root`, since the image's
+non-root `est` user can't write into a bind mount owned by this sandbox's
+root):
+- `cmake --preset ci && cmake --build --preset ci` - `est`, `est_tests`
+  (Catch2 fetched live via `FetchContent`), and `hello_world` all
+  configured, built, and linked with no errors.
+- `./hello_world` printed `est::future value: 42` as expected.
+- `ctest --preset ci` - 30/30 tests passed.
+- `clang-format --dry-run --Werror` over every tracked `.cpp`/`.cppm`/`.h`
+  - clean.
+- `clang-tidy -p build/ci` over every `.cpp`/`.cppm` - zero warnings
+  reported against project code (31544 suppressed warnings were all
+  attributed to non-user/system code, per the project's header-filter
+  convention).
+
+This is the first time the *entire* documented CI pipeline (image build
+through test) has been reproduced independently of GitHub's own runners,
+and it confirms the toolchain pins are correct as committed - no
+Dockerfile or CMake changes were needed. `docker/Dockerfile`'s two
+"package names unconfirmed"/"pin from a blind guess" comments were updated
+to reflect this; the `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` situation is
+unchanged (that revert was for a real packaging gap - a missing
+`std.cppm` - not an unverified pin; see M2's "Round 5" below).
+
+### `import std;` re-adopted, project-wide
+
+Same network-enabled sandbox, immediately following the verification
+above. M2's "Round 5" (see above) had tried `import std;` project-wide
+once already and reverted it after real CI failed with `CMake Error:
+Cannot find source file: /lib/share/libc++/v1/std.cppm` - a concrete but
+unexplained packaging gap at the time, since the session that hit it
+couldn't reach `apt.llvm.org` to investigate. With real registry/package
+access this time, the root cause and a real fix were both found and
+verified end-to-end before touching any source file:
+
+**Root cause.** `libc++-22-dev` installs `libc++.modules.json` (the
+manifest CMake's `import std;` support reads to find the std module's
+sources) twice: once under the versioned
+`/usr/lib/llvm-22/lib/libc++.modules.json`, and again at the standard
+multiarch path `/usr/lib/x86_64-linux-gnu/libc++.modules.json` - the copy
+plain `-stdlib=libc++` actually finds via `clang++
+-print-file-name=libc++.modules.json` (confirmed directly: it resolves to
+`/lib/x86_64-linux-gnu/libc++.modules.json`, `/lib` being the merged-usr
+symlink to `/usr/lib`). Both copies list the same relative
+`source-path": "../share/libc++/v1/std.cppm"`, resolved relative to the
+JSON's own directory - correct *if* the install prefix were flat (as
+upstream LLVM's own release layout is), but Debian's packaging doesn't
+mirror `share/libc++/v1/` next to the multiarch lib dir; it only exists
+under the versioned `/usr/lib/llvm-22/share/libc++/v1/`. So the relative
+resolution lands on `/lib/share/libc++/v1/std.cppm`, which genuinely
+doesn't exist - confirmed directly (`std.cppm` only exists at
+`/usr/lib/llvm-22/share/libc++/v1/std.cppm`), reproducing the exact
+error from the M2 attempt with no guesswork this time.
+
+**Fix.** `docker/Dockerfile` now symlinks
+`/usr/lib/share/libc++/v1 -> /usr/lib/llvm-${LLVM_VERSION}/share/libc++/v1`
+(a directory symlink, not per-file - `std.cppm`/`std.compat.cppm` both
+`#include` sibling `.inc` fragment files from `std/`/`std.compat/`
+subdirectories that a per-file symlink would miss, caught by trying the
+narrower fix first and watching `clang-scan-deps` fail on
+`'std/algorithm.inc' file not found`). This makes the relative path the
+broken `libc++.modules.json` actually looks up resolve to the real,
+versioned module sources without touching Debian's package contents.
+
+**A second, independent bug surfaced once the first was fixed and
+configure succeeded**: the build failed compiling `est`'s own sources
+against the newly-available `std.pcm` with `error: GNU extensions was
+enabled in precompiled file 'std.pcm' but is currently disabled`. Cause:
+`CMAKE_CXX_EXTENSIONS OFF` (and `CMAKE_CXX_STANDARD`/`_STANDARD_REQUIRED`)
+were set in the top-level `CMakeLists.txt` *after* `project()` - but
+`project()`'s own compiler-detection step is what compiles the internal
+`__cmake_cxx23` target (`std.pcm`) that backs `import std;`, using
+whatever extensions setting is active at that exact point, not whatever a
+later `set()` call says. With no explicit setting yet at that point, it
+defaulted to GNU extensions on, while every `est/` target compiled
+afterward correctly picked up `EXTENSIONS OFF` and got plain `c++23` -
+a real, Clang-enforced configuration mismatch between the two, not a
+class of bug specific to this project's code. Fixed by moving those three
+`set()` calls to before `project()` in `CMakeLists.txt`, mirroring the
+compiler/import-std-gate settings that already had to precede `project()`
+in the toolchain file for the same reason. Both bugs were isolated and
+confirmed individually in a scratch CMake project before touching the
+real repo, then the real fix was verified against `est` itself.
+
+**Migration.** With both bugs fixed, every `.cppm`/`.cpp` file went back
+to `import std;` (mirroring the M2 "Round 5" migration this replaces, now
+adjusted for `est:check`, which didn't exist at that point): every
+`module;`-fragment `#include` of a plain standard header became `import
+std;`, except macro-based headers that `import` can never transmit
+(`<cassert>` was already gone from `future.cppm` - it now uses
+`est::check()` - and `<cstdlib>` stays in `examples/hello_world/main.cpp`
+for `EXIT_SUCCESS`/`EXIT_FAILURE`). `est/src/sync/mutex.cppm`'s now-empty
+`module;` fragment was dropped entirely.
+
+**Verified end-to-end**, same sandbox, same from-scratch `docker build`
+approach as the section above (CA-trust caveat unchanged - sandbox-only,
+never committed): `cmake --preset ci` configures cleanly, `cmake --build
+--preset ci` builds `est`/`est_tests`/`hello_world` with zero errors,
+`hello_world` prints `est::future value: 42`, `ctest --preset ci` is
+30/30, `clang-format --dry-run --Werror` is clean, and `clang-tidy` over
+every file reports zero findings against project code - identical results
+to the `#include`-based build this replaces. The `coverage` preset
+(`cmake --build --preset coverage`, `ctest --preset coverage`, the
+`llvm-profdata merge`/`llvm-cov export`/`diff-cover` pipeline from
+`ci.yml`) was also re-run and completes without error.
+
+The M0-era "import std; unverified" TODO and its M2 "Round 5" revert are
+both closed now: the toolchain pins, the packaging-gap symlink, and the
+`CMAKE_CXX_EXTENSIONS` ordering are all committed and confirmed against
+the real pinned image, not just plausible.
 
 A third, smaller item was flagged the same way and has since been
 resolved: `examples/hello_world/main.cpp` uses `std::println` (`<print>`,

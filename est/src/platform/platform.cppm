@@ -1,12 +1,6 @@
-module;
-
-#include <chrono>
-#include <cstdlib>
-#include <iostream>
-#include <source_location>
-#include <string_view>
-
 export module est:platform;
+
+import std;
 
 // The hosted-Linux platform backend - the only est::platform
 // implementation that exists so far (docs/PLAN.md, "Platform
