@@ -561,37 +561,52 @@ Removed.
 - `shared_state<T>`, in `est/src/future.cppm` (`est:future`) — the single
   owned object behind both handles. Holds value-or-exception storage
   (`std::variant<std::monostate, T, std::exception_ptr>`), a continuation
-  list built directly on the M1 `est::mutex`'s waiter list, and a plain
-  (non-atomic — single-threaded, see `est::mutex`'s own docs) reference
-  count. Always heap-allocated via `std::pmr::polymorphic_allocator<std::
-  byte>` — see `make_promise_future()` below — never constructed
-  directly by a caller. Not templated on a generic `Allocator` the way
+  list built on `est::waiter_list` (extracted from `est::mutex` in a
+  later review round — see below), and a plain (non-atomic —
+  single-threaded) reference count. Always heap-allocated via
+  `std::pmr::polymorphic_allocator<std::byte>` — see
+  `make_promise_future()` below — never constructed directly by a
+  caller. Not templated on a generic `Allocator` the way
   `est::timer_queue` is: `shared_state`/`future`/`promise` cross an API
   boundary (many call sites, needs a uniform, non-template-parameterized
   type), which is exactly the case docs/PLAN.md's "Allocator support"
   section already called out for `std::pmr::polymorphic_allocator`-style
   erasure — `est::timer_queue` stays a generic `Allocator` template
   parameter because it doesn't cross such a boundary (one component, one
-  concrete instantiation).
-- Continuations are `shared_state<T>::continuation_node`, a small virtual
-  base (`invoke(shared_state&)`) deriving from `est::mutex_waiter` —
-  exactly what `mutex_waiter`'s "payload-free at this layer" doc comment
-  in M1 anticipated: no second allocation for the list node itself.
-  `future<T>::then(fn)` allocates a concrete `continuation_node` wrapping
-  `fn` (via the `shared_state`'s own allocator, using C++20's
-  `polymorphic_allocator::new_object`/`delete_object`) and hands it to
-  the `shared_state`; completion (`set_value`/`set_exception`) drains
-  *every* queued continuation (LIFO, same order `est::mutex`'s waiter
-  list is documented to use) rather than assuming at most one — nothing
-  stops a caller registering more than one `then()`, and the underlying
-  list already supports it.
+  concrete instantiation). `get()` uses C++23 deducing-this: called on an
+  lvalue it returns `const T&` (non-consuming, safe for multiple readers);
+  called on an rvalue (`std::move(state).get()`) it returns `T&&`, an
+  explicit opt-in to move, same caveat as `std::optional<T>::value() &&`.
+- Continuations are `est::detail::continuation_node<T>` (`est:future`,
+  non-exported — an implementation detail of `then()`, not part of
+  `shared_state`'s public surface), a small virtual `invoke(shared_state&)`
+  deriving from the *type-agnostic* `est::detail::waiter_node`
+  (`destroy(allocator)` + virtual destructor only — nothing `T`-dependent,
+  so it's compiled once instead of once per `T`), itself deriving from
+  `est::mutex_waiter` — exactly what `mutex_waiter`'s "payload-free at
+  this layer" doc comment in M1 anticipated: no second allocation for the
+  list node itself. `future<T>::then(fn)` allocates a concrete
+  `continuation_node` wrapping `fn` (via the `shared_state`'s own
+  allocator, using C++20's `polymorphic_allocator::new_object`/
+  `delete_object`) and hands it to the `shared_state`; completion
+  (`set_value`/`set_exception`) drains *every* queued continuation (LIFO,
+  same order `est::waiter_list` is documented to use) rather than
+  assuming at most one — nothing stops a caller registering more than
+  one `then()`, and the underlying list already supports it. `run()`'s
+  own destroy-on-exit guard is `est::scope_exit` (`est:util.scope_exit`),
+  a small reusable RAII "run this on scope exit" utility, not an ad-hoc
+  local struct.
 - `est::promise<T>`, in `est/src/promise.cppm` (`est:promise`) — producer
-  handle: move-only, `set_value`/`set_exception`.
+  handle: move-only, `set_value(const T&)`/`set_value(T&&)`/
+  `set_exception`.
 - `est::future<T>`, in `est/src/future.cppm` — consumer handle: move-only,
   `.then(fn)` where `fn` is called as `fn(shared_state<T>&)` so it can
   `get()` (rethrowing any stored exception) or `ready()`. Runs
   synchronously, on whichever call stack completes the `shared_state` —
-  there's no loop yet to defer onto (M3 will change that).
+  there's no loop yet to defer onto (M3 will change that). `get()` is
+  also deducing-this: `future.get()` copy-constructs, `std::move(future)
+  .get()` moves — safe unconditionally here since a `future` is a
+  single-consumer handle, unlike `shared_state<T>::get()` itself.
 - `make_promise_future<T>(allocator)`, in `est/src/promise.cppm` —
   constructs a fresh `shared_state<T>` and returns the `{promise, future}`
   pair sharing it; the only way a `shared_state` is created.
@@ -685,6 +700,68 @@ the column limit via a local `using std::pmr::memory_resource;` (so
 `[[nodiscard]]`, which `clang-tidy` requires, no longer forces a wrap at
 all), and a single-line `{ ... }` block with a trailing comment expanded to
 the canonical always-multi-line form.
+
+**Found by real CI, round 2 — a genuine bug, not a toolchain-version
+drift.** The push that fixed the clang-format issue above turned up a
+second, unrelated real-CI-only failure: `est/tests/future_tests.cpp`
+calls `std::make_exception_ptr` but only `#include`s `<stdexcept>`, not
+`<exception>`. Local libstdc++ (the only stdlib available in this
+project's development sandbox) happens to pull `<exception>` in
+transitively through `<stdexcept>`; the pinned Clang 22 + libc++ CI
+toolchain does not, and `import est;` doesn't re-export the includes
+behind `future.cppm`/`promise.cppm`'s own global module fragments to
+importers of the `est` module — correct module semantics, and exactly
+why this went undetected through every local build. Fixed by adding the
+missing include directly.
+
+**A full design-review round from a human reviewer, in parallel with the
+above.** Once PR #3 reached real CI, its actual human reviewer worked
+through `future.cppm` line by line and left a wave of review comments.
+The resulting changes, in the order they landed:
+- `est::mutex`'s intrusive waiter-list mechanics were extracted into a
+  standalone `est::waiter_list` (`est:sync.mutex`) — `mutex` keeps its
+  existing public API, now backed by one. `shared_state<T>` was found to
+  be using `mutex_.lock()`/`unlock()` around every waiter-list operation
+  for no reason: M2 is entirely synchronous and single-threaded, so
+  there was never anything those calls actually protected — real
+  protection is already documented (M4 below) as arriving with
+  coroutine suspension points, not before. `shared_state<T>` now holds
+  an `est::waiter_list` directly, with no lock/unlock calls at all.
+- `continuation_node` was split into a type-agnostic `detail::waiter_node`
+  base plus a `T`-templated `detail::continuation_node<T>`, and moved out
+  of being a nested type of `shared_state<T>` into `est::detail` (see the
+  M2 section above) — less code generated per `T`, and no longer part of
+  `shared_state`'s public surface.
+- `set_value` gained `const T&`/`T&&` overloads (mirroring
+  `std::promise`) instead of a single by-value parameter, avoiding an
+  extra move on the rvalue path; `promise<T>::set_value` got the matching
+  pair so the saving isn't lost one layer up.
+- `shared_state<T>::get()` and `future<T>::get()` both became
+  deducing-this (see the M2 section above).
+- The ad-hoc local `destroy_on_exit` RAII guard in `run()` became
+  `est::scope_exit<Fn>` (`est:util.scope_exit`), a small reusable
+  "run this callable on scope exit" utility.
+- `future<T>`/`promise<T>`'s move-assignment operators became
+  swap-based (`std::swap(state_, other.state_); return *this;`) instead
+  of `reset()`-then-`std::exchange` — simpler, and self-assignment-safe
+  without an explicit check.
+- The M0 walking-skeleton scaffold (`est::placeholder_message()`,
+  `est/src/placeholder.cppm`, `est/tests/skeleton_tests.cpp`) was
+  removed now that real functionality exists to exercise instead;
+  `examples/hello_world` was updated to build a promise/future pair and
+  print its value.
+- One comment (`est::mutex` "satisfying the mutex concept" so
+  `std::scoped_lock` could be used) needed no code change: `mutex`
+  already has `lock()`/`unlock()`, which already satisfies
+  `BasicLockable` — and the mutex-removal change above means
+  `shared_state` doesn't hold a `mutex_` to use `std::scoped_lock` on
+  any more regardless.
+
+Two more substantial asks from the same review — extracting a
+general-purpose `est::shared_ptr<T>` for `shared_state`'s (renamed
+`future_state`'s) own ref-counting, and making `then()` return a
+chainable `future<U>` — are large enough to be their own follow-up
+rounds; see this section's future entries once those land.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

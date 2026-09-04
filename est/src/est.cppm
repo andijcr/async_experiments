@@ -1,6 +1,6 @@
 export module est;
 
-export import :placeholder;
+export import :util.scope_exit;
 export import :platform;
 export import :sync.mutex;
 export import :timer;

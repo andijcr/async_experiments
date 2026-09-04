@@ -7,7 +7,7 @@ target_sources(est
     BASE_DIRS src
     FILES
       src/est.cppm
-      src/placeholder.cppm
+      src/util/scope_exit.cppm
       src/platform/platform.cppm
       src/sync/mutex.cppm
       src/timer.cppm

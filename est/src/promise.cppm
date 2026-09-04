@@ -20,16 +20,14 @@ public:
   promise(promise&& other) noexcept : state_(std::exchange(other.state_, nullptr)) {}
 
   auto operator=(promise&& other) noexcept -> promise& {
-    if (this != &other) {
-      reset();
-      state_ = std::exchange(other.state_, nullptr);
-    }
+    std::swap(state_, other.state_);
     return *this;
   }
 
   ~promise() { reset(); }
 
-  void set_value(T value) { state_->set_value(std::move(value)); }
+  void set_value(const T& value) { state_->set_value(value); }
+  void set_value(T&& value) { state_->set_value(std::move(value)); }
   void set_exception(std::exception_ptr exception) { state_->set_exception(std::move(exception)); }
 
 private:
