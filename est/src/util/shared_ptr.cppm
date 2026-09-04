@@ -25,7 +25,18 @@ public:
   static auto make(allocator_type allocator, Args&&... args) -> shared_ptr {
     auto* control =
         allocator.template new_object<control_block>(allocator, std::forward<Args>(args)...);
-    return shared_ptr(control);
+    shared_ptr result(control);
+    // Wires up T's back-pointer to its own control block, for a T that
+    // opts in by inheriting from est::enable_shared_from_this<T> - a
+    // no-op (the requires-expression is simply false) for every other T.
+    // Must happen after construction (the constructor above already ran
+    // as part of allocating control), same reason
+    // std::enable_shared_from_this needs the same two-step wiring: T
+    // can't know its own control block from inside its own constructor.
+    if constexpr (requires(T& value, void* block) { value.set_owning_control_block(block); }) {
+      control->value.set_owning_control_block(control);
+    }
+    return result;
   }
 
   shared_ptr(const shared_ptr& other) noexcept : control_(other.control_) {
@@ -78,6 +89,23 @@ public:
 
   explicit operator bool() const noexcept { return control_ != nullptr; }
 
+  // Rebuilds a shared_ptr from a control block already known to have at
+  // least one live owner, bumping the ref count exactly like a copy
+  // would - the mechanism est::enable_shared_from_this<T> (below) uses
+  // to hand out shared ownership of T from inside T's own member
+  // functions, without T needing to store its own shared_ptr<T> (which
+  // would be a self-referential cycle this ref-counted pointer's plain
+  // int count could never break: the object would then always hold at
+  // least one reference to itself). Not for general use beyond that -
+  // nothing here can verify an arbitrary void* actually still points at
+  // a live control_block of this T; enable_shared_from_this<T> only ever
+  // passes back a pointer make() itself set.
+  [[nodiscard]] static auto from_owning_control_block(void* control) noexcept -> shared_ptr {
+    auto* typed = static_cast<control_block*>(control);
+    ++typed->ref_count;
+    return shared_ptr(typed);
+  }
+
 private:
   struct control_block {
     template <class... Args>
@@ -92,6 +120,39 @@ private:
   explicit shared_ptr(control_block* control) noexcept : control_(control) {}
 
   control_block* control_ = nullptr;
+};
+
+// Opt-in CRTP base giving a shared_ptr<T>-managed T the ability to hand
+// out new shared ownership of itself (shared_from_this()) from inside
+// its own member functions - the same problem
+// std::enable_shared_from_this solves for std::shared_ptr, needed here
+// because est::future_state<T> (est:future) invokes a then() callback
+// that wants a real est::future<T> - itself just a shared_ptr<T> plus a
+// thin interface - without future_state<T> otherwise having any way to
+// produce one. shared_ptr<T>::make() wires the back-pointer in
+// automatically for any T that inherits from this (see the `if
+// constexpr (requires ...)` there); never call set_owning_control_block
+// directly otherwise. Weak, not owning: stores a raw pointer, never
+// bumps the ref count itself - only shared_from_this() does, exactly
+// like any other shared_ptr copy.
+template <class T> class enable_shared_from_this {
+public:
+  [[nodiscard]] auto shared_from_this() -> shared_ptr<T> {
+    return shared_ptr<T>::from_owning_control_block(control_block_);
+  }
+
+private:
+  // Constructible only by T itself (the one correct CRTP usage - `class
+  // Foo : enable_shared_from_this<Bar>` would otherwise compile and
+  // silently do the wrong thing) and by shared_ptr<T>, which needs to
+  // call set_owning_control_block() below.
+  friend T;
+  friend class shared_ptr<T>;
+  enable_shared_from_this() = default;
+
+  void set_owning_control_block(void* control) noexcept { control_block_ = control; }
+
+  void* control_block_ = nullptr;
 };
 
 } // namespace est

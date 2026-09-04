@@ -679,6 +679,12 @@ flagged the tests' own `.find(x) != npos` idiom in favor of C++23's
   self-referencing `shared_ptr`s yet; building the mixin now means
   guessing at its shape with no real call site to validate against.
   Revisit when one appears (M3's loop is a plausible candidate).
+  **Reopened and implemented in the issue #23 PR** (see that section's
+  "Fourth follow-up" below) once a real call site appeared: a review
+  comment on that PR wanted `then()`'s wrapped-mode callback to receive
+  an `est::future<T>` instead of `future_state<T>&`, which needed exactly
+  this - `est::enable_shared_from_this<T>` now exists in
+  `est/src/util/shared_ptr.cppm`.
 - **#12** (analyze `waiter_list` vs. `std::list`, consider switching) -
   analyzed: the current design is intrusive (the list pointer lives inside
   the already-allocated waiter object, zero extra allocations to enqueue);
@@ -1625,6 +1631,87 @@ member function for call to 'then'` / `note: because
 'detail::then_callback_for<..., int>' evaluated to false`, naming the
 concept and which branch of it failed - not just a `static_assert`
 message from deep inside the implementation.
+
+**Fourth follow-up, reopening issue #11:** a review comment pointed out
+that `future_state<T>` is documented as "a detail of `future`" but was
+`export`ed and handed directly to a "wrapped" `then()` callback as
+`future_state<T>&` - contradicting its own doc comment. Fixing it
+properly meant giving `est::shared_ptr<T>` `enable_shared_from_this`
+parity (`est/src/util/shared_ptr.cppm`) - exactly issue #11
+("shared_ptr adopt-pointer ctor + shared_from_this parity"), closed
+earlier this session for lack of a concrete call site; this is one.
+Flagged the real cost (a genuine API change, not a local fix) before
+doing it, since it meant reopening a design decision the repo owner had
+already made once; asked whether to do it in this PR or as a follow-up,
+and was told to do it here.
+
+- `est::enable_shared_from_this<T>`: an opt-in CRTP base (mirroring
+  `std::enable_shared_from_this`) giving a `shared_ptr<T>`-managed `T`
+  a `shared_from_this()` that hands out a *new*, ref-count-bumped
+  `shared_ptr<T>` to itself. Weak, not owning, on its own: stores only a
+  raw `void*` back-pointer to its own control block, set once by
+  `shared_ptr<T>::make()` (via an `if constexpr (requires ...)` check,
+  a no-op for any `T` that doesn't inherit from it) right after
+  construction - storing an *owning* `shared_ptr<T>` inside `T` itself
+  would be a self-cycle this ref-counted pointer's plain `int` count
+  could never break (the object would then always hold at least one
+  reference to itself). A new `shared_ptr<T>::from_owning_control_block()`
+  reconstructs a real `shared_ptr<T>` from that raw pointer, bumping the
+  ref count exactly like an ordinary copy would - safe specifically
+  because `shared_from_this()` is only ever called while at least one
+  other `shared_ptr<T>` to the same object is known to be alive (the one
+  whose member function is calling it).
+  `bugprone-crtp-constructor-accessibility` (a real clang-tidy finding,
+  not a style nit - it flags exactly the classic CRTP mistake of
+  inheriting `enable_shared_from_this<Wrong>` instead of
+  `enable_shared_from_this<Self>`) made the default constructor private
+  with `friend T;`, so only the one correct CRTP usage can construct it
+  at all.
+- `future_state<T>` now inherits `enable_shared_from_this<future_state<T>>`.
+  Its forward declaration moved out of the `export namespace est {}`
+  block into a plain `namespace est {}` one - visible to `est:promise`
+  (another partition of the same module, which still needs
+  `shared_ptr<future_state<T>>`) without being nameable from `import
+  est;` consumer code at all anymore, closing the contradiction the
+  review comment pointed out. (`est:promise` needed no changes itself -
+  cross-partition visibility within one module doesn't require
+  `export`, only visibility to code outside the module does.)
+- The "wrapped" calling convention's parameter type changed everywhere
+  it's checked or used - `detail::then_callback_for`, `then()`'s own
+  `raw_result_type_tag()`, `concrete_continuation::invoke()`, and the
+  monadic-flatten forwarding lambda in `fulfill()` - from
+  `future_state<T>&` to `future<T>&`, built fresh per invocation via
+  `state.shared_from_this()`. No change to the *unwrapped* convention or
+  to `get()`/`failed()`, which stayed exactly as they were.
+- Every existing test's wrapped-mode lambdas (`[](est::future_state<int>&
+  state) {...}`) rewritten to take `est::future<int>&` instead - a
+  mechanical, if wide, change once the type itself moved. One test
+  needed more than a mechanical rename: a regression test added earlier
+  this PR directly named `future_state<int>&` specifically to take the
+  address of two `get()` calls and prove they matched (verifying
+  `decltype(auto)`, not plain `auto`, on the *underlying* `get()`) - no
+  longer possible to write that way once `future_state` stopped being
+  nameable. Rewritten to observe the same underlying guarantee through
+  the still-public *unwrapped* convention instead: two separate `then()`
+  registrations, each receiving its own `const int&` argument straight
+  from the same `get()`, asserting the two addresses match. Arguably a
+  more representative test of a real usage pattern (multiple readers)
+  than the original internal-access version was.
+- Added direct tests for `enable_shared_from_this` itself in
+  `est/tests/shared_ptr_tests.cpp` (a `self_aware` type opting in,
+  `shared_from_this()` pointing at the same object, and bumping the ref
+  count like an ordinary copy), plus a regression test confirming a `T`
+  that doesn't opt in is completely unaffected.
+
+Re-verified the concept-based diagnostic (previous follow-up) still
+names the right type after this change: the same deliberately
+incompatible callback now fails naming `future<int>&` instead of
+`future_state<int>&` in the "candidate ignored" note. Verified end to
+end in the docker devenv: 50/50 tests (4 new), `clang-format` clean,
+`clang-tidy` clean (one real finding along the way -
+`bugprone-crtp-constructor-accessibility` on the new CRTP base, fixed as
+described above), new-code coverage 98% against `origin/main`
+(`shared_ptr.cppm`'s new code at 100%).
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

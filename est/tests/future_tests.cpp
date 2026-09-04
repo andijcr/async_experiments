@@ -47,23 +47,28 @@ TEST_CASE("set_value then get() returns the value", "[future]") {
   REQUIRE(future.get() == 42);
 }
 
-TEST_CASE("future_state::get() returns a reference into the stored value, not a copy", "[future]") {
-  // Regression test: get()'s deduced return type must be decltype(auto),
-  // not plain auto - plain auto strips references from the return
-  // expression's type (the same rule as `auto x = expr;`), which would
-  // silently turn the documented "non-consuming const T&" into a fresh
-  // copy of T on every call instead of a reference to the one stored in
-  // result_. Caught by a PR review comment, not a test, the first time.
+TEST_CASE("an unwrapped then() receives a reference into the stored value, not a copy",
+          "[future]") {
+  // Regression test: the underlying future_state::get()'s deduced return
+  // type must be decltype(auto), not plain auto - plain auto strips
+  // references from the return expression's type (the same rule as
+  // `auto x = expr;`), which would silently turn the documented
+  // "non-consuming const T&" into a fresh copy of T on every call
+  // instead of a reference to the one stored value. Caught by a PR
+  // review comment, not a test, the first time. Observed here via two
+  // separate unwrapped then() registrations (each gets its own const
+  // int& argument straight from future_state::get(), not exposed to
+  // this test file directly) rather than by naming future_state itself,
+  // which - now that then()'s wrapped mode hands out an est::future<T>
+  // instead (see below) - is no longer part of the public API surface
+  // this test file can reach.
   auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(42);
 
   const int* first_address = nullptr;
   const int* second_address = nullptr;
-  future.then([&](est::future_state<int>& state) {
-    first_address = &state.get();
-    second_address = &state.get();
-    return 0;
-  });
+  future.then([&](const int& value) { first_address = &value; });
+  future.then([&](const int& value) { second_address = &value; });
 
   REQUIRE(first_address != nullptr);
   REQUIRE(first_address == second_address);
@@ -79,7 +84,7 @@ TEST_CASE("set_exception then get() rethrows", "[future]") {
 TEST_CASE("then() registered before set_value runs synchronously on completion", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   bool invoked = false;
-  auto chained = future.then([&](est::future_state<int>& state) {
+  auto chained = future.then([&](est::future<int>& state) {
     invoked = true;
     return state.get();
   });
@@ -95,7 +100,7 @@ TEST_CASE("then() registered after set_value runs immediately", "[future]") {
   promise.set_value(9);
 
   bool invoked = false;
-  auto chained = future.then([&](est::future_state<int>& state) {
+  auto chained = future.then([&](est::future<int>& state) {
     invoked = true;
     return state.get();
   });
@@ -108,7 +113,7 @@ TEST_CASE("then() observes a stored exception via get()", "[future]") {
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool invoked = false;
-  auto chained = future.then([&](est::future_state<int>& state) {
+  auto chained = future.then([&](est::future<int>& state) {
     invoked = true;
     REQUIRE_THROWS_AS((void)state.get(), std::runtime_error);
     return -1;
@@ -120,8 +125,8 @@ TEST_CASE("then() observes a stored exception via get()", "[future]") {
 TEST_CASE("multiple then() registrations are all invoked on completion", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   int count = 0;
-  auto first = future.then([&](est::future_state<int>&) { return ++count; });
-  auto second = future.then([&](est::future_state<int>&) { return ++count; });
+  auto first = future.then([&](est::future<int>&) { return ++count; });
+  auto second = future.then([&](est::future<int>&) { return ++count; });
 
   promise.set_value(1);
   REQUIRE(count == 2);
@@ -134,8 +139,8 @@ TEST_CASE("every then() registration observes the same, correct value via get()"
   // its first call, so a second continuation reading it would see a
   // moved-from value instead of the real one.
   auto [promise, future] = est::make_promise_future<int>();
-  auto first = future.then([](est::future_state<int>& state) { return state.get(); });
-  auto second = future.then([](est::future_state<int>& state) { return state.get(); });
+  auto first = future.then([](est::future<int>& state) { return state.get(); });
+  auto second = future.then([](est::future<int>& state) { return state.get(); });
 
   promise.set_value(42);
   REQUIRE(first.get() == 42);
@@ -144,8 +149,8 @@ TEST_CASE("every then() registration observes the same, correct value via get()"
 
 TEST_CASE("then() returns a future that can itself be chained", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
-  auto chained = future.then([](est::future_state<int>& state) { return state.get() * 2; })
-                     .then([](est::future_state<int>& state) { return state.get() + 1; });
+  auto chained = future.then([](est::future<int>& state) { return state.get() * 2; })
+                     .then([](est::future<int>& state) { return state.get() + 1; });
   promise.set_value(10);
   REQUIRE(chained.get() == 21);
 }
@@ -177,7 +182,7 @@ TEST_CASE("a registered continuation is freed even if never invoked (broken prom
   counting_resource resource;
   {
     auto [promise, future] = est::make_promise_future<int>(&resource);
-    future.then([](est::future_state<int>&) { return 0; });
+    future.then([](est::future<int>&) { return 0; });
     // promise and future both destroyed here, never completed.
   }
   REQUIRE(resource.allocations > 0);
@@ -200,12 +205,12 @@ TEST_CASE("a throwing continuation's exception is isolated to its own downstream
   // second (so it drains first) - proving the throw doesn't stop the
   // sibling still queued behind it.
   bool should_still_run = false;
-  auto normal_chained = future.then([&](est::future_state<int>& state) {
+  auto normal_chained = future.then([&](est::future<int>& state) {
     should_still_run = true;
     return state.get();
   });
   auto throwing_chained =
-      future.then([](est::future_state<int>&) -> int { throw std::runtime_error("boom"); });
+      future.then([](est::future<int>&) -> int { throw std::runtime_error("boom"); });
 
   promise.set_value(1);
 
@@ -219,8 +224,7 @@ TEST_CASE("a throwing continuation's node and downstream future are freed, not l
   counting_resource resource;
   {
     auto [promise, future] = est::make_promise_future<int>(&resource);
-    auto chained =
-        future.then([](est::future_state<int>&) -> int { throw std::runtime_error("boom"); });
+    auto chained = future.then([](est::future<int>&) -> int { throw std::runtime_error("boom"); });
     promise.set_value(1);
     REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
   }
@@ -267,13 +271,13 @@ TEST_CASE(
   REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
 }
 
-TEST_CASE("a wrapped (future_state&) then() callback can inspect failed() instead of catching",
+TEST_CASE("a wrapped (future<T>&) then() callback can inspect failed() instead of catching",
           "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool saw_failure = false;
-  auto chained = future.then([&](est::future_state<int>& state) {
+  auto chained = future.then([&](est::future<int>& state) {
     saw_failure = state.failed();
     return -1;
   });
@@ -327,7 +331,7 @@ TEST_CASE("future<void>: an unwrapped (no-argument) then() is skipped and propag
 TEST_CASE("future<void>: a wrapped then() always runs and can inspect failed()", "[future][void]") {
   auto [promise, future] = est::make_promise_future<void>();
   bool saw_failure = false;
-  auto chained = future.then([&](est::future_state<void>& state) {
+  auto chained = future.then([&](est::future<void>& state) {
     saw_failure = state.failed();
     return 0;
   });

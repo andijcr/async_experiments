@@ -6,12 +6,20 @@ import :sync.mutex;
 import :util.scope_exit;
 import :util.shared_ptr;
 
-export namespace est {
-
+// future_state is intentionally *not* exported: it's the single owned
+// object behind an est::promise<T>/est::future<T> pair, not part of the
+// public API those two handles present (see its own doc comment below).
+// Still visible to other partitions of this module that import :future
+// (est:promise does, to hold a shared_ptr<future_state<T>>) - module
+// visibility across partitions of the same module doesn't require
+// export, only visibility to code outside the module does.
+namespace est {
 template <class T> class future_state;
-template <class T> class future;
+}
 
-} // namespace est
+export namespace est {
+template <class T> class future;
+}
 
 namespace est::detail {
 
@@ -98,22 +106,30 @@ template <class Fn, class T> consteval auto invocable_unwrapped() -> bool {
 // calling conventions future_state<T>::then() documents, so an
 // incompatible callback fails right at the then() call site with a
 // "constraints not satisfied" diagnostic naming this concept, instead of
-// failing deep inside then()'s own implementation.
+// failing deep inside then()'s own implementation. future<T>, not
+// future_state<T>&, for the wrapped shape - future_state is a detail of
+// future (see its own doc comment), not part of the interface a
+// then() callback should see.
 template <class Fn, class T>
-concept then_callback_for = std::invocable<Fn&, future_state<T>&> || invocable_unwrapped<Fn, T>();
+concept then_callback_for = std::invocable<Fn&, future<T>&> || invocable_unwrapped<Fn, T>();
 
 } // namespace est::detail
 
-export namespace est {
+namespace est {
 
 // The single owned object behind an est::promise<T>/est::future<T> pair
-// - a view over shared state, not the state itself (docs/PLAN.md). Holds
-// value-or-exception storage and a continuation slot built on
+// - a view over shared state, not the state itself (docs/PLAN.md). Not
+// exported (see the forward declaration above): a caller never sees
+// this type directly, only through the est::promise<T>/est::future<T>
+// handles that wrap it - including a then() callback registered with
+// the "wrapped" calling convention, which receives a real est::future<T>
+// (built via shared_from_this(), below) rather than a future_state<T>&.
+// Holds value-or-exception storage and a continuation slot built on
 // est::waiter_list. Lifetime is managed externally by an
 // est::shared_ptr<future_state<T>> (see make_promise_future() in
 // est:promise) - never constructed directly by a caller, and holds no
 // ref count of its own.
-template <class T> class future_state {
+template <class T> class future_state : public enable_shared_from_this<future_state<T>> {
 public:
   using continuation_node = detail::continuation_node<T>;
 
@@ -268,9 +284,12 @@ public:
 
   // Registers fn to run once ready. Two calling conventions, chosen by
   // how fn can be invoked (docs/PLAN.md, issue #23):
-  //   - fn(future_state&): "wrapped" - always called, whether this
-  //     future_state succeeded or failed, with *this itself; fn inspects
-  //     ready()/failed()/get() to decide what to do. No implicit unwrap.
+  //   - fn(future<T>&): "wrapped" - always called, whether this
+  //     future_state succeeded or failed, with a fresh future<T> view of
+  //     *this (built via shared_from_this() - future_state is a detail,
+  //     not what a callback should see, see this class's own doc
+  //     comment); fn inspects ready()/failed()/get() to decide what to
+  //     do. No implicit unwrap.
   //   - fn(const T&), or fn() when T is void: "unwrapped" - called only
   //     on success, with the value itself (or no argument at all for
   //     void). On failure fn is *not* called; the returned future fails
@@ -278,7 +297,7 @@ public:
   //     get() as fn's argument expression: get() rethrows on failure,
   //     which lands in the try/catch below exactly like an exception fn
   //     itself throws.)
-  // Checked in that order, so a callback typed to take future_state<T>&
+  // Checked in that order, so a callback typed to take future<T>&
   // explicitly always gets the wrapped, no-unwrap behavior even if it
   // would incidentally also accept a T (e.g. a generic `auto&` lambda).
   //
@@ -324,8 +343,8 @@ private:
   // not satisfied" diagnostic right at the then() call site instead of
   // one buried in here.
   template <class Fn> static consteval auto raw_result_type_tag() {
-    if constexpr (std::invocable<Fn&, future_state&>) {
-      return std::type_identity<std::invoke_result_t<Fn&, future_state&>>{};
+    if constexpr (std::invocable<Fn&, future<T>&>) {
+      return std::type_identity<std::invoke_result_t<Fn&, future<T>&>>{};
     } else if constexpr (std::is_void_v<T>) {
       return std::type_identity<std::invoke_result_t<Fn&>>{};
     } else {
@@ -346,8 +365,13 @@ private:
 
     void invoke(future_state& state) override {
       try {
-        if constexpr (std::invocable<Fn&, future_state&>) {
-          invoke_and_fulfill(state);
+        if constexpr (std::invocable<Fn&, future<T>&>) {
+          // A fresh future<T> per invocation, not a stored one - this
+          // continuation only runs once, so there's nothing to reuse it
+          // for, and future_state<T> itself never keeps a future<T>
+          // alive on its own account.
+          future<T> view(state.shared_from_this());
+          invoke_and_fulfill(view);
         } else if constexpr (std::is_void_v<T>) {
           state.get(); // rethrows on failure, caught below - fn_ is not called
           invoke_and_fulfill();
@@ -398,19 +422,18 @@ private:
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
         using inner_value_type = detail::unwrap_future_t<std::decay_t<R>>;
         auto downstream_copy = downstream_; // copy: the forwarding lambda keeps its own reference
-        std::forward<R>(result).then(
-            [downstream_copy](future_state<inner_value_type>& inner_state) {
-              try {
-                if constexpr (std::is_void_v<inner_value_type>) {
-                  inner_state.get();
-                  downstream_copy->set_value();
-                } else {
-                  downstream_copy->set_value(inner_state.get());
-                }
-              } catch (...) {
-                downstream_copy->set_exception(std::current_exception());
-              }
-            });
+        std::forward<R>(result).then([downstream_copy](future<inner_value_type>& inner_future) {
+          try {
+            if constexpr (std::is_void_v<inner_value_type>) {
+              inner_future.get();
+              downstream_copy->set_value();
+            } else {
+              downstream_copy->set_value(inner_future.get());
+            }
+          } catch (...) {
+            downstream_copy->set_exception(std::current_exception());
+          }
+        });
       } else {
         downstream_->set_value(std::forward<R>(result));
       }
@@ -466,6 +489,10 @@ private:
   std::variant<std::monostate, stored_t, std::exception_ptr> result_;
   std::pmr::polymorphic_allocator<std::byte> allocator_;
 };
+
+} // namespace est
+
+export namespace est {
 
 // Consumer handle: a thin, move-only view over a future_state<T>, backed
 // by an est::shared_ptr so destroying a future does not destroy the

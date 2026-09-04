@@ -37,7 +37,47 @@ private:
   }
 };
 
+// Opts into est::enable_shared_from_this<T> to exercise it directly,
+// independent of its one real caller (est::future_state<T>, est:future).
+class self_aware : public est::enable_shared_from_this<self_aware> {
+public:
+  explicit self_aware(int value_in) : value(value_in) {}
+
+  int value;
+};
+
 } // namespace
+
+TEST_CASE("enable_shared_from_this::shared_from_this() points at the same object", "[shared_ptr]") {
+  auto original = est::shared_ptr<self_aware>::make(std::pmr::get_default_resource(), 42);
+  auto self = original->shared_from_this();
+  REQUIRE(self.get() == original.get());
+  REQUIRE(self->value == 42);
+}
+
+TEST_CASE("shared_from_this() bumps the ref count like an ordinary copy would", "[shared_ptr]") {
+  counting_resource resource;
+  auto original = est::shared_ptr<self_aware>::make(&resource, 1);
+  {
+    auto self = original->shared_from_this();
+    original.reset();
+    // `self` is the only reference left, but it's still a valid one -
+    // shared_from_this() must have bumped the ref count, not just handed
+    // back a raw view of a control block original.reset() just dropped.
+    REQUIRE(resource.deallocations == 0);
+    REQUIRE(self->value == 1);
+  }
+  REQUIRE(resource.deallocations == 1);
+}
+
+TEST_CASE("a shared_ptr<T> for a T that doesn't opt in works exactly as before", "[shared_ptr]") {
+  // Regression test: shared_ptr<T>::make()'s `if constexpr (requires
+  // ...)` wiring for enable_shared_from_this<T> must be a true no-op for
+  // any T that doesn't inherit from it - est::shared_ptr<int> (used
+  // throughout the rest of this file) is exactly such a T.
+  auto ptr = est::shared_ptr<int>::make(std::pmr::get_default_resource(), 7);
+  REQUIRE(*ptr == 7);
+}
 
 TEST_CASE("make() constructs a value reachable through the pointer", "[shared_ptr]") {
   auto ptr = est::shared_ptr<int>::make(std::pmr::get_default_resource(), 42);
