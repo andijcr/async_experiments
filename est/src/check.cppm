@@ -43,9 +43,20 @@ inline constexpr bool checks_enabled = true;
 // build defining NDEBUG. Terminates via
 // platform::hosted_linux::assert_failure() on failure and never
 // returns in that case.
-void check(bool condition,
-           std::string_view message = {},
-           std::source_location location = std::source_location::current()) {
+//
+// `inline` matters here, concretely, not just as an ODR nicety: verified
+// in a -DCMAKE_BUILD_TYPE=Release build (-O3 -DNDEBUG) via objdump/nm
+// that without it, call sites in future.cppm still emit a real `call` to
+// check() - now an empty function body, but still a call plus whatever
+// work its argument expression does - because Clang's cross-TU-via-BMI
+// inlining didn't kick in on its own at this optimization level. Adding
+// `inline` here removed every call site and the symbol itself from the
+// binary entirely, confirming the earlier "compiles away entirely" claim
+// actually holds at the call site too, not just inside this function's
+// own body.
+inline void check(bool condition,
+                  std::string_view message = {},
+                  std::source_location location = std::source_location::current()) {
   if constexpr (checks_enabled) {
     if (!condition) {
       platform::hosted_linux::assert_failure(message, location);

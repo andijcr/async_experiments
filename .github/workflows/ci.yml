@@ -32,14 +32,16 @@ name: ci
 # whatever UID actions/checkout happens to run as. HOME=/tmp avoids tools
 # choking on a UID with no passwd entry / home directory in the image.
 #
-# The last two steps gate on *new-code* (diff/patch) coverage, not overall
-# repository coverage: a separate build with Clang's source-based coverage
-# instrumentation (-fprofile-instr-generate -fcoverage-mapping, the
-# "coverage" CMake preset - see docs/PLAN.md), exported to lcov via
-# llvm-cov, then intersected with the PR's diff via diff-cover so only the
-# lines a PR actually touches are held to the threshold. Needs full git
-# history (fetch-depth: 0) for diff-cover to compute the diff against
-# origin/main.
+# The last step gates on *new-code* (diff/patch) coverage, not overall
+# repository coverage: the "ci" preset itself builds with Clang's
+# source-based coverage instrumentation (-fprofile-instr-generate
+# -fcoverage-mapping - see docs/PLAN.md, "gate CI on new-code coverage"),
+# so the single build+test above already produces .profraw alongside the
+# format/tidy-gated binaries - no separate configure+build+test pass
+# needed. The profraw is exported to lcov via llvm-cov, then intersected
+# with the PR's diff via diff-cover so only the lines a PR actually
+# touches are held to the threshold. Needs full git history
+# (fetch-depth: 0) for diff-cover to compute the diff against origin/main.
 
 on:
   pull_request:
@@ -108,20 +110,13 @@ jobs:
           ${{ env.DEVENV_IMAGE }}
           ctest --preset ci
 
-      - name: configure + build + test (coverage instrumentation)
-        run: >
-          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
-          -v ${{ github.workspace }}:/workspace -w /workspace
-          ${{ env.DEVENV_IMAGE }}
-          bash -c 'cmake --preset coverage && cmake --build --preset coverage && ctest --preset coverage'
-
       - name: new-code coverage gate
         run: >
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
           -v ${{ github.workspace }}:/workspace -w /workspace
           ${{ env.DEVENV_IMAGE }}
           bash -c '
-            llvm-profdata merge -sparse build/coverage/profraw/*.profraw -o build/coverage/coverage.profdata &&
-            llvm-cov export --format=lcov --instr-profile=build/coverage/coverage.profdata build/coverage/est/tests/est_tests --object=build/coverage/est/tests/est_tests > build/coverage/coverage.lcov &&
-            diff-cover build/coverage/coverage.lcov --compare-branch=origin/main --fail-under=80
+            llvm-profdata merge -sparse build/ci/profraw/*.profraw -o build/ci/coverage.profdata &&
+            llvm-cov export --format=lcov --instr-profile=build/ci/coverage.profdata build/ci/est/tests/est_tests --object=build/ci/est/tests/est_tests > build/ci/coverage.lcov &&
+            diff-cover build/ci/coverage.lcov --compare-branch=origin/main --fail-under=80
           '

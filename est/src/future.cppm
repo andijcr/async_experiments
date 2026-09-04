@@ -90,15 +90,21 @@ public:
   }
 
   void set_value(const T& value) {
-    complete([&] { result_.template emplace<T>(value); });
+    check_not_completed();
+    result_.template emplace<T>(value);
+    complete();
   }
 
   void set_value(T&& value) {
-    complete([&] { result_.template emplace<T>(std::move(value)); });
+    check_not_completed();
+    result_.template emplace<T>(std::move(value));
+    complete();
   }
 
   void set_exception(std::exception_ptr exception) {
-    complete([&] { result_.template emplace<std::exception_ptr>(std::move(exception)); });
+    check_not_completed();
+    result_.template emplace<std::exception_ptr>(std::move(exception));
+    complete();
   }
 
   // Registers a continuation node (already allocated via allocator()) to
@@ -204,22 +210,26 @@ private:
     shared_ptr<future_state<U>> downstream_;
   };
 
-  template <class F> void complete(F&& store_result) {
-    // Precondition, not a recoverable error: set_value()/set_exception()
-    // must each be called at most once. Debug-only (unlike
-    // std::promise, which throws) - a release build that violates this
-    // silently overwrites result_ and, for any continuations that already
-    // ran off the first completion, delivers a value/exception they never
-    // see. Revisit if that turns out to matter in practice; not changing
-    // it speculatively now.
-    check(!ready(), "future_state completed more than once");
-    std::forward<F>(store_result)();
+  // Precondition, not a recoverable error: set_value()/set_exception()
+  // must each be called at most once. Debug-only (unlike std::promise,
+  // which throws) - a release build that violates this silently
+  // overwrites result_ and, for any continuations that already ran off
+  // the first completion, delivers a value/exception they never see.
+  // Revisit if that turns out to matter in practice; not changing it
+  // speculatively now. Called by each setter *before* its own emplace
+  // (not from complete(), which runs after - by then ready() is
+  // unconditionally true) - factored out just to keep the same message
+  // in one place across all three setters.
+  void check_not_completed() { check(!ready(), "future_state completed more than once"); }
 
-    // Drain every registered continuation (normally at most one - future
-    // is meant to be a single-consumer handle - but nothing stops a
-    // caller from registering more than one via then(), and the
-    // underlying list already supports it; LIFO, same order
-    // est::waiter_list is documented to use).
+  // Drains every registered continuation (normally at most one - future
+  // is meant to be a single-consumer handle - but nothing stops a caller
+  // from registering more than one via then(), and the underlying list
+  // already supports it; LIFO, same order est::waiter_list is documented
+  // to use). Called by each setter after it has already stored the
+  // result into result_ - this function only drains, it doesn't know or
+  // care what was stored.
+  void complete() {
     while (auto* waiter = waiters_.dequeue()) {
       run(*static_cast<continuation_node*>(waiter));
     }
@@ -238,7 +248,7 @@ private:
   // be revisited once M3's loop dispatches continuations independently
   // instead of inline on the completer's own call stack.
   void run(continuation_node& node) {
-    scope_exit const guard{[&node, allocator = allocator_] { node.destroy(allocator); }};
+    scope_exit const guard{[&node, allocator = allocator_]() noexcept { node.destroy(allocator); }};
     node.invoke(*this);
   }
 

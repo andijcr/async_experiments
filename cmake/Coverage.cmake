@@ -6,8 +6,8 @@
 option(EST_ENABLE_COVERAGE "Build est with Clang source-based coverage instrumentation" OFF)
 
 if(EST_ENABLE_COVERAGE)
-  # LLVM_PROFILE_FILE (set per the "coverage" CTest preset) doesn't create
-  # its own parent directory - it just fails to write silently otherwise.
+  # LLVM_PROFILE_FILE (set per the "ci" CTest preset) doesn't create its
+  # own parent directory - it just fails to write silently otherwise.
   file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/profraw")
 endif()
 
