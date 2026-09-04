@@ -116,9 +116,10 @@ Design constraints, settled up front:
 ```
 async_experiments/
 ├── CMakeLists.txt                # top-level: options, subdirs, toolchain checks
-├── CMakePresets.json              # "default" (local/dev) and "ci" configure presets
+├── CMakePresets.json              # "default"/"ci"/"coverage" configure presets
 ├── cmake/
 │   ├── CompilerWarnings.cmake    # shared warning flags for est targets
+│   ├── Coverage.cmake            # est_enable_coverage(), the "coverage" preset's flags
 │   └── toolchain-hosted-linux.cmake  # compiler/stdlib pin, used by the presets
 ├── docker/
 │   └── Dockerfile                # the one image for local dev + CI
@@ -126,16 +127,24 @@ async_experiments/
 │   ├── CMakeLists.txt
 │   ├── src/
 │   │   ├── est.cppm              # primary module interface (re-exports partitions)
-│   │   ├── placeholder.cppm      # est:placeholder — M0 walking-skeleton partition
+│   │   ├── check.cppm            # est:check — check(), replaces the <cassert> macro
 │   │   ├── platform/platform.cppm  # est:platform — hosted-Linux HAL backend
-│   │   ├── sync/mutex.cppm       # est:sync.mutex
-│   │   └── timer.cppm            # est:timer
+│   │   ├── sync/mutex.cppm       # est:sync.mutex — mutex, mutex_waiter, waiter_list
+│   │   ├── timer.cppm            # est:timer
+│   │   ├── future.cppm           # est:future — future_state<T>, future<T>
+│   │   ├── promise.cppm          # est:promise — promise<T>, make_promise_future()
+│   │   └── util/
+│   │       ├── scope_exit.cppm   # est:util.scope_exit — RAII "run on scope exit"
+│   │       └── shared_ptr.cppm   # est:util.shared_ptr — est::shared_ptr<T>
 │   └── tests/
 │       ├── CMakeLists.txt
-│       ├── skeleton_tests.cpp
 │       ├── platform_tests.cpp
+│       ├── check_tests.cpp
 │       ├── mutex_tests.cpp
-│       └── timer_tests.cpp
+│       ├── timer_tests.cpp
+│       ├── future_tests.cpp
+│       ├── scope_exit_tests.cpp
+│       └── shared_ptr_tests.cpp
 ├── examples/
 │   └── hello_world/
 │       ├── CMakeLists.txt
@@ -150,9 +159,12 @@ async_experiments/
         └── ci.yml                # builds its own SHA-tagged image, then gates on it
 ```
 
-Component granularity grows as milestones land (`future.cppm`/
-`promise.cppm` in M2; `loop.cppm` in M3; `coroutine.cppm` in M4). This
-tree is not a frozen contract.
+Component granularity grows as milestones land (`loop.cppm` in M3;
+`coroutine.cppm` in M4). This tree is not a frozen contract - the M0
+walking-skeleton files it originally showed (`placeholder.cppm`,
+`skeleton_tests.cpp`) are gone, replaced by real M1/M2 components as of
+this update; expect it to lag again as M3+ land unless someone
+remembers to update it.
 
 ---
 
@@ -359,6 +371,57 @@ This job is a required status check for merging into the default branch
 (branch protection is a repo-settings change, not something this plan's
 file changes can configure).
 
+### New-code coverage gate (done)
+
+Raised mid-M2: gate CI on *patch/diff* coverage (are the lines a PR adds
+actually exercised by a test?), not overall repository percentage.
+Implemented self-hosted rather than via a service like Codecov, to keep
+everything inside the same self-contained toolchain this project has
+otherwise stuck to:
+- `cmake/Coverage.cmake`: `EST_ENABLE_COVERAGE` option (default `OFF`,
+  so normal builds pay no instrumentation cost) and an
+  `est_enable_coverage(target)` helper adding Clang's source-based
+  coverage flags (`-fprofile-instr-generate -fcoverage-mapping`) to a
+  target's compile and link options. Applied to `est` and `est_tests`.
+  When on, also creates `<binaryDir>/profraw/` at configure time —
+  `LLVM_PROFILE_FILE` doesn't create its own parent directory and just
+  silently fails to write otherwise.
+- A new `coverage` CMake preset (`CMakePresets.json`, inherits `ci`,
+  `EST_ENABLE_COVERAGE=ON`, `EST_BUILD_EXAMPLES=OFF` — coverage of
+  `hello_world` isn't the point), with a matching `coverage` test preset
+  that sets `LLVM_PROFILE_FILE` to `<binaryDir>/profraw/%p.profraw` so
+  `ctest --preset coverage` (one process per Catch2-discovered test case)
+  writes one profile per process without collisions.
+- `docker/Dockerfile`: added `libclang-rt-<N>-dev` (compiler-rt's profile
+  runtime — what `-fprofile-instr-generate` links against; not reliably
+  pulled by `llvm.sh`'s `all`, same situation as libc++), `llvm-cov`/
+  `llvm-profdata` added to the unversioned-name `update-alternatives`
+  loop, and `diff-cover` (pinned `10.5.1`) via `pip install
+  --break-system-packages` — a throwaway container image, not a shared
+  system, so overriding Debian's PEP 668 guard is the right call, not a
+  workaround.
+- `ci.yml`: two new steps in `gate`, after `test` — configure+build+test
+  with the `coverage` preset, then merge the resulting `.profraw` files
+  (`llvm-profdata merge`), export to lcov (`llvm-cov export`), and gate
+  with `diff-cover ... --compare-branch=origin/main --fail-under=80`
+  (threshold picked as a reasonable starting point, not derived from
+  anything — adjust freely). Needed `fetch-depth: 0` on `actions/
+  checkout` (previously the default shallow depth) so `origin/main`'s
+  history is actually present for `diff-cover` to diff against.
+
+Verified end-to-end locally (this sandbox's Clang 18 has stable,
+long-standing coverage tooling, not a newer-Clang-only feature): every
+command in the two new CI steps, run against the exact `coverage` preset
+CI uses (temporarily stripping the toolchain file's `-stdlib=libc++`
+locally, same workaround used throughout this session for local
+verification), correctly produced per-test-case `.profraw` files, merged
+and exported to a real lcov report mapping to `future.cppm`/
+`promise.cppm`, and `diff-cover` correctly reported 100% coverage of
+M2's new code against `origin/main`. `libclang-rt-18-dev` (this
+sandbox's equivalent of the pinned image's `libclang-rt-<N>-dev`) had to
+be installed to link successfully — confirms that dependency is real,
+not just plausible.
+
 ---
 
 ## `.clang-format` / `.clang-tidy`
@@ -504,35 +567,410 @@ the equivalent stubs in `timer_tests.cpp`'s `fake_platform` — `timer_queue`
 only ever calls `Platform::now()`, so they were dead, misleading code.
 Removed.
 
-### M2 — future / promise / continuation core
-- `shared_state<T, Allocator>`: the single owned object behind both
-  handles. Holds value-or-exception storage, a waiter/continuation list
-  guarded by the M1 `est::mutex`, and a plain (non-atomic — no OS threads
-  to race with, only the interrupt/mainline reentrancy `est::mutex` already
-  handles) reference count. Allocated through the caller-supplied
-  allocator.
-- `est::promise<T>`: producer handle — move-only, `set_value`/`set_exception`.
-- `est::future<T>`: consumer handle — move-only, `.then(continuation)`,
-  later `co_await`-able once M4 lands.
-- **View semantics**: both handles are thin (state pointer + small control
-  logic); destroying a `future` does not destroy the `shared_state` if
-  something else — initially, "something else" is the loop — still
-  references it.
-- **Abandoned-future semantics**: when a `future` is created it registers
-  its `shared_state` with the owning loop's task registry (a strong
-  reference independent of the user's handle). If the user drops the
-  `future`, the loop's reference keeps the state alive and the async work
-  keeps running; on completion with no consumer left, the result/exception
-  is simply discarded (dropped, not silently swallowed without a hook —
-  exact "unobserved exception" policy, e.g. a debug-mode assert or logged
-  warning, is a detail to settle in M2/M3, not now).
+### M2 — future / promise / continuation core (done)
+
+The bullets below describe the *final* shape as of commit `d58babd`
+(after four review-driven redesign rounds — see the "Found by code
+review" / "Round N" retrospective notes further down for how it got
+here and why; skip those on a first read, they're history, not current
+API surface):
+
+- `future_state<T>`, in `est/src/future.cppm` (`est:future`) — the
+  single owned object behind both handles. Holds value-or-exception
+  storage (`std::variant<std::monostate, T, std::exception_ptr>`), a
+  continuation list built on `est::waiter_list` (its own type, extracted
+  from `est::mutex` — see M1's revised section), and a
+  `std::pmr::polymorphic_allocator<std::byte>` used to allocate `then()`
+  continuation nodes. Holds *no* ref count of its own — lifetime is
+  entirely `est::shared_ptr<future_state<T>>`'s job (see below). Not
+  templated on a generic `Allocator` the way `est::timer_queue` is:
+  `future_state`/`future`/`promise` cross an API boundary (many call
+  sites, needs a uniform, non-template-parameterized type), which is
+  exactly the case docs/PLAN.md's "Allocator support" section already
+  called out for `std::pmr::polymorphic_allocator`-style erasure.
+  `get()` uses C++23 deducing-this: called on an lvalue it returns
+  `const T&` (non-consuming, safe for multiple readers); called on an
+  rvalue (`std::move(state).get()`) it returns `T&&`, an explicit
+  opt-in to move, same caveat as `std::optional<T>::value() &&`.
+- `est::shared_ptr<T>` (`est:util.shared_ptr`, `est/src/util/shared_ptr.cppm`)
+  — a small, general-purpose, single-threaded (plain `int` ref count, no
+  atomics) reference-counted pointer, combining the ref count, a
+  `std::pmr::polymorphic_allocator<std::byte>`, and the `T` into one
+  control block allocated in a single call. `promise<T>`/`future<T>`
+  each hold one of `est::shared_ptr<future_state<T>>`.
+- Continuations are `est::detail::continuation_node<T>` (`est:future`,
+  non-exported — an implementation detail of `then()`, not part of
+  `future_state`'s public surface), deriving from the *type-agnostic*
+  `est::detail::waiter_node` (`destroy(allocator)` + virtual destructor
+  only — nothing `T`-dependent, so it's compiled once instead of once
+  per `T`), itself deriving from `est::mutex_waiter` — exactly what
+  `mutex_waiter`'s "payload-free at this layer" doc comment in M1
+  anticipated: no second allocation for the list node itself. Draining
+  (LIFO, same order `est::waiter_list` is documented to use) happens on
+  `set_value()`/`set_exception()`; `run()`'s own destroy-on-exit guard is
+  `est::scope_exit` (`est:util.scope_exit`), a small reusable RAII "run
+  this on scope exit" utility, not an ad-hoc local struct.
+- `est::promise<T>`, in `est/src/promise.cppm` (`est:promise`) — producer
+  handle: move-only (move ctor/assignment/destructor all `= default`,
+  since `est::shared_ptr` itself does the real work), `set_value(const
+  T&)`/`set_value(T&&)`/`set_exception`.
+- `est::future<T>`, in `est/src/future.cppm` — consumer handle: same
+  move-only shape as `promise<T>`. `get()` is deducing-this:
+  `future.get()` copy-constructs, `std::move(future).get()` moves — safe
+  unconditionally here since a `future` is a single-consumer handle,
+  unlike `future_state<T>::get()` itself.
+- `future_state<T>::then(fn)` (with `future<T>::then(fn)` a thin
+  forwarding call to it — comment #12 in the review round below) runs
+  `fn` as `fn(future_state<T>&)`, from which it can `get()`/`ready()`,
+  and **returns a `future<U>`** (`U` = `fn`'s return type,
+  `static_assert`'d non-`void` for now) so `.then().then()` chains. A
+  `fn` exception is caught and routed into that continuation's own
+  downstream `future_state<U>` via `set_exception()` instead of
+  escaping — isolated per-continuation: a throwing `then()` callback no
+  longer stops a sibling continuation queued behind it from running.
+  Still runs synchronously on whichever call stack completes the
+  `future_state` — there's no loop yet to defer onto (M3 will change
+  that).
+- `make_promise_future<T>(allocator)`, in `est/src/promise.cppm` —
+  builds one `est::shared_ptr<future_state<T>>` and copies it into both
+  the `promise<T>` and `future<T>` it returns; the only way a
+  `future_state` is created.
+- **View semantics**: both handles are thin (an `est::shared_ptr` plus
+  nothing else); destroying a `future` does not destroy the
+  `future_state` if something else — a still-live `est::promise`, and
+  eventually (M3) the loop's own keep-alive registration — still
+  references it. Verified directly: dropping a `future` while its
+  `promise` is still alive leaves the `future_state` intact and the
+  `promise` can still complete it.
+- **Abandoned-future semantics — deferred to M3, not a scope cut.** The
+  full version (a dropped `future`'s `future_state` is kept alive by the
+  *loop's* own reference, not the user's, so the async work keeps
+  running in the background) needs `est::loop` to exist to do the
+  registering — M2 has no loop yet. What M2 *does* build is the
+  ref-counted view mechanics that M3 will hook into: `future_state` isn't
+  destroyed while any reference (promise, future, or later the loop's)
+  still holds it. The exact "unobserved exception" policy (result/
+  exception simply discarded vs. a debug-mode assert or logged warning)
+  is still a detail to settle when M3's loop actually implements the
+  registration, not now.
+- `est::check(condition, message, location)` (`est:check`,
+  `est/src/check.cppm`) — a function replacing the `<cassert>` macro,
+  used internally by `future_state` for its own precondition checks
+  (calls into `platform::hosted_linux::assert_failure()` on failure).
+  Not `est::assert`: that name collides with `<cassert>`'s own macro
+  even fully-qualified (see the retrospective note below) - a real
+  finding worth remembering before naming anything else `assert`,
+  anywhere in this codebase.
+
+#### Found by code review, before real CI ever saw it
+
+A `code-review` pass on M2 (before its PR's first CI run) found four real
+issues, all fixed:
+1. **Wrong-type deallocation (real memory corruption risk).**
+   `run()` called `allocator_.delete_object(&node)` on a
+   `continuation_node&` — template deduction picks the *base* type, so
+   `delete_object` deallocated with `continuation_node`'s size/alignment
+   instead of the actual, larger `concrete_continuation<Fn>` that was
+   allocated. Silently "worked" with the default new/delete resource
+   (sized deallocation isn't always enforced in practice) but is
+   undefined behavior per `memory_resource::deallocate`'s contract, and a
+   real, visible corruption risk with a pool-style resource —
+   `make_promise_future`'s allocator parameter explicitly allows passing
+   one. Fixed by giving `continuation_node` a pure-virtual `destroy()`
+   that each `concrete_continuation<Fn>` override calls
+   `allocator.delete_object(this)` from — `this` is the derived type
+   *there*, so the deduction is correct.
+2. **Leaked node if a continuation throws.** `run()` had no
+   exception-safety around `invoke()`; a throwing continuation skipped
+   `delete_object` entirely. Fixed with an RAII guard so `destroy()`
+   always runs. The exception still aborts `complete()`'s drain loop
+   before any later-queued continuations run — an accepted M2-scope
+   limitation (documented in the code), not fixed now: revisit once M3's
+   loop dispatches continuations independently instead of inline on the
+   completer's call stack.
+3. **Value corruption for more than one reader.** `shared_state::get()`
+   moved the value out of the `variant` on every call — correct for
+   exactly one reader, silently wrong for a second: `ready()` still
+   reports true, but the second caller reads a moved-from value. Directly
+   contradicts the class's own documented support for multiple `then()`
+   registrations. Fixed by making `get()` non-consuming (`const T&`
+   instead of `T`); `future<T>::get()` (the single-external-consumer path)
+   now copy-constructs its return value instead of moving.
+4. **Double-completion guard is debug-only, undocumented as such.** Not a
+   bug — `assert(!ready())` matches this project's "validate at
+   boundaries, trust internal guarantees" philosophy — but the original
+   comment didn't say so. Comment clarified; behavior unchanged (revisit
+   only if this turns out to matter in practice, per the project's stated
+   philosophy of not adding validation for scenarios speculatively).
+
+While fixing #1/#2, a related leak was found by inspection (not by the
+review) and fixed the same way: `~shared_state()` didn't drain its
+waiter list, so a continuation registered on a future whose promise is
+dropped without ever completing (a "broken promise", or any continuation
+still queued when #2's throw aborts the drain) leaked permanently — the
+node becomes unreachable once nothing references the `shared_state`
+holding its own waiter list. Fixed by draining (destroying, not
+invoking) any remaining queued nodes in the destructor.
+
+All four are now regression-tested with a `counting_resource`
+(`std::pmr::memory_resource` wrapping the default one, counting
+allocate/deallocate calls) — the only practical way to catch a leaked or
+wrongly-sized allocation in a unit test without a sanitizer. 19/19 tests
+pass locally.
+
+**Found by real CI, not locally reproducible.** PR #3's `clang-format
+--dry-run --Werror` step (pinned Clang 22) flagged two spots in
+`est/tests/future_tests.cpp` that local Clang 18's `clang-format` accepts
+as already-clean — the first confirmed version drift in `clang-format`
+itself (previously only `clang-tidy`'s check set and libc++/libstdc++
+pairing had shown this kind of gap between the sandbox's Clang 18 and the
+pinned Clang 22). Both spots involved a signature/statement sitting right
+at the 100-column wrap boundary, where the two versions' line-breaking
+heuristics disagree on where (or whether) to break. Rather than guessing
+at CI's exact spacing with no way to verify it locally, both were rewritten
+to be unambiguous instead: `do_is_equal`'s override shortened well under
+the column limit via a local `using std::pmr::memory_resource;` (so
+`[[nodiscard]]`, which `clang-tidy` requires, no longer forces a wrap at
+all), and a single-line `{ ... }` block with a trailing comment expanded to
+the canonical always-multi-line form.
+
+**Found by real CI, round 2 — a genuine bug, not a toolchain-version
+drift.** The push that fixed the clang-format issue above turned up a
+second, unrelated real-CI-only failure: `est/tests/future_tests.cpp`
+calls `std::make_exception_ptr` but only `#include`s `<stdexcept>`, not
+`<exception>`. Local libstdc++ (the only stdlib available in this
+project's development sandbox) happens to pull `<exception>` in
+transitively through `<stdexcept>`; the pinned Clang 22 + libc++ CI
+toolchain does not, and `import est;` doesn't re-export the includes
+behind `future.cppm`/`promise.cppm`'s own global module fragments to
+importers of the `est` module — correct module semantics, and exactly
+why this went undetected through every local build. Fixed by adding the
+missing include directly.
+
+**A full design-review round from a human reviewer, in parallel with the
+above.** Once PR #3 reached real CI, its actual human reviewer worked
+through `future.cppm` line by line and left a wave of review comments.
+The resulting changes, in the order they landed:
+- `est::mutex`'s intrusive waiter-list mechanics were extracted into a
+  standalone `est::waiter_list` (`est:sync.mutex`) — `mutex` keeps its
+  existing public API, now backed by one. `shared_state<T>` was found to
+  be using `mutex_.lock()`/`unlock()` around every waiter-list operation
+  for no reason: M2 is entirely synchronous and single-threaded, so
+  there was never anything those calls actually protected — real
+  protection is already documented (M4 below) as arriving with
+  coroutine suspension points, not before. `shared_state<T>` now holds
+  an `est::waiter_list` directly, with no lock/unlock calls at all.
+- `continuation_node` was split into a type-agnostic `detail::waiter_node`
+  base plus a `T`-templated `detail::continuation_node<T>`, and moved out
+  of being a nested type of `shared_state<T>` into `est::detail` (see the
+  M2 section above) — less code generated per `T`, and no longer part of
+  `shared_state`'s public surface.
+- `set_value` gained `const T&`/`T&&` overloads (mirroring
+  `std::promise`) instead of a single by-value parameter, avoiding an
+  extra move on the rvalue path; `promise<T>::set_value` got the matching
+  pair so the saving isn't lost one layer up.
+- `shared_state<T>::get()` and `future<T>::get()` both became
+  deducing-this (see the M2 section above).
+- The ad-hoc local `destroy_on_exit` RAII guard in `run()` became
+  `est::scope_exit<Fn>` (`est:util.scope_exit`), a small reusable
+  "run this callable on scope exit" utility.
+- `future<T>`/`promise<T>`'s move-assignment operators became
+  swap-based (`std::swap(state_, other.state_); return *this;`) instead
+  of `reset()`-then-`std::exchange` — simpler, and self-assignment-safe
+  without an explicit check.
+- The M0 walking-skeleton scaffold (`est::placeholder_message()`,
+  `est/src/placeholder.cppm`, `est/tests/skeleton_tests.cpp`) was
+  removed now that real functionality exists to exercise instead;
+  `examples/hello_world` was updated to build a promise/future pair and
+  print its value.
+- One comment (`est::mutex` "satisfying the mutex concept" so
+  `std::scoped_lock` could be used) needed no code change: `mutex`
+  already has `lock()`/`unlock()`, which already satisfies
+  `BasicLockable` — and the mutex-removal change above means
+  `shared_state` doesn't hold a `mutex_` to use `std::scoped_lock` on
+  any more regardless.
+
+Two more substantial asks from the same review — extracting a
+general-purpose `est::shared_ptr<T>` for `shared_state`'s (renamed
+`future_state`'s) own ref-counting, and making `then()` return a
+chainable `future<U>` — are large enough to be their own follow-up
+rounds; see this section's future entries once those land.
+
+**Round 3: `est::shared_ptr<T>`, and `shared_state` renamed to
+`future_state`.** New `est::shared_ptr<T>` (`est:util.shared_ptr`,
+`est/src/util/shared_ptr.cppm`) — single-threaded (plain `int` ref count,
+no atomics), pmr-allocator-backed, combining the ref count, the
+allocator, and the `T` into one control block allocated in a single
+`allocator.new_object<control_block>` call (no separate control-block
+allocation the way `std::shared_ptr` needs one when not built via
+`make_shared`). `shared_state<T>` is renamed `future_state<T>` (per the
+reviewer's own suggested name) and drops `ref_count_`/`add_ref()`/
+`release()` entirely; `promise<T>`/`future<T>` now hold an
+`est::shared_ptr<future_state<T>>` instead of a raw pointer plus
+hand-rolled ref-counting. A pleasant side effect: `future<T>`/`promise<T>`'s
+move constructor/assignment and destructor all became `= default` —
+`shared_ptr`'s own move (already swap-based) and destructor do the work
+that used to be spelled out by hand in each handle.
+
+**Found by real CI, again — same clang-format wrap-boundary drift as
+before, three more times.** `future_state<T>::get()`'s deducing-this
+signature (added in round 2, above) sat at the same kind of ambiguous
+100-column wrap boundary as the earlier `do_is_equal` case; fixed the
+same way, via a named `get_result_t` alias for the (otherwise inline)
+`std::conditional_t<...>` return type. The *next* push's real CI then
+caught two more instances that a local-Clang-18 check couldn't:
+`est::shared_ptr`'s new `make()` signature, and a second copy of the
+`do_is_equal` pattern in its own test file's `counting_resource` helper
+(the `est/tests/future_tests.cpp` copy had already been fixed this way -
+this one was a fresh copy-paste that didn't inherit the fix). Same fix
+both times: `make()` got a named `allocator_type` alias; the test helper
+got the same `using std::pmr::memory_resource;` treatment as before.
+This pattern - any signature landing near the 100-column boundary is a
+real risk of CI-only failure regardless of how many times it's been
+seen before - is now common enough to just design around from the start
+(name the type, keep new signatures well clear of the boundary) rather
+than re-discovering it per occurrence.
+
+**Docker was tried as a way to close this gap entirely, and is blocked in
+this session's sandbox.** Building the pinned devenv image
+(`docker/Dockerfile`) locally, to run the *exact* CI toolchain instead of
+guessing at Clang 22's behavior from Clang 18, would eliminate this whole
+class of version-drift bug. The Docker daemon itself runs fine here (it
+just needed starting), but pulling any base image from Docker Hub is
+blocked by this sandbox's network egress policy - reproducible directly
+(`docker pull debian:bookworm-slim` fails the same way), not specific to
+this Dockerfile. Not a workaround-able failure (403 policy denial, not a
+transient error) - noted here as a real limitation of this development
+sandbox specifically, not of the project's actual CI, which builds this
+same image successfully on every run.
+
+**Round 4: `then()` returns a chained `future<U>`.** `future<T>::then(Fn)`
+changed from `void` to `future<U>` (`U` = `Fn`'s return type,
+`static_assert`ed non-`void` for now - chaining a `future<void>` isn't
+supported yet). The node-allocation-and-registration sequence moved from
+`future<T>::then()` into a new `future_state<T>::then()` member (per
+review comment #12: "could be hidden in a member function"), which
+`future<T>::then()` now just forwards to. Each `then()` callback's
+exception, if any, is caught inside the new continuation node and routed
+into its own downstream `future_state<U>` via `set_exception()` instead
+of escaping - a deliberate, real behavior change from before: a throwing
+continuation no longer aborts `complete()`'s drain loop for
+later-queued siblings, only its own downstream future observes the
+failure. The old "documented M2-scope limitation" test asserting the
+opposite (a throw aborts the whole drain) was replaced with two tests:
+one proving a sibling continuation still runs after an earlier one
+throws, one proving the throwing continuation's own node and downstream
+future are still freed, not leaked. A `future_state<T>` forward
+declaration of `future<T>` (and vice versa) was needed since
+`future_state::then()` returns a `future<U>` but is defined before
+`future` in the same partition - ordinary mutual forward declaration,
+nothing module-specific.
+
+**Round 5: `import std;`, project-wide - tried, and reverted after a
+real-CI finding.** Two changes were meant to make it work:
+`cmake/toolchain-hosted-linux.cmake` setting
+`CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` to `"0e5b6991-d74f-4b3d-a41c-cf096e0b2508"`
+(the gate value for CMake 3.30.0-3.31.7, confirmed via WebSearch since
+the original scaffolding session couldn't reach cmake.org/discourse to
+check; the pinned `CMAKE_VERSION`, 3.31.0, falls inside that range)
+before `project()`, and the top-level `CMakeLists.txt` setting
+`CMAKE_CXX_MODULE_STD ON` to actually request the module once the gate
+allowed it. Every `.cppm`/`.cpp` file's `#include`s became `import
+std;`. Locally unverifiable by construction (this sandbox's CMake,
+3.28.3, predates the feature outright, and upgrading it isn't possible
+either - apt.llvm.org is blocked by the same network egress policy that
+blocked Docker Hub earlier, confirmed by trying it directly) - discussed
+with the user before proceeding on that basis, and pushed to let real CI
+be the only available judge.
+
+Real CI's answer: the gate value and Clang 22.1.8 detection both worked
+fine, but configure then failed -
+```
+CMake Error: Cannot find source file: /lib/share/libc++/v1/std.cppm
+```
+- the devenv image's installed `libc++-${LLVM_VERSION}-dev` package
+doesn't actually ship the standard library module's own source file at
+the path CMake expects. `docker/Dockerfile`'s own comment on that
+package install already flagged the package names as unconfirmed
+(network-blocked when written); this is that risk landing concretely.
+Fixing it means finding which apt.llvm.org package (if any, for this
+LLVM_VERSION/Debian combination) actually provides `std.cppm` and
+adjusting the Dockerfile - not attempted, since apt.llvm.org is blocked
+here too and the investigation couldn't be done. Reverted per the
+plan's own stated contingency for this outcome: every file back to
+`#include`s, `CMAKE_CXX_MODULE_STD` removed from `CMakeLists.txt`,
+`CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` left commented out in the toolchain
+file with the concrete finding recorded in place of the old "couldn't
+check" TODO, so a future attempt starts from a real lead instead of
+from scratch. Local build verification is fully back as a result - the
+"gone for the rest of this session" tradeoff from the initial attempt
+did not end up holding.
+
+**One thing from that round survives independently: `est::check()`, a
+real function instead of the `<cassert>` macro - requested directly by
+the user, not tied to a review comment.** New partition `est:check`
+(`est/src/check.cppm`), exported from `est`. Calls into a new
+`platform::hosted_linux::assert_failure(message, location)` -
+`[[noreturn]]`, prints to `std::cerr`, calls `std::abort()` - the
+backend's answer to "what happens when a check fails," same reasoning
+as `now()` already being the backend's answer to "what time is it": a
+future bare-metal backend answers this differently without
+`est::check()` itself changing. `future.cppm` no longer needs
+`<cassert>` at all as a result (it already dropped every other classic
+include when `import std;` was tried, and kept that reverted back
+afterward - simply never needed `<cassert>` again once `check()`
+existed).
+
+**Found the hard way: a function cannot be named `assert`, even
+namespaced.** The first version of this was named `est::assert()`
+directly, per the literal request. It compiles the library itself fine,
+but every test file broke: Catch2's headers transitively `#include
+<cassert>`, and the C library's `assert` is a function-like macro - the
+preprocessor expands any `assert(` token sequence by raw text match
+*before* the compiler ever parses the `est::` qualifier in front of it,
+so `est::assert(true)` becomes `est::` followed by `<cassert>`'s own
+macro expansion, a parse error. Fully-qualifying the call doesn't help;
+nothing at the language level can protect a function literally named
+`assert` from this in any translation unit that also has `<cassert>` in
+scope, transitively or not. Renamed to `check()` (and `assertions_enabled`
+to `checks_enabled`, `assert.cppm`/`assert_tests.cpp` to
+`check.cppm`/`check_tests.cpp`) to sidestep the collision entirely
+rather than working around it per call site.
+
+Two real differences from the macro it replaces, not just a drop-in,
+documented directly in `check.cppm`: no automatic condition-
+stringification (a function can't see the caller's source text the way
+a macro can via `#condition` - pass an explicit message instead of the
+old `assert(cond && "message")` idiom), and `condition` is an ordinary
+function argument, so it's always *evaluated* even when disabled -
+unlike the macro, which under `NDEBUG` never evaluates its argument at
+all. `std::source_location::current()`, defaulted at each call site,
+replaces `__FILE__`/`__LINE__`. Still debug-only like the macro it
+replaces: `checks_enabled` mirrors `NDEBUG`, and the `if constexpr`
+around the check compiles it away entirely (not just skips it at
+runtime) when set. New `est/tests/check_tests.cpp` covers the
+pass-through (condition-true) path only - the failure path unavoidably
+terminates the process (`[[noreturn]]`, `std::abort()`), same as the
+macro's always did, and isn't practically unit-testable without
+process-isolation tooling this project doesn't have.
+
+**Status as of commit `d58babd`: PR #3 (M2 + the new-code coverage gate +
+this whole review round) is real-CI green and `mergeable_state: clean`.**
+Every review thread on it is resolved. Not yet merged - waiting on the
+user (or the next agent, if asked to proceed) to actually merge it; this
+session did not merge unilaterally, per the project's own "confirm
+before pushing/merging" posture. **Next step once merged:** reset the
+`claude/cpp-async-framework-design-jm6ra3` branch onto the post-merge
+`main` and start M3 (below) - platform/timer/mutex (M1) and
+future/promise/continuation (M2) are both done; nothing is blocking M3
+from starting immediately.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until
   the next timer deadline, repeats; `run_until_idle()` for tests/examples
   that shouldn't block forever.
-- Owns/creates the `shared_state`s it's handed (see M2's abandoned-future
+- Owns/creates the `future_state`s it's handed (see M2's abandoned-future
   design) and is the thing that actually resumes continuations when a
   `promise` is fulfilled or a timer fires.
 - I/O (sockets, files, epoll/io_uring) is explicitly **out of scope** for
@@ -552,7 +990,7 @@ Removed.
 - `est::task<T>` coroutine type with a `promise_type` that binds to
   `est::promise<T>`/`est::future<T>` under the hood.
 - `operator co_await` on `est::future<T>`, suspending into a continuation
-  registered on the `shared_state`, using symmetric transfer where the
+  registered on the `future_state`, using symmetric transfer where the
   standard allows it.
 - Coroutine frame allocation wired through the same allocator convention
   established in M1/M2 (`allocator_arg_t` + allocator as the coroutine's
@@ -574,7 +1012,9 @@ Removed.
 - Flesh out `examples/hello_world` into something that actually exercises
   the stack meaningfully (e.g. a coroutine that awaits a timer, prints,
   spawns a couple of abandoned background tasks, then the loop drains them
-  before exiting) rather than the M0 placeholder.
+  before exiting) - well beyond today's version (M2, a single
+  `promise`/`future` pair with no loop or coroutines yet), itself already
+  a step up from the original M0 walking-skeleton placeholder.
 - Fill in real unit test coverage for future/promise/loop/coroutine
   (M0–M4 land with tests per-component; this milestone is about
   integration-level coverage and edge cases: abandoned futures, exceptions

@@ -5,7 +5,9 @@ import est;
 
 auto main() -> int {
   try {
-    std::println("{}", est::placeholder_message());
+    auto [promise, future] = est::make_promise_future<int>();
+    promise.set_value(42);
+    std::println("est::future value: {}", future.get());
   } catch (...) {
     return EXIT_FAILURE;
   }

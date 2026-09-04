@@ -43,6 +43,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         ninja-build \
         python3 \
+        python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Pinned Clang/LLVM snapshot from apt.llvm.org ---
@@ -55,11 +56,13 @@ RUN wget --inet4-only -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
     && rm -f /tmp/llvm.sh \
     && rm -rf /var/lib/apt/lists/*
 
-# libc++, explicitly: this image has no gcc/libstdc++-dev at all, and even
-# where a libstdc++ happens to be present Clang won't use it for
-# `import std;`/<print> support without pairing it with libc++ - `all`
-# above does not reliably pull in libc++'s own dev packages. Package names
-# below follow apt.llvm.org's usual libc++-<N>-dev/libc++abi-<N>-dev
+# libc++ and compiler-rt, explicitly: this image has no gcc/libstdc++-dev
+# at all, and even where a libstdc++ happens to be present Clang won't use
+# it for `import std;`/<print> support without pairing it with libc++ -
+# `all` above does not reliably pull in either of these. compiler-rt's
+# profile runtime (libclang_rt.profile) is what -fprofile-instr-generate
+# links against for the coverage gate below. Package names follow
+# apt.llvm.org's usual libc++-<N>-dev/libc++abi-<N>-dev/libclang-rt-<N>-dev
 # convention but were not confirmed against a real `apt-cache search`
 # (this session couldn't reach apt.llvm.org directly - see docs/PLAN.md,
 # "Known open items"). Verify these package names exist for the pinned
@@ -68,15 +71,24 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         "libc++-${LLVM_VERSION}-dev" \
         "libc++abi-${LLVM_VERSION}-dev" \
+        "libclang-rt-${LLVM_VERSION}-dev" \
     && rm -rf /var/lib/apt/lists/*
 
 # Unversioned names (`clang`, `clang++`, `clang-format`, `clang-tidy`, ...)
 # resolve to the pinned version, so the rest of this Dockerfile and the CI
 # workflow don't need to know LLVM_VERSION.
-RUN for tool in clang clang++ clang-format clang-tidy clang-scan-deps lld lldb; do \
+RUN for tool in clang clang++ clang-format clang-tidy clang-scan-deps lld lldb llvm-cov llvm-profdata; do \
         update-alternatives --install "/usr/bin/${tool}" "${tool}" \
             "/usr/bin/${tool}-${LLVM_VERSION}" 100; \
     done
+
+# diff-cover: intersects the llvm-cov lcov report below with a PR's diff
+# to gate on new-code coverage rather than the whole repo's. Pinned to
+# match what this session verified the coverage pipeline against locally.
+# Debian's system Python is "externally managed" (PEP 668); this is a
+# throwaway container image, not a shared system, so overriding that
+# guard is the right call here, not a workaround to avoid fixing properly.
+RUN pip install --no-cache-dir --break-system-packages diff-cover==10.5.1
 
 # --- Pinned CMake ---
 # The distro package is generally far behind the C++20/23-modules-support

@@ -16,13 +16,17 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 add_executable(est_tests
-  skeleton_tests.cpp
   platform_tests.cpp
+  check_tests.cpp
   mutex_tests.cpp
   timer_tests.cpp
+  future_tests.cpp
+  scope_exit_tests.cpp
+  shared_ptr_tests.cpp
 )
 target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2WithMain)
 est_set_warnings(est_tests)
+est_enable_coverage(est_tests)
 
 # Catch2's TEST_CASE expands to code using __COUNTER__ (a long-standing,
 # widely-supported extension, but not yet standard - Clang 22 added

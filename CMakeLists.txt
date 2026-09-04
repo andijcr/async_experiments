@@ -30,6 +30,7 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "est links statically by default" FORCE)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(CompilerWarnings)
+include(Coverage)
 
 option(EST_BUILD_TESTS "Build est unit tests" ON)
 option(EST_BUILD_EXAMPLES "Build est example apps" ON)

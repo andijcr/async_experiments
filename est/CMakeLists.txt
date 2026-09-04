@@ -7,14 +7,19 @@ target_sources(est
     BASE_DIRS src
     FILES
       src/est.cppm
-      src/placeholder.cppm
+      src/util/scope_exit.cppm
+      src/util/shared_ptr.cppm
       src/platform/platform.cppm
+      src/check.cppm
       src/sync/mutex.cppm
       src/timer.cppm
+      src/future.cppm
+      src/promise.cppm
 )
 
 target_compile_features(est PUBLIC cxx_std_23)
 est_set_warnings(est)
+est_enable_coverage(est)
 
 if(EST_BUILD_TESTS)
   add_subdirectory(tests)

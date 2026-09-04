@@ -1,6 +1,10 @@
 module;
 
 #include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <source_location>
+#include <string_view>
 
 export module est:platform;
 
@@ -18,6 +22,22 @@ struct hosted_linux {
   using duration = clock::duration;
 
   [[nodiscard]] static auto now() noexcept -> time_point { return clock::now(); }
+
+  // Reports a failed est::check() and terminates - the hosted-Linux
+  // backend's answer to "what actually happens when a check fails,"
+  // same reasoning as now() being the backend's answer to "what time
+  // is it": a future bare-metal backend, or a test fake, gets to
+  // answer this differently (halt, trigger a debug break, ...) without
+  // est::check() itself changing.
+  [[noreturn]] static void assert_failure(std::string_view message,
+                                          std::source_location location) noexcept {
+    std::cerr << location.file_name() << ':' << location.line() << ": assertion failed";
+    if (!message.empty()) {
+      std::cerr << ": " << message;
+    }
+    std::cerr << " (in " << location.function_name() << ")\n";
+    std::abort();
+  }
 };
 
 } // namespace est::platform
