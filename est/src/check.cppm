@@ -1,10 +1,6 @@
-module;
-
-#include <source_location>
-#include <string_view>
-
 export module est:check;
 
+import std;
 import :platform;
 
 export namespace est {
@@ -15,11 +11,9 @@ inline constexpr bool checks_enabled = false;
 inline constexpr bool checks_enabled = true;
 #endif
 
-// A function replacement for the <cassert> macro - stands on its own
-// regardless of the `import std;` project-wide attempt this landed
-// alongside (docs/PLAN.md: that attempt was tried and reverted after a
-// real-CI toolchain gap; this function still avoids future.cppm's own
-// prior need for the assert() macro either way).
+// A function replacement for the <cassert> macro - avoids future.cppm's
+// own prior need for the assert() macro (see below for why a function
+// literally named `assert` doesn't work).
 // std::source_location::current(), defaulted here and evaluated at
 // each call site, replaces __FILE__/__LINE__.
 //

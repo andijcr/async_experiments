@@ -72,6 +72,25 @@ RUN apt-get update \
         "libclang-rt-${LLVM_VERSION}-dev" \
     && rm -rf /var/lib/apt/lists/*
 
+# Work around a real Debian packaging gap: `libc++-<N>-dev` installs
+# `libc++.modules.json` (the manifest CMake's `import std;` support
+# reads) at the standard multiarch path so plain `-stdlib=libc++` finds
+# it via `clang++ -print-file-name=libc++.modules.json` without needing
+# the versioned resource dir. But that JSON's `source-path` for the std
+# module is relative to its own directory and assumes a flat install
+# prefix - `<prefix>/lib/<triple>/libc++.modules.json` next to
+# `<prefix>/share/libc++/v1/std.cppm` - which Debian's packaging doesn't
+# actually have: the std module's real sources only exist under the
+# versioned `/usr/lib/llvm-${LLVM_VERSION}/share/libc++/v1/`, not
+# mirrored to a plain `/usr/share/libc++/v1/`. Without this, `import
+# std;` fails to configure with "Cannot find source file:
+# /lib/share/libc++/v1/std.cppm" (confirmed - see docs/PLAN.md, "import
+# std; re-adopted, project-wide"). A directory symlink at the path the
+# JSON's relative resolution actually looks for fixes it without
+# touching the real, versioned installation.
+RUN mkdir -p /usr/lib/share/libc++ \
+    && ln -s "/usr/lib/llvm-${LLVM_VERSION}/share/libc++/v1" /usr/lib/share/libc++/v1
+
 # Unversioned names (`clang`, `clang++`, `clang-format`, `clang-tidy`, ...)
 # resolve to the pinned version, so the rest of this Dockerfile and the CI
 # workflow don't need to know LLVM_VERSION.

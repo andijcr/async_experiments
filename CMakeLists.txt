@@ -1,13 +1,26 @@
 cmake_minimum_required(VERSION 3.28)
 
+# CMAKE_CXX_STANDARD/_STANDARD_REQUIRED/_EXTENSIONS must be set before
+# project(), not after: project()'s own compiler-detection step is what
+# compiles the `import std;` support library (the internal
+# `__cmake_cxx23` target/`std.pcm`), and it does so using whatever
+# extensions setting is active *at that point* - not whatever a later
+# set() call in this file says. Setting CMAKE_CXX_EXTENSIONS OFF only
+# after project() left std.pcm compiled with GNU extensions (the
+# default) while every est/ target compiled without them, and Clang
+# correctly refused to load a precompiled module with a mismatched
+# configuration: "GNU extensions was enabled in precompiled file
+# 'std.pcm' but is currently disabled". Confirmed by reproducing the
+# failure, then fixing it exactly this way, against the real pinned
+# toolchain (docs/PLAN.md, "import std; re-adopted, project-wide").
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 project(async_experiments
   DESCRIPTION "est: an educational single-threaded async framework for C++23/26"
   LANGUAGES CXX
 )
-
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Module dependency scanning (FILE_SET CXX_MODULES) needs Ninja.
 if(NOT CMAKE_GENERATOR MATCHES "Ninja")
@@ -17,6 +30,17 @@ if(NOT CMAKE_GENERATOR MATCHES "Ninja")
   )
 endif()
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
+
+# Project-level opt-in for `import std;` (the toolchain file's
+# CMAKE_EXPERIMENTAL_CXX_IMPORT_STD only unlocks the feature; this is
+# what actually requests it - seeds every target's CXX_MODULE_STD
+# property). Every est source file uses `import std;` instead of classic
+# `#include`s now (docs/PLAN.md, "import std; re-adopted, project-wide")
+# - a build without the gate set (no toolchain file, e.g. this project's
+# own structural local-smoke-test builds against a pre-3.30 CMake) will
+# fail to configure importing std at all, not just warn; there is no
+# `#include`-based fallback path left to fall back to.
+set(CMAKE_CXX_MODULE_STD ON)
 
 # Compiler, standard library (libc++), and the import-std experimental
 # gate are pinned in cmake/toolchain-hosted-linux.cmake, applied via the
