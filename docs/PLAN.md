@@ -828,6 +828,27 @@ just whether it compiles.
   standard streams' static initialization isn't something `import std;`
   skips.
 
+**The "coverage doesn't regress" claim above turned out to be an
+artifact of the stale baseline it was checked against, not a real
+result.** It was measured while this change's PR was still stacked on
+the not-yet-merged `est::platform` redesign PR, whose own diff's covered
+lines diluted the uncovered `assert_failure()` body down to 85%. Once
+that PR merged and this one's base moved to point at `main` directly,
+`diff-cover` against the *real* current `main` showed the true, isolated
+result: 0% - all of `assert_failure()`'s few lines uncovered, none of
+the other PR's covered lines left to average against. A follow-up
+review comment asked to consolidate the three `std::print`/`std::println`
+calls into one (implemented - see the format string above); this didn't
+fix the gate either, and if anything made the per-line accounting worse
+(each argument expression in a wrapped multi-line call gets its own
+coverage region, so the single call spans more counted-but-uncovered
+lines than the three short calls it replaced). Per the repo owner's
+explicit direction, the coverage gate was not chased further for this
+PR - `assert_failure()`'s body stays genuinely untestable-by-construction
+without process-isolation tooling (the same situation `est::check()`'s
+own failure path has always been in), and building that tooling wasn't
+asked for here.
+
 `.clang-format` is based on the LLVM style as a starting point (closest
 existing style to how Clang's own modules/coroutines code is formatted, and
 clang-format's most battle-tested base for bleeding-edge syntax like module

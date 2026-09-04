@@ -45,42 +45,44 @@ public:
     return std::chrono::steady_clock::now();
   }
 
-  // std::print/println directly to std::cerr, one field at a time - not
-  // std::format-ing a std::string first and printing that: the whole
-  // point of std::print's format_string overload is writing straight
-  // into the destination, so building an intermediate string here would
-  // just be a pointless extra allocation-and-copy on a path that only
-  // exists to report a bug anyway. Three separate writes instead of one
-  // atomic one means concurrent std::cerr output from elsewhere could in
-  // principle interleave mid-diagnostic - not a concern this framework's
-  // design needs to guard against (docs/PLAN.md's very first constraint:
-  // single-threaded, no cross-thread shared state), so not worth the
-  // string-building this would otherwise cost to avoid.
+  // One std::println call, not several - a reviewer comment on an
+  // earlier, multi-call version pointed out there's no reason to split
+  // this into 2-3 separate writes when a single format string says the
+  // same thing; always including `message` (even when empty, giving
+  // "assertion failed:  (in func)" with a blank between the colons) is a
+  // deliberate simplification, not an oversight - the empty case is rare
+  // enough (every current est::check() call site either always or never
+  // passes one) that a special-cased branch to avoid a stray blank isn't
+  // worth the extra code on a path that only exists to report a bug.
+  // Directly to std::cerr, not building an intermediate std::string
+  // first: the whole point of std::print's format_string overload is
+  // writing straight into the destination.
   //
   // std::cerr (an ostream), not stderr (a FILE*): unlike stderr, std::cerr
   // is a proper namespace-std entity, so it needs nothing beyond
-  // `import std;` to reach - no #include, unlike
-  // the FILE*-based stderr this replaced (see docs/PLAN.md). Confirmed
-  // with a standalone `import std;`-only program that actually triggers
-  // this path (not just compiles it) that std::cerr writes correctly
-  // with no <iostream> #include anywhere in the TU - the standard
-  // library's own static initialization for the standard streams isn't
-  // skipped just because the include was replaced by an import.
+  // `import std;` to reach - no #include, unlike the FILE*-based stderr
+  // this replaced (see docs/PLAN.md). Confirmed with a standalone
+  // `import std;`-only program that actually triggers this path (not
+  // just compiles it) that std::cerr writes correctly with no <iostream>
+  // #include anywhere in the TU - the standard library's own static
+  // initialization for the standard streams isn't skipped just because
+  // the include was replaced by an import.
   [[noreturn]] void assert_failure(std::string_view message,
                                    std::source_location location) const noexcept override {
-    // std::print/println can throw (std::format_error, or an I/O
-    // failure) - caught and discarded rather than left to escape this
-    // noexcept function: aborting either way is the whole point of
+    // std::println can throw (std::format_error, or an I/O failure) -
+    // caught and discarded rather than left to escape this noexcept
+    // function: aborting either way is the whole point of
     // assert_failure, so a best-effort diagnostic isn't worth preferring
     // one termination path over another. Same pattern
     // examples/hello_world/main.cpp already needs around its own
     // std::println call, for the same reason.
     try {
-      std::print(std::cerr, "{}:{}: assertion failed", location.file_name(), location.line());
-      if (!message.empty()) {
-        std::print(std::cerr, ": {}", message);
-      }
-      std::println(std::cerr, " (in {})", location.function_name());
+      std::println(std::cerr,
+                   "{}:{}: assertion failed: {} (in {})",
+                   location.file_name(),
+                   location.line(),
+                   message,
+                   location.function_name());
       // Deliberately empty: std::abort() unconditionally follows below
       // regardless of whether the diagnostic above printed successfully,
       // so there's nothing to handle or re-throw here.
