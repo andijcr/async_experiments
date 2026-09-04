@@ -8,6 +8,7 @@ target_sources(est
     FILES
       src/est.cppm
       src/util/scope_exit.cppm
+      src/util/shared_ptr.cppm
       src/platform/platform.cppm
       src/sync/mutex.cppm
       src/timer.cppm

@@ -763,6 +763,44 @@ general-purpose `est::shared_ptr<T>` for `shared_state`'s (renamed
 chainable `future<U>` — are large enough to be their own follow-up
 rounds; see this section's future entries once those land.
 
+**Round 3: `est::shared_ptr<T>`, and `shared_state` renamed to
+`future_state`.** New `est::shared_ptr<T>` (`est:util.shared_ptr`,
+`est/src/util/shared_ptr.cppm`) — single-threaded (plain `int` ref count,
+no atomics), pmr-allocator-backed, combining the ref count, the
+allocator, and the `T` into one control block allocated in a single
+`allocator.new_object<control_block>` call (no separate control-block
+allocation the way `std::shared_ptr` needs one when not built via
+`make_shared`). `shared_state<T>` is renamed `future_state<T>` (per the
+reviewer's own suggested name) and drops `ref_count_`/`add_ref()`/
+`release()` entirely; `promise<T>`/`future<T>` now hold an
+`est::shared_ptr<future_state<T>>` instead of a raw pointer plus
+hand-rolled ref-counting. A pleasant side effect: `future<T>`/`promise<T>`'s
+move constructor/assignment and destructor all became `= default` —
+`shared_ptr`'s own move (already swap-based) and destructor do the work
+that used to be spelled out by hand in each handle.
+
+**Found by real CI, again — same clang-format wrap-boundary drift as
+before, different signature.** `future_state<T>::get()`'s deducing-this
+signature (added in round 2, above) sat at the same kind of ambiguous
+100-column wrap boundary as the earlier `do_is_equal` case, and Clang 22
+wanted a different wrap than local Clang 18 had already accepted as
+clean. Same fix as before: shortened the signature instead of guessing
+at spacing, this time via a named `get_result_t` alias for the
+(otherwise inline) `std::conditional_t<...>` return type.
+
+**Docker was tried as a way to close this gap entirely, and is blocked in
+this session's sandbox.** Building the pinned devenv image
+(`docker/Dockerfile`) locally, to run the *exact* CI toolchain instead of
+guessing at Clang 22's behavior from Clang 18, would eliminate this whole
+class of version-drift bug. The Docker daemon itself runs fine here (it
+just needed starting), but pulling any base image from Docker Hub is
+blocked by this sandbox's network egress policy - reproducible directly
+(`docker pull debian:bookworm-slim` fails the same way), not specific to
+this Dockerfile. Not a workaround-able failure (403 policy denial, not a
+transient error) - noted here as a real limitation of this development
+sandbox specifically, not of the project's actual CI, which builds this
+same image successfully on every run.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until

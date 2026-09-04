@@ -21,6 +21,7 @@ add_executable(est_tests
   timer_tests.cpp
   future_tests.cpp
   scope_exit_tests.cpp
+  shared_ptr_tests.cpp
 )
 target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2WithMain)
 est_set_warnings(est_tests)

@@ -11,18 +11,19 @@ export module est:future;
 
 import :sync.mutex;
 import :util.scope_exit;
+import :util.shared_ptr;
 
 export namespace est {
 
-template <class T> class shared_state;
+template <class T> class future_state;
 
 } // namespace est
 
 namespace est::detail {
 
-// Type-agnostic base for a shared_state<T>'s queued continuations: only
+// Type-agnostic base for a future_state<T>'s queued continuations: only
 // the parts that don't depend on T live here, so they're compiled once
-// instead of once per T. shared_state<T>'s own destructor (which only
+// instead of once per T. future_state<T>'s own destructor (which only
 // ever needs to destroy(), never invoke()) operates on this directly.
 class waiter_node : public mutex_waiter {
 public:
@@ -47,11 +48,11 @@ public:
 
 // The T-dependent half of a queued continuation: adds only the one
 // thing that actually needs T (invoke()). Not nested inside
-// shared_state<T> - it's an implementation detail of :future, not part
-// of shared_state's public surface, so it lives here instead.
+// future_state<T> - it's an implementation detail of :future, not part
+// of future_state's public surface, so it lives here instead.
 template <class T> class continuation_node : public waiter_node {
 public:
-  virtual void invoke(shared_state<T>& state) = 0;
+  virtual void invoke(future_state<T>& state) = 0;
 };
 
 } // namespace est::detail
@@ -61,29 +62,29 @@ export namespace est {
 // The single owned object behind an est::promise<T>/est::future<T> pair
 // - a view over shared state, not the state itself (docs/PLAN.md). Holds
 // value-or-exception storage and a continuation slot built on
-// est::waiter_list, plus a plain (non-atomic - single-threaded, see
-// est::mutex's own docs) reference count. Always heap-allocated via a
-// std::pmr::polymorphic_allocator (see make_promise_future() in
-// est:promise) - never constructed directly by a caller.
-template <class T> class shared_state {
+// est::waiter_list. Lifetime is managed externally by an
+// est::shared_ptr<future_state<T>> (see make_promise_future() in
+// est:promise) - never constructed directly by a caller, and holds no
+// ref count of its own.
+template <class T> class future_state {
 public:
   using continuation_node = detail::continuation_node<T>;
 
-  explicit shared_state(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept
+  explicit future_state(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept
       : allocator_(allocator) {}
 
-  shared_state(const shared_state&) = delete;
-  auto operator=(const shared_state&) -> shared_state& = delete;
-  shared_state(shared_state&&) = delete;
-  auto operator=(shared_state&&) -> shared_state& = delete;
+  future_state(const future_state&) = delete;
+  auto operator=(const future_state&) -> future_state& = delete;
+  future_state(future_state&&) = delete;
+  auto operator=(future_state&&) -> future_state& = delete;
 
   // Destroys (without invoking) any continuation still queued: either the
   // promise was dropped without ever completing, or complete()'s drain
   // loop was aborted partway through by a throwing continuation (see
   // run()'s comment). Without this, those already-allocated nodes are
-  // simply unreachable once this shared_state itself is gone - a
+  // simply unreachable once this future_state itself is gone - a
   // permanent leak, not just a skipped notification.
-  ~shared_state() {
+  ~future_state() {
     while (auto* waiter = waiters_.dequeue()) {
       // Safe by construction, not by RTTI: every waiter ever enqueued
       // into waiters_ is a detail::waiter_node (set_continuation() only
@@ -122,6 +123,13 @@ public:
     return !std::holds_alternative<std::monostate>(result_);
   }
 
+  // Return type of get(this Self&&, ...) below - named so the function's
+  // own signature stays short enough to sidestep clang-format
+  // version-specific line-wrap disagreements (see docs/PLAN.md's note on
+  // this happening once already for a similar signature).
+  template <class Self>
+  using get_result_t = std::conditional_t<std::is_lvalue_reference_v<Self>, const T&, T&&>;
+
   // Retrieves the value, or rethrows the stored exception. Precondition:
   // ready(). Deducing this: called on an lvalue (or const lvalue), this
   // returns const T& - non-consuming, safe for the multiple registered
@@ -131,9 +139,7 @@ public:
   // std::optional<T>::value() &&: moving from a value something else
   // (another queued continuation, or a later then()) still needs is the
   // caller's mistake to avoid, not something this class defends against.
-  template <class Self>
-  [[nodiscard]] auto
-  get(this Self&& self) -> std::conditional_t<std::is_lvalue_reference_v<Self>, const T&, T&&> {
+  template <class Self> [[nodiscard]] auto get(this Self&& self) -> get_result_t<Self> {
     assert(self.ready());
     if (auto* exception = std::get_if<std::exception_ptr>(&self.result_)) {
       std::rethrow_exception(*exception);
@@ -149,17 +155,6 @@ public:
     return allocator_;
   }
 
-  void add_ref() noexcept { ++ref_count_; }
-
-  // Decrements the reference count; destroys and deallocates this
-  // shared_state (via the allocator it was constructed with) if that
-  // was the last reference.
-  void release() noexcept {
-    if (--ref_count_ == 0) {
-      allocator_.delete_object(this);
-    }
-  }
-
 private:
   template <class F> void complete(F&& store_result) {
     // Precondition, not a recoverable error: set_value()/set_exception()
@@ -169,7 +164,7 @@ private:
     // ran off the first completion, delivers a value/exception they never
     // see. Revisit if that turns out to matter in practice; not changing
     // it speculatively now.
-    assert(!ready() && "shared_state completed more than once");
+    assert(!ready() && "future_state completed more than once");
     std::forward<F>(store_result)();
 
     // Drain every registered continuation (normally at most one - future
@@ -183,7 +178,7 @@ private:
   }
 
   // Guarantees the node is destroyed even if invoke() throws (a
-  // continuation's own exception is not this shared_state's problem to
+  // continuation's own exception is not this future_state's problem to
   // swallow, but leaking the node it ran in would be a separate bug on
   // top of whatever the continuation did). A throwing continuation does
   // still abort the drain loop in complete() before any later-queued
@@ -197,41 +192,35 @@ private:
 
   waiter_list waiters_;
   std::variant<std::monostate, T, std::exception_ptr> result_;
-  int ref_count_ = 0;
   std::pmr::polymorphic_allocator<std::byte> allocator_;
 };
 
-// Consumer handle: a thin, move-only view over a shared_state<T>.
-// Destroying a future does not destroy the shared_state if something
-// else - a still-live est::promise, or (once est::loop exists, M3) the
-// loop's own keep-alive registration - still references it.
+// Consumer handle: a thin, move-only view over a future_state<T>, backed
+// by an est::shared_ptr so destroying a future does not destroy the
+// future_state if something else - a still-live est::promise, or (once
+// est::loop exists, M3) the loop's own keep-alive registration - still
+// references it.
 template <class T> class future {
 public:
-  explicit future(shared_state<T>* state) noexcept : state_(state) {}
+  explicit future(shared_ptr<future_state<T>> state) noexcept : state_(std::move(state)) {}
   future(const future&) = delete;
   auto operator=(const future&) -> future& = delete;
-
-  future(future&& other) noexcept : state_(std::exchange(other.state_, nullptr)) {}
-
-  auto operator=(future&& other) noexcept -> future& {
-    std::swap(state_, other.state_);
-    return *this;
-  }
-
-  ~future() { reset(); }
+  future(future&&) noexcept = default;
+  auto operator=(future&&) noexcept -> future& = default;
+  ~future() = default;
 
   [[nodiscard]] auto ready() const noexcept -> bool { return state_->ready(); }
 
   // Deducing this: future.get() (lvalue) copy-constructs from the
-  // shared_state's non-consuming get(); std::move(future).get() forwards
-  // its rvalue-ness through, so the shared_state's value is moved
+  // future_state's non-consuming get(); std::move(future).get() forwards
+  // its rvalue-ness through, so the future_state's value is moved
   // directly into the return value instead of copied - safe here
   // specifically because a future is a single-consumer handle, unlike
-  // shared_state<T>::get() itself, which multiple then() continuations
+  // future_state<T>::get() itself, which multiple then() continuations
   // may each call.
   //
-  // self isn't itself forwarded (NOLINTNEXTLINE below): state_ is a raw
-  // pointer member, and forwarding a pointer doesn't propagate value
+  // self isn't itself forwarded (NOLINTNEXTLINE below): state_ is a
+  // shared_ptr member, and forwarding it doesn't propagate value
   // category to what it points to the way it would for a value/reference
   // member - the if constexpr branch is what actually turns *state_'s
   // lvalue-ness into an xvalue for the rvalue-self case.
@@ -244,9 +233,9 @@ public:
     }
   }
 
-  // Registers fn to run once ready, as fn(shared_state<T>&) - from which
+  // Registers fn to run once ready, as fn(future_state<T>&) - from which
   // it can call get() (rethrowing any stored exception) or ready(). Runs
-  // synchronously, on whichever call stack completes the shared_state
+  // synchronously, on whichever call stack completes the future_state
   // (M2 has no loop yet to defer onto - see docs/PLAN.md, M3).
   template <class Fn> void then(Fn&& fn) {
     using node_type = concrete_continuation<std::decay_t<Fn>>;
@@ -256,10 +245,10 @@ public:
 
 private:
   template <class Fn>
-  class concrete_continuation final : public shared_state<T>::continuation_node {
+  class concrete_continuation final : public future_state<T>::continuation_node {
   public:
     explicit concrete_continuation(Fn fn) : fn_(std::move(fn)) {}
-    void invoke(shared_state<T>& state) override { fn_(state); }
+    void invoke(future_state<T>& state) override { fn_(state); }
 
     // `this` here is concrete_continuation<Fn>*, so delete_object
     // deallocates with this type's actual size/alignment - the whole
@@ -273,14 +262,7 @@ private:
     Fn fn_;
   };
 
-  void reset() noexcept {
-    if (state_ != nullptr) {
-      state_->release();
-      state_ = nullptr;
-    }
-  }
-
-  shared_state<T>* state_ = nullptr;
+  shared_ptr<future_state<T>> state_;
 };
 
 } // namespace est

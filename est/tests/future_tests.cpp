@@ -62,7 +62,7 @@ TEST_CASE("then() registered before set_value runs synchronously on completion",
   auto [promise, future] = est::make_promise_future<int>();
   bool invoked = false;
   int observed = 0;
-  future.then([&](est::shared_state<int>& state) {
+  future.then([&](est::future_state<int>& state) {
     invoked = true;
     observed = state.get();
   });
@@ -79,7 +79,7 @@ TEST_CASE("then() registered after set_value runs immediately", "[future]") {
 
   bool invoked = false;
   int observed = 0;
-  future.then([&](est::shared_state<int>& state) {
+  future.then([&](est::future_state<int>& state) {
     invoked = true;
     observed = state.get();
   });
@@ -92,7 +92,7 @@ TEST_CASE("then() observes a stored exception via get()", "[future]") {
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool invoked = false;
-  future.then([&](est::shared_state<int>& state) {
+  future.then([&](est::future_state<int>& state) {
     invoked = true;
     REQUIRE_THROWS_AS((void)state.get(), std::runtime_error);
   });
@@ -102,22 +102,22 @@ TEST_CASE("then() observes a stored exception via get()", "[future]") {
 TEST_CASE("multiple then() registrations are all invoked on completion", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   int count = 0;
-  future.then([&](est::shared_state<int>&) { ++count; });
-  future.then([&](est::shared_state<int>&) { ++count; });
+  future.then([&](est::future_state<int>&) { ++count; });
+  future.then([&](est::future_state<int>&) { ++count; });
 
   promise.set_value(1);
   REQUIRE(count == 2);
 }
 
 TEST_CASE("every then() registration observes the same, correct value via get()", "[future]") {
-  // Regression test: get() used to move the value out of shared_state on
+  // Regression test: get() used to move the value out of future_state on
   // its first call, so a second continuation reading it would see a
   // moved-from value instead of the real one.
   auto [promise, future] = est::make_promise_future<int>();
   int first_observed = -1;
   int second_observed = -1;
-  future.then([&](est::shared_state<int>& state) { first_observed = state.get(); });
-  future.then([&](est::shared_state<int>& state) { second_observed = state.get(); });
+  future.then([&](est::future_state<int>& state) { first_observed = state.get(); });
+  future.then([&](est::future_state<int>& state) { second_observed = state.get(); });
 
   promise.set_value(42);
   REQUIRE(first_observed == 42);
@@ -139,19 +139,19 @@ TEST_CASE("dropping the future doesn't prevent the promise from completing", "[f
     auto dropped = std::move(future); // destroyed at the end of this scope
   }
 
-  promise.set_value(1); // shared_state stays alive via the promise's own reference
+  promise.set_value(1); // future_state stays alive via the promise's own reference
   SUCCEED("no crash");
 }
 
 TEST_CASE("a registered continuation is freed even if never invoked (broken promise)", "[future]") {
-  // Regression test: shared_state's destructor didn't drain its
+  // Regression test: future_state's destructor didn't drain its
   // continuation list, so a then() registered on a future whose promise
   // is dropped without ever completing leaked the continuation node
-  // forever - it just sat, unreachable, in the mutex's waiter list.
+  // forever - it just sat, unreachable, in the waiter list.
   counting_resource resource;
   {
     auto [promise, future] = est::make_promise_future<int>(&resource);
-    future.then([](est::shared_state<int>&) {});
+    future.then([](est::future_state<int>&) {});
     // promise and future both destroyed here, never completed.
   }
   REQUIRE(resource.allocations > 0);
@@ -169,17 +169,17 @@ TEST_CASE("a throwing continuation still gets its node freed, not leaked", "[fut
   {
     auto [promise, future] = est::make_promise_future<int>(&resource);
 
-    // The drain order is LIFO (documented on est::mutex's waiter list),
-    // so the *second*-registered continuation runs first: register the
+    // The drain order is LIFO (documented on est::waiter_list), so the
+    // *second*-registered continuation runs first: register the
     // one that must not run first, and the throwing one second, so it's
     // the one actually dequeued and invoked first.
     bool should_not_run = false;
-    future.then([&](est::shared_state<int>&) { should_not_run = true; });
-    future.then([](est::shared_state<int>&) { throw std::runtime_error("boom"); });
+    future.then([&](est::future_state<int>&) { should_not_run = true; });
+    future.then([](est::future_state<int>&) { throw std::runtime_error("boom"); });
 
     REQUIRE_THROWS_AS(promise.set_value(1), std::runtime_error);
     REQUIRE_FALSE(should_not_run); // documented M2-scope limitation: drain aborts on throw
-  } // promise and future destroyed here; shared_state's destructor drains
+  } // promise and future destroyed here; future_state's destructor drains
     // the still-queued continuation node too.
 
   REQUIRE(resource.allocations > 0);
