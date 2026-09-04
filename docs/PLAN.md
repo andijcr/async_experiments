@@ -863,6 +863,54 @@ with the allocator-heavy, manual-control-flow style this framework needs
 the mutex/waiter-list design below). Exact rule set is tuned as real code
 exists to run it against.
 
+### Issue #21: CI cache timing (investigated)
+
+Question raised: can the "build devenv image" step be simplified or
+cached for faster CI? Checked with real data instead of guessing — pulled
+per-step timing (`started_at`/`completed_at`) for several recent `gate`
+job runs via the GitHub Actions API:
+
+| run (Dockerfile touched?) | build-image step duration |
+|---|---|
+| #25, Dockerfile changed (added the libc++ symlink workaround) | 105s |
+| #27, #29, #32, #33, Dockerfile unchanged | 69–70s |
+
+This confirms `cache-from/to: type=gha` is genuinely working — an actual
+layer-changing rebuild costs ~35s more than a full cache hit, not a full
+from-scratch rebuild (which installs Clang/LLVM/CMake from the network
+and takes minutes, per the "Docker build verified end-to-end" timings
+earlier in this doc). So the step is already cached; there was no bug to
+fix there.
+
+The ~70s that remains even on a full cache hit isn't wasted rebuild work —
+it's `docker/build-push-action`'s fixed cost of spinning up buildx,
+fetching the cache manifest/blobs from the GHA cache backend, and
+`load`ing the resulting image into the runner's local Docker daemon. That
+cost is inherent to the "build locally, cache via GHA, never push"
+approach this workflow deliberately chose (see the `ci.yml` header
+comment and "Adversarial review findings" above) specifically so `pull_request`
+runs from forks — which get a read-only `GITHUB_TOKEN` — still work. The
+alternatives that would shrink this further (a registry-based cache,
+or a job-level `container:` pulling a pre-pushed tag) both need push
+(`packages: write`) access and were already rejected for exactly that
+reason; re-litigating them would reintroduce the fork-PR breakage this
+design exists to avoid.
+
+One real, safe simplification found and applied: `cache-to` was
+`type=gha,mode=max`, but `docker/Dockerfile` is single-stage — `mode=max`
+only earns its keep by additionally caching intermediate stages that
+aren't in the final image, and there are none here. Changed to
+`mode=min`, which caches exactly the layers `mode=max` would have cached
+in this single-stage case, with slightly less cache-export bookkeeping.
+Not expected to be a dramatic win (the `Post build devenv image` step
+that writes the cache was already only ~2s), but it's strictly no worse
+and more correctly expresses what's actually being cached.
+
+No other change made: the build step's ~70s cache-hit floor is an
+accepted, understood cost of a design that already made a deliberate
+push-vs-local-cache tradeoff for fork-PR support, not a regression or an
+oversight.
+
 ---
 
 ## Roadmap

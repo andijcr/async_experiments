@@ -73,7 +73,11 @@ jobs:
           load: true
           tags: ${{ env.DEVENV_IMAGE }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # mode=min (not max): the Dockerfile is single-stage, so there is
+          # no intermediate build stage for mode=max to additionally cache -
+          # it would just export the same final-image layers with more
+          # overhead. See docs/PLAN.md, "issue #21: CI cache timing".
+          cache-to: type=gha,mode=min
 
       - name: clang-format check
         run: >
