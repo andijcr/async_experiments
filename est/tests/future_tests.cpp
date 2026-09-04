@@ -91,15 +91,12 @@ TEST_CASE("then() observes a stored exception via get()", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
-  bool caught = false;
+  bool invoked = false;
   future.then([&](est::shared_state<int>& state) {
-    try {
-      (void)state.get();
-    } catch (const std::runtime_error&) {
-      caught = true;
-    }
+    invoked = true;
+    REQUIRE_THROWS_AS((void)state.get(), std::runtime_error);
   });
-  REQUIRE(caught);
+  REQUIRE(invoked);
 }
 
 TEST_CASE("multiple then() registrations are all invoked on completion", "[future]") {
