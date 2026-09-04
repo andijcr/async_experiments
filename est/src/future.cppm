@@ -1,14 +1,14 @@
 module;
 
-// assert() is a macro - macros aren't transmitted across `import`
-// (modules carry declarations, not preprocessor state), so <cassert>
-// stays in the global module fragment even though everything else here
-// comes from `import std;` below.
-#include <cassert>
+#include <exception>
+#include <memory_resource>
+#include <type_traits>
+#include <utility>
+#include <variant>
 
 export module est:future;
 
-import std;
+import :check;
 import :sync.mutex;
 import :util.scope_exit;
 import :util.shared_ptr;
@@ -141,7 +141,7 @@ public:
   // (another queued continuation, or a later then()) still needs is the
   // caller's mistake to avoid, not something this class defends against.
   template <class Self> [[nodiscard]] auto get(this Self&& self) -> get_result_t<Self> {
-    assert(self.ready());
+    check(self.ready());
     if (auto* exception = std::get_if<std::exception_ptr>(&self.result_)) {
       std::rethrow_exception(*exception);
     }
@@ -219,7 +219,7 @@ private:
     // ran off the first completion, delivers a value/exception they never
     // see. Revisit if that turns out to matter in practice; not changing
     // it speculatively now.
-    assert(!ready() && "future_state completed more than once");
+    check(!ready(), "future_state completed more than once");
     std::forward<F>(store_result)();
 
     // Drain every registered continuation (normally at most one - future

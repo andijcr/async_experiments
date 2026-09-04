@@ -833,50 +833,93 @@ declaration of `future<T>` (and vice versa) was needed since
 `future` in the same partition - ordinary mutual forward declaration,
 nothing module-specific.
 
-**Round 5: `import std;`, project-wide.** Closes the long-standing TODO
-(M0, "Docker strategy" / "Known open items") that this was ever an
-unverified gap in the first place. Two changes make it work:
-`cmake/toolchain-hosted-linux.cmake` sets
+**Round 5: `import std;`, project-wide - tried, and reverted after a
+real-CI finding.** Two changes were meant to make it work:
+`cmake/toolchain-hosted-linux.cmake` setting
 `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` to `"0e5b6991-d74f-4b3d-a41c-cf096e0b2508"`
-(the gate value for CMake 3.30.0-3.31.7 - confirmed via WebSearch this
-round, since the original scaffolding session couldn't reach
-cmake.org/discourse to check; the pinned `CMAKE_VERSION` (3.31.0,
-`docker/Dockerfile`) falls inside that range) before `project()`, where a
-toolchain file's content runs; the top-level `CMakeLists.txt` then sets
+(the gate value for CMake 3.30.0-3.31.7, confirmed via WebSearch since
+the original scaffolding session couldn't reach cmake.org/discourse to
+check; the pinned `CMAKE_VERSION`, 3.31.0, falls inside that range)
+before `project()`, and the top-level `CMakeLists.txt` setting
 `CMAKE_CXX_MODULE_STD ON` to actually request the module once the gate
-allows it. Every `.cppm`/`.cpp` file's `module; #include <...>;` /
-`#include <...>` block became `import std;` (or, for two non-module
-`.cpp` files, `import std;` alongside the unaffected `#include
-<catch2/...>` - Catch2 isn't a module).
+allowed it. Every `.cppm`/`.cpp` file's `#include`s became `import
+std;`. Locally unverifiable by construction (this sandbox's CMake,
+3.28.3, predates the feature outright, and upgrading it isn't possible
+either - apt.llvm.org is blocked by the same network egress policy that
+blocked Docker Hub earlier, confirmed by trying it directly) - discussed
+with the user before proceeding on that basis, and pushed to let real CI
+be the only available judge.
 
-Two headers stayed as plain `#include`s specifically because their
-public API is macro-based, and macros are never transmitted across an
-`import` (modules carry declarations, not preprocessor state) -
-`import std;` genuinely cannot replace them: `<cassert>` in
-`future.cppm` (the `assert()` macro), and `<cstdlib>` in
-`examples/hello_world/main.cpp` (`EXIT_FAILURE`/`EXIT_SUCCESS`). Both
-kept in the smallest scope that still compiles (a `module;` global
-module fragment for `future.cppm`, since it's a module interface unit;
-a plain top-level `#include` for `main.cpp`, since it isn't one).
+Real CI's answer: the gate value and Clang 22.1.8 detection both worked
+fine, but configure then failed -
+```
+CMake Error: Cannot find source file: /lib/share/libc++/v1/std.cppm
+```
+- the devenv image's installed `libc++-${LLVM_VERSION}-dev` package
+doesn't actually ship the standard library module's own source file at
+the path CMake expects. `docker/Dockerfile`'s own comment on that
+package install already flagged the package names as unconfirmed
+(network-blocked when written); this is that risk landing concretely.
+Fixing it means finding which apt.llvm.org package (if any, for this
+LLVM_VERSION/Debian combination) actually provides `std.cppm` and
+adjusting the Dockerfile - not attempted, since apt.llvm.org is blocked
+here too and the investigation couldn't be done. Reverted per the
+plan's own stated contingency for this outcome: every file back to
+`#include`s, `CMAKE_CXX_MODULE_STD` removed from `CMakeLists.txt`,
+`CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` left commented out in the toolchain
+file with the concrete finding recorded in place of the old "couldn't
+check" TODO, so a future attempt starts from a real lead instead of
+from scratch. Local build verification is fully back as a result - the
+"gone for the rest of this session" tradeoff from the initial attempt
+did not end up holding.
 
-**Accepted, deliberate tradeoff: local build verification is gone for
-the rest of this session (and this repository, in this sandbox), not
-just degraded.** `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`/`CMAKE_CXX_MODULE_STD`
-don't exist before CMake 3.30; this sandbox's CMake is 3.28.3, and
-upgrading it isn't possible here either (apt.llvm.org is blocked by the
-same network egress policy that blocked Docker Hub above - confirmed by
-trying it directly, same "policy denial, don't route around it"
-outcome). A structural configure+build attempt without the toolchain
-file fails cleanly and immediately (`fatal error: module 'std' not
-found`) rather than silently, at least - not a subtle miscompile risk,
-just a hard stop on the one verification path this session has relied
-on for every prior round. Discussed directly with the user before
-proceeding (not a unilateral call): confirmed as the intended tradeoff
-rather than something to design around. From here on (this PR's
-remaining pushes, and M3/M4/M5 later, in this sandbox specifically),
-build-level verification is real-CI-only; the established push-then-
-watch-CI loop still applies, just without the local pre-check that
-usually catches mistakes before spending a CI round-trip on them.
+**One thing from that round survives independently: `est::check()`, a
+real function instead of the `<cassert>` macro - requested directly by
+the user, not tied to a review comment.** New partition `est:check`
+(`est/src/check.cppm`), exported from `est`. Calls into a new
+`platform::hosted_linux::assert_failure(message, location)` -
+`[[noreturn]]`, prints to `std::cerr`, calls `std::abort()` - the
+backend's answer to "what happens when a check fails," same reasoning
+as `now()` already being the backend's answer to "what time is it": a
+future bare-metal backend answers this differently without
+`est::check()` itself changing. `future.cppm` no longer needs
+`<cassert>` at all as a result (it already dropped every other classic
+include when `import std;` was tried, and kept that reverted back
+afterward - simply never needed `<cassert>` again once `check()`
+existed).
+
+**Found the hard way: a function cannot be named `assert`, even
+namespaced.** The first version of this was named `est::assert()`
+directly, per the literal request. It compiles the library itself fine,
+but every test file broke: Catch2's headers transitively `#include
+<cassert>`, and the C library's `assert` is a function-like macro - the
+preprocessor expands any `assert(` token sequence by raw text match
+*before* the compiler ever parses the `est::` qualifier in front of it,
+so `est::assert(true)` becomes `est::` followed by `<cassert>`'s own
+macro expansion, a parse error. Fully-qualifying the call doesn't help;
+nothing at the language level can protect a function literally named
+`assert` from this in any translation unit that also has `<cassert>` in
+scope, transitively or not. Renamed to `check()` (and `assertions_enabled`
+to `checks_enabled`, `assert.cppm`/`assert_tests.cpp` to
+`check.cppm`/`check_tests.cpp`) to sidestep the collision entirely
+rather than working around it per call site.
+
+Two real differences from the macro it replaces, not just a drop-in,
+documented directly in `check.cppm`: no automatic condition-
+stringification (a function can't see the caller's source text the way
+a macro can via `#condition` - pass an explicit message instead of the
+old `assert(cond && "message")` idiom), and `condition` is an ordinary
+function argument, so it's always *evaluated* even when disabled -
+unlike the macro, which under `NDEBUG` never evaluates its argument at
+all. `std::source_location::current()`, defaulted at each call site,
+replaces `__FILE__`/`__LINE__`. Still debug-only like the macro it
+replaces: `checks_enabled` mirrors `NDEBUG`, and the `if constexpr`
+around the check compiles it away entirely (not just skips it at
+runtime) when set. New `est/tests/check_tests.cpp` covers the
+pass-through (condition-true) path only - the failure path unavoidably
+terminates the process (`[[noreturn]]`, `std::abort()`), same as the
+macro's always did, and isn't practically unit-testable without
+process-isolation tooling this project doesn't have.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

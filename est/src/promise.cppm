@@ -1,6 +1,11 @@
+module;
+
+#include <exception>
+#include <memory_resource>
+#include <utility>
+
 export module est:promise;
 
-import std;
 import :future;
 import :util.shared_ptr;
 

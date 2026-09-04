@@ -1,7 +1,7 @@
 import est;
-import std;
 
 #include <catch2/catch_test_macros.hpp>
+#include <stdexcept>
 
 TEST_CASE("scope_exit runs its callable on normal scope exit", "[scope_exit]") {
   bool ran = false;

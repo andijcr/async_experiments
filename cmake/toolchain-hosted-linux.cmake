@@ -24,16 +24,20 @@ set(CMAKE_CXX_COMPILER clang++)
 set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-stdlib=libc++")
 
-# Gates CMake's experimental `import std;` support. This value is
-# specific to the CMake release range it was validated against
-# (3.30.0-3.31.7, confirmed via CMake's own release notes/discourse -
-# docs/PLAN.md's "Known open items" TODO this replaces couldn't verify
-# this directly since apt.llvm.org/cmake.org were unreachable from the
-# session that wrote the original scaffolding); docker/Dockerfile's
-# pinned CMAKE_VERSION (3.31.0) falls inside that range. Must be set
-# before project() - a toolchain file's content runs at exactly that
-# point, which is why this lives here and not in the top-level
-# CMakeLists.txt (CMAKE_CXX_MODULE_STD, the project-level opt-in that
-# actually requests the std module once this gate allows it, is set
-# there instead).
-set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "0e5b6991-d74f-4b3d-a41c-cf096e0b2508")
+# `import std;` was tried project-wide (docs/PLAN.md, M2 review round 5)
+# and reverted - not still unverified, but confirmed broken with this
+# image as currently built. CMAKE_EXPERIMENTAL_CXX_IMPORT_STD
+# "0e5b6991-d74f-4b3d-a41c-cf096e0b2508" (the correct gate value for our
+# pinned CMAKE_VERSION 3.31.0) was accepted fine and Clang 22.1.8 was
+# detected correctly, but configure then failed:
+#   CMake Error: Cannot find source file: /lib/share/libc++/v1/std.cppm
+# i.e. the devenv image's installed libc++ package doesn't actually ship
+# the std module's own source file at the path CMake expects - a
+# packaging gap in docker/Dockerfile's `libc++-${LLVM_VERSION}-dev`
+# install (that file's own comment already flagged the package names as
+# unconfirmed - this is that risk landing). Fixing it means finding
+# which apt.llvm.org package (if any, for this LLVM_VERSION/Debian
+# combination) actually provides std.cppm and adjusting the Dockerfile -
+# apt.llvm.org is blocked by this sandbox's network egress policy, so
+# that investigation could not be done as part of this finding.
+# set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "0e5b6991-d74f-4b3d-a41c-cf096e0b2508")

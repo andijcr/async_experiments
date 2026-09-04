@@ -1,7 +1,11 @@
 import est;
-import std;
 
 #include <catch2/catch_test_macros.hpp>
+#include <cstddef>
+#include <exception>
+#include <memory_resource>
+#include <stdexcept>
+#include <utility>
 
 namespace {
 

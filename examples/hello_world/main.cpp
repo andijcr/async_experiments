@@ -1,10 +1,7 @@
 import est;
-import std;
 
-// EXIT_FAILURE/EXIT_SUCCESS are macros - unlike std::println below, they
-// aren't transmitted by `import std;` (modules don't carry preprocessor
-// state), so <cstdlib> stays a plain #include.
 #include <cstdlib>
+#include <print>
 
 auto main() -> int {
   try {

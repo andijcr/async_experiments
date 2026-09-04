@@ -1,6 +1,13 @@
+module;
+
+#include <algorithm>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <vector>
+
 export module est:timer;
 
-import std;
 import :platform;
 
 export namespace est {
