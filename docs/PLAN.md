@@ -116,9 +116,10 @@ Design constraints, settled up front:
 ```
 async_experiments/
 ├── CMakeLists.txt                # top-level: options, subdirs, toolchain checks
-├── CMakePresets.json              # "default" (local/dev) and "ci" configure presets
+├── CMakePresets.json              # "default"/"ci"/"coverage" configure presets
 ├── cmake/
 │   ├── CompilerWarnings.cmake    # shared warning flags for est targets
+│   ├── Coverage.cmake            # est_enable_coverage(), the "coverage" preset's flags
 │   └── toolchain-hosted-linux.cmake  # compiler/stdlib pin, used by the presets
 ├── docker/
 │   └── Dockerfile                # the one image for local dev + CI
@@ -126,19 +127,24 @@ async_experiments/
 │   ├── CMakeLists.txt
 │   ├── src/
 │   │   ├── est.cppm              # primary module interface (re-exports partitions)
-│   │   ├── placeholder.cppm      # est:placeholder — M0 walking-skeleton partition
+│   │   ├── check.cppm            # est:check — check(), replaces the <cassert> macro
 │   │   ├── platform/platform.cppm  # est:platform — hosted-Linux HAL backend
-│   │   ├── sync/mutex.cppm       # est:sync.mutex
+│   │   ├── sync/mutex.cppm       # est:sync.mutex — mutex, mutex_waiter, waiter_list
 │   │   ├── timer.cppm            # est:timer
-│   │   ├── future.cppm           # est:future — shared_state<T>, future<T>
-│   │   └── promise.cppm          # est:promise — promise<T>, make_promise_future()
+│   │   ├── future.cppm           # est:future — future_state<T>, future<T>
+│   │   ├── promise.cppm          # est:promise — promise<T>, make_promise_future()
+│   │   └── util/
+│   │       ├── scope_exit.cppm   # est:util.scope_exit — RAII "run on scope exit"
+│   │       └── shared_ptr.cppm   # est:util.shared_ptr — est::shared_ptr<T>
 │   └── tests/
 │       ├── CMakeLists.txt
-│       ├── skeleton_tests.cpp
 │       ├── platform_tests.cpp
+│       ├── check_tests.cpp
 │       ├── mutex_tests.cpp
 │       ├── timer_tests.cpp
-│       └── future_tests.cpp
+│       ├── future_tests.cpp
+│       ├── scope_exit_tests.cpp
+│       └── shared_ptr_tests.cpp
 ├── examples/
 │   └── hello_world/
 │       ├── CMakeLists.txt
@@ -154,7 +160,11 @@ async_experiments/
 ```
 
 Component granularity grows as milestones land (`loop.cppm` in M3;
-`coroutine.cppm` in M4). This tree is not a frozen contract.
+`coroutine.cppm` in M4). This tree is not a frozen contract - the M0
+walking-skeleton files it originally showed (`placeholder.cppm`,
+`skeleton_tests.cpp`) are gone, replaced by real M1/M2 components as of
+this update; expect it to lag again as M3+ land unless someone
+remembers to update it.
 
 ---
 
@@ -558,76 +568,99 @@ only ever calls `Platform::now()`, so they were dead, misleading code.
 Removed.
 
 ### M2 — future / promise / continuation core (done)
-- `shared_state<T>`, in `est/src/future.cppm` (`est:future`) — the single
-  owned object behind both handles. Holds value-or-exception storage
-  (`std::variant<std::monostate, T, std::exception_ptr>`), a continuation
-  list built on `est::waiter_list` (extracted from `est::mutex` in a
-  later review round — see below), and a plain (non-atomic —
-  single-threaded) reference count. Always heap-allocated via
-  `std::pmr::polymorphic_allocator<std::byte>` — see
-  `make_promise_future()` below — never constructed directly by a
-  caller. Not templated on a generic `Allocator` the way
-  `est::timer_queue` is: `shared_state`/`future`/`promise` cross an API
-  boundary (many call sites, needs a uniform, non-template-parameterized
-  type), which is exactly the case docs/PLAN.md's "Allocator support"
-  section already called out for `std::pmr::polymorphic_allocator`-style
-  erasure — `est::timer_queue` stays a generic `Allocator` template
-  parameter because it doesn't cross such a boundary (one component, one
-  concrete instantiation). `get()` uses C++23 deducing-this: called on an
-  lvalue it returns `const T&` (non-consuming, safe for multiple readers);
-  called on an rvalue (`std::move(state).get()`) it returns `T&&`, an
-  explicit opt-in to move, same caveat as `std::optional<T>::value() &&`.
+
+The bullets below describe the *final* shape as of commit `d58babd`
+(after four review-driven redesign rounds — see the "Found by code
+review" / "Round N" retrospective notes further down for how it got
+here and why; skip those on a first read, they're history, not current
+API surface):
+
+- `future_state<T>`, in `est/src/future.cppm` (`est:future`) — the
+  single owned object behind both handles. Holds value-or-exception
+  storage (`std::variant<std::monostate, T, std::exception_ptr>`), a
+  continuation list built on `est::waiter_list` (its own type, extracted
+  from `est::mutex` — see M1's revised section), and a
+  `std::pmr::polymorphic_allocator<std::byte>` used to allocate `then()`
+  continuation nodes. Holds *no* ref count of its own — lifetime is
+  entirely `est::shared_ptr<future_state<T>>`'s job (see below). Not
+  templated on a generic `Allocator` the way `est::timer_queue` is:
+  `future_state`/`future`/`promise` cross an API boundary (many call
+  sites, needs a uniform, non-template-parameterized type), which is
+  exactly the case docs/PLAN.md's "Allocator support" section already
+  called out for `std::pmr::polymorphic_allocator`-style erasure.
+  `get()` uses C++23 deducing-this: called on an lvalue it returns
+  `const T&` (non-consuming, safe for multiple readers); called on an
+  rvalue (`std::move(state).get()`) it returns `T&&`, an explicit
+  opt-in to move, same caveat as `std::optional<T>::value() &&`.
+- `est::shared_ptr<T>` (`est:util.shared_ptr`, `est/src/util/shared_ptr.cppm`)
+  — a small, general-purpose, single-threaded (plain `int` ref count, no
+  atomics) reference-counted pointer, combining the ref count, a
+  `std::pmr::polymorphic_allocator<std::byte>`, and the `T` into one
+  control block allocated in a single call. `promise<T>`/`future<T>`
+  each hold one of `est::shared_ptr<future_state<T>>`.
 - Continuations are `est::detail::continuation_node<T>` (`est:future`,
   non-exported — an implementation detail of `then()`, not part of
-  `shared_state`'s public surface), a small virtual `invoke(shared_state&)`
-  deriving from the *type-agnostic* `est::detail::waiter_node`
-  (`destroy(allocator)` + virtual destructor only — nothing `T`-dependent,
-  so it's compiled once instead of once per `T`), itself deriving from
-  `est::mutex_waiter` — exactly what `mutex_waiter`'s "payload-free at
-  this layer" doc comment in M1 anticipated: no second allocation for the
-  list node itself. `future<T>::then(fn)` allocates a concrete
-  `continuation_node` wrapping `fn` (via the `shared_state`'s own
-  allocator, using C++20's `polymorphic_allocator::new_object`/
-  `delete_object`) and hands it to the `shared_state`; completion
-  (`set_value`/`set_exception`) drains *every* queued continuation (LIFO,
-  same order `est::waiter_list` is documented to use) rather than
-  assuming at most one — nothing stops a caller registering more than
-  one `then()`, and the underlying list already supports it. `run()`'s
-  own destroy-on-exit guard is `est::scope_exit` (`est:util.scope_exit`),
-  a small reusable RAII "run this on scope exit" utility, not an ad-hoc
-  local struct.
+  `future_state`'s public surface), deriving from the *type-agnostic*
+  `est::detail::waiter_node` (`destroy(allocator)` + virtual destructor
+  only — nothing `T`-dependent, so it's compiled once instead of once
+  per `T`), itself deriving from `est::mutex_waiter` — exactly what
+  `mutex_waiter`'s "payload-free at this layer" doc comment in M1
+  anticipated: no second allocation for the list node itself. Draining
+  (LIFO, same order `est::waiter_list` is documented to use) happens on
+  `set_value()`/`set_exception()`; `run()`'s own destroy-on-exit guard is
+  `est::scope_exit` (`est:util.scope_exit`), a small reusable RAII "run
+  this on scope exit" utility, not an ad-hoc local struct.
 - `est::promise<T>`, in `est/src/promise.cppm` (`est:promise`) — producer
-  handle: move-only, `set_value(const T&)`/`set_value(T&&)`/
-  `set_exception`.
-- `est::future<T>`, in `est/src/future.cppm` — consumer handle: move-only,
-  `.then(fn)` where `fn` is called as `fn(shared_state<T>&)` so it can
-  `get()` (rethrowing any stored exception) or `ready()`. Runs
-  synchronously, on whichever call stack completes the `shared_state` —
-  there's no loop yet to defer onto (M3 will change that). `get()` is
-  also deducing-this: `future.get()` copy-constructs, `std::move(future)
-  .get()` moves — safe unconditionally here since a `future` is a
-  single-consumer handle, unlike `shared_state<T>::get()` itself.
+  handle: move-only (move ctor/assignment/destructor all `= default`,
+  since `est::shared_ptr` itself does the real work), `set_value(const
+  T&)`/`set_value(T&&)`/`set_exception`.
+- `est::future<T>`, in `est/src/future.cppm` — consumer handle: same
+  move-only shape as `promise<T>`. `get()` is deducing-this:
+  `future.get()` copy-constructs, `std::move(future).get()` moves — safe
+  unconditionally here since a `future` is a single-consumer handle,
+  unlike `future_state<T>::get()` itself.
+- `future_state<T>::then(fn)` (with `future<T>::then(fn)` a thin
+  forwarding call to it — comment #12 in the review round below) runs
+  `fn` as `fn(future_state<T>&)`, from which it can `get()`/`ready()`,
+  and **returns a `future<U>`** (`U` = `fn`'s return type,
+  `static_assert`'d non-`void` for now) so `.then().then()` chains. A
+  `fn` exception is caught and routed into that continuation's own
+  downstream `future_state<U>` via `set_exception()` instead of
+  escaping — isolated per-continuation: a throwing `then()` callback no
+  longer stops a sibling continuation queued behind it from running.
+  Still runs synchronously on whichever call stack completes the
+  `future_state` — there's no loop yet to defer onto (M3 will change
+  that).
 - `make_promise_future<T>(allocator)`, in `est/src/promise.cppm` —
-  constructs a fresh `shared_state<T>` and returns the `{promise, future}`
-  pair sharing it; the only way a `shared_state` is created.
-- **View semantics**: both handles are thin (state pointer + move-only
-  ownership via `add_ref()`/`release()`); destroying a `future` does not
-  destroy the `shared_state` if something else — a still-live
-  `est::promise`, and eventually (M3) the loop's own keep-alive
-  registration — still references it. Verified directly: dropping a
-  `future` while its `promise` is still alive leaves the `shared_state`
-  intact and the `promise` can still complete it.
+  builds one `est::shared_ptr<future_state<T>>` and copies it into both
+  the `promise<T>` and `future<T>` it returns; the only way a
+  `future_state` is created.
+- **View semantics**: both handles are thin (an `est::shared_ptr` plus
+  nothing else); destroying a `future` does not destroy the
+  `future_state` if something else — a still-live `est::promise`, and
+  eventually (M3) the loop's own keep-alive registration — still
+  references it. Verified directly: dropping a `future` while its
+  `promise` is still alive leaves the `future_state` intact and the
+  `promise` can still complete it.
 - **Abandoned-future semantics — deferred to M3, not a scope cut.** The
-  full version (a dropped `future`'s `shared_state` is kept alive by the
+  full version (a dropped `future`'s `future_state` is kept alive by the
   *loop's* own reference, not the user's, so the async work keeps
   running in the background) needs `est::loop` to exist to do the
   registering — M2 has no loop yet. What M2 *does* build is the
-  ref-counted view mechanics that M3 will hook into: `shared_state` isn't
+  ref-counted view mechanics that M3 will hook into: `future_state` isn't
   destroyed while any reference (promise, future, or later the loop's)
   still holds it. The exact "unobserved exception" policy (result/
   exception simply discarded vs. a debug-mode assert or logged warning)
   is still a detail to settle when M3's loop actually implements the
   registration, not now.
+- `est::check(condition, message, location)` (`est:check`,
+  `est/src/check.cppm`) — a function replacing the `<cassert>` macro,
+  used internally by `future_state` for its own precondition checks
+  (calls into `platform::hosted_linux::assert_failure()` on failure).
+  Not `est::assert`: that name collides with `<cassert>`'s own macro
+  even fully-qualified (see the retrospective note below) - a real
+  finding worth remembering before naming anything else `assert`,
+  anywhere in this codebase.
 
 #### Found by code review, before real CI ever saw it
 
@@ -921,12 +954,23 @@ terminates the process (`[[noreturn]]`, `std::abort()`), same as the
 macro's always did, and isn't practically unit-testable without
 process-isolation tooling this project doesn't have.
 
+**Status as of commit `d58babd`: PR #3 (M2 + the new-code coverage gate +
+this whole review round) is real-CI green and `mergeable_state: clean`.**
+Every review thread on it is resolved. Not yet merged - waiting on the
+user (or the next agent, if asked to proceed) to actually merge it; this
+session did not merge unilaterally, per the project's own "confirm
+before pushing/merging" posture. **Next step once merged:** reset the
+`claude/cpp-async-framework-design-jm6ra3` branch onto the post-merge
+`main` and start M3 (below) - platform/timer/mutex (M1) and
+future/promise/continuation (M2) are both done; nothing is blocking M3
+from starting immediately.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until
   the next timer deadline, repeats; `run_until_idle()` for tests/examples
   that shouldn't block forever.
-- Owns/creates the `shared_state`s it's handed (see M2's abandoned-future
+- Owns/creates the `future_state`s it's handed (see M2's abandoned-future
   design) and is the thing that actually resumes continuations when a
   `promise` is fulfilled or a timer fires.
 - I/O (sockets, files, epoll/io_uring) is explicitly **out of scope** for
@@ -946,7 +990,7 @@ process-isolation tooling this project doesn't have.
 - `est::task<T>` coroutine type with a `promise_type` that binds to
   `est::promise<T>`/`est::future<T>` under the hood.
 - `operator co_await` on `est::future<T>`, suspending into a continuation
-  registered on the `shared_state`, using symmetric transfer where the
+  registered on the `future_state`, using symmetric transfer where the
   standard allows it.
 - Coroutine frame allocation wired through the same allocator convention
   established in M1/M2 (`allocator_arg_t` + allocator as the coroutine's
@@ -968,7 +1012,9 @@ process-isolation tooling this project doesn't have.
 - Flesh out `examples/hello_world` into something that actually exercises
   the stack meaningfully (e.g. a coroutine that awaits a timer, prints,
   spawns a couple of abandoned background tasks, then the loop drains them
-  before exiting) rather than the M0 placeholder.
+  before exiting) - well beyond today's version (M2, a single
+  `promise`/`future` pair with no loop or coroutines yet), itself already
+  a step up from the original M0 walking-skeleton placeholder.
 - Fill in real unit test coverage for future/promise/loop/coroutine
   (M0–M4 land with tests per-component; this milestone is about
   integration-level coverage and edge cases: abandoned futures, exceptions
