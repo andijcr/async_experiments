@@ -1596,6 +1596,36 @@ confirmed it actually catches the regression by temporarily reverting to
 plain `auto` first (the address-of an rvalue doesn't even compile, let
 alone match) before restoring the fix.
 
+**Third follow-up, a design improvement requested in review:** `then()`'s
+`Fn` template parameter was unconstrained; an incompatible callback (one
+matching neither calling convention) only failed via a `static_assert`
+buried inside the private `raw_result_type_tag()` helper - a correct but
+unnecessarily deep diagnostic. Added `detail::then_callback_for<Fn, T>`,
+a concept expressing the same "invocable with `future_state<T>&`, or
+with `const T&`/nothing for `T=void`" disjunction, and constrained
+`then()` with it (`template <detail::then_callback_for<T> Fn> auto
+then(Fn&& fn)`), removing the now-redundant `static_assert`s from
+`raw_result_type_tag()` (Fn's invocability is already guaranteed by the
+time that helper runs). Needed one more instance of the
+"can't write `const T&` unconditionally for `T=void`" pattern already
+seen twice above in this same file: `std::invocable<Fn&, const T&>`
+can't appear directly inside the concept's `||` even when it's the
+*second*, seemingly short-circuited operand - `&&`/`||` short-circuit
+runtime/constexpr *evaluation*, not the requirement that every
+subexpression's types be well-formed to begin with, and forming a
+reference to `void` is a hard, non-SFINAE-eligible error regardless of
+where it's written. Solved with a small `consteval` helper
+(`invocable_unwrapped<Fn, T>()`) using genuinely separate `if constexpr`
+branches, the same technique `get()` and `then()` already use, called as
+an ordinary boolean-valued expression from inside the concept. Verified
+the actual diagnostic improvement directly: a deliberately incompatible
+callback (`future.then([](std::string){ return 1; })` on a `future<int>`)
+now fails right at the `then()` call site with `error: no matching
+member function for call to 'then'` / `note: because
+'detail::then_callback_for<..., int>' evaluated to false`, naming the
+concept and which branch of it failed - not just a `static_assert`
+message from deep inside the implementation.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until

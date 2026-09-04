@@ -76,6 +76,32 @@ template <class U> struct unwrap_future<future<U>> {
 };
 template <class R> using unwrap_future_t = unwrap_future<R>::type;
 
+// The "unwrapped" half of then()'s two calling conventions (see
+// future_state<T>::then()'s own doc comment): Fn invocable with the
+// value itself, or with no arguments at all when T is void. A plain
+// `std::invocable<Fn&, const T&>` can't be written unconditionally for
+// both cases - forming "const T&" is a hard, non-SFINAE-eligible error
+// for T=void (unlike a deduction failure, a directly-named reference to
+// void is ill-formed the moment the compiler tries to form the type at
+// all, concept or not) - so the two cases are kept in genuinely separate
+// (not just short-circuited) if constexpr branches, the same technique
+// future_state<T>::get() and then() themselves already rely on.
+template <class Fn, class T> consteval auto invocable_unwrapped() -> bool {
+  if constexpr (std::is_void_v<T>) {
+    return std::invocable<Fn&>;
+  } else {
+    return std::invocable<Fn&, const T&>;
+  }
+}
+
+// Constrains then()'s Fn at the template-parameter level, per the two
+// calling conventions future_state<T>::then() documents, so an
+// incompatible callback fails right at the then() call site with a
+// "constraints not satisfied" diagnostic naming this concept, instead of
+// failing deep inside then()'s own implementation.
+template <class Fn, class T>
+concept then_callback_for = std::invocable<Fn&, future_state<T>&> || invocable_unwrapped<Fn, T>();
+
 } // namespace est::detail
 
 export namespace est {
@@ -270,7 +296,7 @@ public:
   // from running. Runs synchronously, on whichever call stack completes
   // this future_state (M2 has no loop yet to defer onto - see
   // docs/PLAN.md, M3).
-  template <class Fn> auto then(Fn&& fn) {
+  template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
     auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator_, allocator_);
@@ -291,20 +317,18 @@ private:
   // T=void the unwrapped-with-a-value alternative names the ill-formed
   // "const void&" - if constexpr, unlike conditional_t, discards the
   // untaken branch instead of instantiating it.
+  //
+  // No static_assert here for an Fn that matches neither shape - then()'s
+  // own detail::then_callback_for<T> constraint on Fn already rules that
+  // out before this is ever instantiated, with a clearer "constraints
+  // not satisfied" diagnostic right at the then() call site instead of
+  // one buried in here.
   template <class Fn> static consteval auto raw_result_type_tag() {
     if constexpr (std::invocable<Fn&, future_state&>) {
       return std::type_identity<std::invoke_result_t<Fn&, future_state&>>{};
     } else if constexpr (std::is_void_v<T>) {
-      static_assert(std::invocable<Fn&>,
-                    "then()'s callback must be invocable with future_state<void>& (wrapped, "
-                    "runs regardless of success/failure) or with no arguments (unwrapped, runs "
-                    "only on success and auto-propagates a failure)");
       return std::type_identity<std::invoke_result_t<Fn&>>{};
     } else {
-      static_assert(std::invocable<Fn&, const T&>,
-                    "then()'s callback must be invocable with future_state<T>& (wrapped, runs "
-                    "regardless of success/failure) or with a const T& (unwrapped, runs only on "
-                    "success and auto-propagates a failure)");
       return std::type_identity<std::invoke_result_t<Fn&, const T&>>{};
     }
   }
