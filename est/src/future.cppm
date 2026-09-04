@@ -200,7 +200,14 @@ public:
   // std::conditional_t (which - unlike if constexpr - instantiates both
   // of its type arguments unconditionally) - so the return type is
   // deduced, and each live alternative is spelled out under its own if
-  // constexpr instead.
+  // constexpr instead. decltype(auto), not plain auto: plain auto
+  // deduction strips references from the return expression's type (the
+  // same rule as `auto x = expr;`), which would silently turn the
+  // lvalue branch's intended non-consuming const T& into a full copy of
+  // T on every call - decltype(auto) instead takes the return
+  // expression's exact type, reference and all, the same way the
+  // explicit `-> get_result_t<Self>` trailing return type this replaced
+  // used to.
   //
   // check(self.ready()) above is this function's only *documented*
   // guard, and - like every other est::check() call - compiles away
@@ -214,7 +221,7 @@ public:
   // T = void one, keeps that same accidental behavior rather than
   // letting T = void alone skip it by returning before ever touching
   // result_'s active alternative.
-  template <class Self> [[nodiscard]] auto get(this Self&& self) {
+  template <class Self> [[nodiscard]] decltype(auto) get(this Self&& self) {
     check(self.ready());
     if (auto* exception = std::get_if<std::exception_ptr>(&self.result_)) {
       std::rethrow_exception(*exception);

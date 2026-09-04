@@ -1544,7 +1544,7 @@ aliases that, per this pinned Clang/libc++ version, don't need the
 "missing" lines are callback bodies that tests deliberately assert never
 run - the whole point of the auto-propagate-on-failure tests).
 
-**Follow-up fix, found by a `code-review` pass on the merged PR:**
+**Follow-up fix, found by a `code-review` pass on PR #24:**
 `future_state<void>::get()` silently "succeeded" (returned normally) when
 called before the future was ever completed, in a Release (`NDEBUG`)
 build - inconsistent with every other `T`. The precondition
@@ -1568,6 +1568,33 @@ Not unit-tested: like `check()`'s own failure path and
 `checks_enabled` is off, which this project's `ctest` binary never
 builds with - untestable without process-isolation tooling this project
 doesn't have, same accepted gap as those two.
+
+**Second follow-up fix, found by the repo owner's own PR review:** `get()`'s
+deduced return type was plain `auto`, not `decltype(auto)` - a real
+regression this redesign introduced, not present before it. Plain `auto`
+return-type deduction strips references from the return expression's
+type (the same rule `auto x = expr;` follows for a local variable), so
+`return static_cast<const T&>(std::get<T>(self.result_));` under a plain
+`auto` return type silently deduced to `T` *by value*, not `const T&` -
+turning the class's own documented "non-consuming `const T&`, safe for
+multiple readers" contract into an unconditional copy of `T` on every
+call, and (for the rvalue branch) a copy/move outcome subtly different
+from the documented "returns `T&&`, an opt-in to move" too. `T = int` in
+every existing test meant nothing caught this: a copied `int` and a
+referenced `int` compare equal either way. `decltype(auto)` instead
+takes the exact type of the return expression, references included -
+the same behavior the original, pre-redesign `-> get_result_t<Self>`
+explicit trailing return type gave for free, restored without
+reintroducing the `std::conditional_t`-instantiates-both-branches trap
+`get_result_t` couldn't survive for `T = void` (see above). Verified the
+mechanism directly with a standalone reproduction (plain `auto` copies,
+`decltype(auto)` doesn't, confirmed by printing from copy/move
+constructors) before applying the fix in-repo. Added a regression test
+(`future_state::get() returns a reference into the stored value, not a
+copy`) that takes `&state.get()` twice and requires the same address -
+confirmed it actually catches the regression by temporarily reverting to
+plain `auto` first (the address-of an rvalue doesn't even compile, let
+alone match) before restoring the fix.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

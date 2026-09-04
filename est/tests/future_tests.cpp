@@ -47,6 +47,28 @@ TEST_CASE("set_value then get() returns the value", "[future]") {
   REQUIRE(future.get() == 42);
 }
 
+TEST_CASE("future_state::get() returns a reference into the stored value, not a copy", "[future]") {
+  // Regression test: get()'s deduced return type must be decltype(auto),
+  // not plain auto - plain auto strips references from the return
+  // expression's type (the same rule as `auto x = expr;`), which would
+  // silently turn the documented "non-consuming const T&" into a fresh
+  // copy of T on every call instead of a reference to the one stored in
+  // result_. Caught by a PR review comment, not a test, the first time.
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_value(42);
+
+  const int* first_address = nullptr;
+  const int* second_address = nullptr;
+  future.then([&](est::future_state<int>& state) {
+    first_address = &state.get();
+    second_address = &state.get();
+    return 0;
+  });
+
+  REQUIRE(first_address != nullptr);
+  REQUIRE(first_address == second_address);
+}
+
 TEST_CASE("set_exception then get() rethrows", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
