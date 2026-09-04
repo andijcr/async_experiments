@@ -1,14 +1,14 @@
 module;
 
+// assert() is a macro - macros aren't transmitted across `import`
+// (modules carry declarations, not preprocessor state), so <cassert>
+// stays in the global module fragment even though everything else here
+// comes from `import std;` below.
 #include <cassert>
-#include <exception>
-#include <memory_resource>
-#include <type_traits>
-#include <utility>
-#include <variant>
 
 export module est:future;
 
+import std;
 import :sync.mutex;
 import :util.scope_exit;
 import :util.shared_ptr;

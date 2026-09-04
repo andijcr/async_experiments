@@ -26,6 +26,17 @@ set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 # useful for structural smoke-testing against whatever toolchain happens
 # to be on hand.
 
+# Project-level opt-in for `import std;` (the toolchain file's
+# CMAKE_EXPERIMENTAL_CXX_IMPORT_STD only unlocks the feature; this is
+# what actually requests it - seeds every target's CXX_MODULE_STD
+# property). Every est source file uses `import std;` instead of classic
+# `#include`s now (docs/PLAN.md, M2 review round 5) - a build without
+# the gate set (no toolchain file, e.g. this project's own structural
+# local-smoke-test builds against a pre-3.30 CMake) will fail to
+# configure importing std at all, not just warn; there is no
+# `#include`-based fallback path left to fall back to.
+set(CMAKE_CXX_MODULE_STD ON)
+
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "est links statically by default" FORCE)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

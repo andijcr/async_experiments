@@ -1,9 +1,6 @@
-module;
-
-#include <memory_resource>
-#include <utility>
-
 export module est:util.shared_ptr;
+
+import std;
 
 export namespace est {
 

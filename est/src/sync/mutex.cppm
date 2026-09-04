@@ -1,5 +1,3 @@
-module;
-
 export module est:sync.mutex;
 
 export namespace est {

@@ -1,10 +1,6 @@
-module;
-
-#include <concepts>
-#include <type_traits>
-#include <utility>
-
 export module est:util.scope_exit;
+
+import std;
 
 export namespace est {
 

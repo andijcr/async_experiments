@@ -833,6 +833,51 @@ declaration of `future<T>` (and vice versa) was needed since
 `future` in the same partition - ordinary mutual forward declaration,
 nothing module-specific.
 
+**Round 5: `import std;`, project-wide.** Closes the long-standing TODO
+(M0, "Docker strategy" / "Known open items") that this was ever an
+unverified gap in the first place. Two changes make it work:
+`cmake/toolchain-hosted-linux.cmake` sets
+`CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` to `"0e5b6991-d74f-4b3d-a41c-cf096e0b2508"`
+(the gate value for CMake 3.30.0-3.31.7 - confirmed via WebSearch this
+round, since the original scaffolding session couldn't reach
+cmake.org/discourse to check; the pinned `CMAKE_VERSION` (3.31.0,
+`docker/Dockerfile`) falls inside that range) before `project()`, where a
+toolchain file's content runs; the top-level `CMakeLists.txt` then sets
+`CMAKE_CXX_MODULE_STD ON` to actually request the module once the gate
+allows it. Every `.cppm`/`.cpp` file's `module; #include <...>;` /
+`#include <...>` block became `import std;` (or, for two non-module
+`.cpp` files, `import std;` alongside the unaffected `#include
+<catch2/...>` - Catch2 isn't a module).
+
+Two headers stayed as plain `#include`s specifically because their
+public API is macro-based, and macros are never transmitted across an
+`import` (modules carry declarations, not preprocessor state) -
+`import std;` genuinely cannot replace them: `<cassert>` in
+`future.cppm` (the `assert()` macro), and `<cstdlib>` in
+`examples/hello_world/main.cpp` (`EXIT_FAILURE`/`EXIT_SUCCESS`). Both
+kept in the smallest scope that still compiles (a `module;` global
+module fragment for `future.cppm`, since it's a module interface unit;
+a plain top-level `#include` for `main.cpp`, since it isn't one).
+
+**Accepted, deliberate tradeoff: local build verification is gone for
+the rest of this session (and this repository, in this sandbox), not
+just degraded.** `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`/`CMAKE_CXX_MODULE_STD`
+don't exist before CMake 3.30; this sandbox's CMake is 3.28.3, and
+upgrading it isn't possible here either (apt.llvm.org is blocked by the
+same network egress policy that blocked Docker Hub above - confirmed by
+trying it directly, same "policy denial, don't route around it"
+outcome). A structural configure+build attempt without the toolchain
+file fails cleanly and immediately (`fatal error: module 'std' not
+found`) rather than silently, at least - not a subtle miscompile risk,
+just a hard stop on the one verification path this session has relied
+on for every prior round. Discussed directly with the user before
+proceeding (not a unilateral call): confirmed as the intended tradeoff
+rather than something to design around. From here on (this PR's
+remaining pushes, and M3/M4/M5 later, in this sandbox specifically),
+build-level verification is real-CI-only; the established push-then-
+watch-CI loop still applies, just without the local pre-check that
+usually catches mistakes before spending a CI round-trip on them.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until

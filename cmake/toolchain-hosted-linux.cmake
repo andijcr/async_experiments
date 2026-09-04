@@ -24,9 +24,16 @@ set(CMAKE_CXX_COMPILER clang++)
 set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-stdlib=libc++")
 
-# TODO: pin CMAKE_EXPERIMENTAL_CXX_IMPORT_STD to the gate value validated
-# for docker/Dockerfile's pinned CMAKE_VERSION once that pin itself exists
-# - see docs/PLAN.md, "Known open items" (apt.llvm.org/cmake.org were
-# unreachable from the session that wrote this scaffolding, so neither
-# pin could be looked up or validated).
-# set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "<gate-value-for-pinned-cmake-version>")
+# Gates CMake's experimental `import std;` support. This value is
+# specific to the CMake release range it was validated against
+# (3.30.0-3.31.7, confirmed via CMake's own release notes/discourse -
+# docs/PLAN.md's "Known open items" TODO this replaces couldn't verify
+# this directly since apt.llvm.org/cmake.org were unreachable from the
+# session that wrote the original scaffolding); docker/Dockerfile's
+# pinned CMAKE_VERSION (3.31.0) falls inside that range. Must be set
+# before project() - a toolchain file's content runs at exactly that
+# point, which is why this lives here and not in the top-level
+# CMakeLists.txt (CMAKE_CXX_MODULE_STD, the project-level opt-in that
+# actually requests the std module once this gate allows it, is set
+# there instead).
+set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "0e5b6991-d74f-4b3d-a41c-cf096e0b2508")
