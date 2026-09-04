@@ -702,6 +702,89 @@ push --delete` was blocked by this session's own permission classifier as
 a destructive action on shared GitHub state. Left for the repo owner to
 do directly, or to explicitly authorize.
 
+### `est::platform` becomes a runtime-polymorphic global object
+
+Issue #6 was closed not-planned above because the proposed decl/def split
+didn't actually remove `est::timer_queue`'s `Platform` template parameter
+and would have broken the fake-platform test seam for no concrete win.
+The repo owner came back with a genuinely different design that solves
+both problems at once: a virtual `interface` base, exactly one concrete
+`final` implementation (`hosted_linux`), and a single globally accessible
+instance of it that `est::check()`/`est::timer_queue` call through
+directly - no template parameter left at all.
+
+- `est::platform::interface`: pure-virtual `now()` and `assert_failure()`
+  - the same two operations M1's stateless-policy-type design exposed as
+    static members, now as virtual member functions so a single object
+    reference can stand in for "the platform."
+- `est::platform::hosted_linux final : interface` — the same
+  implementation as before (`std::chrono::steady_clock::now()`;
+  `format_assertion_message()` + `std::println(stderr, ...)` +
+  `std::abort()`), just as override rather than static members.
+- `est::platform::instance()` returns the current global `interface&`
+  (backed by a plain `interface*` in a non-exported
+  `est::platform::detail` namespace, defaulted to a `hosted_linux`).
+  `est::check()` and `est::timer_queue::schedule_after()` call through
+  it directly - `timer_queue<Allocator>` has one template parameter now,
+  not two.
+- `est::platform::override_instance(interface&)` retargets the global for
+  the caller's scope, returning an `est::scope_exit` that restores the
+  previous instance on destruction - nests correctly. Deliberately built
+  on `est::scope_exit` rather than a hand-rolled RAII class once code
+  review pointed out `override_guard`'s first draft was reinventing
+  exactly what `scope_exit` already exists for.
+
+**The real tradeoff, stated plainly**: this replaces a direct call
+(`Platform::now()`, resolved at compile time) with an indirect one
+(`platform::instance().now()`, resolved through a vtable) on every
+`timer_queue::schedule_after()` and `est::check()` failure. `est::check()`
+is unaffected in Release builds specifically - its `if constexpr
+(checks_enabled)` branch (and the virtual call inside it) is discarded at
+compile time when `NDEBUG` is set, same as before. For `timer_queue`,
+the indirect call is now unconditional in both Debug and Release - a
+real, deliberate cost taken in exchange for dropping the template
+parameter entirely, not a regression that slipped in unnoticed.
+
+**A real bug found by code review before this landed, fixed:**
+`namespace detail { ... }` holding the two mutable globals
+(`default_instance`, `current_instance`) was originally nested *inside*
+the `export namespace est::platform { ... }` block - meaning they were
+exported and directly assignable by any `import est;` consumer, bypassing
+`override_instance()`'s RAII restore entirely. Fixed by splitting the
+file into three blocks: the exported `interface`/`hosted_linux`
+definitions, a plain (non-exported) `namespace est::platform::detail
+{ ... }` for the two globals, then a second exported block for
+`instance()`/`override_instance()` - mirroring `future.cppm`'s own
+`est::detail` convention for keeping implementation state out of the
+public surface.
+
+**A second, incorrect "fix" from that same review round, caught by a
+follow-up review and reverted.** The first round also flagged the
+`fake_platform`/`stub_platform` test doubles' `current`/`epoch` fields as
+carrying a genuinely-redundant `{}` initializer
+(`readability-redundant-member-init`); the fix applied at the time
+dropped the `{}` outright, on the assumption that
+`std::chrono::time_point`'s default constructor was a *defaulted* one
+that would leave an automatic-storage-duration member indeterminate. A
+second review pass caught that this reasoning was simply wrong - checked
+directly against the pinned toolchain's own `<chrono>` header, `libc++`'s
+`time_point()` is a real, *user-provided* constructor
+(`time_point() : __d_(duration::zero()) {}`), not a defaulted one, so it
+always zero-initializes regardless of storage duration. The linter's
+original suggestion was correct all along; reverted to dropping the `{}`
+(no `{}`, no NOLINT) once the standard-library source itself settled the
+question instead of an assumption about it. Recorded here as a reminder
+that "the linter is wrong" needs an actual header/standard citation, not
+just a plausible-sounding claim about defaulted-vs-indeterminate
+initialization - the same mistake elsewhere would be much harder to catch
+than a two-line test fixture.
+
+Verified end-to-end in the same from-scratch `docker build` approach as
+the rest of this document's recent entries: `clang-format` clean,
+`clang-tidy` zero findings, 34/34 tests (two new ones directly exercising
+`override_instance()`'s swap/restore/nesting behavior), coverage gate at
+89%.
+
 ---
 
 ## `.clang-format` / `.clang-tidy`
@@ -748,7 +831,9 @@ exists to run it against.
   type with a single static member, `now()`, not a runtime-polymorphic
   interface. `est::timer_queue` is templated on it (defaulted to
   `hosted_linux`), so tests can substitute a fake and a future bare-metal
-  backend is a new template argument, not a redesign.
+  backend is a new template argument, not a redesign. **Superseded** — see
+  "`est::platform` becomes a runtime-polymorphic global object" below:
+  this whole paragraph describes the M1 design, not the current one.
 - `est::timer_queue<Platform, Allocator>`, in `est/src/timer.cppm`
   (`est:timer`) — a `std::vector`-backed binary min-heap of one-shot
   deadlines (`schedule_at`/`schedule_after`, `cancel` — O(n) linear-scan
@@ -756,6 +841,9 @@ exists to run it against.
   templated on the allocator per docs/PLAN.md's allocator-first design.
   No callbacks/continuations yet — that's `est::loop`'s job in M3; this
   is only the scheduling structure a future loop will own and drive.
+  **The `Platform` template parameter is gone** as of the same later
+  revision noted above — `timer_queue<Allocator>` now calls
+  `platform::instance().now()` directly.
 - `est::mutex`, in `est/src/sync/mutex.cppm` (`est:sync.mutex`) — exactly
   the `int` lock word (`state_`) plus intrusive singly-linked waiter list
   (`mutex_waiter* waiters_`, LIFO push/pop) the plan called for.

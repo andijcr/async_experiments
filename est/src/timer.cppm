@@ -5,18 +5,18 @@ import :platform;
 
 export namespace est {
 
-// A min-heap of pending one-shot deadlines, ordered by Platform::now().
-// Templated on the allocator used for the underlying storage, part of
-// the framework's allocator-first design (docs/PLAN.md, "Allocator
-// support") rather than bolted on later. Periodic timers and actually
-// firing continuations are est::loop's job (M3); this is just the
-// scheduling structure a future loop will own and drive.
-template <class Platform = platform::hosted_linux, class Allocator = std::allocator<std::byte>>
-class timer_queue {
+// A min-heap of pending one-shot deadlines, ordered by
+// platform::instance().now(). Templated on the allocator used for the
+// underlying storage, part of the framework's allocator-first design
+// (docs/PLAN.md, "Allocator support") rather than bolted on later.
+// Periodic timers and actually firing continuations are est::loop's job
+// (M3); this is just the scheduling structure a future loop will own and
+// drive.
+template <class Allocator = std::allocator<std::byte>> class timer_queue {
 public:
-  using clock = Platform::clock;
-  using time_point = Platform::time_point;
-  using duration = Platform::duration;
+  using clock = std::chrono::steady_clock;
+  using time_point = clock::time_point;
+  using duration = clock::duration;
   using id = std::size_t;
 
   explicit timer_queue(const Allocator& allocator = Allocator()) : entries_(allocator) {}
@@ -29,7 +29,9 @@ public:
     return new_id;
   }
 
-  auto schedule_after(duration delay) -> id { return schedule_at(Platform::now() + delay); }
+  auto schedule_after(duration delay) -> id {
+    return schedule_at(platform::instance().now() + delay);
+  }
 
   // Returns false if `target` wasn't found (already fired, or invalid).
   auto cancel(id target) -> bool {
@@ -64,6 +66,12 @@ public:
   }
 
 private:
+  // Always fully constructed via a designated initializer at its one use
+  // site (schedule_at()) - never default-constructed - so `timer_id`
+  // needs no default member initializer to actually be safe. Suppressed
+  // rather than given a `= 0` that would misleadingly suggest a
+  // meaningful default id for a case that can't occur.
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-type-member-init)
   struct entry {
     time_point deadline;
     id timer_id;
