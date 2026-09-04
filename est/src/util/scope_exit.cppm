@@ -8,7 +8,16 @@ export namespace est {
 // return or exception) - a generic version of the ad-hoc RAII guards
 // this codebase kept hand-rolling for exactly this purpose (e.g.
 // est::future's shared_state::run(), before this existed).
-template <std::invocable Fn> class scope_exit {
+//
+// Fn must be nothrow-invocable: ~scope_exit() calls it unconditionally,
+// including while another exception is already propagating (the guard
+// exiting via an exception is exactly the case this class exists for) -
+// a throwing fn_ there would call std::terminate, and even without an
+// active exception, a throwing destructor is its own hazard. Constrained
+// here, at the type, rather than left as an unstated precondition.
+template <class Fn>
+  requires std::is_nothrow_invocable_v<Fn>
+class scope_exit {
 public:
   explicit scope_exit(Fn fn) noexcept(std::is_nothrow_move_constructible_v<Fn>)
       : fn_(std::move(fn)) {}

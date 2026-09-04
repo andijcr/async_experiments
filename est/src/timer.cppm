@@ -25,7 +25,7 @@ public:
   auto schedule_at(time_point deadline) -> id {
     const id new_id = next_id_++;
     entries_.push_back(entry{.deadline = deadline, .timer_id = new_id});
-    std::push_heap(entries_.begin(), entries_.end(), by_deadline_descending);
+    std::ranges::push_heap(entries_, std::ranges::greater{}, &entry::deadline);
     return new_id;
   }
 
@@ -33,14 +33,12 @@ public:
 
   // Returns false if `target` wasn't found (already fired, or invalid).
   auto cancel(id target) -> bool {
-    const auto it = std::find_if(entries_.begin(), entries_.end(), [target](const entry& e) {
-      return e.timer_id == target;
-    });
+    const auto it = std::ranges::find(entries_, target, &entry::timer_id);
     if (it == entries_.end()) {
       return false;
     }
     entries_.erase(it);
-    std::make_heap(entries_.begin(), entries_.end(), by_deadline_descending);
+    std::ranges::make_heap(entries_, std::ranges::greater{}, &entry::deadline);
     return true;
   }
 
@@ -59,7 +57,7 @@ public:
     if (entries_.empty() || entries_.front().deadline > now) {
       return std::nullopt;
     }
-    std::pop_heap(entries_.begin(), entries_.end(), by_deadline_descending);
+    std::ranges::pop_heap(entries_, std::ranges::greater{}, &entry::deadline);
     const id ready_id = entries_.back().timer_id;
     entries_.pop_back();
     return ready_id;
@@ -70,12 +68,6 @@ private:
     time_point deadline;
     id timer_id;
   };
-
-  // std::push_heap/pop_heap build a max-heap by default; negating the
-  // comparison surfaces the *earliest* deadline at entries_.front().
-  static auto by_deadline_descending(const entry& lhs, const entry& rhs) -> bool {
-    return lhs.deadline > rhs.deadline;
-  }
 
   using entry_allocator = std::allocator_traits<Allocator>::template rebind_alloc<entry>;
   std::vector<entry, entry_allocator> entries_;

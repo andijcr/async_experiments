@@ -118,10 +118,10 @@ Design constraints, settled up front:
 ```
 async_experiments/
 ├── CMakeLists.txt                # top-level: options, subdirs, toolchain checks
-├── CMakePresets.json              # "default"/"ci"/"coverage" configure presets
+├── CMakePresets.json              # "default"/"ci" configure presets ("ci" carries coverage too)
 ├── cmake/
 │   ├── CompilerWarnings.cmake    # shared warning flags for est targets
-│   ├── Coverage.cmake            # est_enable_coverage(), the "coverage" preset's flags
+│   ├── Coverage.cmake            # est_enable_coverage(), the "ci" preset's coverage flags
 │   └── toolchain-hosted-linux.cmake  # compiler/stdlib pin, used by the presets
 ├── docker/
 │   └── Dockerfile                # the one image for local dev + CI
@@ -563,6 +563,144 @@ M2's new code against `origin/main`. `libclang-rt-18-dev` (this
 sandbox's equivalent of the pinned image's `libclang-rt-<N>-dev`) had to
 be installed to link successfully — confirms that dependency is real,
 not just plausible.
+
+### Coverage folded into the main `ci` build (closes a filed optimization issue)
+
+The separate `coverage` preset/CI step above was real but redundant: it
+re-ran the *entire* configure+build+test cycle a second time, just to add
+two compiler flags, when the plain `ci` preset's own build+test could
+carry those flags instead and produce the same `.profraw` as a side
+effect of the test run CI was already doing. Folded `EST_ENABLE_COVERAGE=ON`
+directly into the `ci` configure preset and moved `LLVM_PROFILE_FILE`
+onto the `ci` test preset (pointing at `build/ci/profraw/`); the separate
+`coverage` preset and its dedicated `ci.yml` step are gone.
+`EST_BUILD_EXAMPLES=OFF` (the old coverage preset's other override,
+"coverage of `hello_world` isn't the point") wasn't carried over -
+`hello_world` still builds under `ci`, now just also coverage-instrumented
+along with everything else; it never runs under `ctest`, so it produces
+no `.profraw` and costs nothing beyond a few extra instrumented
+instructions in a binary already being built anyway. Net effect: `gate`
+drops one full configure+build+test pass without losing any coverage
+signal - verified in a from-scratch `docker build` that the single `ci`
+build+test still produces `.profraw`, and the merge/export/diff-cover
+steps (now reading from `build/ci/` instead of `build/coverage/`) still
+run cleanly against it.
+
+### First backlog-issue triage pass
+
+The repo owner filed a batch of GitHub issues (line comments left while reading
+the code) - #4 through #17 - covering small correctness/style asks, two
+larger design proposals, and two explicitly milestone-gated ideas. Each was
+either implemented and verified, or rejected with recorded reasoning
+(`gh issue close --reason not_planned` plus a comment); two are left open,
+correctly deferred to M3/M4. All code changes below were verified together,
+end to end, in the same from-scratch `docker build` this session had already
+set up (configure, build, 32/32 tests, `clang-format`, `clang-tidy` - zero
+findings - and the coverage gate at 90%).
+
+**Implemented:**
+- **#4** (verify `check()` calls are elided in release builds) - they
+  weren't, quite: a `-DCMAKE_BUILD_TYPE=Release` build's `objdump`/`nm`
+  output showed real `call est::check(...)` instructions still present -
+  the `if constexpr (checks_enabled)` inside `check()` only elided its own
+  internal branch, not the call site, since Clang's module-BMI visibility
+  didn't trigger cross-TU inlining on its own at `-O3`. Marking `check()`
+  `inline` fixed it completely - confirmed via the same `objdump`/`nm`
+  check that every call site and the symbol itself are now gone.
+- **#5** (platform should use `std::print`, not naked `std::cerr <<`;
+  everywhere else should stick to `std::format`) - `platform.cppm`'s
+  `assert_failure` rewritten to `std::println(stderr, ...)`, the one place
+  in the framework that actually performs I/O. Surfaced two follow-on
+  findings while doing it: `stderr` (an ordinary extern global in glibc,
+  not a macro) still isn't made visible by `import std;` - confirmed via
+  the compiler's own diagnostic - so `<cstdio>` stays a plain `#include`;
+  and `std::println` can throw (`std::format_error`), which `clang-tidy`
+  correctly flagged as an exception escaping a `noexcept` function -
+  wrapped in a `try`/`catch (...)` that falls through to the unconditional
+  `std::abort()` regardless, same idiom `hello_world/main.cpp` already
+  uses for its own `std::println` call.
+- **#8** (merge the separate coverage build into the main CI build+test)
+  - folded `EST_ENABLE_COVERAGE=ON` and `LLVM_PROFILE_FILE` directly into
+    the `ci` preset; removed the now-redundant `coverage` preset and
+    `ci.yml` step entirely. One configure+build+test pass now produces
+    both the format/tidy-gated binaries and the coverage data.
+- **#10** (constrain `scope_exit`'s `Fn` to nothrow-invocable) -
+  `~scope_exit()` calls `fn_()` unconditionally, including while another
+  exception is already propagating (the guard's whole reason to exist);
+  a throwing `fn_` there calls `std::terminate`. Added
+  `std::is_nothrow_invocable_v<Fn>` to the template constraint; fixed the
+  two call sites (`future.cppm`'s `run()`, `scope_exit_tests.cpp`) whose
+  lambdas weren't marked `noexcept` and would otherwise have failed to
+  compile against the new constraint.
+- **#16** (`future_state::complete` doesn't need to take a functor) -
+  `set_value`/`set_exception` now emplace into `result_` directly and call
+  a plain, non-template `complete()` that only drains queued
+  continuations; the `check(!ready())` precondition moved to each setter
+  (it must run *before* that setter's own emplace, so `complete()` itself
+  can't perform it - by the time `complete()` runs, `ready()` is
+  unconditionally true).
+- **#17** (use `std::ranges` + projections, `timer.cppm` and generally) -
+  `cancel()`'s `std::find_if` + lambda became `std::ranges::find(entries_,
+  target, &entry::timer_id)`; the three heap operations
+  (`push_heap`/`pop_heap`/`make_heap`) became their `std::ranges`
+  equivalents with `std::ranges::greater{}` + a `&entry::deadline`
+  projection, replacing the free `by_deadline_descending` comparator
+  entirely. `timer.cppm` was the only file in the project using classic
+  `<algorithm>` calls, so the "in general" part of the ask had no other
+  call sites to touch.
+
+A real coverage-gate finding came out of #4/#5's rewrite: touching
+`platform.cppm`'s previously-untested `assert_failure` body made
+`diff-cover` correctly flag the newly-changed lines as uncovered (they
+always had been - the gate just never had reason to look at this file
+before). Extracted the actual formatting logic (the only part with real
+branching - the "is message empty" case) into a separate, exported,
+testable `format_assertion_message()`, leaving `assert_failure` itself as
+a thin, still-untestable `[[noreturn]]`/`std::abort()` wrapper around it
+(same "not practically unit-testable without process-isolation tooling"
+situation `check()`'s own failure path already documents). New
+`platform_tests.cpp` cases cover both the empty- and non-empty-message
+branches; `clang-tidy`'s `readability-container-contains` then correctly
+flagged the tests' own `.find(x) != npos` idiom in favor of C++23's
+`.contains()`.
+
+**Closed as not planned, with reasoning left on each issue:**
+- **#6** (split `platform.cppm` into a declare-only interface + a
+  link-time `platform_stdcpp.cppm` implementation, to "remove some
+  templating") - doesn't actually remove `timer_queue<Platform>`'s
+  template parameter (that exists to swap in `timer_tests.cpp`'s fake
+  clock at compile time, orthogonal to where a type's member bodies live)
+  and would add a second module partition for two one-line static
+  functions with no concrete payoff today - only one platform backend
+  exists. Revisit once/if a second backend (the bare-metal stretch goal)
+  is actually being built.
+- **#11** (`shared_ptr` adopt-a-pointer constructor + a `shared_base`
+  mixin for `shared_from_this()` parity) - nothing in the codebase needs
+  self-referencing `shared_ptr`s yet; building the mixin now means
+  guessing at its shape with no real call site to validate against.
+  Revisit when one appears (M3's loop is a plausible candidate).
+- **#12** (analyze `waiter_list` vs. `std::list`, consider switching) -
+  analyzed: the current design is intrusive (the list pointer lives inside
+  the already-allocated waiter object, zero extra allocations to enqueue);
+  `std::list` is node-based with no small-object optimization, so
+  switching would add a mandatory heap allocation per enqueue where there
+  is currently none - a straight regression against this project's
+  allocator-first design goal, not an improvement, given the current
+  design already meets every actual requirement (LIFO push/pop only).
+
+**Left open, acknowledged as correctly milestone-gated (no code change):**
+- **#13** (make `mutex` satisfy `std::mutex`'s named requirement) and
+  **#15** (`future::get()` suspending the caller when not ready) both
+  explicitly depend on `est::loop` (M3) existing, and #15 also needs the
+  coroutine adapters (M4) to express the suspension point. Neither exists
+  yet - correctly scoped as filed, nothing to implement now.
+
+**Blocked, needs the repo owner:** #9 asked to delete already-merged
+branches (`claude/cpp-async-framework-design-jm6ra3` and `poc`, both
+confirmed ancestors of `main` via `git merge-base --is-ancestor`) - `git
+push --delete` was blocked by this session's own permission classifier as
+a destructive action on shared GitHub state. Left for the repo owner to
+do directly, or to explicitly authorize.
 
 ---
 
