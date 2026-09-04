@@ -1441,6 +1441,109 @@ before pushing/merging" posture. **Next step once merged:** reset the
 future/promise/continuation (M2) are both done; nothing is blocking M3
 from starting immediately.
 
+### Issue #23: redesigned `then()` chaining, `failed()`, `future<void>` (done)
+
+Requested by the repo owner as a from-scratch redesign of `then()`'s
+calling convention, on top of M2's shape described above. `est/src/
+future.cppm`/`est/src/promise.cppm` changed; `future_state<T>::then()`'s
+own doc comment now describes this directly, so only the *design
+decisions* behind it are recorded here.
+
+- **`bool failed()`**, on both `future_state<T>` and `future<T>` —
+  `ready() && holds an exception`. Lets a callback that wants the
+  wrapped, no-unwrap calling convention (next bullet) check
+  success/failure without calling `get()` (which rethrows) just to find
+  out.
+- **Two calling conventions for `then(fn)`, chosen by how `fn` can be
+  invoked** — checked in this order:
+  1. `fn(future_state<T>&)` — "wrapped": always called, on success *or*
+     failure, with the `future_state` itself; `fn` inspects
+     `ready()`/`failed()`/`get()` to decide what to do. This is M2's
+     original (only) convention, unchanged.
+  2. `fn(const T&)`, or `fn()` when `T` is `void` — "unwrapped": called
+     only on success, with the value itself (or nothing, for `void`). On
+     failure `fn` is *not* called at all — the returned future fails
+     with the same exception instead.
+  Checked in that order so a callback explicitly typed to take
+  `future_state<T>&` always gets wrapped, no-unwrap behavior, even if it
+  would incidentally also accept a `T` (a generic `auto&` lambda, say).
+  The unwrapped path's "call only on success, else auto-propagate" isn't
+  a separate branch in the implementation — it falls out for free by
+  making `get()` (which already rethrows on failure) `fn`'s own argument
+  expression: a failure surfaces as an exception thrown *before* `fn`
+  ever runs, caught by the same `catch (...)` that already handles `fn`
+  throwing on its own.
+- **`future<T>::then()`'s callback may now return `void`** (producing a
+  `future<void>`) or **a `future<U>`** — the latter is *flattened*: the
+  returned future is `future<U>` directly, not `future<future<U>>` a
+  caller would have to unwrap again themselves (futures are monadic).
+  Implemented by registering a second, internal *wrapped* continuation on
+  the inner `future<U>` that forwards its value/exception into the outer
+  continuation's own downstream `future_state<U>` once it resolves -
+  reusing the exact same get()-rethrows-into-catch propagation idiom, so
+  flattening didn't need any new machinery of its own, just one more use
+  of `then()`.
+- **`future_state<void>`/`future<void>` are not separate class template
+  specializations** — `future_state<T>`/`future<T>`/`promise<T>` stay
+  single, generic templates, made `void`-safe internally instead. Two
+  techniques do the actual work:
+  - Methods split by `void`-ness (`set_value()` vs. `set_value(const
+    T&)`/`set_value(T&&)`) use a trailing `requires` clause
+    (`requires std::is_void_v<T>` / `requires (!std::is_void_v<T>)`) to
+    pick the right overload - but the clause alone isn't enough:
+    a parameter's *type* is elaborated the moment the enclosing class
+    template is instantiated, `requires`-clause or not, so
+    `set_value(const T&)`'s parameter would still try to form `const
+    void&` (ill-formed) for `future_state<void>` even though that
+    overload is constrained out. Fixed by spelling the parameter as
+    `const stored_t&` instead of `const T&`, where `stored_t` is `T`
+    itself except when `T` is `void`, in which case it's a private
+    stand-in tag type (`detail::void_value`) — never actually `void`,
+    so the reference is always well-formed, and identical to `T` for
+    every other `T` this class was already used with.
+  - `get()`'s return type differs three ways (`void`, `const T&`, `T&&`)
+    depending on `T`'s void-ness and the deducing-`this` parameter's
+    value category. A single `std::conditional_t`-based trailing return
+    type (the way `T`/`stored_t` above are picked) doesn't work here:
+    `std::conditional_t` instantiates *both* of its type arguments
+    unconditionally (unlike `if constexpr`, which discards the untaken
+    branch), and the non-`void` alternative names `const void&`/`void&&`
+    for `T=void` regardless of which branch would actually be selected
+    at runtime. Fixed by dropping the explicit return type entirely
+    (deduced `auto`) and spelling each of the three cases under its own
+    `if constexpr`, so the ill-formed alternatives are never
+    instantiated for `T=void` in the first place. The same
+    `conditional_t`-instantiates-both-branches trap applies to computing
+    `then()`'s own downstream type from `fn`'s (wrapped- or unwrapped-
+    shaped) invoke result — solved the same way, via a small `consteval`
+    helper with `if constexpr` branches instead of a `conditional_t`
+    expression.
+- **A structured-binding gotcha hit while writing the new tests**, worth
+  recording since it silently produces a "call to deleted [copy]
+  constructor" error that looks unrelated to the actual cause:
+  `auto [promise, future] = make_promise_future<T>();` followed later by
+  `return future;` (returning a *structured binding name* from a lambda
+  building a `future<U>` to flatten into) does **not** get the implicit
+  move-on-return that returning an ordinary named local variable would -
+  the standard's implicit-move rule is specifically about "the name of
+  an object with automatic storage duration declared in the body...of a
+  function", which a structured-binding name (an alias into an anonymous
+  tuple-like object) doesn't count as. Needs an explicit
+  `return std::move(future);`; `future`/`promise` are move-only, so the
+  implicit-copy fallback the compiler otherwise tries fails instead of
+  silently doing something unwanted.
+
+Verified end-to-end in the from-scratch docker devenv image: configure,
+build, 46/46 tests (14 new, covering `failed()`, both calling
+conventions and their failure-auto-propagation, `future<void>` end to
+end, and both value- and `void`-returning flatten), `clang-format`
+clean, `clang-tidy` clean (one real finding along the way -
+`readability-redundant-typename` on three `using X = typename Y::type;`
+aliases that, per this pinned Clang/libc++ version, don't need the
+`typename` disambiguator; removed), new-code coverage 97% (the only
+"missing" lines are callback bodies that tests deliberately assert never
+run - the whole point of the auto-propagate-on-failure tests).
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until

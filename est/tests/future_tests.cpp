@@ -205,3 +205,190 @@ TEST_CASE("a throwing continuation's node and downstream future are freed, not l
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
+
+// --- Issue #23: redesigned chaining - failed(), unwrapped-vs-wrapped
+// then(), future<void>, and monadic flattening. ---
+
+TEST_CASE("failed() is false on success and true once set_exception() runs", "[future]") {
+  auto [value_promise, value_future] = est::make_promise_future<int>();
+  REQUIRE_FALSE(value_future.failed());
+  value_promise.set_value(1);
+  REQUIRE_FALSE(value_future.failed());
+
+  auto [error_promise, error_future] = est::make_promise_future<int>();
+  error_promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+  REQUIRE(error_future.failed());
+}
+
+TEST_CASE("then() with a plain-value callback (unwrapped) runs with the parent's value",
+          "[future]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_value(21);
+  auto chained = future.then([](int value) { return value * 2; });
+  REQUIRE(chained.get() == 42);
+}
+
+TEST_CASE(
+    "then() with a plain-value callback (unwrapped) is skipped and auto-propagates on failure",
+    "[future]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+
+  bool invoked = false;
+  auto chained = future.then([&](int value) {
+    invoked = true;
+    return value;
+  });
+
+  REQUIRE_FALSE(invoked);
+  REQUIRE(chained.failed());
+  REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
+}
+
+TEST_CASE("a wrapped (future_state&) then() callback can inspect failed() instead of catching",
+          "[future]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+
+  bool saw_failure = false;
+  auto chained = future.then([&](est::future_state<int>& state) {
+    saw_failure = state.failed();
+    return -1;
+  });
+
+  REQUIRE(saw_failure);
+  REQUIRE(chained.get() == -1);
+}
+
+TEST_CASE("future<void>: set_value()/get() round-trip with nothing to carry", "[future][void]") {
+  auto [promise, future] = est::make_promise_future<void>();
+  REQUIRE_FALSE(future.ready());
+  promise.set_value();
+  REQUIRE(future.ready());
+  REQUIRE_FALSE(future.failed());
+  future.get(); // must not throw
+  SUCCEED("get() returned without throwing");
+}
+
+TEST_CASE("future<void>: set_exception()/get() rethrows", "[future][void]") {
+  auto [promise, future] = est::make_promise_future<void>();
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+  REQUIRE(future.failed());
+  REQUIRE_THROWS_AS(future.get(), std::runtime_error);
+}
+
+TEST_CASE("future<void>: an unwrapped (no-argument) then() runs on success", "[future][void]") {
+  auto [promise, future] = est::make_promise_future<void>();
+  bool invoked = false;
+  auto chained = future.then([&] {
+    invoked = true;
+    return 7;
+  });
+  promise.set_value();
+  REQUIRE(invoked);
+  REQUIRE(chained.get() == 7);
+}
+
+TEST_CASE("future<void>: an unwrapped (no-argument) then() is skipped and propagates on failure",
+          "[future][void]") {
+  auto [promise, future] = est::make_promise_future<void>();
+  bool invoked = false;
+  auto chained = future.then([&] {
+    invoked = true;
+    return 7;
+  });
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+  REQUIRE_FALSE(invoked);
+  REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
+}
+
+TEST_CASE("future<void>: a wrapped then() always runs and can inspect failed()", "[future][void]") {
+  auto [promise, future] = est::make_promise_future<void>();
+  bool saw_failure = false;
+  auto chained = future.then([&](est::future_state<void>& state) {
+    saw_failure = state.failed();
+    return 0;
+  });
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+  REQUIRE(saw_failure);
+  REQUIRE(chained.get() == 0);
+}
+
+TEST_CASE("a void-returning then() callback produces a future<void>", "[future][void]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  bool invoked = false;
+  auto chained = future.then([&](int value) {
+    invoked = true;
+    (void)value;
+  });
+  promise.set_value(5);
+  REQUIRE(invoked);
+  REQUIRE(chained.ready());
+  REQUIRE_FALSE(chained.failed());
+  chained.get(); // void, must not throw
+}
+
+TEST_CASE("then() returning a future<U> flattens into future<U>, not future<future<U>>",
+          "[future]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  auto chained = future.then([](int value) {
+    auto [inner_promise, inner_future] = est::make_promise_future<int>();
+    inner_promise.set_value(value * 10);
+    // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
+    // move-on-return
+    return std::move(inner_future);
+  });
+  promise.set_value(4);
+  REQUIRE(chained.get() == 40);
+}
+
+TEST_CASE("flattening propagates the inner future's failure into the outer future", "[future]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  auto chained = future.then([](int value) {
+    auto [inner_promise, inner_future] = est::make_promise_future<int>();
+    (void)value;
+    inner_promise.set_exception(std::make_exception_ptr(std::runtime_error("inner boom")));
+    // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
+    // move-on-return
+    return std::move(inner_future);
+  });
+  promise.set_value(1);
+  REQUIRE(chained.failed());
+  REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
+}
+
+TEST_CASE("then() returning future<void> flattens into future<void>", "[future][void]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  bool inner_ran = false;
+  auto chained = future.then([&](int value) {
+    (void)value;
+    auto [inner_promise, inner_future] = est::make_promise_future<void>();
+    inner_ran = true;
+    inner_promise.set_value();
+    // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
+    // move-on-return
+    return std::move(inner_future);
+  });
+  promise.set_value(1);
+  REQUIRE(inner_ran);
+  REQUIRE(chained.ready());
+  chained.get();
+}
+
+TEST_CASE("flattening a chained then() frees every node involved, no leak", "[future]") {
+  counting_resource resource;
+  {
+    auto [promise, future] = est::make_promise_future<int>(&resource);
+    auto chained = future.then([&resource](int value) {
+      auto [inner_promise, inner_future] = est::make_promise_future<int>(&resource);
+      inner_promise.set_value(value + 1);
+      // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
+      // move-on-return
+      return std::move(inner_future);
+    });
+    promise.set_value(1);
+    REQUIRE(chained.get() == 2);
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
