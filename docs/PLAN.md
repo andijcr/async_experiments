@@ -1713,6 +1713,38 @@ end in the docker devenv: 50/50 tests (4 new), `clang-format` clean,
 described above), new-code coverage 98% against `origin/main`
 (`shared_ptr.cppm`'s new code at 100%).
 
+**Fifth follow-up, found by a `code-review` pass on the PR:**
+`enable_shared_from_this<T>::shared_from_this()` had no precondition
+check at all - calling it on a `T` never actually constructed via
+`shared_ptr<T>::make()` (e.g. a stack-allocated or `new`-ed
+`self_aware`) dereferenced a null `control_block_` with zero diagnostic.
+Every other precondition in this codebase - `future_state::get()`'s
+`ready()`, `set_value()`'s `check_not_completed()` - is guarded by
+`est::check()`, even if only in debug builds; this one had none, unlike
+`std::enable_shared_from_this`, which at least throws `std::bad_weak_ptr`
+for the equivalent misuse. Fixed by adding
+`check(control_block_ != nullptr, ...)` to `shared_from_this()` (needed
+a new `import :check;` in `shared_ptr.cppm`, safe: `:check` already
+depends on `:platform`, itself only on `:util.scope_exit`, no cycle with
+`:util.shared_ptr`).
+
+Deliberately *not* extended to this file's other bare-pointer operations
+(`operator*`/`operator->` on an empty `shared_ptr`) - those match
+`std::shared_ptr`'s own long-documented "caller's mistake" contract that
+every `shared_ptr` user already knows to avoid, while an
+`enable_shared_from_this`-derived `T` built outside `make()` is a much
+less obvious, project-specific way to reach the same failure mode. Not
+unit-tested: like `check()`'s own failure path elsewhere in this
+codebase, this only manifests as an abort with `checks_enabled` on,
+which every test here already runs with - untestable without
+process-isolation tooling this project doesn't have, same accepted gap.
+
+The same review pass re-surfaced the `fulfill()` monadic-flatten
+allocation overhead already reported and discussed earlier on this PR
+(see "flattening a chained then() frees every node involved" area of
+`future.cppm`) - not a new finding, still not chased per that earlier
+discussion.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until

@@ -1,6 +1,7 @@
 export module est:util.shared_ptr;
 
 import std;
+import :check;
 
 export namespace est {
 
@@ -137,7 +138,19 @@ private:
 // like any other shared_ptr copy.
 template <class T> class enable_shared_from_this {
 public:
+  // Precondition: this object was actually constructed via
+  // shared_ptr<T>::make() (which is what sets control_block_ - see
+  // set_owning_control_block() below). Debug-checked, unlike the rest of
+  // this file's own bare-pointer operations (dereferencing an empty
+  // shared_ptr, say) - those match std::shared_ptr's own long-documented
+  // "caller's mistake" contract, but building a T that inherits this and
+  // then stack- or new-allocating it directly instead of going through
+  // make() is a much less obvious way to reach the same null-pointer
+  // misuse, specific to this project's own primitive rather than
+  // something every shared_ptr user already knows to avoid.
   [[nodiscard]] auto shared_from_this() -> shared_ptr<T> {
+    check(control_block_ != nullptr,
+          "shared_from_this() called on a T never constructed via shared_ptr<T>::make()");
     return shared_ptr<T>::from_owning_control_block(control_block_);
   }
 
