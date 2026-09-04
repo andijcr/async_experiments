@@ -780,13 +780,23 @@ move constructor/assignment and destructor all became `= default` —
 that used to be spelled out by hand in each handle.
 
 **Found by real CI, again — same clang-format wrap-boundary drift as
-before, different signature.** `future_state<T>::get()`'s deducing-this
+before, three more times.** `future_state<T>::get()`'s deducing-this
 signature (added in round 2, above) sat at the same kind of ambiguous
-100-column wrap boundary as the earlier `do_is_equal` case, and Clang 22
-wanted a different wrap than local Clang 18 had already accepted as
-clean. Same fix as before: shortened the signature instead of guessing
-at spacing, this time via a named `get_result_t` alias for the
-(otherwise inline) `std::conditional_t<...>` return type.
+100-column wrap boundary as the earlier `do_is_equal` case; fixed the
+same way, via a named `get_result_t` alias for the (otherwise inline)
+`std::conditional_t<...>` return type. The *next* push's real CI then
+caught two more instances that a local-Clang-18 check couldn't:
+`est::shared_ptr`'s new `make()` signature, and a second copy of the
+`do_is_equal` pattern in its own test file's `counting_resource` helper
+(the `est/tests/future_tests.cpp` copy had already been fixed this way -
+this one was a fresh copy-paste that didn't inherit the fix). Same fix
+both times: `make()` got a named `allocator_type` alias; the test helper
+got the same `using std::pmr::memory_resource;` treatment as before.
+This pattern - any signature landing near the 100-column boundary is a
+real risk of CI-only failure regardless of how many times it's been
+seen before - is now common enough to just design around from the start
+(name the type, keep new signatures well clear of the boundary) rather
+than re-discovering it per occurrence.
 
 **Docker was tried as a way to close this gap entirely, and is blocked in
 this session's sandbox.** Building the pinned devenv image
@@ -800,6 +810,28 @@ this Dockerfile. Not a workaround-able failure (403 policy denial, not a
 transient error) - noted here as a real limitation of this development
 sandbox specifically, not of the project's actual CI, which builds this
 same image successfully on every run.
+
+**Round 4: `then()` returns a chained `future<U>`.** `future<T>::then(Fn)`
+changed from `void` to `future<U>` (`U` = `Fn`'s return type,
+`static_assert`ed non-`void` for now - chaining a `future<void>` isn't
+supported yet). The node-allocation-and-registration sequence moved from
+`future<T>::then()` into a new `future_state<T>::then()` member (per
+review comment #12: "could be hidden in a member function"), which
+`future<T>::then()` now just forwards to. Each `then()` callback's
+exception, if any, is caught inside the new continuation node and routed
+into its own downstream `future_state<U>` via `set_exception()` instead
+of escaping - a deliberate, real behavior change from before: a throwing
+continuation no longer aborts `complete()`'s drain loop for
+later-queued siblings, only its own downstream future observes the
+failure. The old "documented M2-scope limitation" test asserting the
+opposite (a throw aborts the whole drain) was replaced with two tests:
+one proving a sibling continuation still runs after an earlier one
+throws, one proving the throwing continuation's own node and downstream
+future are still freed, not leaked. A `future_state<T>` forward
+declaration of `future<T>` (and vice versa) was needed since
+`future_state::then()` returns a `future<U>` but is defined before
+`future` in the same partition - ordinary mutual forward declaration,
+nothing module-specific.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

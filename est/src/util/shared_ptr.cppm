@@ -15,11 +15,17 @@ export namespace est {
 // std::shared_ptr needs one when not built via make_shared).
 template <class T> class shared_ptr {
 public:
+  // Named (rather than spelled out at each use below) partly for
+  // convention, partly so signatures using it stay short enough to
+  // sidestep clang-format version-specific line-wrap disagreements (see
+  // docs/PLAN.md's note on this happening more than once already for a
+  // similarly-shaped signature).
+  using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
+
   shared_ptr() noexcept = default;
 
   template <class... Args>
-  static auto make(std::pmr::polymorphic_allocator<std::byte> allocator,
-                   Args&&... args) -> shared_ptr {
+  static auto make(allocator_type allocator, Args&&... args) -> shared_ptr {
     auto* control =
         allocator.template new_object<control_block>(allocator, std::forward<Args>(args)...);
     return shared_ptr(control);
@@ -78,10 +84,10 @@ public:
 private:
   struct control_block {
     template <class... Args>
-    explicit control_block(std::pmr::polymorphic_allocator<std::byte> allocator_in, Args&&... args)
+    explicit control_block(allocator_type allocator_in, Args&&... args)
         : allocator(allocator_in), value(std::forward<Args>(args)...) {}
 
-    std::pmr::polymorphic_allocator<std::byte> allocator;
+    allocator_type allocator;
     int ref_count = 1;
     T value;
   };

@@ -16,6 +16,7 @@ import :util.shared_ptr;
 export namespace est {
 
 template <class T> class future_state;
+template <class T> class future;
 
 } // namespace est
 
@@ -155,7 +156,61 @@ public:
     return allocator_;
   }
 
+  // Registers fn to run once ready, as fn(future_state&) - from which it
+  // can call get() (rethrowing any stored exception) or ready(). Returns
+  // a future<U> (U = fn's return type) that completes with fn's result,
+  // so then() calls chain: fn's exception, if any, is caught here and
+  // routed into the returned future via set_exception() instead of
+  // escaping - unlike this class's own set_value()/set_exception(),
+  // which still abort complete()'s drain loop on an uncaught exception
+  // (see run()'s comment), a chained continuation's failure is isolated
+  // to its own downstream future and does not stop sibling continuations
+  // from running. Runs synchronously, on whichever call stack completes
+  // this future_state (M2 has no loop yet to defer onto - see
+  // docs/PLAN.md, M3).
+  template <class Fn> auto then(Fn&& fn) -> future<std::invoke_result_t<Fn, future_state&>> {
+    using result_type = std::invoke_result_t<Fn, future_state&>;
+    static_assert(!std::is_void_v<result_type>,
+                  "then()'s callback must return a value for now - chaining a future<void> "
+                  "isn't supported yet (docs/PLAN.md)");
+    auto downstream = shared_ptr<future_state<result_type>>::make(allocator_, allocator_);
+    auto downstream_for_node = downstream; // copy: the node keeps its own reference too
+    using node_type = concrete_continuation<std::decay_t<Fn>, result_type>;
+    auto* node = allocator_.template new_object<node_type>(std::forward<Fn>(fn),
+                                                           std::move(downstream_for_node));
+    set_continuation(*node);
+    return future<result_type>(std::move(downstream));
+  }
+
 private:
+  // Wraps a then() callback together with the downstream future_state it
+  // reports its result (or exception) to.
+  template <class Fn, class U> class concrete_continuation final : public continuation_node {
+  public:
+    concrete_continuation(Fn fn, shared_ptr<future_state<U>> downstream)
+        : fn_(std::move(fn)), downstream_(std::move(downstream)) {}
+
+    void invoke(future_state& state) override {
+      try {
+        downstream_->set_value(fn_(state));
+      } catch (...) {
+        downstream_->set_exception(std::current_exception());
+      }
+    }
+
+    // `this` here is concrete_continuation<Fn, U>*, so delete_object
+    // deallocates with this type's actual size/alignment - the whole
+    // reason destroy() is virtual instead of the caller deallocating
+    // through a waiter_node& (see that class's own doc comment).
+    void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+      allocator.delete_object(this);
+    }
+
+  private:
+    Fn fn_;
+    shared_ptr<future_state<U>> downstream_;
+  };
+
   template <class F> void complete(F&& store_result) {
     // Precondition, not a recoverable error: set_value()/set_exception()
     // must each be called at most once. Debug-only (unlike
@@ -180,11 +235,15 @@ private:
   // Guarantees the node is destroyed even if invoke() throws (a
   // continuation's own exception is not this future_state's problem to
   // swallow, but leaking the node it ran in would be a separate bug on
-  // top of whatever the continuation did). A throwing continuation does
-  // still abort the drain loop in complete() before any later-queued
-  // continuations run; that's an M2-scope limitation, to be revisited
-  // once M3's loop dispatches continuations independently instead of
-  // inline on the completer's own call stack.
+  // top of whatever the continuation did). A then()-created continuation
+  // never actually throws out of invoke() - its own try/catch routes any
+  // exception into its downstream future instead (see then()'s doc
+  // comment) - but a continuation_node isn't required to go through
+  // then(), so this guard stays: a hypothetical throwing one would still
+  // abort the drain loop in complete() before any later-queued
+  // continuations run, an accepted M2-scope limitation for that case, to
+  // be revisited once M3's loop dispatches continuations independently
+  // instead of inline on the completer's own call stack.
   void run(continuation_node& node) {
     scope_exit const guard{[&node, allocator = allocator_] { node.destroy(allocator); }};
     node.invoke(*this);
@@ -233,35 +292,11 @@ public:
     }
   }
 
-  // Registers fn to run once ready, as fn(future_state<T>&) - from which
-  // it can call get() (rethrowing any stored exception) or ready(). Runs
-  // synchronously, on whichever call stack completes the future_state
-  // (M2 has no loop yet to defer onto - see docs/PLAN.md, M3).
-  template <class Fn> void then(Fn&& fn) {
-    using node_type = concrete_continuation<std::decay_t<Fn>>;
-    auto* node = state_->allocator().template new_object<node_type>(std::forward<Fn>(fn));
-    state_->set_continuation(*node);
-  }
+  // Forwards to future_state<T>::then() (see its own doc comment) - the
+  // node allocation and registration live there now, not here.
+  template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn)); }
 
 private:
-  template <class Fn>
-  class concrete_continuation final : public future_state<T>::continuation_node {
-  public:
-    explicit concrete_continuation(Fn fn) : fn_(std::move(fn)) {}
-    void invoke(future_state<T>& state) override { fn_(state); }
-
-    // `this` here is concrete_continuation<Fn>*, so delete_object
-    // deallocates with this type's actual size/alignment - the whole
-    // reason destroy() is virtual instead of the caller deallocating
-    // through a waiter_node& (see that class's own doc comment).
-    void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
-      allocator.delete_object(this);
-    }
-
-  private:
-    Fn fn_;
-  };
-
   shared_ptr<future_state<T>> state_;
 };
 

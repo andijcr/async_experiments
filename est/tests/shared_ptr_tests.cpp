@@ -6,11 +6,13 @@ import est;
 
 namespace {
 
+using std::pmr::memory_resource;
+
 // Wraps the default resource, counting allocate()/deallocate() calls so
 // tests can assert every allocation was balanced by a deallocation - the
 // only practical way to catch a leaked (or wrongly-sized) control block
 // in a unit test without a sanitizer.
-class counting_resource : public std::pmr::memory_resource {
+class counting_resource : public memory_resource {
 public:
   int allocations = 0;
   int deallocations = 0;
@@ -26,8 +28,12 @@ private:
     std::pmr::new_delete_resource()->deallocate(ptr, bytes, alignment);
   }
 
-  [[nodiscard]] auto
-  do_is_equal(const std::pmr::memory_resource& other) const noexcept -> bool override {
+  // Unqualified memory_resource (via the using-declaration above) keeps this
+  // signature under the column limit with [[nodiscard]] kept, rather than
+  // relying on a return-type line-wrap: clang-format 18 (local) and 22 (CI)
+  // disagree on how to wrap this signature when written with the fully
+  // qualified std::pmr::memory_resource name.
+  [[nodiscard]] auto do_is_equal(const memory_resource& other) const noexcept -> bool override {
     return this == &other;
   }
 };

@@ -61,16 +61,15 @@ TEST_CASE("set_exception then get() rethrows", "[future]") {
 TEST_CASE("then() registered before set_value runs synchronously on completion", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   bool invoked = false;
-  int observed = 0;
-  future.then([&](est::future_state<int>& state) {
+  auto chained = future.then([&](est::future_state<int>& state) {
     invoked = true;
-    observed = state.get();
+    return state.get();
   });
   REQUIRE_FALSE(invoked);
 
   promise.set_value(7);
   REQUIRE(invoked);
-  REQUIRE(observed == 7);
+  REQUIRE(chained.get() == 7);
 }
 
 TEST_CASE("then() registered after set_value runs immediately", "[future]") {
@@ -78,13 +77,12 @@ TEST_CASE("then() registered after set_value runs immediately", "[future]") {
   promise.set_value(9);
 
   bool invoked = false;
-  int observed = 0;
-  future.then([&](est::future_state<int>& state) {
+  auto chained = future.then([&](est::future_state<int>& state) {
     invoked = true;
-    observed = state.get();
+    return state.get();
   });
   REQUIRE(invoked);
-  REQUIRE(observed == 9);
+  REQUIRE(chained.get() == 9);
 }
 
 TEST_CASE("then() observes a stored exception via get()", "[future]") {
@@ -92,21 +90,25 @@ TEST_CASE("then() observes a stored exception via get()", "[future]") {
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool invoked = false;
-  future.then([&](est::future_state<int>& state) {
+  auto chained = future.then([&](est::future_state<int>& state) {
     invoked = true;
     REQUIRE_THROWS_AS((void)state.get(), std::runtime_error);
+    return -1;
   });
   REQUIRE(invoked);
+  REQUIRE(chained.get() == -1);
 }
 
 TEST_CASE("multiple then() registrations are all invoked on completion", "[future]") {
   auto [promise, future] = est::make_promise_future<int>();
   int count = 0;
-  future.then([&](est::future_state<int>&) { ++count; });
-  future.then([&](est::future_state<int>&) { ++count; });
+  auto first = future.then([&](est::future_state<int>&) { return ++count; });
+  auto second = future.then([&](est::future_state<int>&) { return ++count; });
 
   promise.set_value(1);
   REQUIRE(count == 2);
+  REQUIRE(first.ready());
+  REQUIRE(second.ready());
 }
 
 TEST_CASE("every then() registration observes the same, correct value via get()", "[future]") {
@@ -114,14 +116,20 @@ TEST_CASE("every then() registration observes the same, correct value via get()"
   // its first call, so a second continuation reading it would see a
   // moved-from value instead of the real one.
   auto [promise, future] = est::make_promise_future<int>();
-  int first_observed = -1;
-  int second_observed = -1;
-  future.then([&](est::future_state<int>& state) { first_observed = state.get(); });
-  future.then([&](est::future_state<int>& state) { second_observed = state.get(); });
+  auto first = future.then([](est::future_state<int>& state) { return state.get(); });
+  auto second = future.then([](est::future_state<int>& state) { return state.get(); });
 
   promise.set_value(42);
-  REQUIRE(first_observed == 42);
-  REQUIRE(second_observed == 42);
+  REQUIRE(first.get() == 42);
+  REQUIRE(second.get() == 42);
+}
+
+TEST_CASE("then() returns a future that can itself be chained", "[future]") {
+  auto [promise, future] = est::make_promise_future<int>();
+  auto chained = future.then([](est::future_state<int>& state) { return state.get() * 2; })
+                     .then([](est::future_state<int>& state) { return state.get() + 1; });
+  promise.set_value(10);
+  REQUIRE(chained.get() == 21);
 }
 
 TEST_CASE("promise/future are move-only and moving transfers ownership", "[future]") {
@@ -151,37 +159,53 @@ TEST_CASE("a registered continuation is freed even if never invoked (broken prom
   counting_resource resource;
   {
     auto [promise, future] = est::make_promise_future<int>(&resource);
-    future.then([](est::future_state<int>&) {});
+    future.then([](est::future_state<int>&) { return 0; });
     // promise and future both destroyed here, never completed.
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-TEST_CASE("a throwing continuation still gets its node freed, not leaked", "[future]") {
-  // Regression test: run() used to deallocate through delete_object on a
-  // continuation_node& (wrong size/alignment for the actual derived
-  // type - separately fixed) without a try/finally-equivalent, so an
-  // exception from invoke() skipped deallocation entirely and left the
-  // node leaked; a still-queued second continuation was abandoned
-  // (leaked) too, since complete()'s drain loop never got to it.
+TEST_CASE("a throwing continuation's exception is isolated to its own downstream future",
+          "[future]") {
+  // Regression test: complete()'s drain loop used to abort entirely when
+  // a continuation threw, abandoning any later-queued sibling
+  // continuation. then() now catches a callback's exception and routes
+  // it into that continuation's own downstream future via
+  // set_exception() instead of letting it escape - a throwing
+  // continuation no longer stops its siblings from running.
+  auto [promise, future] = est::make_promise_future<int>();
+
+  // Drain order is LIFO (documented on est::waiter_list): the
+  // second-registered continuation drains first. Register the
+  // must-still-run one first (so it drains last) and the throwing one
+  // second (so it drains first) - proving the throw doesn't stop the
+  // sibling still queued behind it.
+  bool should_still_run = false;
+  auto normal_chained = future.then([&](est::future_state<int>& state) {
+    should_still_run = true;
+    return state.get();
+  });
+  auto throwing_chained =
+      future.then([](est::future_state<int>&) -> int { throw std::runtime_error("boom"); });
+
+  promise.set_value(1);
+
+  REQUIRE(should_still_run);
+  REQUIRE(normal_chained.get() == 1);
+  REQUIRE_THROWS_AS(throwing_chained.get(), std::runtime_error);
+}
+
+TEST_CASE("a throwing continuation's node and downstream future are freed, not leaked",
+          "[future]") {
   counting_resource resource;
   {
     auto [promise, future] = est::make_promise_future<int>(&resource);
-
-    // The drain order is LIFO (documented on est::waiter_list), so the
-    // *second*-registered continuation runs first: register the
-    // one that must not run first, and the throwing one second, so it's
-    // the one actually dequeued and invoked first.
-    bool should_not_run = false;
-    future.then([&](est::future_state<int>&) { should_not_run = true; });
-    future.then([](est::future_state<int>&) { throw std::runtime_error("boom"); });
-
-    REQUIRE_THROWS_AS(promise.set_value(1), std::runtime_error);
-    REQUIRE_FALSE(should_not_run); // documented M2-scope limitation: drain aborts on throw
-  } // promise and future destroyed here; future_state's destructor drains
-    // the still-queued continuation node too.
-
+    auto chained =
+        future.then([](est::future_state<int>&) -> int { throw std::runtime_error("boom"); });
+    promise.set_value(1);
+    REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
+  }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
