@@ -40,9 +40,8 @@ inline constexpr bool checks_enabled = true;
 //
 // Debug-only, same as the macro it replaces: the `if constexpr` below
 // compiles the check away entirely (not just skips it at runtime) in a
-// build defining NDEBUG. Terminates via
-// platform::hosted_linux::assert_failure() on failure and never
-// returns in that case.
+// build defining NDEBUG. Terminates via platform::instance().
+// assert_failure() on failure and never returns in that case.
 //
 // `inline` matters here, concretely, not just as an ODR nicety: verified
 // in a -DCMAKE_BUILD_TYPE=Release build (-O3 -DNDEBUG) via objdump/nm
@@ -59,7 +58,7 @@ inline void check(bool condition,
                   std::source_location location = std::source_location::current()) {
   if constexpr (checks_enabled) {
     if (!condition) {
-      platform::hosted_linux::assert_failure(message, location);
+      platform::instance().assert_failure(message, location);
     }
   }
 }
