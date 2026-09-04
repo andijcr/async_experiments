@@ -201,12 +201,26 @@ public:
   // of its type arguments unconditionally) - so the return type is
   // deduced, and each live alternative is spelled out under its own if
   // constexpr instead.
+  //
+  // check(self.ready()) above is this function's only *documented*
+  // guard, and - like every other est::check() call - compiles away
+  // entirely under NDEBUG, at which point a caller violating the
+  // precondition is undefined behavior by design (see
+  // check_not_completed()'s own comment on this class's general
+  // validate-at-boundaries philosophy). But std::get<T>() below also
+  // throws std::bad_variant_access unconditionally, regardless of
+  // NDEBUG, as an accidental (not intentionally designed) second line of
+  // defense for T != void; every std::get<stored_t> call, including the
+  // T = void one, keeps that same accidental behavior rather than
+  // letting T = void alone skip it by returning before ever touching
+  // result_'s active alternative.
   template <class Self> [[nodiscard]] auto get(this Self&& self) {
     check(self.ready());
     if (auto* exception = std::get_if<std::exception_ptr>(&self.result_)) {
       std::rethrow_exception(*exception);
     }
     if constexpr (std::is_void_v<T>) {
+      (void)std::get<stored_t>(self.result_);
       return;
     } else if constexpr (std::is_lvalue_reference_v<Self>) {
       return static_cast<const T&>(std::get<T>(self.result_));

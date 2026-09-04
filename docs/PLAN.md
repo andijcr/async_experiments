@@ -1544,6 +1544,31 @@ aliases that, per this pinned Clang/libc++ version, don't need the
 "missing" lines are callback bodies that tests deliberately assert never
 run - the whole point of the auto-propagate-on-failure tests).
 
+**Follow-up fix, found by a `code-review` pass on the merged PR:**
+`future_state<void>::get()` silently "succeeded" (returned normally) when
+called before the future was ever completed, in a Release (`NDEBUG`)
+build - inconsistent with every other `T`. The precondition
+(`ready()`) is checked via `est::check()`, which by design compiles away
+entirely under `NDEBUG` (see `check_not_completed()`'s own comment on
+this project's validate-at-boundaries philosophy) - that part is
+unchanged and correct. What was inconsistent: for `T != void`, `get()`
+still went on to call `std::get<T>(result_)`, which throws
+`std::bad_variant_access` *unconditionally* (not gated by `NDEBUG`) if
+`result_`'s active alternative isn't `T` - an accidental, undocumented
+second line of defense. For `T = void`, the live branch was just
+`return;`, never touching `result_` at all, so that accidental defense
+didn't apply - a caller bug (reading a `future<void>` too early) was
+silently masked specifically for `void`, while the identical bug on any
+other `future<T>` was at least loudly reported. Fixed by having the
+`void` branch also do `(void)std::get<stored_t>(self.result_);` before
+returning, so it exercises the exact same (still accidental, still not a
+substitute for `check()`) safety net every other `T` already gets.
+Not unit-tested: like `check()`'s own failure path and
+`platform::hosted_linux::assert_failure()`, this only manifests when
+`checks_enabled` is off, which this project's `ctest` binary never
+builds with - untestable without process-isolation tooling this project
+doesn't have, same accepted gap as those two.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until
