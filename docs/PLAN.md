@@ -337,6 +337,59 @@ whoever has current documentation open), followed by an actual
 `docker build` + in-container configure/build/test to confirm the pin works
 before relying on it in CI.
 
+### Docker build verified end-to-end (network-enabled sandbox, post-M2)
+
+A later session's sandbox had real, if unusual, network access: `apt.llvm.org`,
+GitHub release downloads (`cmake.org`'s distribution point), and Docker Hub
+were all reachable directly (not just from real GitHub Actions), unlike
+every prior session recorded in this document. `dockerd` itself needed
+starting by hand (`nohup dockerd &`; the packaged `/etc/init.d/docker`
+script's `ulimit -Hn`/`ulimit -u unlimited` calls fail under this sandbox's
+restrictions, so it has to be invoked directly rather than via `service
+docker start`).
+
+`docker build -f docker/Dockerfile .` hit one sandbox-specific snag:
+this environment transparently MITMs all outbound TLS (including from
+containers, regardless of proxy env vars) through an internal egress
+gateway, so `wget`'s fetch of `apt.llvm.org/llvm.sh` failed cert
+validation inside the build. This is purely an artifact of the sandbox,
+not of the image or of real CI, so it was **not** fixed in the committed
+Dockerfile; instead a throwaway local copy added a `COPY`-the-sandbox's-CA
++ `update-ca-certificates` step ahead of the network `RUN`s, verified with
+that copy, then discarded.
+
+With that sandbox-only trust issue worked around, the real, repo-relevant
+result: `docker build` succeeded outright with the existing pins
+(`LLVM_VERSION=22`, `CMAKE_VERSION=3.31.0`) - `Debian clang version
+22.1.8`, `cmake version 3.31.0`, and `libc++-22-dev`/`libc++abi-22-dev`/
+`libclang-rt-22-dev` all installed clean, matching what real CI had
+already found (see "First real toolchain build" above) but now confirmed
+independently, from a cold image build rather than relying on a prior
+CI run. Running the full CI sequence in a container from that image,
+mounted against this repo's actual tree (`--user root`, since the image's
+non-root `est` user can't write into a bind mount owned by this sandbox's
+root):
+- `cmake --preset ci && cmake --build --preset ci` - `est`, `est_tests`
+  (Catch2 fetched live via `FetchContent`), and `hello_world` all
+  configured, built, and linked with no errors.
+- `./hello_world` printed `est::future value: 42` as expected.
+- `ctest --preset ci` - 30/30 tests passed.
+- `clang-format --dry-run --Werror` over every tracked `.cpp`/`.cppm`/`.h`
+  - clean.
+- `clang-tidy -p build/ci` over every `.cpp`/`.cppm` - zero warnings
+  reported against project code (31544 suppressed warnings were all
+  attributed to non-user/system code, per the project's header-filter
+  convention).
+
+This is the first time the *entire* documented CI pipeline (image build
+through test) has been reproduced independently of GitHub's own runners,
+and it confirms the toolchain pins are correct as committed - no
+Dockerfile or CMake changes were needed. `docker/Dockerfile`'s two
+"package names unconfirmed"/"pin from a blind guess" comments were updated
+to reflect this; the `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` situation is
+unchanged (that revert was for a real packaging gap - a missing
+`std.cppm` - not an unverified pin; see M2's "Round 5" below).
+
 A third, smaller item was flagged the same way and has since been
 resolved: `examples/hello_world/main.cpp` uses `std::println` (`<print>`,
 C++23) rather than `printf`/`puts`, which could not be locally

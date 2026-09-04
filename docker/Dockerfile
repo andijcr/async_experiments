@@ -3,17 +3,16 @@
 # only installs the toolchain (Clang, libc++, CMake, Ninja) - selecting
 # clang/clang++ and -stdlib=libc++ is cmake/toolchain-hosted-linux.cmake's
 # job, applied via the "default"/"ci" CMake presets, not this image's
-# environment. See docs/PLAN.md ("Docker strategy" / "Known open items")
-# for why the version pins below are TODOs rather than filled-in values:
-# this scaffolding was written from a session whose network egress policy
-# blocked apt.llvm.org and cmake.org, so the exact snapshot/version numbers
-# below could not be looked up or validated by a real `docker build`.
+# environment.
 #
-# TODO: pin LLVM_VERSION to the actual current 22 (or 23 trunk) snapshot
-# apt.llvm.org serves, and CMAKE_VERSION to a release whose
-# CMAKE_EXPERIMENTAL_CXX_IMPORT_STD gate value has been confirmed to work
-# with that Clang (record the matching gate value in the top-level
-# CMakeLists.txt at the same time — see the TODO there).
+# The LLVM_VERSION/CMAKE_VERSION pins below were originally written blind
+# (see docs/PLAN.md "Known open items" for that history) but have since
+# been confirmed twice: once by real CI (docs/PLAN.md, "First real
+# toolchain build") and again by a from-scratch `docker build` plus a full
+# configure/build/tidy/format/test pass in a network-enabled sandbox
+# (docs/PLAN.md, "Docker build verified end-to-end"). Clang resolves to
+# 22.1.8; libc++-22-dev/libc++abi-22-dev/libclang-rt-22-dev all exist and
+# install cleanly for this LLVM_VERSION/Debian combination.
 
 FROM debian:bookworm-slim
 
@@ -63,10 +62,9 @@ RUN wget --inet4-only -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
 # profile runtime (libclang_rt.profile) is what -fprofile-instr-generate
 # links against for the coverage gate below. Package names follow
 # apt.llvm.org's usual libc++-<N>-dev/libc++abi-<N>-dev/libclang-rt-<N>-dev
-# convention but were not confirmed against a real `apt-cache search`
-# (this session couldn't reach apt.llvm.org directly - see docs/PLAN.md,
-# "Known open items"). Verify these package names exist for the pinned
-# LLVM_VERSION when this image is first actually built.
+# convention - confirmed to exist and install cleanly for LLVM_VERSION=22
+# on debian:bookworm-slim (see docs/PLAN.md, "Docker build verified
+# end-to-end").
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         "libc++-${LLVM_VERSION}-dev" \
