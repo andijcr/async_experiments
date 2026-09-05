@@ -5,7 +5,7 @@ import std;
 
 namespace {
 
-// A minimal, distinguishable-from-hosted_linux stub - only used to prove
+// A minimal, distinguishable-from-hosted_stdcpp stub - only used to prove
 // override_instance() actually retargets instance(), via a fixed,
 // recognizable now(). Never triggers assert_failure() in these tests.
 class stub_platform final : public est::platform::interface {
@@ -69,15 +69,15 @@ TEST_CASE("nested override_instance guards restore the correct previous instance
   REQUIRE(&est::platform::instance() == &original);
 }
 
-TEST_CASE("hosted_linux's clock is monotonically non-decreasing", "[platform]") {
+TEST_CASE("hosted_stdcpp's clock is monotonically non-decreasing", "[platform]") {
   const auto first = est::platform::instance().now();
   const auto second = est::platform::instance().now();
   REQUIRE(second >= first);
 }
 
-TEST_CASE("hosted_linux's sleep_until() returns once the deadline has passed", "[platform]") {
+TEST_CASE("hosted_stdcpp's sleep_until() returns once the deadline has passed", "[platform]") {
   // A tiny (1ms) real deadline, not a fake clock: this exercises
-  // hosted_linux::sleep_until()'s actual std::this_thread::sleep_until()
+  // hosted_stdcpp::sleep_until()'s actual std::this_thread::sleep_until()
   // call - est::loop's own tests (est/tests/loop_tests.cpp) exclusively
   // use a fake, instant sleep_until() instead, which never touches this
   // real implementation at all.
@@ -86,7 +86,7 @@ TEST_CASE("hosted_linux's sleep_until() returns once the deadline has passed", "
   REQUIRE(est::platform::instance().now() >= deadline);
 }
 
-// hosted_linux::assert_failure()'s formatting isn't separately unit-tested:
+// hosted_stdcpp::assert_failure()'s formatting isn't separately unit-tested:
 // unlike an earlier version of this file, it's no longer split out into a
 // standalone, testable helper - it's inlined directly into the
 // [[noreturn]]/std::abort() body, the same not-practically-unit-testable
