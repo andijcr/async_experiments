@@ -18,6 +18,7 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(est_tests
   platform_tests.cpp
   check_tests.cpp
+  intrusive_list_tests.cpp
   mutex_tests.cpp
   timer_tests.cpp
   loop_tests.cpp

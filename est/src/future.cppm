@@ -3,7 +3,7 @@ export module est:future;
 import std;
 import :check;
 import :loop;
-import :sync.mutex;
+import :util.intrusive_list;
 import :util.shared_ptr;
 
 // future_state is intentionally *not* exported: it's the single owned
@@ -123,7 +123,7 @@ namespace est {
 // the "wrapped" calling convention, which receives a real est::future<T>
 // (built via shared_from_this(), below) rather than a future_state<T>&.
 // Holds value-or-exception storage and a continuation slot built on
-// est::waiter_list. Lifetime is managed externally by an
+// est::intrusive_list. Lifetime is managed externally by an
 // est::shared_ptr<future_state<T>> (see make_promise_future() in
 // est:promise) - never constructed directly by a caller, and holds no
 // ref count of its own.
@@ -171,14 +171,7 @@ public:
   // still-pending nodes are simply unreachable once this future_state
   // itself is gone - a permanent leak, not just a skipped notification.
   ~future_state() {
-    while (auto* waiter = waiters_.dequeue()) {
-      // Safe by construction, not by RTTI: every waiter ever enqueued
-      // into waiters_ is a detail::ready_node (set_continuation() only
-      // accepts a continuation_node&, itself a ready_node) - there is
-      // no dynamic_cast alternative worth paying for here.
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-      static_cast<detail::ready_node*>(waiter)->destroy(loop_.allocator());
-    }
+    waiters_.drain([this](continuation_node& node) { node.destroy(loop_.allocator()); });
   }
 
   void set_value()
@@ -519,7 +512,7 @@ private:
   // (normally at most one - future is meant to be a single-consumer
   // handle - but nothing stops a caller from registering more than one
   // via then(), and the underlying list already supports it; drained in
-  // est::waiter_list's documented LIFO order). Called by each setter
+  // est::intrusive_list's documented LIFO order). Called by each setter
   // after it has already stored the result into result_ - this function
   // only drains, it doesn't know or care what was stored. Each node
   // binds a fresh shared_ptr back to this future_state right before
@@ -529,15 +522,14 @@ private:
   // every other reference to it (promise, future) is dropped in the
   // meantime.
   void complete() {
-    while (auto* waiter = waiters_.dequeue()) {
-      auto& node = *static_cast<continuation_node*>(waiter);
+    waiters_.drain([this](continuation_node& node) {
       node.bind_owner(this->shared_from_this());
       loop_.enqueue_ready(node);
-    }
+    });
   }
 
   loop& loop_;
-  waiter_list waiters_;
+  intrusive_list<continuation_node> waiters_;
   std::variant<std::monostate, stored_t, std::exception_ptr> result_;
 };
 

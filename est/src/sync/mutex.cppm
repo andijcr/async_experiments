@@ -1,47 +1,21 @@
 export module est:sync.mutex;
 
+import :util.intrusive_list;
+
 export namespace est {
 
-// An intrusive singly-linked list node for parties waiting on a mutex.
-// Deliberately payload-free at this layer: est::future's shared_state
-// (M2) will embed one of these to link itself into a mutex's waiter
-// list, without the mutex needing to know what a future is.
-class mutex_waiter {
-public:
-  mutex_waiter* next = nullptr;
-};
+// A waiting party's link into est::mutex's own waiter list - a distinctly
+// named alias for est::intrusive_list_node (est:util.intrusive_list), the
+// generic intrusive-list node this project's other waiter/ready-queue-
+// shaped structures (est::future_state<T>'s pending continuations,
+// est::loop's ready-queue entries) are also built on directly. Kept as
+// its own name here, not spelled out as est::intrusive_list_node at every
+// use site, so est::mutex's own public API (enqueue()/dequeue() below)
+// reads as "a waiting party," not as a generic list detail leaking
+// through.
+using mutex_waiter = intrusive_list_node;
 
-// The intrusive singly-linked LIFO list mutex itself is built on,
-// extracted into its own type so a caller that only needs waiter-list
-// bookkeeping - not the lock word wrapped around it - can use it
-// directly (est::future's shared_state, M2: nothing there is
-// concurrent, so there was never anything for mutex's lock()/unlock()
-// to actually protect - see docs/PLAN.md). LIFO is the natural order
-// for a singly-linked list; nothing in this project needs FIFO
-// fairness among waiters.
-class waiter_list {
-public:
-  void enqueue(mutex_waiter& waiter) noexcept {
-    waiter.next = head_;
-    head_ = &waiter;
-  }
-
-  [[nodiscard]] auto dequeue() noexcept -> mutex_waiter* {
-    auto* head = head_;
-    if (head != nullptr) {
-      head_ = head->next;
-      head->next = nullptr;
-    }
-    return head;
-  }
-
-  [[nodiscard]] auto has_waiters() const noexcept -> bool { return head_ != nullptr; }
-
-private:
-  mutex_waiter* head_ = nullptr;
-};
-
-// Deliberately minimal: one `int` lock word plus a waiter_list of
+// Deliberately minimal: one `int` lock word plus an intrusive_list of
 // waiting parties. No OS object, no syscall, no allocation.
 //
 // lock()/unlock() are bookkeeping only right now - there's nothing to
@@ -76,11 +50,11 @@ public:
   // Caller must hold the lock. Returns nullptr if the list is empty.
   [[nodiscard]] auto dequeue() noexcept -> mutex_waiter* { return waiters_.dequeue(); }
 
-  [[nodiscard]] auto has_waiters() const noexcept -> bool { return waiters_.has_waiters(); }
+  [[nodiscard]] auto has_waiters() const noexcept -> bool { return !waiters_.empty(); }
 
 private:
   int state_ = 0;
-  waiter_list waiters_;
+  intrusive_list<mutex_waiter> waiters_;
 };
 
 } // namespace est

@@ -1,5 +1,6 @@
 export module est;
 
+export import :util.intrusive_list;
 export import :util.scope_exit;
 export import :util.shared_ptr;
 export import :platform;
