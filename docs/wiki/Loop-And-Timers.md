@@ -35,14 +35,17 @@ it.
 ## The ready-queue
 
 `loop::enqueue_ready(detail::ready_node&)` pushes onto `ready_`, an
-`est::waiter_list` — the same intrusive LIFO list `est::mutex` uses for its
-own waiters (see [Architecture](Architecture.md)). `run_until_idle()`/`run()`
+`est::intrusive_list<detail::ready_node>` — the same generic intrusive-list
+container `est::mutex` and `est::future_state<T>` each use for their own
+queues (see [Architecture](Architecture.md)), templated here on
+`detail::ready_node` specifically so `dequeue()` already hands back a
+`detail::ready_node*` directly, no cast needed. `run_until_idle()`/`run()`
 drain it via `drain_ready()`:
 
 ```cpp
 void drain_ready() {
-  while (auto* waiter = ready_.dequeue()) {
-    run_one(*static_cast<detail::ready_node*>(waiter));
+  while (auto* node = ready_.dequeue()) {
+    run_one(*node);
     if (stop_requested_) {
       return;
     }

@@ -11,8 +11,8 @@ more, split across two module partitions:
 
 ```mermaid
 classDiagram
-  class mutex_waiter {
-    +next : mutex_waiter*
+  class intrusive_list_node {
+    +next : intrusive_list_node*
   }
   class ready_node {
     +run() void
@@ -30,12 +30,15 @@ classDiagram
     +invoke(state) void
     +destroy(allocator) void
   }
-  mutex_waiter <|-- ready_node
+  intrusive_list_node <|-- ready_node
   ready_node <|-- continuation_node_T
   continuation_node_T <|-- concrete_continuation_Fn_U
 ```
 
-- `mutex_waiter` lives in `est:sync.mutex`.
+- `intrusive_list_node` (real name `est::intrusive_list_node`) lives in
+  `est:util.intrusive_list` — a genuinely generic utility, not something
+  borrowed from `est::mutex`; `est::mutex`'s own `mutex_waiter` is just an
+  alias for it (see [Architecture](Architecture.md)).
 - `ready_node` (real name `est::detail::ready_node`) lives in `est:loop`.
 - `continuation_node_T` (real name `est::detail::continuation_node<T>`)
   lives in `est:future`.
@@ -47,13 +50,19 @@ classDiagram
 namespaces don't render reliably in Mermaid class diagrams — see the code
 excerpts below for the real, fully-qualified signatures.)
 
-- **`mutex_waiter`** (`est:sync.mutex`) is nothing but an intrusive `next`
-  pointer. It's the root of *two* completely unrelated intrusive lists in
-  this codebase: `est::mutex`'s own waiter list, and (via `ready_node`)
-  both `future_state<T>`'s "not yet ready" queue and `est::loop`'s "ready to
-  run" queue. Reusing one link field across all of them is safe because a
-  node is only ever a member of one such list at a time — see "Node
-  lifecycle" below.
+- **`intrusive_list_node`** (`est:util.intrusive_list`) is nothing but an
+  intrusive `next` pointer. It's the root of *three* independent intrusive
+  lists in this codebase: `est::mutex`'s own waiter list (via the
+  `mutex_waiter` alias), and (via `ready_node`) both `future_state<T>`'s
+  "not yet ready" queue and `est::loop`'s "ready to run" queue. Reusing one
+  link field across all of them is safe because a node is only ever a
+  member of one such list at a time — see "Node lifecycle" below. The
+  accompanying `est::intrusive_list<T>` container (templated so
+  `dequeue()` hands back `T*` directly, no cast needed at the call site)
+  is what each of the three actually stores its nodes in - see
+  [Allocation Patterns](Allocation-Patterns.md) and
+  [Architecture](Architecture.md) for more on why this lives in a shared
+  util partition instead of inside `est:sync.mutex`.
 - **`ready_node`** (`est:loop`) is the type-erased base the loop's
   ready-queue actually holds. It adds exactly two things: `run()` (invoke
   whatever this is, however it does that) and `destroy(allocator)`

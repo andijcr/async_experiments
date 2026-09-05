@@ -2045,6 +2045,65 @@ in the pinned Docker devenv after both rounds: 63/63 tests pass,
 `clang-format`/`clang-tidy` clean, new-code coverage 95% against
 `origin/main`.
 
+### Refactor: `mutex_waiter`/`waiter_list` generalized into `est::intrusive_list` (done)
+
+Requested by the repo owner directly: `mutex_waiter` was never actually
+mutex-specific (just an intrusive `next` pointer), but lived in
+`est:sync.mutex` anyway - `:loop` and `:future` each imported that
+partition purely to borrow it (as `ready_node`'s/`continuation_node<T>`'s
+base and as `waiter_list`'s element type), with zero interest in
+`est::mutex`/lock semantics. Moved the node type and its list container to
+a new `est:util.intrusive_list` partition, alongside `:util.scope_exit`/
+`:util.shared_ptr`:
+
+- `est::intrusive_list_node` (renamed from `mutex_waiter`) and
+  `est::intrusive_list<T>` (renamed from `waiter_list`, now a template
+  constrained via `std::derived_from<T, intrusive_list_node>`) replace the
+  old fixed, `mutex_waiter`-only pair. `est::mutex` keeps `mutex_waiter` as
+  a plain alias for `intrusive_list_node` - `est::mutex`'s own public API
+  (`enqueue(mutex_waiter&)` etc.) still reads as "a waiting party," not as
+  a generic list detail leaking through, and `mutex_tests.cpp` needed zero
+  changes.
+- **Helpers extracted from the users, per the same request.**
+  `intrusive_list<T>::dequeue()` now returns `T*` directly instead of the
+  base node type - every call site (`est::mutex`'s own forwarding,
+  `est::loop`'s ready-queue, `future_state<T>`'s pending-continuation
+  queue) was immediately downcasting the base pointer straight back to
+  whatever `T` actually is anyway, each with its own "safe by
+  construction, not by RTTI" comment and `NOLINTNEXTLINE
+  (cppcoreguidelines-pro-type-static-cast-downcast)`. The cast (and its
+  justification) now lives once, inside `dequeue()` itself, not
+  duplicated at three call sites. A new `drain(fn)` method extracts the
+  identical "dequeue everything left, act on each" loop `est::loop`'s and
+  `est::future_state<T>`'s own destructors both needed (destroying an
+  abandoned node) and `future_state<T>::complete()` needed (handing every
+  pending continuation to `est::loop`) - three copies of the same
+  while-loop-plus-cast collapsed into one shared implementation.
+  `est::loop::drain_ready()` keeps its own manual loop (unlike the other
+  three, it needs to stop partway through to honor `stop()` mid-drain,
+  which a generic `drain()` can't support) but still drops its own cast,
+  since `dequeue()` now returns the right type directly.
+- `est::detail::ready_node` now derives from `est::intrusive_list_node`
+  directly instead of from `mutex_waiter` - it was only ever inheriting
+  from `mutex_waiter` to borrow the link-field machinery, never because a
+  ready-to-run continuation is semantically "a mutex waiter." `:loop` and
+  `:future` both dropped their `import :sync.mutex;` entirely, replaced
+  with `import :util.intrusive_list;` - a real reduction in coupling, not
+  just a rename, since neither ever used anything else from `:sync.mutex`.
+- A new `est/tests/intrusive_list_tests.cpp` tests `intrusive_list<T>`
+  directly (LIFO order, `dequeue()` returning the derived type with no
+  cast needed at the call site, `drain()`'s visit order and end state) -
+  the new generalized behavior wasn't exercised by `mutex_tests.cpp`'s own
+  indirect use through `est::mutex`.
+- The published wiki pages (`docs/wiki/`) were updated in the same
+  change: the module dependency graph, the continuation-node type
+  hierarchy diagram, and every prose reference to `mutex_waiter`/
+  `waiter_list` living in `est:sync.mutex` now reflect the new home and
+  names.
+
+Verified in the pinned Docker devenv: 68/68 tests pass (5 new), `clang-
+format`/`clang-tidy` clean, new-code coverage 98% against `origin/main`.
+
 ### M4 — coroutine adapters
 - `est::task<T>` coroutine type with a `promise_type` that binds to
   `est::promise<T>`/`est::future<T>` under the hood.

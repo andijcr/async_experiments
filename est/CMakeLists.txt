@@ -7,6 +7,7 @@ target_sources(est
     BASE_DIRS src
     FILES
       src/est.cppm
+      src/util/intrusive_list.cppm
       src/util/scope_exit.cppm
       src/util/shared_ptr.cppm
       src/platform/platform.cppm

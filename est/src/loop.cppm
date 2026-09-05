@@ -3,8 +3,8 @@ export module est:loop;
 import std;
 import :check;
 import :platform;
-import :sync.mutex;
 import :timer;
+import :util.intrusive_list;
 import :util.scope_exit;
 
 // Type-erased primitives est::loop's ready-queue and pending-timer list
@@ -25,7 +25,7 @@ namespace est::detail {
 // One entry in est::loop's ready-queue: something already known to be
 // ready to run, whatever produced it - a fulfilled future_state<T>'s
 // continuation today, a resumed coroutine handle eventually (M4).
-class ready_node : public mutex_waiter {
+class ready_node : public intrusive_list_node {
 public:
   ready_node() = default;
   ready_node(const ready_node&) = delete;
@@ -102,15 +102,7 @@ public:
   // future_state<T>'s own destructor: a loop dropped mid-program simply
   // abandons whatever it hadn't gotten to yet, rather than leaking it.
   ~loop() {
-    while (auto* waiter = ready_.dequeue()) {
-      // Safe by construction, not by RTTI: every waiter ever enqueued
-      // into ready_ is a detail::ready_node (enqueue_ready() only
-      // accepts one) - there is no dynamic_cast alternative worth paying
-      // for here, same reasoning est:future's own former waiter_node
-      // downcast used.
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-      static_cast<detail::ready_node*>(waiter)->destroy(allocator_);
-    }
+    ready_.drain([this](detail::ready_node& node) { node.destroy(allocator_); });
     for (const auto& entry : pending_timers_) {
       entry.node->destroy(allocator_);
     }
@@ -207,9 +199,8 @@ private:
   }
 
   void drain_ready() {
-    while (auto* waiter = ready_.dequeue()) {
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-      run_one(*static_cast<detail::ready_node*>(waiter));
+    while (auto* node = ready_.dequeue()) {
+      run_one(*node);
       if (stop_requested_) {
         return;
       }
@@ -271,7 +262,7 @@ private:
   static constexpr clock::duration long_running_threshold = std::chrono::milliseconds(50);
 
   allocator_type allocator_;
-  waiter_list ready_;
+  intrusive_list<detail::ready_node> ready_;
   timer_queue<allocator_type> timers_;
   std::pmr::vector<pending_entry> pending_timers_;
   bool stop_requested_ = false;

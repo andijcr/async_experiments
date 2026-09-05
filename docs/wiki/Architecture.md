@@ -13,7 +13,8 @@ graph BT
   check[":check<br/>est::check()"]
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
-  mutex[":sync.mutex<br/>mutex_waiter, waiter_list, mutex"]
+  intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
+  mutex[":sync.mutex<br/>mutex_waiter, mutex"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;"]
@@ -21,15 +22,16 @@ graph BT
 
   check --> platform
   shared_ptr --> check
+  mutex --> intrusive_list
   timer --> platform
   loop --> check
   loop --> platform
-  loop --> mutex
+  loop --> intrusive_list
   loop --> timer
   loop --> scope_exit
   future --> check
   future --> loop
-  future --> mutex
+  future --> intrusive_list
   future --> shared_ptr
   promise --> future
   promise --> loop
@@ -105,14 +107,16 @@ on top of `timer_node` to bridge a raw timer callback into a
 `future<void>`. Dependency direction stays a clean DAG: `:loop` → `:future`
 → `:promise`.
 
-This is also *why* `est::loop`'s ready-queue and `est::mutex`'s waiter list
-share one root type, `mutex_waiter` (just an intrusive `next` pointer):
-`ready_node : public mutex_waiter`, so the exact same `waiter_list`
-enqueue/dequeue mechanics `est::mutex` uses for its own waiters are reused,
-unmodified, for both `future_state<T>`'s "not yet ready" queue and
-`est::loop`'s "ready to run" queue. See
-[Continuation Node Mechanism](Continuation-Node-Mechanism.md) for the full
-type hierarchy this produces.
+This is also *why* `est::loop`'s ready-queue, `est::future_state<T>`'s
+"not yet ready" queue, and `est::mutex`'s own waiter list all share one
+root node type and one list container - `est::intrusive_list_node` and
+`est::intrusive_list<T>` (`est:util.intrusive_list`), a genuinely generic
+utility rather than something borrowed from `est::mutex`: `ready_node :
+public intrusive_list_node` directly, so the same enqueue/dequeue
+mechanics `est::mutex` uses for its own waiters are reused, unmodified,
+for both queues, with none of the three depending on either of the
+others. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md)
+for the full type hierarchy this produces.
 
 ## The producer/consumer split: `promise<T>` / `future<T>` / `future_state<T>`
 

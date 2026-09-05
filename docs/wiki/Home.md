@@ -62,7 +62,8 @@ run.
 | Platform seam (clock, `sleep_until`, `assert_failure`, `printdbg`) | `est/src/platform/platform.cppm` |
 | `est::check()` | `est/src/check.cppm` |
 | `est::shared_ptr<T>`, `enable_shared_from_this<T>` | `est/src/util/shared_ptr.cppm` |
-| `est::mutex`, `mutex_waiter`, `waiter_list` | `est/src/sync/mutex.cppm` |
+| `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
+| `est::mutex`, `mutex_waiter` | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
 | `est::future_state<T>`, `est::future<T>`, `continuation_node<T>` | `est/src/future.cppm` |
