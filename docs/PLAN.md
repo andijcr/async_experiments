@@ -1,5 +1,12 @@
 # `est` — an educational async framework for C++23/26
 
+This file is the project's full decision log — every milestone, every
+reviewed design decision, every bug found and fixed, in the order it
+happened. For a reader's guide to *how the code works right now* (module
+architecture, the continuation-node mechanism, allocation patterns for
+`.then()` chains, the run loop) see [`docs/wiki/`](wiki/Home.md) instead —
+it summarizes and cross-references this file rather than duplicating it.
+
 ## Context
 
 This is a from-scratch educational project: a coroutine-friendly async

@@ -1,0 +1,133 @@
+# Architecture
+
+## Module layout and dependency direction
+
+`est` is one C++23 module (`est`) split into partitions, one per source file.
+`est/src/est.cppm` is the umbrella that `export import`s every partition, so
+consumer code just does `import est;`. The partitions form a strict DAG —
+each only imports the partitions below it:
+
+```mermaid
+graph BT
+  platform[":platform<br/>clock, sleep_until, assert_failure, printdbg"]
+  check[":check<br/>est::check()"]
+  scope_exit[":util.scope_exit"]
+  shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
+  mutex[":sync.mutex<br/>mutex_waiter, waiter_list, mutex"]
+  timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
+  loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
+  future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;"]
+  promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
+
+  check --> platform
+  shared_ptr --> check
+  timer --> platform
+  loop --> check
+  loop --> platform
+  loop --> mutex
+  loop --> timer
+  loop --> scope_exit
+  future --> check
+  future --> loop
+  future --> mutex
+  future --> shared_ptr
+  promise --> future
+  promise --> loop
+  promise --> platform
+  promise --> shared_ptr
+```
+
+The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
+above them** — even though a loop's whole job is running futures'
+continuations. See "Why `:loop` doesn't depend on `:future`" below; it's the
+key to understanding how the continuation mechanism is split across files.
+
+## Design philosophy
+
+- **Single-threaded, no atomics, no real concurrency protection — yet.**
+  `est::shared_ptr`'s ref count is a plain `int`, `est::mutex` is bookkeeping
+  only (`lock()`/`unlock()` just toggle a word), and `est::loop` is driven
+  from exactly one call stack. This isn't an oversight to fix later; it's a
+  deliberate scope boundary recorded early in `docs/PLAN.md` ("Revised:
+  critical sections removed") — protection gets added when a backend that
+  actually needs it exists (bare-metal interrupts, or a future multi-loop),
+  not speculatively.
+- **Allocator-first.** Every owned object — `shared_ptr<T>`'s control block,
+  a continuation node, `timer_queue`'s storage, `loop`'s own containers — is
+  built through a `std::pmr::polymorphic_allocator<std::byte>`, threaded in
+  explicitly rather than defaulting to global `new`/`delete`. See
+  [Allocation Patterns](Allocation-Patterns.md) for what that buys a caller
+  in practice.
+- **`est::platform` is the one runtime-polymorphic seam.** Everything that
+  differs between a hosted-Linux program and a hypothetical future bare-metal
+  target — the monotonic clock (`now()`), how to wait for a deadline
+  (`sleep_until()`), what happens when a precondition check fails
+  (`assert_failure()`) — goes through `est::platform::interface`, a virtual
+  base swapped via a single global pointer (`instance()`/
+  `override_instance()`). Everything else in the framework is templates and
+  concrete classes; this is the only place virtual dispatch is used for
+  polymorphism rather than for type erasure.
+- **`est::check()`, not `assert()`.** A plain function (named to avoid
+  colliding with the `<cassert>` macro even fully-qualified — a real mistake
+  made once and documented), compiled away entirely under `NDEBUG`. Every
+  precondition it guards is explicitly documented as "debug-checked,
+  undefined behavior on release-build violation" — the codebase's consistent
+  stance rather than something reinvented per call site.
+- **Explicit dependencies over global state, except where global state is
+  the whole point.** `est::platform::instance()` is a deliberate global (a
+  stateless vtable swap, safe to share). `est::loop` is deliberately *not* a
+  global (see [The Loop and Timers](Loop-And-Timers.md)) — it carries real
+  mutable state that a shared global would let leak between unrelated call
+  sites (or tests). This asymmetry is intentional, not inconsistent: the
+  test is "does this object have state a second, unrelated use of it could
+  see or corrupt."
+
+## Why `:loop` doesn't depend on `:future`
+
+`est::loop`'s ready-queue needs to hold something type-erased — logically,
+"a future's queued continuation." The natural design would have `loop`
+import `:future` and hold `est::detail::continuation_node<T>*` (type-erased
+down to just `T`, or further). But `future_state<T>` *also* needs to depend
+on `loop` — every `then()` call hands its continuation to
+`loop.enqueue_ready()` instead of running it inline. Two partitions can't
+import each other in C++20 modules (or in any sane build), so one direction
+has to give.
+
+The fix: `:loop` defines its *own* minimal type-erased bases —
+`est::detail::ready_node` (a `run()` + `destroy(allocator)` pair, the ready-
+queue's element type) and `est::detail::timer_node` (`fire()` +
+`destroy(allocator)`, the pending-timer list's element type) — and knows
+nothing about futures, promises, or continuations at all.
+`:future`'s `continuation_node<T>` then *inherits* `ready_node` (adding the
+one T-dependent thing it needs, `invoke(future_state<T>&)`), and
+`:promise`'s `sleep_for()`/`sleep_until()` build a `concrete_timer_node<Fn>`
+on top of `timer_node` to bridge a raw timer callback into a
+`future<void>`. Dependency direction stays a clean DAG: `:loop` → `:future`
+→ `:promise`.
+
+This is also *why* `est::loop`'s ready-queue and `est::mutex`'s waiter list
+share one root type, `mutex_waiter` (just an intrusive `next` pointer):
+`ready_node : public mutex_waiter`, so the exact same `waiter_list`
+enqueue/dequeue mechanics `est::mutex` uses for its own waiters are reused,
+unmodified, for both `future_state<T>`'s "not yet ready" queue and
+`est::loop`'s "ready to run" queue. See
+[Continuation Node Mechanism](Continuation-Node-Mechanism.md) for the full
+type hierarchy this produces.
+
+## The producer/consumer split: `promise<T>` / `future<T>` / `future_state<T>`
+
+`est::future_state<T>` is the one owned object behind a promise/future pair —
+the value-or-exception storage plus the continuation queue. It is
+**deliberately not exported** from the module: a caller only ever sees it
+through the thin, `shared_ptr`-backed `est::promise<T>` (producer) and
+`est::future<T>` (consumer) handles that wrap it, including inside a
+"wrapped" `then()` callback (which gets a real `future<T>`, built on demand
+via `enable_shared_from_this`, never the `future_state<T>` itself). This
+mirrors `std::promise`/`std::future`'s own split, but goes one step further
+by making the shared state module-private — there's no way for calling code
+to name `future_state<T>` even by accident.
+
+`make_promise_future<T>(loop&)` (`est:promise`) is the *only* way a
+`future_state<T>` gets created; `promise<T>`/`future<T>` otherwise only exist
+as the result of a move. See [Allocation Patterns](Allocation-Patterns.md)
+for exactly what that single call allocates.
