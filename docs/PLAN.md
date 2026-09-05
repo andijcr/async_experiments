@@ -1832,7 +1832,7 @@ tests unchanged, `clang-format`/`clang-tidy` clean, new-code coverage
 throwing value copy/move, not the known-failure case that used to also
 pass through it), not worth a dedicated throwing-type test for.
 
-### M3 — the looper
+### M3 — the looper (done)
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until
   the next timer deadline, repeats; `run_until_idle()` for tests/examples
@@ -1852,6 +1852,120 @@ pass through it), not worth a dedicated throwing-type test for.
   clear diagnostic instead of "the whole program mysteriously stalled."
   Threshold value/configurability and exact log destination are details
   to settle when this is actually implemented, not now.
+
+#### Implementation (issue #27, PR pending)
+
+Two foundational design forks were settled with the repo owner via
+`AskUserQuestion` before writing any code, since both were expensive to
+walk back once dozens of tests and the whole future/promise API were
+built around one answer:
+
+1. **Loop wiring: an explicit `loop&` reference, not a global singleton
+   like `est::platform::instance()`.** `future_state<T>` now holds a
+   `loop&` instead of its own allocator — the allocator it uses is simply
+   `loop_.allocator()`. `make_promise_future<T>(allocator)` became
+   `make_promise_future<T>(loop&)`. Deliberately not a global-with-
+   override-for-tests seam the way `platform` is: unlike platform (a
+   stateless vtable swap), a loop carries real mutable state (its
+   ready-queue, pending timers) that a shared global would accumulate
+   cross-test contamination in — every test constructs its own.
+2. **Deferral scope: *all* continuations defer through the loop once one
+   exists, not just timer-originated ones.** `future_state<T>::complete()`
+   (and `set_continuation()`'s already-ready immediate-run path) now push
+   the ready continuation onto the loop's ready-queue instead of invoking
+   it inline on the fulfilling call stack — matching this file's own M3
+   description above ("is the thing that actually resumes continuations")
+   and the M2 section's repeated "M3 will change that" notes. This meant
+   rewriting every one of M2/issue #23's ~40 future/promise tests to
+   construct a local `est::loop` and call `run_until_idle()` before
+   observing a continuation's side effects — a cost flagged as coming,
+   not a surprise.
+
+**Avoiding a circular module dependency between `:loop` and
+`:future`/`:promise`.** `loop`'s ready-queue needs a type-erased "thing to
+run" — naturally `est::future`'s own continuation nodes — but
+`future_state<T>` also needs to depend on `loop` to defer onto it, so
+`:loop` cannot `import :future`. Resolved by keeping `:loop` the strictly
+lower-level partition:
+- `est::detail::ready_node` (new, in `:loop`) is the type-erased base for
+  anything the ready-queue can hold (`run()` + `destroy(allocator)`) —
+  `:future`'s `continuation_node<T>` now inherits it directly instead of
+  `:future` defining its own `waiter_node` (which this replaces
+  entirely). Dependency direction: `:loop` → `:future` → `:promise`, a
+  clean DAG.
+- Timer callbacks use the identical intrusive-virtual-node approach
+  (`est::detail::timer_node`, `fire()` + `destroy(allocator)`) rather than
+  a type-erased `std::move_only_function`, keeping timer-callback storage
+  on the same pmr-allocator plumbing already threaded everywhere else in
+  this codebase instead of introducing a second, inconsistent allocation
+  mechanism.
+- `sleep_for()`/`sleep_until()` (the `future<void>`-returning sugar over
+  `loop::schedule_timer()`) live in `est/src/promise.cppm` (`:promise`,
+  which already imports both `:future` and can import `:loop`) — `:loop`
+  itself never names `future`/`promise` anywhere.
+
+**A new self-reference-cycle risk, caught before it shipped, not by a
+test.** Once completion defers to the loop instead of running inline, a
+continuation node can sit in the ready-queue with nothing external still
+referencing its `future_state<T>` — naively "fixed" by having
+`continuation_node<T>` hold a permanent `shared_ptr<future_state<T>>`
+back-reference (via `shared_from_this()`, from issue #11/#24) instead of
+a raw pointer. Tracing it through found a real bug in that first draft: a
+node still only *pending* in `future_state<T>`'s own `waiters_` (not yet
+ready) is already exclusively owned, by raw pointer, by that same
+`future_state` — binding a permanent `shared_ptr` back to it from
+construction time on would make the `future_state` count itself as one of
+its own owners, keeping an abandoned, never-completed `future_state` (and
+its still-pending node) alive forever instead of letting normal
+ref-counting destroy it once its promise and future are both dropped.
+Fixed by adding `continuation_node<T>::bind_owner()`, called exactly once
+— by `complete()`/`set_continuation()`, right before handing the node to
+`loop.enqueue_ready()` — instead of at construction: the `shared_ptr` is
+only acquired once a node is guaranteed to run soon and is no longer
+reachable from the future_state's own `waiters_`, so no cycle exists in
+either state.
+
+**`platform::interface` gained a third primitive: `sleep_until()`.**
+Mirrors `now()`/`assert_failure()`'s own reasoning — `loop`'s "sleep until
+the next timer deadline" step needs a seam a test fake can override to
+advance its own fake clock instantly instead of actually blocking, the
+same way `est/tests/timer_tests.cpp`'s existing `fake_platform` already
+does for `now()`. `hosted_linux::sleep_until()` itself is a plain
+`std::this_thread::sleep_until(deadline)`.
+
+**`run()` and `run_until_idle()` are currently identical.** Both drain
+ready work, sleep until the next timer deadline, and repeat until truly
+idle (no ready work, no pending timers) or `stop()` is called. The
+difference this file's own spec anticipates — `run()` blocking
+indefinitely, kept alive by a live I/O reactor with more external wakeup
+sources than timers — only becomes real once I/O support lands (still
+explicitly out of scope); until then nothing could ever wake a fully idle
+loop back up anyway (no I/O, single-threaded), so returning is the only
+sane behavior for both. Documented as such in `loop.cppm` rather than
+pretending a difference that doesn't exist yet.
+
+**Verified in the pinned Docker devenv (`est-devenv:sandbox3`):**
+63/63 tests pass (13 new in `est/tests/loop_tests.cpp`, plus 1 new direct
+`hosted_linux::sleep_until()` test in `platform_tests.cpp` and 2 fake-
+platform stubs updated to implement the new pure-virtual method);
+`clang-format --dry-run --Werror` clean (one real formatting fix needed,
+caught by the check as expected); `clang-tidy` clean (one real finding:
+`cppcoreguidelines-pro-type-static-cast-downcast` on `loop.cppm`'s two
+safe-by-construction downcasts from `mutex_waiter*`/`ready_node*`,
+suppressed with the same `NOLINTNEXTLINE` reasoning `future.cppm`'s
+identical pre-existing downcast already documents); new-code coverage
+95% against `origin/main` (comfortably over the 80% gate). The remaining
+uncovered lines are all the same kind of "deliberately untestable or
+deliberately never executed" gaps this project has consistently declined
+to chase elsewhere: fake-platform stub bodies required only to satisfy
+`platform::interface` and never actually called by their own test file
+(`timer_tests.cpp`'s no-op `sleep_until()`, mirroring `assert_failure()`'s
+own long-accepted precedent), an empty `catch (...) {}` around
+`loop.cppm`'s best-effort diagnostic `std::println` call (same reasoning
+as `hosted_linux::assert_failure()`'s identical catch block), and a
+callback body a test explicitly asserts *never runs* (`loop_tests.cpp`'s
+`stop()` test — the uncovered line is the point of the test, not a gap in
+it).
 
 ### M4 — coroutine adapters
 - `est::task<T>` coroutine type with a `promise_type` that binds to

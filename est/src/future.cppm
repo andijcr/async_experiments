@@ -2,8 +2,8 @@ export module est:future;
 
 import std;
 import :check;
+import :loop;
 import :sync.mutex;
-import :util.scope_exit;
 import :util.shared_ptr;
 
 // future_state is intentionally *not* exported: it's the single owned
@@ -23,38 +23,36 @@ template <class T> class future;
 
 namespace est::detail {
 
-// Type-agnostic base for a future_state<T>'s queued continuations: only
-// the parts that don't depend on T live here, so they're compiled once
-// instead of once per T. future_state<T>'s own destructor (which only
-// ever needs to destroy(), never invoke()) operates on this directly.
-class waiter_node : public mutex_waiter {
+// The T-dependent half of a queued continuation, sitting on top of
+// est:loop's own type-erased detail::ready_node (see that partition's
+// doc comment on why :loop can't instead depend on :future): adds only
+// the one thing that actually needs T (invoke()), plus the plumbing
+// run() needs to call it once est::loop actually dequeues and runs this
+// node. Not nested inside future_state<T> - it's an implementation
+// detail of :future, not part of future_state's public surface, so it
+// lives here instead.
+template <class T> class continuation_node : public detail::ready_node {
 public:
-  waiter_node() = default;
-  waiter_node(const waiter_node&) = delete;
-  auto operator=(const waiter_node&) -> waiter_node& = delete;
-  waiter_node(waiter_node&&) = delete;
-  auto operator=(waiter_node&&) -> waiter_node& = delete;
-  virtual ~waiter_node() = default;
+  void run() final { invoke(*owner_); }
 
-  // Deallocates *this through the *actual* allocated type (each
-  // override does `allocator.delete_object(this)` with `this` typed as
-  // the concrete class). Calling `allocator.delete_object` on a
-  // waiter_node& directly would deduce the base type and deallocate
-  // with the base's size/alignment instead of the derived type actually
-  // allocated - undefined behaviour per memory_resource::deallocate's
-  // precondition that the size/alignment match the original allocate()
-  // call, silently "working" with the default new/delete resource but
-  // corrupting a pool-style resource.
-  virtual void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept = 0;
-};
-
-// The T-dependent half of a queued continuation: adds only the one
-// thing that actually needs T (invoke()). Not nested inside
-// future_state<T> - it's an implementation detail of :future, not part
-// of future_state's public surface, so it lives here instead.
-template <class T> class continuation_node : public waiter_node {
-public:
   virtual void invoke(future_state<T>& state) = 0;
+
+  // Called exactly once, by future_state<T>::complete()/
+  // set_continuation() right before this node is handed to
+  // est::loop::enqueue_ready() - takes real shared ownership of the
+  // future_state so it survives the gap between being enqueued and the
+  // loop actually draining it. Deliberately *not* done at construction
+  // time: a node still only pending in future_state<T>'s own waiters_
+  // (not yet ready) is already exclusively owned (by pointer, not
+  // shared_ptr) by that same future_state - binding a permanent
+  // shared_ptr back to it from there on would be a self-reference cycle
+  // (the future_state would count itself as one of its own owners),
+  // keeping an abandoned, never-completed future_state alive forever
+  // instead of destroying it (and its still-pending nodes) normally.
+  void bind_owner(shared_ptr<future_state<T>> owner) { owner_ = std::move(owner); }
+
+private:
+  shared_ptr<future_state<T>> owner_;
 };
 
 // A placeholder "success" alternative for future_state<void>'s result_
@@ -129,6 +127,14 @@ namespace est {
 // est::shared_ptr<future_state<T>> (see make_promise_future() in
 // est:promise) - never constructed directly by a caller, and holds no
 // ref count of its own.
+//
+// Holds a reference to the est::loop it was created against (M3,
+// docs/PLAN.md) rather than its own allocator - the allocator it uses is
+// simply the loop's (loop_.allocator()), an explicit dependency threaded
+// through make_promise_future(loop&) (est:promise) rather than a global
+// singleton like est::platform::instance(): unlike platform, a loop
+// carries real mutable state (its ready-queue, pending timers) a shared
+// global would accumulate cross-test contamination in.
 template <class T> class future_state : public enable_shared_from_this<future_state<T>> {
 public:
   using continuation_node = detail::continuation_node<T>;
@@ -138,28 +144,28 @@ public:
   // stand-in tag type is used instead - see detail::void_value.
   using stored_t = std::conditional_t<std::is_void_v<T>, detail::void_value, T>;
 
-  explicit future_state(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept
-      : allocator_(allocator) {}
+  explicit future_state(loop& loop_ref) noexcept : loop_(loop_ref) {}
 
   future_state(const future_state&) = delete;
   auto operator=(const future_state&) -> future_state& = delete;
   future_state(future_state&&) = delete;
   auto operator=(future_state&&) -> future_state& = delete;
 
-  // Destroys (without invoking) any continuation still queued: either the
-  // promise was dropped without ever completing, or complete()'s drain
-  // loop was aborted partway through by a throwing continuation (see
-  // run()'s comment). Without this, those already-allocated nodes are
-  // simply unreachable once this future_state itself is gone - a
-  // permanent leak, not just a skipped notification.
+  // Destroys (without invoking) any continuation still queued: the
+  // promise was dropped without ever completing (a continuation that
+  // did become ready was already handed off to est::loop by complete()/
+  // set_continuation(), and is that loop's responsibility to destroy,
+  // not this future_state's - see loop.cppm). Without this, those
+  // still-pending nodes are simply unreachable once this future_state
+  // itself is gone - a permanent leak, not just a skipped notification.
   ~future_state() {
     while (auto* waiter = waiters_.dequeue()) {
       // Safe by construction, not by RTTI: every waiter ever enqueued
-      // into waiters_ is a detail::waiter_node (set_continuation() only
-      // accepts a continuation_node&, itself a waiter_node) - there is
+      // into waiters_ is a detail::ready_node (set_continuation() only
+      // accepts a continuation_node&, itself a ready_node) - there is
       // no dynamic_cast alternative worth paying for here.
       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-      static_cast<detail::waiter_node*>(waiter)->destroy(allocator_);
+      static_cast<detail::ready_node*>(waiter)->destroy(loop_.allocator());
     }
   }
 
@@ -201,12 +207,15 @@ public:
   }
 
   // Registers a continuation node (already allocated via allocator()) to
-  // run once ready. If already ready, invokes it immediately instead of
-  // queueing - single-threaded and synchronous for now; est::loop (M3)
-  // will change this to schedule via the ready-queue instead.
+  // run once ready. If already ready, hands it straight to est::loop's
+  // ready-queue instead of queueing it locally - either way, this
+  // future_state never invokes a continuation itself; est::loop always
+  // does, on its own drain pass, never inline on this call stack (M3,
+  // docs/PLAN.md).
   void set_continuation(continuation_node& node) {
     if (ready()) {
-      run(node);
+      node.bind_owner(this->shared_from_this());
+      loop_.enqueue_ready(node);
       return;
     }
     waiters_.enqueue(node);
@@ -307,7 +316,7 @@ public:
   }
 
   [[nodiscard]] auto allocator() const noexcept -> std::pmr::polymorphic_allocator<std::byte> {
-    return allocator_;
+    return loop_.allocator();
   }
 
   // Registers fn to run once ready. Two calling conventions, chosen by
@@ -336,21 +345,22 @@ public:
   // again themselves. Either way, an exception fn throws (or, in the
   // flattened case, that the inner future<V> fails with) is caught here
   // and routed into the returned future via set_exception() instead of
-  // escaping - unlike this class's own set_value()/set_exception(),
-  // which still abort complete()'s drain loop on an uncaught exception
-  // (see run()'s comment), a chained continuation's failure is isolated
-  // to its own downstream future and does not stop sibling continuations
-  // from running. Runs synchronously, on whichever call stack completes
-  // this future_state (M2 has no loop yet to defer onto - see
-  // docs/PLAN.md, M3).
+  // escaping - a chained continuation's failure is isolated to its own
+  // downstream future and does not stop a sibling continuation queued
+  // behind it from running. Never runs inline on whichever call stack
+  // completes this future_state: est::loop always defers actually
+  // invoking it to its own ready-queue drain pass instead (M3,
+  // docs/PLAN.md) - the returned future<U> reuses this future_state's
+  // own loop, so a chain of then() calls all resolve on that one loop.
   template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
-    auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator_, allocator_);
+    auto downstream =
+        shared_ptr<future_state<downstream_value_type>>::make(loop_.allocator(), loop_);
     auto downstream_for_node = downstream; // copy: the node keeps its own reference too
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-    auto* node = allocator_.template new_object<node_type>(std::forward<Fn>(fn),
-                                                           std::move(downstream_for_node));
+    auto* node = loop_.allocator().template new_object<node_type>(std::forward<Fn>(fn),
+                                                                  std::move(downstream_for_node));
     set_continuation(*node);
     return future<downstream_value_type>(std::move(downstream));
   }
@@ -421,7 +431,8 @@ private:
     // `this` here is concrete_continuation<Fn, U>*, so delete_object
     // deallocates with this type's actual size/alignment - the whole
     // reason destroy() is virtual instead of the caller deallocating
-    // through a waiter_node& (see that class's own doc comment).
+    // through a detail::ready_node& (see that class's own doc comment,
+    // est:loop).
     void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
       allocator.delete_object(this);
     }
@@ -492,39 +503,30 @@ private:
   // in one place across all three setters.
   void check_not_completed() { check(!ready(), "future_state completed more than once"); }
 
-  // Drains every registered continuation (normally at most one - future
-  // is meant to be a single-consumer handle - but nothing stops a caller
-  // from registering more than one via then(), and the underlying list
-  // already supports it; LIFO, same order est::waiter_list is documented
-  // to use). Called by each setter after it has already stored the
-  // result into result_ - this function only drains, it doesn't know or
-  // care what was stored.
+  // Hands every registered continuation off to est::loop's ready-queue
+  // (normally at most one - future is meant to be a single-consumer
+  // handle - but nothing stops a caller from registering more than one
+  // via then(), and the underlying list already supports it; drained in
+  // est::waiter_list's documented LIFO order). Called by each setter
+  // after it has already stored the result into result_ - this function
+  // only drains, it doesn't know or care what was stored. Each node
+  // binds a fresh shared_ptr back to this future_state right before
+  // being handed off (see continuation_node<T>::bind_owner()'s own doc
+  // comment on why not earlier), so this future_state is guaranteed to
+  // survive until est::loop actually runs (and destroys) it, even if
+  // every other reference to it (promise, future) is dropped in the
+  // meantime.
   void complete() {
     while (auto* waiter = waiters_.dequeue()) {
-      run(*static_cast<continuation_node*>(waiter));
+      auto& node = *static_cast<continuation_node*>(waiter);
+      node.bind_owner(this->shared_from_this());
+      loop_.enqueue_ready(node);
     }
   }
 
-  // Guarantees the node is destroyed even if invoke() throws (a
-  // continuation's own exception is not this future_state's problem to
-  // swallow, but leaking the node it ran in would be a separate bug on
-  // top of whatever the continuation did). A then()-created continuation
-  // never actually throws out of invoke() - its own try/catch routes any
-  // exception into its downstream future instead (see then()'s doc
-  // comment) - but a continuation_node isn't required to go through
-  // then(), so this guard stays: a hypothetical throwing one would still
-  // abort the drain loop in complete() before any later-queued
-  // continuations run, an accepted M2-scope limitation for that case, to
-  // be revisited once M3's loop dispatches continuations independently
-  // instead of inline on the completer's own call stack.
-  void run(continuation_node& node) {
-    scope_exit const guard{[&node, allocator = allocator_]() noexcept { node.destroy(allocator); }};
-    node.invoke(*this);
-  }
-
+  loop& loop_;
   waiter_list waiters_;
   std::variant<std::monostate, stored_t, std::exception_ptr> result_;
-  std::pmr::polymorphic_allocator<std::byte> allocator_;
 };
 
 } // namespace est
@@ -533,9 +535,9 @@ export namespace est {
 
 // Consumer handle: a thin, move-only view over a future_state<T>, backed
 // by an est::shared_ptr so destroying a future does not destroy the
-// future_state if something else - a still-live est::promise, or (once
-// est::loop exists, M3) the loop's own keep-alive registration - still
-// references it.
+// future_state if something else - a still-live est::promise, or a
+// continuation node already handed off to est::loop's ready-queue (M3,
+// see continuation_node<T>::bind_owner()) - still references it.
 template <class T> class future {
 public:
   explicit future(shared_ptr<future_state<T>> state) noexcept : state_(std::move(state)) {}

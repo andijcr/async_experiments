@@ -14,6 +14,13 @@ public:
     return current;
   }
 
+  // A no-op: these tests exercise est::timer_queue directly and never
+  // drive an est::loop, so sleep_until() is never actually called - every
+  // est::platform::interface implementation must still provide one
+  // (docs/PLAN.md, M3). See est/tests/loop_tests.cpp's own fake_platform
+  // for an implementation that actually advances a fake clock instead.
+  void sleep_until(std::chrono::steady_clock::time_point /*deadline*/) const noexcept override {}
+
   [[noreturn]] void assert_failure(std::string_view /*message*/,
                                    std::source_location /*location*/) const noexcept override {
     std::abort();

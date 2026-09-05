@@ -8,7 +8,8 @@ import std;
 
 auto main() -> int {
   try {
-    auto [promise, future] = est::make_promise_future<int>();
+    est::loop loop;
+    auto [promise, future] = est::make_promise_future<int>(loop);
     promise.set_value(42);
     std::println("est::future value: {}", future.get());
   } catch (...) {
