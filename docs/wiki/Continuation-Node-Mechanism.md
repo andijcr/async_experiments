@@ -277,21 +277,21 @@ instantiation.
 ## Flattening is not a special case
 
 When `Fn`'s result is itself a `future<V>`, `then()` doesn't special-case
-the node hierarchy at all — `fulfill()`'s `is_future_v` branch just calls
-`.then()` *again*, on the inner future, registering an ordinary wrapped
-continuation that forwards the inner result into the outer `downstream_`:
+the node hierarchy at all — `fulfill()`'s `is_future_v` branch registers an
+ordinary forwarding callback on the inner future that reports its eventual
+value or exception straight into the outer `downstream_`:
 
 ```cpp
 template <class R> void fulfill(R&& result) {
   if constexpr (detail::is_future_v<std::decay_t<R>>) {
     using inner_value_type = detail::unwrap_future_t<std::decay_t<R>>;
     auto downstream_copy = downstream_;
-    std::forward<R>(result).then([downstream_copy](future<inner_value_type>& inner_future) {
+    std::forward<R>(result).on_ready([downstream_copy](future<inner_value_type>& inner_future) {
       if (inner_future.failed()) {
         downstream_copy->set_exception(inner_future.get_exception());
         return;
       }
-      // ...forward the value (or a thrown exception while copying it)...
+      // ...forward the value (moved, not copied) or a thrown exception...
     });
   } else {
     downstream_->set_value(std::forward<R>(result));
@@ -299,13 +299,78 @@ template <class R> void fulfill(R&& result) {
 }
 ```
 
-That nested `.then()` call goes through *exactly* the same `then()`
-implementation described above — a new `concrete_continuation` gets
-allocated for the forwarding lambda, a new (throwaway) downstream
-`future_state` gets created for it, and it defers to `est::loop` exactly
-like any other continuation. This is elegant (no special-cased node type
-for flattening) but not free: it's the direct cause of the extra
-allocations a flattening `.then()` costs, documented in
-[Allocation Patterns](Allocation-Patterns.md#flattening-costs-two-extra-allocations)
-and tracked as a known inefficiency in
-[issue #25](https://github.com/andijcr/async_experiments/issues/25).
+An earlier version of this called `.then()` here instead of `.on_ready()`
+(issue #25). That's the more obvious way to register a callback, and it
+worked — but `then()` exists to hand the *caller* a `future<U>` to chain
+onward from, and this call site had nowhere to put one: the forwarding
+lambda already reports straight into the real `downstream_`, and the
+`future<void>` `.then()` handed back was discarded the instant it was
+created. Paying for that anyway meant a throwaway `future_state<void>`
+plus a full `concrete_continuation<Fn, void>` — with its own
+wrapped/unwrapped dispatch and `fulfill()`/`invoke_and_fulfill()`
+machinery, none of which the forwarding lambda (always wrapped, always
+`void`-returning) ever needed — for every single flattening `.then()`
+call, allocated and freed without anything ever observing either one.
+
+### `on_ready()`: `then()` without a downstream
+
+`on_ready()` is `then()`'s registration mechanism (`set_continuation()`)
+with the downstream-future half removed:
+
+```cpp
+template <class Fn>
+  requires std::invocable<Fn&, future<T>&>
+void on_ready(Fn&& fn) {
+  using decayed_fn = std::decay_t<Fn>;
+  auto* node = loop_.allocator().template new_object<raw_continuation<decayed_fn>>(
+      std::forward<Fn>(fn));
+  set_continuation(*node);
+}
+```
+
+Its node, `raw_continuation<Fn>`, is templated on `Fn` alone — no `U`, no
+`downstream_` member, no dispatch:
+
+```cpp
+template <class Fn> class raw_continuation final : public continuation_node {
+public:
+  explicit raw_continuation(Fn fn) : fn_(std::move(fn)) {}
+  void invoke(future_state& state) override {
+    future<T> view(state.shared_from_this());
+    fn_(view);
+  }
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    allocator.delete_object(this);
+  }
+private:
+  Fn fn_;
+};
+```
+
+`invoke()` builds the same `future<T>` view `then()`'s own wrapped mode
+builds (`state.shared_from_this()`) and calls `fn_` with it — always
+wrapped, since `on_ready()` has exactly one calling convention, not two.
+Whatever `fn` returns is discarded, and an exception `fn` throws is not
+caught here: unlike `then()`, there's no downstream to route it into, so
+`fn` owns its own error handling — `fulfill()`'s forwarding lambda already
+wraps its own logic in a `try`/`catch` for exactly this reason.
+
+The net effect for a flattening `.then()` call: one fewer allocated
+`future_state`, one fewer allocated node (a smaller one, at that, with no
+wrapped/unwrapped branching or `fulfill()` recursion baked into its
+`invoke()`), and — because `fulfill()`'s forwarding lambda also switched
+from a copying `inner_future.get()` to `std::move(inner_future).get()` in
+the same change — one copy turned into a move. That move isn't just
+faster: `inner_future` is a fresh, single-owner `future<U>` (`fn`'s own
+return value, not a stored one), so copying it forced `U` to be
+copy-constructible even for a purely internal forwarding step a caller
+never sees — a `future<std::unique_ptr<T>>` returned from a `then()`
+callback couldn't be flattened at all under the old code, since
+`std::unique_ptr` has no copy constructor to select. `future_tests.cpp`'s
+own regression test for this fix exists specifically because it would not
+have compiled before it.
+
+[Allocation Patterns](Allocation-Patterns.md#flattening-costs-one-extra-allocation)
+has the same story from that page's own angle (total allocation counts per
+`then()` shape); [issue #25](https://github.com/andijcr/async_experiments/issues/25)
+is where this was found and fixed.

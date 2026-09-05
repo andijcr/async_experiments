@@ -37,42 +37,35 @@ complex `.then()` chain actually cost."
 | `make_promise_future<T>(loop)` | **1** | `future_state<T>`'s control block |
 | `future<T>::then(fn)` (plain, non-flattening) | **2** | the downstream `future_state<U>`'s control block, plus the `concrete_continuation<Fn, U>` node |
 | `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`'s control block, plus the `concrete_timer_node<Fn>` node |
-| `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 2 more when it runs** | the usual 2 for the visible registration, plus 2 more, *invisible to the caller*, for a throwaway forwarding continuation — see below |
+| `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 1 more when it runs** | the usual 2 for the visible registration, plus 1 more, *invisible to the caller*, for `on_ready()`'s forwarding node — see below |
 
 A plain chain of `N` `.then()` calls off one `make_promise_future` therefore
 costs **`1 + 2N`** allocations, full stop — regardless of how deep the chain
 is, each link is exactly 2 allocations, known statically at the call site.
 
-## Flattening costs two extra allocations
+## Flattening costs one extra allocation
 
 [Continuation Node Mechanism](Continuation-Node-Mechanism.md#flattening-is-not-a-special-case)
 covers *why*: a `.then()` callback returning `future<V>` doesn't get special
-node-hierarchy treatment. `fulfill()` just calls `.then()` *again*, on the
-inner future, registering an ordinary forwarding continuation:
+node-hierarchy treatment. `fulfill()` registers an ordinary forwarding
+callback via `on_ready()` (not `then()`) on the inner future:
 
 ```cpp
-std::forward<R>(result).then([downstream_copy](future<inner_value_type>& inner_future) {
-  // ...forwards inner_future's value/exception into downstream_copy...
+std::forward<R>(result).on_ready([downstream_copy](future<inner_value_type>& inner_future) {
+  // ...forwards inner_future's value (moved) or exception into downstream_copy...
 });
 ```
 
-That nested `.then()` call is a completely ordinary one — it costs the usual
-2 allocations (a throwaway `future_state<void>` downstream, since the
-forwarding lambda returns `void`, plus its own `concrete_continuation` node)
-— except **nobody ever reads the `future<void>` it returns**. `fulfill()`
-discards it immediately. Both the throwaway downstream and its node are
-allocated, used for exactly one purpose (observing the inner future's
-completion once), and freed — pure overhead that produces no observable
-value.
-
-This is a real, known inefficiency, filed as
-[issue #25](https://github.com/andijcr/async_experiments/issues/25)
-("`then()` flatten path allocates a throwaway `future_state` + continuation
-node per call") rather than silently accepted — the fix would need a
-lower-level "register a raw callback, no downstream future needed" primitive
-on `future_state<T>` that `fulfill()`'s flatten branch could use instead of
-going through the full `then()` machinery. Not implemented yet: it's a real
-internal-API addition, not a local tweak.
+`on_ready()` (issue #25) is `then()`'s registration mechanism with the
+downstream-future half removed: it allocates one `raw_continuation<Fn>`
+node — templated on `Fn` alone, with no `downstream_` member and no
+wrapped/unwrapped dispatch — and registers it directly, with no
+`future_state<U>`/`future<U>` created for anyone to read. An earlier version
+of this called `.then()` here instead, which worked (the discarded
+`future<void>` it returned was never wrong, just wasted) but paid for a
+second, throwaway `future_state<void>` plus a full `concrete_continuation`
+node every single time, for a caller — `fulfill()`, the only one that
+exists — with nowhere to put a downstream future in the first place.
 
 ## Worked example: a three-link chain
 
