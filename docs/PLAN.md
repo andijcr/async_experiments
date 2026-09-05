@@ -679,6 +679,12 @@ flagged the tests' own `.find(x) != npos` idiom in favor of C++23's
   self-referencing `shared_ptr`s yet; building the mixin now means
   guessing at its shape with no real call site to validate against.
   Revisit when one appears (M3's loop is a plausible candidate).
+  **Reopened and implemented in the issue #23 PR** (see that section's
+  "Fourth follow-up" below) once a real call site appeared: a review
+  comment on that PR wanted `then()`'s wrapped-mode callback to receive
+  an `est::future<T>` instead of `future_state<T>&`, which needed exactly
+  this - `est::enable_shared_from_this<T>` now exists in
+  `est/src/util/shared_ptr.cppm`.
 - **#12** (analyze `waiter_list` vs. `std::list`, consider switching) -
   analyzed: the current design is intrusive (the list pointer lives inside
   the already-allocated waiter object, zero extra allocations to enqueue);
@@ -1440,6 +1446,391 @@ before pushing/merging" posture. **Next step once merged:** reset the
 `main` and start M3 (below) - platform/timer/mutex (M1) and
 future/promise/continuation (M2) are both done; nothing is blocking M3
 from starting immediately.
+
+### Issue #23: redesigned `then()` chaining, `failed()`, `future<void>` (done)
+
+Requested by the repo owner as a from-scratch redesign of `then()`'s
+calling convention, on top of M2's shape described above. `est/src/
+future.cppm`/`est/src/promise.cppm` changed; `future_state<T>::then()`'s
+own doc comment now describes this directly, so only the *design
+decisions* behind it are recorded here.
+
+- **`bool failed()`**, on both `future_state<T>` and `future<T>` —
+  `ready() && holds an exception`. Lets a callback that wants the
+  wrapped, no-unwrap calling convention (next bullet) check
+  success/failure without calling `get()` (which rethrows) just to find
+  out.
+- **Two calling conventions for `then(fn)`, chosen by how `fn` can be
+  invoked** — checked in this order:
+  1. `fn(future_state<T>&)` — "wrapped": always called, on success *or*
+     failure, with the `future_state` itself; `fn` inspects
+     `ready()`/`failed()`/`get()` to decide what to do. This is M2's
+     original (only) convention, unchanged.
+  2. `fn(const T&)`, or `fn()` when `T` is `void` — "unwrapped": called
+     only on success, with the value itself (or nothing, for `void`). On
+     failure `fn` is *not* called at all — the returned future fails
+     with the same exception instead.
+  Checked in that order so a callback explicitly typed to take
+  `future_state<T>&` always gets wrapped, no-unwrap behavior, even if it
+  would incidentally also accept a `T` (a generic `auto&` lambda, say).
+  The unwrapped path's "call only on success, else auto-propagate" isn't
+  a separate branch in the implementation — it falls out for free by
+  making `get()` (which already rethrows on failure) `fn`'s own argument
+  expression: a failure surfaces as an exception thrown *before* `fn`
+  ever runs, caught by the same `catch (...)` that already handles `fn`
+  throwing on its own.
+- **`future<T>::then()`'s callback may now return `void`** (producing a
+  `future<void>`) or **a `future<U>`** — the latter is *flattened*: the
+  returned future is `future<U>` directly, not `future<future<U>>` a
+  caller would have to unwrap again themselves (futures are monadic).
+  Implemented by registering a second, internal *wrapped* continuation on
+  the inner `future<U>` that forwards its value/exception into the outer
+  continuation's own downstream `future_state<U>` once it resolves -
+  reusing the exact same get()-rethrows-into-catch propagation idiom, so
+  flattening didn't need any new machinery of its own, just one more use
+  of `then()`.
+- **`future_state<void>`/`future<void>` are not separate class template
+  specializations** — `future_state<T>`/`future<T>`/`promise<T>` stay
+  single, generic templates, made `void`-safe internally instead. Two
+  techniques do the actual work:
+  - Methods split by `void`-ness (`set_value()` vs. `set_value(const
+    T&)`/`set_value(T&&)`) use a trailing `requires` clause
+    (`requires std::is_void_v<T>` / `requires (!std::is_void_v<T>)`) to
+    pick the right overload - but the clause alone isn't enough:
+    a parameter's *type* is elaborated the moment the enclosing class
+    template is instantiated, `requires`-clause or not, so
+    `set_value(const T&)`'s parameter would still try to form `const
+    void&` (ill-formed) for `future_state<void>` even though that
+    overload is constrained out. Fixed by spelling the parameter as
+    `const stored_t&` instead of `const T&`, where `stored_t` is `T`
+    itself except when `T` is `void`, in which case it's a private
+    stand-in tag type (`detail::void_value`) — never actually `void`,
+    so the reference is always well-formed, and identical to `T` for
+    every other `T` this class was already used with.
+  - `get()`'s return type differs three ways (`void`, `const T&`, `T&&`)
+    depending on `T`'s void-ness and the deducing-`this` parameter's
+    value category. A single `std::conditional_t`-based trailing return
+    type (the way `T`/`stored_t` above are picked) doesn't work here:
+    `std::conditional_t` instantiates *both* of its type arguments
+    unconditionally (unlike `if constexpr`, which discards the untaken
+    branch), and the non-`void` alternative names `const void&`/`void&&`
+    for `T=void` regardless of which branch would actually be selected
+    at runtime. Fixed by dropping the explicit return type entirely
+    (deduced `auto`) and spelling each of the three cases under its own
+    `if constexpr`, so the ill-formed alternatives are never
+    instantiated for `T=void` in the first place. The same
+    `conditional_t`-instantiates-both-branches trap applies to computing
+    `then()`'s own downstream type from `fn`'s (wrapped- or unwrapped-
+    shaped) invoke result — solved the same way, via a small `consteval`
+    helper with `if constexpr` branches instead of a `conditional_t`
+    expression.
+- **A structured-binding gotcha hit while writing the new tests**, worth
+  recording since it silently produces a "call to deleted [copy]
+  constructor" error that looks unrelated to the actual cause:
+  `auto [promise, future] = make_promise_future<T>();` followed later by
+  `return future;` (returning a *structured binding name* from a lambda
+  building a `future<U>` to flatten into) does **not** get the implicit
+  move-on-return that returning an ordinary named local variable would -
+  the standard's implicit-move rule is specifically about "the name of
+  an object with automatic storage duration declared in the body...of a
+  function", which a structured-binding name (an alias into an anonymous
+  tuple-like object) doesn't count as. Needs an explicit
+  `return std::move(future);`; `future`/`promise` are move-only, so the
+  implicit-copy fallback the compiler otherwise tries fails instead of
+  silently doing something unwanted.
+
+Verified end-to-end in the from-scratch docker devenv image: configure,
+build, 46/46 tests (14 new, covering `failed()`, both calling
+conventions and their failure-auto-propagation, `future<void>` end to
+end, and both value- and `void`-returning flatten), `clang-format`
+clean, `clang-tidy` clean (one real finding along the way -
+`readability-redundant-typename` on three `using X = typename Y::type;`
+aliases that, per this pinned Clang/libc++ version, don't need the
+`typename` disambiguator; removed), new-code coverage 97% (the only
+"missing" lines are callback bodies that tests deliberately assert never
+run - the whole point of the auto-propagate-on-failure tests).
+
+**Follow-up fix, found by a `code-review` pass on PR #24:**
+`future_state<void>::get()` silently "succeeded" (returned normally) when
+called before the future was ever completed, in a Release (`NDEBUG`)
+build - inconsistent with every other `T`. The precondition
+(`ready()`) is checked via `est::check()`, which by design compiles away
+entirely under `NDEBUG` (see `check_not_completed()`'s own comment on
+this project's validate-at-boundaries philosophy) - that part is
+unchanged and correct. What was inconsistent: for `T != void`, `get()`
+still went on to call `std::get<T>(result_)`, which throws
+`std::bad_variant_access` *unconditionally* (not gated by `NDEBUG`) if
+`result_`'s active alternative isn't `T` - an accidental, undocumented
+second line of defense. For `T = void`, the live branch was just
+`return;`, never touching `result_` at all, so that accidental defense
+didn't apply - a caller bug (reading a `future<void>` too early) was
+silently masked specifically for `void`, while the identical bug on any
+other `future<T>` was at least loudly reported. Fixed by having the
+`void` branch also do `(void)std::get<stored_t>(self.result_);` before
+returning, so it exercises the exact same (still accidental, still not a
+substitute for `check()`) safety net every other `T` already gets.
+Not unit-tested: like `check()`'s own failure path and
+`platform::hosted_linux::assert_failure()`, this only manifests when
+`checks_enabled` is off, which this project's `ctest` binary never
+builds with - untestable without process-isolation tooling this project
+doesn't have, same accepted gap as those two.
+
+**Second follow-up fix, found by the repo owner's own PR review:** `get()`'s
+deduced return type was plain `auto`, not `decltype(auto)` - a real
+regression this redesign introduced, not present before it. Plain `auto`
+return-type deduction strips references from the return expression's
+type (the same rule `auto x = expr;` follows for a local variable), so
+`return static_cast<const T&>(std::get<T>(self.result_));` under a plain
+`auto` return type silently deduced to `T` *by value*, not `const T&` -
+turning the class's own documented "non-consuming `const T&`, safe for
+multiple readers" contract into an unconditional copy of `T` on every
+call, and (for the rvalue branch) a copy/move outcome subtly different
+from the documented "returns `T&&`, an opt-in to move" too. `T = int` in
+every existing test meant nothing caught this: a copied `int` and a
+referenced `int` compare equal either way. `decltype(auto)` instead
+takes the exact type of the return expression, references included -
+the same behavior the original, pre-redesign `-> get_result_t<Self>`
+explicit trailing return type gave for free, restored without
+reintroducing the `std::conditional_t`-instantiates-both-branches trap
+`get_result_t` couldn't survive for `T = void` (see above). Verified the
+mechanism directly with a standalone reproduction (plain `auto` copies,
+`decltype(auto)` doesn't, confirmed by printing from copy/move
+constructors) before applying the fix in-repo. Added a regression test
+(`future_state::get() returns a reference into the stored value, not a
+copy`) that takes `&state.get()` twice and requires the same address -
+confirmed it actually catches the regression by temporarily reverting to
+plain `auto` first (the address-of an rvalue doesn't even compile, let
+alone match) before restoring the fix.
+
+**Third follow-up, a design improvement requested in review:** `then()`'s
+`Fn` template parameter was unconstrained; an incompatible callback (one
+matching neither calling convention) only failed via a `static_assert`
+buried inside the private `raw_result_type_tag()` helper - a correct but
+unnecessarily deep diagnostic. Added `detail::then_callback_for<Fn, T>`,
+a concept expressing the same "invocable with `future_state<T>&`, or
+with `const T&`/nothing for `T=void`" disjunction, and constrained
+`then()` with it (`template <detail::then_callback_for<T> Fn> auto
+then(Fn&& fn)`), removing the now-redundant `static_assert`s from
+`raw_result_type_tag()` (Fn's invocability is already guaranteed by the
+time that helper runs). Needed one more instance of the
+"can't write `const T&` unconditionally for `T=void`" pattern already
+seen twice above in this same file: `std::invocable<Fn&, const T&>`
+can't appear directly inside the concept's `||` even when it's the
+*second*, seemingly short-circuited operand - `&&`/`||` short-circuit
+runtime/constexpr *evaluation*, not the requirement that every
+subexpression's types be well-formed to begin with, and forming a
+reference to `void` is a hard, non-SFINAE-eligible error regardless of
+where it's written. Solved with a small `consteval` helper
+(`invocable_unwrapped<Fn, T>()`) using genuinely separate `if constexpr`
+branches, the same technique `get()` and `then()` already use, called as
+an ordinary boolean-valued expression from inside the concept. Verified
+the actual diagnostic improvement directly: a deliberately incompatible
+callback (`future.then([](std::string){ return 1; })` on a `future<int>`)
+now fails right at the `then()` call site with `error: no matching
+member function for call to 'then'` / `note: because
+'detail::then_callback_for<..., int>' evaluated to false`, naming the
+concept and which branch of it failed - not just a `static_assert`
+message from deep inside the implementation.
+
+**Fourth follow-up, reopening issue #11:** a review comment pointed out
+that `future_state<T>` is documented as "a detail of `future`" but was
+`export`ed and handed directly to a "wrapped" `then()` callback as
+`future_state<T>&` - contradicting its own doc comment. Fixing it
+properly meant giving `est::shared_ptr<T>` `enable_shared_from_this`
+parity (`est/src/util/shared_ptr.cppm`) - exactly issue #11
+("shared_ptr adopt-pointer ctor + shared_from_this parity"), closed
+earlier this session for lack of a concrete call site; this is one.
+Flagged the real cost (a genuine API change, not a local fix) before
+doing it, since it meant reopening a design decision the repo owner had
+already made once; asked whether to do it in this PR or as a follow-up,
+and was told to do it here.
+
+- `est::enable_shared_from_this<T>`: an opt-in CRTP base (mirroring
+  `std::enable_shared_from_this`) giving a `shared_ptr<T>`-managed `T`
+  a `shared_from_this()` that hands out a *new*, ref-count-bumped
+  `shared_ptr<T>` to itself. Weak, not owning, on its own: stores only a
+  raw `void*` back-pointer to its own control block, set once by
+  `shared_ptr<T>::make()` (via an `if constexpr (requires ...)` check,
+  a no-op for any `T` that doesn't inherit from it) right after
+  construction - storing an *owning* `shared_ptr<T>` inside `T` itself
+  would be a self-cycle this ref-counted pointer's plain `int` count
+  could never break (the object would then always hold at least one
+  reference to itself). A new `shared_ptr<T>::from_owning_control_block()`
+  reconstructs a real `shared_ptr<T>` from that raw pointer, bumping the
+  ref count exactly like an ordinary copy would - safe specifically
+  because `shared_from_this()` is only ever called while at least one
+  other `shared_ptr<T>` to the same object is known to be alive (the one
+  whose member function is calling it).
+  `bugprone-crtp-constructor-accessibility` (a real clang-tidy finding,
+  not a style nit - it flags exactly the classic CRTP mistake of
+  inheriting `enable_shared_from_this<Wrong>` instead of
+  `enable_shared_from_this<Self>`) made the default constructor private
+  with `friend T;`, so only the one correct CRTP usage can construct it
+  at all.
+- `future_state<T>` now inherits `enable_shared_from_this<future_state<T>>`.
+  Its forward declaration moved out of the `export namespace est {}`
+  block into a plain `namespace est {}` one - visible to `est:promise`
+  (another partition of the same module, which still needs
+  `shared_ptr<future_state<T>>`) without being nameable from `import
+  est;` consumer code at all anymore, closing the contradiction the
+  review comment pointed out. (`est:promise` needed no changes itself -
+  cross-partition visibility within one module doesn't require
+  `export`, only visibility to code outside the module does.)
+- The "wrapped" calling convention's parameter type changed everywhere
+  it's checked or used - `detail::then_callback_for`, `then()`'s own
+  `raw_result_type_tag()`, `concrete_continuation::invoke()`, and the
+  monadic-flatten forwarding lambda in `fulfill()` - from
+  `future_state<T>&` to `future<T>&`, built fresh per invocation via
+  `state.shared_from_this()`. No change to the *unwrapped* convention or
+  to `get()`/`failed()`, which stayed exactly as they were.
+- Every existing test's wrapped-mode lambdas (`[](est::future_state<int>&
+  state) {...}`) rewritten to take `est::future<int>&` instead - a
+  mechanical, if wide, change once the type itself moved. One test
+  needed more than a mechanical rename: a regression test added earlier
+  this PR directly named `future_state<int>&` specifically to take the
+  address of two `get()` calls and prove they matched (verifying
+  `decltype(auto)`, not plain `auto`, on the *underlying* `get()`) - no
+  longer possible to write that way once `future_state` stopped being
+  nameable. Rewritten to observe the same underlying guarantee through
+  the still-public *unwrapped* convention instead: two separate `then()`
+  registrations, each receiving its own `const int&` argument straight
+  from the same `get()`, asserting the two addresses match. Arguably a
+  more representative test of a real usage pattern (multiple readers)
+  than the original internal-access version was.
+- Added direct tests for `enable_shared_from_this` itself in
+  `est/tests/shared_ptr_tests.cpp` (a `self_aware` type opting in,
+  `shared_from_this()` pointing at the same object, and bumping the ref
+  count like an ordinary copy), plus a regression test confirming a `T`
+  that doesn't opt in is completely unaffected.
+
+Re-verified the concept-based diagnostic (previous follow-up) still
+names the right type after this change: the same deliberately
+incompatible callback now fails naming `future<int>&` instead of
+`future_state<int>&` in the "candidate ignored" note. Verified end to
+end in the docker devenv: 50/50 tests (4 new), `clang-format` clean,
+`clang-tidy` clean (one real finding along the way -
+`bugprone-crtp-constructor-accessibility` on the new CRTP base, fixed as
+described above), new-code coverage 98% against `origin/main`
+(`shared_ptr.cppm`'s new code at 100%).
+
+**Fifth follow-up, found by a `code-review` pass on the PR:**
+`enable_shared_from_this<T>::shared_from_this()` had no precondition
+check at all - calling it on a `T` never actually constructed via
+`shared_ptr<T>::make()` (e.g. a stack-allocated or `new`-ed
+`self_aware`) dereferenced a null `control_block_` with zero diagnostic.
+Every other precondition in this codebase - `future_state::get()`'s
+`ready()`, `set_value()`'s `check_not_completed()` - is guarded by
+`est::check()`, even if only in debug builds; this one had none, unlike
+`std::enable_shared_from_this`, which at least throws `std::bad_weak_ptr`
+for the equivalent misuse. Fixed by adding
+`check(control_block_ != nullptr, ...)` to `shared_from_this()` (needed
+a new `import :check;` in `shared_ptr.cppm`, safe: `:check` already
+depends on `:platform`, itself only on `:util.scope_exit`, no cycle with
+`:util.shared_ptr`).
+
+Deliberately *not* extended to this file's other bare-pointer operations
+(`operator*`/`operator->` on an empty `shared_ptr`) - those match
+`std::shared_ptr`'s own long-documented "caller's mistake" contract that
+every `shared_ptr` user already knows to avoid, while an
+`enable_shared_from_this`-derived `T` built outside `make()` is a much
+less obvious, project-specific way to reach the same failure mode. Not
+unit-tested: like `check()`'s own failure path elsewhere in this
+codebase, this only manifests as an abort with `checks_enabled` on,
+which every test here already runs with - untestable without
+process-isolation tooling this project doesn't have, same accepted gap.
+
+The same review pass re-surfaced the `fulfill()` monadic-flatten
+allocation overhead already reported and discussed earlier on this PR
+(see "flattening a chained then() frees every node involved" area of
+`future.cppm`) - not a new finding, still not chased per that earlier
+discussion.
+
+**Sixth follow-up, a simplification suggested in review:** `get()`'s
+lvalue branch explicitly cast its result to `const T&`
+(`static_cast<const T&>(std::get<T>(self.result_))`) rather than just
+forwarding `self` uniformly and letting `std::get<T>`'s own overload set
+pick the reference category - the reviewer suspected the explicit
+`const` cast might no longer be necessary but asked to check before
+changing it. Traced every call site of `future_state::get()`
+(`then()`'s unwrapped dispatch, the flatten forwarding lambda,
+`future<T>::get()` itself) - none read the result more than once or
+mutate through it; each either discards it immediately (after the
+rethrow-on-failure side effect) or copies/forwards it straight into
+something else. Confirmed the `const` cast was protecting against a
+capability nothing internal to this file ever exercises, and one no
+*external* caller can reach either now that `future_state` is
+module-private (previous follow-up) - the property `const T&` was
+guarding used to matter when `future_state<T>&` was a public `then()`
+callback parameter, and stopped mattering once that parameter type
+became `future<T>&` instead.
+
+Simplified accordingly: the `if constexpr (std::is_lvalue_reference_v
+<Self>)` branch is gone, replaced by a single `return
+std::get<T>(std::forward<Self>(self).result_);` - `decltype(auto)`
+(already in place from the earlier `auto`-vs-`decltype(auto)` follow-up)
+takes whatever `std::get`'s own overload set picks for the forwarded
+value category: `T&` for a mutable lvalue, `const T&` for a const
+lvalue, `T&&` for an rvalue. A mutable lvalue `get()` call now returns a
+genuinely mutable `T&` instead of a forced `const T&` - confirmed safe
+specifically *because* of the module-privacy change two follow-ups back,
+not in spite of it. Verified end to end: 50/50 tests unchanged,
+`clang-format`/`clang-tidy` clean, no call site needed updating.
+
+Two more review comments landed on this PR after the above:
+
+**Seventh, a design question left open:** whether `future<T>::then()`
+could pass a `future<T>` clone of itself down into `then()`/the
+continuation node, instead of `future_state<T>` needing
+`enable_shared_from_this` (the fourth follow-up) at all. Worked through
+it: making that actually save anything (not just move the cost)
+requires the clone to be conditional on `Fn` needing the wrapped shape,
+which means `future<T>::then()` needs its own copy of the
+`std::invocable<Fn&, future<T>&>` check (a 5th occurrence of the same
+predicate, after the concept, `raw_result_type_tag()`, and `invoke()`),
+plus splitting `future_state::then()` into two overloads (with/without
+a `future<T>` parameter) sharing most of their body. Weighed against
+that: `enable_shared_from_this` costs `future_state` one `void*` (8
+bytes) and a vtable-free CRTP base, and `shared_from_this()` itself is
+already only ever called lazily, once per *wrapped* continuation that
+actually runs - never for unwrapped ones. Posted the trade-off and left
+it to the repo owner to decide whether the per-instance bytes are worth
+the added overload/duplication; not changed pending their answer.
+
+**Eighth and ninth, a real optimization applied in two places:**
+`invoke()`'s unwrapped-mode auto-propagate-on-failure path (`state.get()`,
+relying on its rethrow to land in the surrounding `catch (...)`) was
+doing an actual C++ throw/catch round-trip purely to retrieve an
+exception `failed()` could already tell us was there - the
+monadic-flatten forwarding continuation in `fulfill()` had the exact
+same pattern (`inner_future.get()`, rethrow into `catch (...)`) for the
+same reason. Added `get_exception()` - a plain
+`std::get<std::exception_ptr>(result_)`, no rethrow, pairing with
+`failed()` - on both `future_state<T>` and (since the flatten lambda
+only ever holds a `future<T>&`, never the private `future_state<T>`
+directly) `future<T>` itself, and restructured both call sites to check
+`failed()` first, calling `get_exception()` for the *known*
+propagate-on-failure case instead of relying on `get()`'s throw.
+`catch (...)` stays around the remaining, genuinely-uncertain path in
+both places (an `fn_` exception in `invoke()`; an unexpected exception
+from copying/moving the value itself in the flatten lambda) - only the
+"we already know it failed" branch stopped paying for a throw/catch
+round-trip it didn't need. `get_exception()` needed one
+`NOLINTNEXTLINE(bugprone-exception-escape)`: `std::get` would throw
+`std::bad_variant_access` if the (unchecked) precondition were ever
+violated, which - escaping this `noexcept` function - terminates
+instead of continuing on bad state; intended fail-fast behavior for a
+violated precondition, not something to route around.
+
+`get_exception()` is genuinely public on `future<T>` now (not just an
+internal `future_state` helper), pairing with the already-public
+`failed()` - a deliberate, small, minimal API addition rather than
+routing the flatten lambda through friendship, since it's a natural
+counterpart to a capability already exposed. Verified end to end: 50/50
+tests unchanged, `clang-format`/`clang-tidy` clean, new-code coverage
+97% against `origin/main` - the only new gap is the flatten lambda's
+`catch (...)` body itself (lines it can now only reach for a genuinely
+throwing value copy/move, not the known-failure case that used to also
+pass through it), not worth a dedicated throwing-type test for.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

@@ -9,6 +9,13 @@ export namespace est {
 // Producer handle: a thin, move-only view over a future_state<T>.
 template <class T> class promise {
 public:
+  // Same as future_state<T>::stored_t: T itself, except when T is void,
+  // where it's a stand-in tag type instead - const T&/T&& below would be
+  // "reference to void", ill-formed, and (unlike a requires-clause,
+  // which only gates overload resolution) a parameter type is elaborated
+  // as soon as promise<T> itself is instantiated, requires-clause or not.
+  using stored_t = future_state<T>::stored_t;
+
   explicit promise(shared_ptr<future_state<T>> state) noexcept : state_(std::move(state)) {}
   promise(const promise&) = delete;
   auto operator=(const promise&) -> promise& = delete;
@@ -16,8 +23,24 @@ public:
   auto operator=(promise&&) noexcept -> promise& = default;
   ~promise() = default;
 
-  void set_value(const T& value) { state_->set_value(value); }
-  void set_value(T&& value) { state_->set_value(std::move(value)); }
+  void set_value()
+    requires std::is_void_v<T>
+  {
+    state_->set_value();
+  }
+
+  void set_value(const stored_t& value)
+    requires(!std::is_void_v<T>)
+  {
+    state_->set_value(value);
+  }
+
+  void set_value(stored_t&& value)
+    requires(!std::is_void_v<T>)
+  {
+    state_->set_value(std::move(value));
+  }
+
   void set_exception(std::exception_ptr exception) { state_->set_exception(std::move(exception)); }
 
 private:
