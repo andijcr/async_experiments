@@ -127,7 +127,7 @@ sequenceDiagram
   participant caller
   participant parent as parent future_state&lt;T&gt;
   participant node as continuation_node&lt;T&gt;
-  participant loop as est::loop
+  participant est_loop as est::loop
 
   caller->>parent: then(fn)
   parent->>node: allocate (holds fn, downstream)
@@ -139,12 +139,12 @@ sequenceDiagram
     parent->>parent: complete(): waiters_.dequeue()
   end
   parent->>node: bind_owner(shared_from_this())
-  parent->>loop: enqueue_ready(node)
+  parent->>est_loop: enqueue_ready(node)
   Note over node: node now holds a real shared_ptr<br/>keeping `parent` alive
-  loop->>loop: drain_ready(): ready_.dequeue()
-  loop->>node: run() -> invoke(*owner_)
+  est_loop->>est_loop: drain_ready(): ready_.dequeue()
+  est_loop->>node: run() -> invoke(*owner_)
   node->>node: runs fn_, reports into downstream_
-  loop->>node: destroy(allocator) [always, via scope_exit guard]
+  est_loop->>node: destroy(allocator) [always, via scope_exit guard]
 ```
 
 Two possible starting states, one converging path:
