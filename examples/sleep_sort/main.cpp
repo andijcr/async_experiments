@@ -24,11 +24,7 @@ auto main() -> int {
     std::ranges::iota(numbers, 1);
     std::ranges::shuffle(numbers, std::mt19937{std::random_device{}()});
 
-    std::print("input: ");
-    for (const int n : numbers) {
-      std::print("{} ", n);
-    }
-    std::println();
+    std::println("input: {}", numbers);
 
     est::loop loop;
     using namespace std::chrono_literals;
