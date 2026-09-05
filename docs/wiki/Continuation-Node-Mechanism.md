@@ -198,20 +198,23 @@ continuation still sitting in the loop's ready-queue, even if every other
 ## The two calling conventions
 
 `invoke()`'s real body — the part `concrete_continuation<Fn, U>` actually
-implements — dispatches on how `Fn` can be called, checked in this order:
+implements — dispatches on how `Fn` can be called, checked in this order
+(precedence changed by issue #39 — see below):
 
 ```cpp
 void invoke(future_state& state) override {
   try {
-    if constexpr (std::invocable<Fn&, future<T>&>) {
+    if constexpr (detail::invocable_unwrapped<Fn, T>()) {
+      if (state.failed()) {                        // "unwrapped", auto-propagate
+        downstream_->set_exception(state.get_exception());
+      } else if constexpr (std::is_void_v<T>) {
+        invoke_and_fulfill();                        // "unwrapped", T = void
+      } else {
+        invoke_and_fulfill(state.get());              // "unwrapped", T != void
+      }
+    } else {
       future<T> view(state.shared_from_this());   // "wrapped"
       invoke_and_fulfill(view);
-    } else if (state.failed()) {                  // "unwrapped", auto-propagate
-      downstream_->set_exception(state.get_exception());
-    } else if constexpr (std::is_void_v<T>) {
-      invoke_and_fulfill();                        // "unwrapped", T = void
-    } else {
-      invoke_and_fulfill(state.get());              // "unwrapped", T != void
     }
   } catch (...) {
     downstream_->set_exception(std::current_exception());
@@ -219,25 +222,57 @@ void invoke(future_state& state) override {
 }
 ```
 
-- **Wrapped** (`Fn` invocable with `future<T>&`): always called, success or
-  failure, with a *fresh* `future<T>` view built via `shared_from_this()` —
-  never a stored one, since a continuation only ever runs once. `Fn`
-  inspects `ready()`/`failed()`/`get()` itself to decide what to do. No
-  implicit unwrap, no auto-propagation.
 - **Unwrapped** (`Fn` invocable with `const T&`, or with nothing when
   `T = void`): called *only* on success, with the value itself. On failure,
   `Fn` is skipped entirely and the exception is forwarded straight into
   `downstream_` via `get_exception()` — a plain pointer copy, not a
   throw/catch round-trip, since `failed()` already established there's an
   exception waiting.
+- **Wrapped** (`Fn` invocable with `future<T>&`): always called, success or
+  failure, with a *fresh* `future<T>` view built via `shared_from_this()` —
+  never a stored one, since a continuation only ever runs once. `Fn`
+  inspects `ready()`/`failed()`/`get()` itself to decide what to do. No
+  implicit unwrap, no auto-propagation.
 
-Checked in that order so a callback explicitly typed to take `future<T>&`
-always gets wrapped, no-unwrap behavior, even if it would incidentally also
-accept a plain `T` (e.g. a generic `auto&` lambda). `then_callback_for<Fn, T>`
-(the concept constraining `then()`'s template parameter) mirrors this exact
-dispatch, so an `Fn` matching neither shape fails right at the `then()` call
-site with a "constraints not satisfied" diagnostic, not deep inside
-`invoke()`'s own instantiation.
+Checked in that order — unwrapped first — so a generic callback (e.g. an
+`auto&` lambda, incidentally invocable both ways, since a template
+parameter binds to either) defaults to unwrapped. Wrapped is only chosen
+when unwrapped genuinely isn't viable: `Fn` explicitly typed to take
+`future<T>&` isn't invocable with a plain `const T&`, so it still falls
+through to wrapped exactly as before — the precedence change only affects
+callbacks generic enough to accept both shapes, flipping which one they
+get by default. (An earlier version of this code checked wrapped first,
+so a generic lambda like this silently got wrapped, no-unwrap behavior
+without opting into it — found and reported as issue #39.)
+
+`then_callback_for<Fn, T>` (the concept constraining `then()`'s template
+parameter) needed the identical reordering, and for a sharper reason than
+just matching `invoke()`'s own precedence:
+
+```cpp
+template <class Fn, class T>
+concept then_callback_for = invocable_unwrapped<Fn, T>() || std::invocable<Fn&, future<T>&>;
+```
+
+Constraint disjunction (`||`) short-circuits left-to-right — whichever
+operand is written first is the one actually evaluated for an `Fn` that
+satisfies it, the second never even instantiated. That matters here
+because the two checks aren't equally safe to attempt: a generic callback
+that's only *valid* when called with a plain `T` — one that returns a copy
+of its argument, say, which `future<T>`'s deleted copy constructor makes
+ill-formed for a `future<T>&` argument — doesn't fail `std::invocable<Fn&,
+future<T>&>` gracefully. "Use of a deleted function" isn't an
+overload-resolution failure the way "no viable candidate" is, so it isn't
+SFINAE-friendly; instantiating that check at all is a hard compile error,
+constraint or no constraint. With the wrapped shape checked first (as an
+earlier version of this concept had it), such an `Fn` failed to compile
+outright. Checking `invocable_unwrapped<Fn, T>()` first means an `Fn` for
+which it's satisfied never triggers the wrapped check at all — the same
+short-circuiting that makes the precedence change effective for dispatch
+is what makes it *necessary* here, not just consistent. An `Fn` matching
+neither shape still fails right at the `then()` call site with a
+"constraints not satisfied" diagnostic, not deep inside `invoke()`'s own
+instantiation.
 
 ## Flattening is not a special case
 

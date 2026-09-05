@@ -108,8 +108,22 @@ template <class Fn, class T> consteval auto invocable_unwrapped() -> bool {
 // future_state<T>&, for the wrapped shape - future_state is a detail of
 // future (see its own doc comment), not part of the interface a
 // then() callback should see.
+//
+// invocable_unwrapped<Fn, T>() checked first, not just as a matter of
+// style matching then()'s own dispatch order (issue #39) but because it
+// has to be: constraint disjunction (||) short-circuits left-to-right, so
+// whichever operand comes first is the one actually evaluated for an Fn
+// that satisfies it. A generic callback (an `auto&` lambda, say) that's
+// only valid when called with a plain T - e.g. one that returns a copy of
+// its argument, which future<T>'s deleted copy constructor makes
+// ill-formed for a future<T>& argument - hard-errors (not a graceful
+// SFINAE failure - "use of a deleted function" isn't overload-resolution
+// failure) if std::invocable<Fn&, future<T>&> is instantiated for it at
+// all, checked first or not. Checking invocable_unwrapped first means
+// such an Fn is fully satisfied - and short-circuits away from ever
+// instantiating the wrapped check - before that ever happens.
 template <class Fn, class T>
-concept then_callback_for = std::invocable<Fn&, future<T>&> || invocable_unwrapped<Fn, T>();
+concept then_callback_for = invocable_unwrapped<Fn, T>() || std::invocable<Fn&, future<T>&>;
 
 } // namespace est::detail
 
@@ -325,13 +339,8 @@ public:
   }
 
   // Registers fn to run once ready. Two calling conventions, chosen by
-  // how fn can be invoked (docs/PLAN.md, issue #23):
-  //   - fn(future<T>&): "wrapped" - always called, whether this
-  //     future_state succeeded or failed, with a fresh future<T> view of
-  //     *this (built via shared_from_this() - future_state is a detail,
-  //     not what a callback should see, see this class's own doc
-  //     comment); fn inspects ready()/failed()/get() to decide what to
-  //     do. No implicit unwrap.
+  // how fn can be invoked (docs/PLAN.md, issue #23; precedence changed
+  // by issue #39):
   //   - fn(const T&), or fn() when T is void: "unwrapped" - called only
   //     on success, with the value itself (or no argument at all for
   //     void). On failure fn is *not* called; the returned future fails
@@ -339,9 +348,18 @@ public:
   //     get() as fn's argument expression: get() rethrows on failure,
   //     which lands in the try/catch below exactly like an exception fn
   //     itself throws.)
-  // Checked in that order, so a callback typed to take future<T>&
-  // explicitly always gets the wrapped, no-unwrap behavior even if it
-  // would incidentally also accept a T (e.g. a generic `auto&` lambda).
+  //   - fn(future<T>&): "wrapped" - always called, whether this
+  //     future_state succeeded or failed, with a fresh future<T> view of
+  //     *this (built via shared_from_this() - future_state is a detail,
+  //     not what a callback should see, see this class's own doc
+  //     comment); fn inspects ready()/failed()/get() to decide what to
+  //     do. No implicit unwrap.
+  // Checked in that order - unwrapped first - so a generic callback (e.g.
+  // an `auto&`/`auto&&` lambda, incidentally invocable both ways) is
+  // interpreted as unwrapped by default. Wrapped is only chosen when
+  // unwrapped genuinely isn't viable, i.e. fn is explicitly typed to take
+  // future<T>& - an explicit opt-in the caller has to write, not a shape
+  // that falls out of generic code by accident.
   //
   // The returned future's value type is fn's return type U, unless U is
   // itself a future<V> - futures are monadic, so a continuation that
@@ -386,12 +404,16 @@ private:
   // not satisfied" diagnostic right at the then() call site instead of
   // one buried in here.
   template <class Fn> static consteval auto raw_result_type_tag() {
-    if constexpr (std::invocable<Fn&, future<T>&>) {
-      return std::type_identity<std::invoke_result_t<Fn&, future<T>&>>{};
-    } else if constexpr (std::is_void_v<T>) {
-      return std::type_identity<std::invoke_result_t<Fn&>>{};
-    } else {
+    if constexpr (std::is_void_v<T>) {
+      if constexpr (std::invocable<Fn&>) {
+        return std::type_identity<std::invoke_result_t<Fn&>>{};
+      } else {
+        return std::type_identity<std::invoke_result_t<Fn&, future<T>&>>{};
+      }
+    } else if constexpr (std::invocable<Fn&, const T&>) {
       return std::type_identity<std::invoke_result_t<Fn&, const T&>>{};
+    } else {
+      return std::type_identity<std::invoke_result_t<Fn&, future<T>&>>{};
     }
   }
   template <class Fn> using raw_result_t = decltype(raw_result_type_tag<Fn>())::type;
@@ -408,25 +430,30 @@ private:
 
     void invoke(future_state& state) override {
       try {
-        if constexpr (std::invocable<Fn&, future<T>&>) {
-          // A fresh future<T> per invocation, not a stored one - this
-          // continuation only runs once, so there's nothing to reuse it
-          // for, and future_state<T> itself never keeps a future<T>
-          // alive on its own account.
+        if constexpr (detail::invocable_unwrapped<Fn, T>()) {
+          if (state.failed()) {
+            // Unwrapped mode's auto-propagate-on-failure, fn_ not called:
+            // failed() already tells us there's an exception waiting, so
+            // fetching it via get_exception() is a plain pointer copy -
+            // cheaper than the alternative of calling get() purely to
+            // have it rethrow into the catch below, even though this
+            // isn't the happy path either way.
+            downstream_->set_exception(state.get_exception());
+          } else if constexpr (std::is_void_v<T>) {
+            invoke_and_fulfill();
+          } else {
+            invoke_and_fulfill(state.get());
+          }
+        } else {
+          // Wrapped mode: unwrapped isn't viable for Fn (checked first,
+          // above - see then()'s own doc comment on precedence, issue
+          // #39), so then_callback_for<Fn, T> guarantees Fn is invocable
+          // with future<T>& instead. A fresh future<T> per invocation,
+          // not a stored one - this continuation only runs once, so
+          // there's nothing to reuse it for, and future_state<T> itself
+          // never keeps a future<T> alive on its own account.
           future<T> view(state.shared_from_this());
           invoke_and_fulfill(view);
-        } else if (state.failed()) {
-          // Unwrapped mode's auto-propagate-on-failure, fn_ not called:
-          // failed() already tells us there's an exception waiting, so
-          // fetching it via get_exception() is a plain pointer copy -
-          // cheaper than the alternative of calling get() purely to
-          // have it rethrow into the catch below, even though this
-          // isn't the happy path either way.
-          downstream_->set_exception(state.get_exception());
-        } else if constexpr (std::is_void_v<T>) {
-          invoke_and_fulfill();
-        } else {
-          invoke_and_fulfill(state.get());
         }
       } catch (...) {
         downstream_->set_exception(std::current_exception());
