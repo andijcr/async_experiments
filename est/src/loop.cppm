@@ -194,19 +194,13 @@ private:
     node.run();
     const auto elapsed = platform::instance().now() - start;
     if (elapsed > long_running_threshold) {
-      // Best-effort diagnostic only, same stance as
-      // platform::hosted_linux::assert_failure()'s own std::println call
-      // - a failure to print this warning isn't itself worth stopping
-      // the loop over.
-      try {
-        std::println(
-            std::cerr,
-            "est::loop: a continuation took {}ms (> {}ms threshold) to run",
-            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
-            std::chrono::duration_cast<std::chrono::milliseconds>(long_running_threshold).count());
-        // NOLINTNEXTLINE(bugprone-empty-catch)
-      } catch (...) {
-      }
+      // Formatting and printing itself is platform::printdbg()'s job, not
+      // this loop's - it already owns the "best-effort, nothrow diagnostic
+      // straight to std::cerr" pattern (see its own doc comment).
+      platform::printdbg(
+          "est::loop: a continuation took {}ms (> {}ms threshold) to run",
+          std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+          std::chrono::duration_cast<std::chrono::milliseconds>(long_running_threshold).count());
     }
   }
 

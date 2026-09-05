@@ -147,4 +147,23 @@ export namespace est::platform {
   return scope_exit([previous]() noexcept { detail::current_instance = previous; });
 }
 
+// A best-effort, nothrow debug diagnostic straight to std::cerr - the
+// platform-level home for the "format and print a line, swallow whatever
+// std::println itself could throw (a format error, or an I/O failure)"
+// pattern this module's own hosted_linux::assert_failure() already needs
+// around its own std::println call, factored out so a caller like
+// est::loop (its long-running-callback warning, docs/PLAN.md M3) doesn't
+// have to duplicate that try/catch locally. A plain function template,
+// not a virtual interface method: C++ has no virtual function templates
+// (a vtable can't have an entry per possible instantiation), so this
+// can't be swapped per backend the way now()/sleep_until()/
+// assert_failure() are - every backend gets the same std::cerr behavior.
+template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
+  try {
+    std::println(std::cerr, fmt, std::forward<Ts>(args)...);
+    // NOLINTNEXTLINE(bugprone-empty-catch)
+  } catch (...) {
+  }
+}
+
 } // namespace est::platform
