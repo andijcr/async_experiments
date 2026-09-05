@@ -1796,25 +1796,41 @@ actually runs - never for unwrapped ones. Posted the trade-off and left
 it to the repo owner to decide whether the per-instance bytes are worth
 the added overload/duplication; not changed pending their answer.
 
-**Eighth, a real optimization:** `invoke()`'s unwrapped-mode
-auto-propagate-on-failure path (`state.get()`, relying on its rethrow to
-land in the surrounding `catch (...)`) was doing an actual C++
-throw/catch round-trip purely to retrieve an exception `failed()` could
-already tell us was there. Added a private `get_exception()` - a plain
-`std::get<std::exception_ptr>(result_)`, no rethrow - and restructured
-`invoke()` to check `state.failed()` directly first, calling
-`get_exception()` instead of relying on `get()`'s throw for the *known*
-propagate-on-failure case. `catch (...)` around the whole function stays
-exactly as needed for genuine exceptions `fn_` itself throws - only the
-"we already know it failed" path stopped paying for an exception
+**Eighth and ninth, a real optimization applied in two places:**
+`invoke()`'s unwrapped-mode auto-propagate-on-failure path (`state.get()`,
+relying on its rethrow to land in the surrounding `catch (...)`) was
+doing an actual C++ throw/catch round-trip purely to retrieve an
+exception `failed()` could already tell us was there - the
+monadic-flatten forwarding continuation in `fulfill()` had the exact
+same pattern (`inner_future.get()`, rethrow into `catch (...)`) for the
+same reason. Added `get_exception()` - a plain
+`std::get<std::exception_ptr>(result_)`, no rethrow, pairing with
+`failed()` - on both `future_state<T>` and (since the flatten lambda
+only ever holds a `future<T>&`, never the private `future_state<T>`
+directly) `future<T>` itself, and restructured both call sites to check
+`failed()` first, calling `get_exception()` for the *known*
+propagate-on-failure case instead of relying on `get()`'s throw.
+`catch (...)` stays around the remaining, genuinely-uncertain path in
+both places (an `fn_` exception in `invoke()`; an unexpected exception
+from copying/moving the value itself in the flatten lambda) - only the
+"we already know it failed" branch stopped paying for a throw/catch
 round-trip it didn't need. `get_exception()` needed one
 `NOLINTNEXTLINE(bugprone-exception-escape)`: `std::get` would throw
-`std::bad_variant_access` if the (unchecked, internal-only) precondition
-were ever violated, which - escaping this `noexcept` function -
-terminates instead of continuing on bad state; intended fail-fast
-behavior for this single, controlled call site, not something to route
-around. Verified end to end: 50/50 tests unchanged,
-`clang-format`/`clang-tidy` clean.
+`std::bad_variant_access` if the (unchecked) precondition were ever
+violated, which - escaping this `noexcept` function - terminates
+instead of continuing on bad state; intended fail-fast behavior for a
+violated precondition, not something to route around.
+
+`get_exception()` is genuinely public on `future<T>` now (not just an
+internal `future_state` helper), pairing with the already-public
+`failed()` - a deliberate, small, minimal API addition rather than
+routing the flatten lambda through friendship, since it's a natural
+counterpart to a capability already exposed. Verified end to end: 50/50
+tests unchanged, `clang-format`/`clang-tidy` clean, new-code coverage
+97% against `origin/main` - the only new gap is the flatten lambda's
+`catch (...)` body itself (lines it can now only reach for a genuinely
+throwing value copy/move, not the known-failure case that used to also
+pass through it), not worth a dedicated throwing-type test for.
 
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the

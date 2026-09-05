@@ -224,6 +224,22 @@ public:
     return std::holds_alternative<std::exception_ptr>(result_);
   }
 
+  // Returns the stored exception_ptr directly, without going through
+  // get()'s throw/rethrow. Precondition: failed(). Pairs with failed()
+  // for a caller that already knows there's an exception waiting and
+  // wants to forward it without paying for a throw/catch round-trip
+  // just to retrieve a pointer - used internally by then()'s
+  // unwrapped-mode auto-propagate path and the monadic-flatten
+  // forwarding continuation (both below). std::get<...> would throw
+  // std::bad_variant_access if the precondition were violated, which -
+  // escaping this noexcept function - terminates instead of continuing
+  // on bad state; intended fail-fast behavior for a violated
+  // precondition, not something to route around.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
+  [[nodiscard]] auto get_exception() const noexcept -> std::exception_ptr {
+    return std::get<std::exception_ptr>(result_);
+  }
+
   // Retrieves the value, or rethrows the stored exception; returns void
   // for future_state<void> (nothing to retrieve, only the rethrow can
   // happen). Precondition: ready(). Deducing this, forwarded straight
@@ -340,23 +356,6 @@ public:
   }
 
 private:
-  // Returns the stored exception_ptr directly, without going through
-  // get()'s throw/rethrow - precondition: failed(). Only used by
-  // invoke()'s unwrapped-mode auto-propagate path below: once failed()
-  // has already told us there's an exception waiting, fetching it here
-  // is a plain pointer copy, not a throw/catch round-trip, to forward
-  // into the downstream future - cheaper than the alternative even
-  // though this is deliberately not the happy path. std::get<...> would
-  // throw std::bad_variant_access if the precondition were violated,
-  // which - escaping this noexcept function - terminates instead of
-  // continuing on bad state; that's the intended fail-fast behavior for
-  // a violated precondition on this single, controlled call site, not
-  // something to route around.
-  // NOLINTNEXTLINE(bugprone-exception-escape)
-  [[nodiscard]] auto get_exception() const noexcept -> std::exception_ptr {
-    return std::get<std::exception_ptr>(result_);
-  }
-
   // Fn's raw (pre-flatten) result type, dispatching wrapped-vs-unwrapped
   // exactly as then() itself does above. A plain (non-consteval-required,
   // never actually called - only ever named inside decltype()) function
@@ -447,18 +446,23 @@ private:
     // set_value() if it's a plain U, or - if it's itself a future<U> -
     // by registering a wrapped (no-unwrap) continuation on it that
     // forwards its eventual value/exception into downstream_ once it
-    // resolves. That forwarding continuation reuses this same
-    // get()-rethrows-into-catch propagation idiom as invoke() above,
-    // rather than needing its own access to the inner future's private
-    // state.
+    // resolves. That forwarding continuation checks failed()/
+    // get_exception() directly for the known-failure case (same reason
+    // invoke() above does: avoids a throw/catch round-trip to retrieve
+    // an exception_ptr already known to be there), keeping try/catch
+    // only around the success path, for whatever unexpected exception
+    // copying/moving the value itself might throw.
     template <class R> void fulfill(R&& result) {
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
         using inner_value_type = detail::unwrap_future_t<std::decay_t<R>>;
         auto downstream_copy = downstream_; // copy: the forwarding lambda keeps its own reference
         std::forward<R>(result).then([downstream_copy](future<inner_value_type>& inner_future) {
+          if (inner_future.failed()) {
+            downstream_copy->set_exception(inner_future.get_exception());
+            return;
+          }
           try {
             if constexpr (std::is_void_v<inner_value_type>) {
-              inner_future.get();
               downstream_copy->set_value();
             } else {
               downstream_copy->set_value(inner_future.get());
@@ -544,6 +548,15 @@ public:
   [[nodiscard]] auto ready() const noexcept -> bool { return state_->ready(); }
 
   [[nodiscard]] auto failed() const noexcept -> bool { return state_->failed(); }
+
+  // Returns the stored exception_ptr directly, without going through
+  // get()'s throw/rethrow. Precondition: failed(). Pairs with failed()
+  // for a caller that already knows there's an exception waiting and
+  // wants to forward or inspect it without paying for a throw/catch
+  // round-trip just to retrieve a pointer.
+  [[nodiscard]] auto get_exception() const noexcept -> std::exception_ptr {
+    return state_->get_exception();
+  }
 
   // Deducing this: future.get() (lvalue) copy-constructs from the
   // future_state's non-consuming get(); std::move(future).get() forwards
