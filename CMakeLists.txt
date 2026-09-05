@@ -70,4 +70,5 @@ add_subdirectory(est)
 
 if(EST_BUILD_EXAMPLES)
   add_subdirectory(examples/hello_world)
+  add_subdirectory(examples/sleep_sort)
 endif()
