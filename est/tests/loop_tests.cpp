@@ -53,6 +53,9 @@ public:
     std::abort();
   }
 
+  // A no-op: nothing in these tests triggers a debug diagnostic.
+  void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
+
   mutable std::chrono::steady_clock::time_point current;
 };
 
@@ -82,6 +85,14 @@ public:
                                    std::source_location /*location*/) const noexcept override {
     std::abort();
   }
+
+  // A no-op, not a std::cerr write: this fake's whole purpose is
+  // triggering detect_loop_stall()'s default body's diagnostic (see this
+  // class's own doc comment above), which does call this - but the test
+  // using it doesn't assert on the printed content (see its own doc
+  // comment), so silently discarding it here just keeps test output
+  // clean rather than actually writing anything.
+  void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
 
   mutable std::chrono::steady_clock::time_point current;
   std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);

@@ -19,25 +19,34 @@ import :util.scope_exit;
 // global instance at startup, not a framework redesign.
 export namespace est::platform {
 
-// A best-effort, nothrow debug diagnostic straight to std::cerr - shared
-// by interface::detect_loop_stall()'s default implementation below and
-// hosted_stdcpp::assert_failure(), so neither has to duplicate the
-// "format and print a line, swallow whatever std::println itself could
-// throw (a format error, or an I/O failure)" pattern locally. Declared
-// ahead of interface (rather than in its usual spot further down, next
-// to override_instance()) specifically so detect_loop_stall() can call
-// it. A plain function template, not a virtual interface method: C++ has
-// no virtual function templates (a vtable can't have an entry per
-// possible instantiation), so this can't be swapped per backend the way
-// now()/sleep_until()/assert_failure() are - every backend gets the same
-// std::cerr behavior.
-template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
-  try {
-    std::println(std::cerr, fmt, std::forward<Ts>(args)...);
-    // NOLINTNEXTLINE(bugprone-empty-catch)
-  } catch (...) {
-  }
-}
+class interface;
+
+// Declared here (defined later, once hosted_stdcpp/detail::
+// current_instance exist for its body to reference) purely so printdbg()
+// below - and, transitively, interface::detect_loop_stall()'s default
+// body - can call it. See instance()'s own canonical doc comment further
+// down for what it actually does.
+[[nodiscard]] auto instance() noexcept -> interface&;
+
+// A best-effort, nothrow debug diagnostic. Does the compile-time-checked
+// formatting itself (so a caller gets std::format_string<Ts...>'s usual
+// call-site diagnostics for a mismatched format string) and hands the
+// type-erased result to interface::vprintdbg() below - mirroring
+// std::print()'s own split from std::vprint_unicode(). Declared ahead of
+// interface (rather than in its usual spot further down, next to
+// override_instance()) specifically so detect_loop_stall() can call it -
+// defined only after interface is a complete type, further down (calling
+// vprintdbg() on the reference instance() returns needs a complete type,
+// not just this forward declaration).
+//
+// Unlike an earlier version, this *is* backend-swappable - it's now a
+// thin wrapper deferring to whichever platform::interface is currently
+// installed, per review: "printdbg should defer to the interface." Only
+// the formatting step has to be a template (std::format_string<Ts...>'s
+// compile-time check needs the caller's own argument types); the actual
+// "where does this text go" decision now belongs to vprintdbg(), which
+// isn't.
+template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept;
 
 class interface {
 public:
@@ -66,6 +75,22 @@ public:
   // debug break, ...) without est::check() itself changing.
   [[noreturn]] virtual void assert_failure(std::string_view message,
                                            std::source_location location) const noexcept = 0;
+
+  // Emits a formatted debug diagnostic - the "where does this text
+  // actually go" half of printdbg() above (see its own doc comment),
+  // mirroring std::vprint_unicode()'s split from std::print(): printdbg()
+  // does the compile-time-checked formatting and type-erases the
+  // arguments via std::make_format_args(), this decides what happens to
+  // the result. Pure virtual, not defaulted the way
+  // reset_loop_stall_detection()/detect_loop_stall() below are: unlike
+  // "measure wall-clock time" (genuinely backend-agnostic), "where does a
+  // debug line go" has no universal answer - a bare-metal backend may
+  // have no console at all, or want to write somewhere other than a
+  // stream. An implementation must swallow its own failures (an I/O
+  // error, e.g.) internally - printdbg() itself already promises nothrow,
+  // best-effort behavior, and can't do that on this method's behalf
+  // without seeing inside it.
+  virtual void vprintdbg(std::string_view fmt, std::format_args args) const noexcept = 0;
 
   // Marks the start of a fresh "how long does the next node/timer
   // callback take" measurement window - est::loop::run_one() calls this
@@ -116,6 +141,27 @@ private:
   std::chrono::steady_clock::time_point stall_start_;
 };
 
+// The actual body, deferred until here (see the forward declaration's own
+// doc comment above): calling vprintdbg() on the reference instance()
+// returns needs interface to be a complete type, which it only just
+// became.
+//
+// args deliberately isn't std::forward'd below: std::make_format_args()
+// itself takes its arguments by plain lvalue reference (Args&..., not a
+// forwarding reference), storing references into the format_args it
+// returns for vprintdbg() to use immediately afterward - forwarding an
+// rvalue argument here would bind that reference to a temporary about to
+// expire, not extend anything's lifetime the way it might look like it
+// should.
+// NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
+template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
+  try {
+    instance().vprintdbg(fmt.get(), std::make_format_args(args...));
+    // NOLINTNEXTLINE(bugprone-empty-catch)
+  } catch (...) {
+  }
+}
+
 class hosted_stdcpp final : public interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
@@ -124,6 +170,26 @@ public:
 
   void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
     std::this_thread::sleep_until(deadline);
+  }
+
+  // std::vprint_unicode(), not std::println(): this is the type-erased
+  // half of the split printdbg()/interface::vprintdbg() (platform.cppm's
+  // own doc comments) exists for - fmt/args already arrive pre-erased via
+  // std::format_args, exactly what std::vprint_unicode() itself takes, so
+  // there's no formatting left for this override to do beyond handing
+  // both straight through to std::cerr.
+  void vprintdbg(std::string_view fmt, std::format_args args) const noexcept override {
+    // Same reasoning as assert_failure()'s own try/catch below:
+    // std::vprint_unicode() can throw (a format error, or an I/O
+    // failure), swallowed here rather than escaping this noexcept
+    // method - printdbg() promises best-effort, nothrow behavior to its
+    // own caller, and this is the one place actually positioned to
+    // fulfill that promise for this backend.
+    try {
+      std::vprint_unicode(std::cerr, fmt, args);
+      // NOLINTNEXTLINE(bugprone-empty-catch)
+    } catch (...) {
+    }
   }
 
   // One std::println call, not several - a reviewer comment on an

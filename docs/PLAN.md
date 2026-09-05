@@ -2337,6 +2337,55 @@ already exercises this path end-to-end, platform-relocated or not);
 `clang-format`/`clang-tidy` clean; full suite also passes under the
 `sanitize` preset (ASan+UBSan).
 
+#### Review follow-up: `printdbg()` made backend-swappable too
+
+A PR review comment on the refactor above pointed out an inconsistency it
+introduced: `printdbg()` itself was left exactly as it always had been -
+hardcoded to `std::println(std::cerr, ...)`, with its own doc comment
+explicitly noting "this can't be swapped per backend... every backend gets
+the same `std::cerr` behavior" - even though the diagnostic it exists for
+(`detect_loop_stall()`'s default body) had just become backend-swappable
+one call up. Suggested fix: split `printdbg()` the same way
+`std::print()` splits from `std::vprint_unicode()` - formatting stays a
+template (`std::format_string<Ts...>` needs the caller's own argument
+types for its compile-time check), but *where the formatted text goes*
+becomes a new `interface` method.
+
+- **`interface::vprintdbg(std::string_view fmt, std::format_args args)`** -
+  pure virtual, unlike `reset_loop_stall_detection()`/`detect_loop_stall()`
+  above: "measure wall-clock time" has one sensible default nearly any
+  backend can share, but "where does a debug line go" doesn't - a
+  bare-metal target may have no console at all. `hosted_stdcpp`'s override
+  calls `std::vprint_unicode(std::cerr, fmt, args)` (swallowing whatever it
+  throws, same as `assert_failure()`'s own `std::println` call already
+  does).
+- **`printdbg()`** now does its compile-time-checked formatting, then
+  hands the format string and `std::make_format_args(args...)` (not
+  `std::forward`'d - `make_format_args()` itself takes plain lvalue
+  references, and forwarding an rvalue argument here would bind that
+  reference to a temporary about to expire) to
+  `platform::instance().vprintdbg(...)`.
+
+Because `vprintdbg()` is pure virtual, every existing test fake needed one
+new override - unlike `reset_loop_stall_detection()`/`detect_loop_stall()`,
+which every fake inherited for free. Three (`fake_platform` in
+`timer_tests.cpp`, `fake_platform`/`jumping_platform` in `loop_tests.cpp`)
+just discard the message, matching the established no-op-override
+convention for a method nothing in that file needs to actually observe
+(`sleep_until()`'s own no-op precedent in `timer_tests.cpp`).
+`platform_tests.cpp`'s `stub_platform` instead *records* the formatted
+message (via `std::vformat(fmt, args)`), specifically so a new test -
+"`printdbg()` dispatches through the currently overridden instance" -
+can confirm the whole point of this change: `printdbg()` is now a genuine
+part of the `override_instance()`-swappable seam, not a fixed behavior
+every backend was stuck with.
+
+Verified in the pinned Docker devenv: 71/71 tests pass (1 new); `clang-
+format`/`clang-tidy` clean (one `cppcoreguidelines-missing-std-forward`
+false positive NOLINT'd, for the deliberate non-forwarding described
+above); full suite also passes under the `sanitize` preset (ASan+UBSan);
+both example binaries still run correctly.
+
 ### M5 — polish + hello-world
 - Flesh out `examples/hello_world` into something that actually exercises
   the stack meaningfully (e.g. a coroutine that awaits a timer, prints,

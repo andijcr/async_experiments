@@ -26,8 +26,23 @@ public:
     std::abort();
   }
 
+  // Records the formatted message rather than writing it anywhere, so a
+  // test can confirm printdbg() actually dispatches through the
+  // currently overridden instance (platform.cppm's own doc comments on
+  // printdbg()/vprintdbg() - the whole point of the split from an
+  // earlier, non-swappable version) instead of writing to std::cerr
+  // itself.
+  void vprintdbg(std::string_view fmt, std::format_args args) const noexcept override {
+    try {
+      last_vprintdbg_message = std::vformat(fmt, args);
+      // NOLINTNEXTLINE(bugprone-empty-catch)
+    } catch (...) {
+    }
+  }
+
   static constexpr std::chrono::steady_clock::time_point epoch{};
   mutable std::optional<std::chrono::steady_clock::time_point> last_sleep_until;
+  mutable std::optional<std::string> last_vprintdbg_message;
 };
 
 } // namespace
@@ -51,6 +66,13 @@ TEST_CASE("sleep_until() dispatches through the currently overridden instance", 
   const auto deadline = stub_platform::epoch + 5s;
   est::platform::instance().sleep_until(deadline);
   REQUIRE(stub.last_sleep_until == deadline);
+}
+
+TEST_CASE("printdbg() dispatches through the currently overridden instance", "[platform]") {
+  stub_platform stub;
+  const auto guard = est::platform::override_instance(stub);
+  est::platform::printdbg("value is {}", 42);
+  REQUIRE(stub.last_vprintdbg_message == "value is 42");
 }
 
 TEST_CASE("nested override_instance guards restore the correct previous instance", "[platform]") {
