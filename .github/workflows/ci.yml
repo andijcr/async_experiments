@@ -32,9 +32,9 @@ name: ci
 # whatever UID actions/checkout happens to run as. HOME=/tmp avoids tools
 # choking on a UID with no passwd entry / home directory in the image.
 #
-# The last step gates on *new-code* (diff/patch) coverage, not overall
-# repository coverage: the "ci" preset itself builds with Clang's
-# source-based coverage instrumentation (-fprofile-instr-generate
+# The coverage step gates on *new-code* (diff/patch) coverage, not
+# overall repository coverage: the "ci" preset itself builds with
+# Clang's source-based coverage instrumentation (-fprofile-instr-generate
 # -fcoverage-mapping - see docs/PLAN.md, "gate CI on new-code coverage"),
 # so the single build+test above already produces .profraw alongside the
 # format/tidy-gated binaries - no separate configure+build+test pass
@@ -42,6 +42,14 @@ name: ci
 # with the PR's diff via diff-cover so only the lines a PR actually
 # touches are held to the threshold. Needs full git history
 # (fetch-depth: 0) for diff-cover to compute the diff against origin/main.
+#
+# The final two steps are a second, separate configure+build+test pass
+# using the "sanitize" preset (-fsanitize=address,undefined on est and
+# est_tests; examples excluded - see cmake/Sanitizers.cmake). This can't
+# reuse the "ci" preset's own build: coverage instrumentation and
+# sanitizer instrumentation are different compile/link flags on the same
+# targets, so they need separate build directories (build/sanitize, via
+# the preset's own binaryDir, not build/ci).
 
 on:
   pull_request:
@@ -124,3 +132,24 @@ jobs:
             llvm-cov export --format=lcov --instr-profile=build/ci/coverage.profdata build/ci/est/tests/est_tests --object=build/ci/est/tests/est_tests > build/ci/coverage.lcov &&
             diff-cover build/ci/coverage.lcov --compare-branch=origin/main --fail-under=80
           '
+
+      - name: configure (sanitizers)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          cmake --preset sanitize
+
+      - name: build (sanitizers)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          cmake --build --preset sanitize
+
+      - name: test (sanitizers)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace
+          ${{ env.DEVENV_IMAGE }}
+          ctest --preset sanitize

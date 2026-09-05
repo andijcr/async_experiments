@@ -952,6 +952,70 @@ docs/wiki pages, and every historical mention of `hosted_linux` earlier in
 this document, which record what the code was actually called at the time
 and aren't rewritten after the fact.
 
+---
+
+### CI gate: AddressSanitizer + UndefinedBehaviorSanitizer unit test build (done)
+
+Added a third build configuration alongside "default" (local dev) and
+"ci" (format/tidy/build/test/coverage): a `sanitize` CMake preset that
+builds `est`/`est_tests` with `-fsanitize=address,undefined` and runs the
+full unit test suite under it, gating PRs the same way the coverage step
+already does.
+
+**`cmake/Sanitizers.cmake`** follows `cmake/Coverage.cmake`'s own shape:
+an `EST_ENABLE_SANITIZERS` option (default `OFF`, so normal builds pay no
+instrumentation cost) and an `est_enable_sanitizers(target)` function
+applied to `est` and `est_tests`. Support is checked, not assumed - a
+`check_cxx_compiler_flag(-fsanitize=address,undefined ...)` probe at
+configure time - so a toolchain whose compiler doesn't accept the flag
+gets a clear `message(WARNING ...)` and an uninstrumented build instead
+of an obscure link failure or a silently-untested "pass" (this project's
+pinned Clang 22 + `libclang-rt-22-dev` supports both sanitizers, so the
+gate is live in practice, but the check exists for whatever toolchain
+finds this file next). `-fno-sanitize-recover=all` on both targets makes
+any single violation - of either sanitizer - abort the process
+immediately, so `ctest`'s exit code (and so the CI gate) actually fails
+on a finding instead of the run continuing past a printed diagnostic and
+reporting green.
+
+`CMakePresets.json` gained a `sanitize` configure/build/test preset:
+`CMAKE_BUILD_TYPE=Debug`, `EST_ENABLE_SANITIZERS=ON`,
+`EST_BUILD_EXAMPLES=OFF`. Examples are excluded deliberately - the ask
+was for a *unit test* sanitizer build, and `hello_world`/`sleep_sort`
+aren't run in CI at all, so instrumenting them would only cost build time
+for no additional gate coverage. The test preset sets
+`ASAN_OPTIONS=halt_on_error=1:detect_leaks=1` and
+`UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1` as a second,
+belt-and-suspenders layer on top of `-fno-sanitize-recover=all` (the
+compiled-in flag already forces an abort; the env vars make that
+explicit and add a leak-check pass ASan doesn't run by default).
+
+`.github/workflows/ci.yml`'s existing `gate` job gained three more steps
+at the end - configure/build/test against the `sanitize` preset - reusing
+the same already-built devenv image rather than adding a second job, the
+same reasoning as every other step in that job. This needs its own build
+directory (`build/sanitize`, via the preset's own `binaryDir`): coverage
+instrumentation (the `ci` preset) and sanitizer instrumentation are
+different, mutually-undesirable compile/link flags on the same targets,
+so the two configurations can't share one build.
+
+**Verified in the pinned Docker devenv**, beyond the normal build+test
+pass:
+- `check_cxx_compiler_flag` correctly reports sanitizer support against
+  the pinned Clang 22 toolchain (`Performing Test
+  EST_COMPILER_SUPPORTS_SANITIZERS - Success`).
+- All 68 existing unit tests pass under `-fsanitize=address,undefined` -
+  the codebase was already sanitizer-clean, this just makes that an
+  enforced property going forward rather than an unverified assumption.
+- The gate actually gates: a deliberately introduced heap-buffer-overflow
+  (temporary, reverted before committing) made `ctest --preset sanitize`
+  report a failed test and a nonzero exit, with ASan's diagnostic
+  (allocation site, shadow-byte map) printed to stderr - confirming the
+  wiring catches a real bug rather than just building successfully.
+- The `ci` preset's own build/test/format/tidy/coverage pass is
+  unaffected - `EST_ENABLE_SANITIZERS` defaults `OFF` and is never set
+  there, so this is purely additive.
+
 ## Roadmap
 
 ### M0 — Repo scaffolding (done: this commit)
