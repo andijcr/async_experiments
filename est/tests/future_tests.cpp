@@ -333,6 +333,44 @@ TEST_CASE("a wrapped (future<T>&) then() callback can inspect failed() instead o
   REQUIRE(chained.get() == -1);
 }
 
+// Regression test for issue #39: a generic callback (here, an `auto&`
+// lambda) is incidentally invocable both ways - with `future<int>&` and
+// with `const int&` - since a template parameter binds to either. An
+// earlier version of then() checked the wrapped shape first, so a
+// generic lambda like this one silently got wrapped (no-unwrap)
+// behavior even though nothing about it opted into that explicitly. Now
+// unwrapped is checked first: `value` below is deduced as `int`, not
+// `est::future<int>`, and this callback is skipped (not invoked) on
+// failure rather than being invoked to inspect it.
+TEST_CASE("a generic callback defaults to unwrapped, not wrapped, when both are viable",
+          "[future]") {
+  est::loop loop;
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  promise.set_value(21);
+
+  auto chained = future.then([](auto& value) { return value * 2; });
+  loop.run_until_idle();
+  REQUIRE(chained.get() == 42);
+}
+
+TEST_CASE("a generic callback, defaulted to unwrapped, is skipped and auto-propagates on failure",
+          "[future]") {
+  est::loop loop;
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+
+  bool invoked = false;
+  auto chained = future.then([&](auto& value) {
+    invoked = true;
+    return value;
+  });
+  loop.run_until_idle();
+
+  REQUIRE_FALSE(invoked);
+  REQUIRE(chained.failed());
+  REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
+}
+
 TEST_CASE("future<void>: set_value()/get() round-trip with nothing to carry", "[future][void]") {
   est::loop loop;
   auto [promise, future] = est::make_promise_future<void>(loop);

@@ -2216,6 +2216,69 @@ format`/`clang-tidy` clean, new-code coverage 98% against `origin/main`.
   waiter. Needs coroutine machinery to suspend/resume, so it lands here
   rather than in M1.
 
+M4 itself is still in progress on a separate branch/PR (`feature/coroutines`,
+PR #37) as of this section - not yet merged into `main` - so its own
+"Implementation" write-up lives there, not here.
+
+### Issue #39: `then()`'s wrapped-vs-unwrapped precedence, flipped (done)
+
+Reported by the repo owner against issue #23's original design (see that
+section above): `then()` checked the *wrapped* shape (`Fn` invocable with
+`future<T>&`) before the *unwrapped* shape (`Fn` invocable with `const T&`,
+or with nothing for `T = void`). For an `Fn` explicitly typed one way or
+the other this made no difference, but a **generic** callback — an `auto&`
+or `auto&&` lambda, incidentally invocable both ways, since a template
+parameter binds to either — silently got wrapped, no-unwrap behavior
+without ever opting into it. The repo owner's framing: "an auto lambda
+should be interpreted as T, not future<T>. T should take precedence over
+future<T> (which should be an explicit decision by the user)."
+
+Fixed by swapping the check order in the two places `future_state<T>::then()`
+dispatches on it — `raw_result_type_tag()` (computing `Fn`'s pre-flatten
+result type) and `concrete_continuation<Fn, U>::invoke()` (actually calling
+`Fn`) — to check `detail::invocable_unwrapped<Fn, T>()` first, falling
+through to the wrapped shape only when unwrapped isn't viable. An `Fn`
+explicitly typed to take `future<T>&` still gets wrapped behavior exactly
+as before (it isn't invocable with a plain `const T&`, so unwrapped was
+never viable for it to begin with) — only a callback generic enough to
+accept both shapes changes behavior, now defaulting to unwrapped. Getting
+wrapped behavior deliberately still requires writing it explicitly
+(`[](est::future<T>& state) { ... }`), exactly the "explicit decision by
+the user" the repo owner asked for.
+
+`then_callback_for<Fn, T>` (the concept constraining `then()`'s Fn
+parameter) needed no change — `std::invocable<Fn&, future<T>&> ||
+invocable_unwrapped<Fn, T>()`'s `||` doesn't care about operand order, only
+whether at least one side holds.
+
+Two new regression tests in `future_tests.cpp` exercise a generic `auto&`
+lambda through both the success and failure paths, checking it now gets
+unwrapped semantics (called with the plain value on success; skipped, not
+invoked, with the exception auto-propagated on failure) — the same
+observable behavior an explicitly `const T&`-typed callback already had,
+now also the default for a generic one.
+
+A related, harder issue found while writing regression tests for this fix:
+`then_callback_for<Fn, T>`'s own disjunction, `std::invocable<Fn&,
+future<T>&> || invocable_unwrapped<Fn, T>()`, needed the same reordering,
+and not just for consistency. Constraint disjunction (`||`) short-circuits
+left-to-right, so whichever operand is written first is the one actually
+evaluated for an `Fn` that satisfies it. A generic callback that's only
+*valid* when called with a plain `T` - e.g. one that returns a copy of its
+argument, which `future<T>`'s deleted copy constructor makes ill-formed
+for a `future<T>&` argument - hard-errors, not a graceful SFINAE failure,
+if `std::invocable<Fn&, future<T>&>` is even instantiated for it ("use of
+a deleted function" isn't overload-resolution failure). With the wrapped
+check written first in the concept, such a callback failed to compile at
+all, constraint or no constraint. Reordering the concept's own disjunction
+to check `invocable_unwrapped<Fn, T>()` first fixes this the same way it
+fixes the dispatch: satisfied there, the wrapped check is never even
+attempted.
+
+Verified in the pinned Docker devenv: 70/70 tests pass (2 new);
+`clang-format`/`clang-tidy` clean; full suite also passes under the
+`sanitize` preset (ASan+UBSan).
+
 ### M5 — polish + hello-world
 - Flesh out `examples/hello_world` into something that actually exercises
   the stack meaningfully (e.g. a coroutine that awaits a timer, prints,
