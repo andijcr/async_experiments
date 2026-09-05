@@ -30,6 +30,15 @@ public:
 
   [[nodiscard]] virtual auto now() const noexcept -> std::chrono::steady_clock::time_point = 0;
 
+  // Blocks the calling thread until `deadline`, or returns immediately if
+  // it has already passed - est::loop's answer to "how do I wait for the
+  // next timer" without a busy-loop, same reasoning as now()/
+  // assert_failure() being platform hooks: a test fake overrides this to
+  // advance its own fake clock instead of actually blocking, so a loop
+  // test exercising real timer-driven wakeups runs instantly instead of
+  // for real wall-clock seconds (est/tests/loop_tests.cpp).
+  virtual void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept = 0;
+
   // Reports a failed est::check() and terminates - the platform's answer
   // to "what actually happens when a check fails," same reasoning as
   // now() being the answer to "what time is it": a bare-metal backend,
@@ -43,6 +52,10 @@ class hosted_linux final : public interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
     return std::chrono::steady_clock::now();
+  }
+
+  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+    std::this_thread::sleep_until(deadline);
   }
 
   // One std::println call, not several - a reviewer comment on an
@@ -132,6 +145,25 @@ export namespace est::platform {
 [[nodiscard]] inline auto override_instance(interface& replacement) noexcept {
   interface* const previous = std::exchange(detail::current_instance, &replacement);
   return scope_exit([previous]() noexcept { detail::current_instance = previous; });
+}
+
+// A best-effort, nothrow debug diagnostic straight to std::cerr - the
+// platform-level home for the "format and print a line, swallow whatever
+// std::println itself could throw (a format error, or an I/O failure)"
+// pattern this module's own hosted_linux::assert_failure() already needs
+// around its own std::println call, factored out so a caller like
+// est::loop (its long-running-callback warning, docs/PLAN.md M3) doesn't
+// have to duplicate that try/catch locally. A plain function template,
+// not a virtual interface method: C++ has no virtual function templates
+// (a vtable can't have an entry per possible instantiation), so this
+// can't be swapped per backend the way now()/sleep_until()/
+// assert_failure() are - every backend gets the same std::cerr behavior.
+template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
+  try {
+    std::println(std::cerr, fmt, std::forward<Ts>(args)...);
+    // NOLINTNEXTLINE(bugprone-empty-catch)
+  } catch (...) {
+  }
 }
 
 } // namespace est::platform

@@ -14,12 +14,20 @@ public:
     return epoch;
   }
 
+  // Records the last deadline it was asked to sleep until, so a test can
+  // confirm override_instance() actually retargets sleep_until() too -
+  // never actually blocks.
+  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+    last_sleep_until = deadline;
+  }
+
   [[noreturn]] void assert_failure(std::string_view /*message*/,
                                    std::source_location /*location*/) const noexcept override {
     std::abort();
   }
 
   static constexpr std::chrono::steady_clock::time_point epoch{};
+  mutable std::optional<std::chrono::steady_clock::time_point> last_sleep_until;
 };
 
 } // namespace
@@ -34,6 +42,15 @@ TEST_CASE("override_instance retargets instance() and restores it when the guard
     REQUIRE(est::platform::instance().now() == stub_platform::epoch);
   }
   REQUIRE(&est::platform::instance() == &original);
+}
+
+TEST_CASE("sleep_until() dispatches through the currently overridden instance", "[platform]") {
+  stub_platform stub;
+  const auto guard = est::platform::override_instance(stub);
+  using namespace std::chrono_literals;
+  const auto deadline = stub_platform::epoch + 5s;
+  est::platform::instance().sleep_until(deadline);
+  REQUIRE(stub.last_sleep_until == deadline);
 }
 
 TEST_CASE("nested override_instance guards restore the correct previous instance", "[platform]") {
@@ -56,6 +73,17 @@ TEST_CASE("hosted_linux's clock is monotonically non-decreasing", "[platform]") 
   const auto first = est::platform::instance().now();
   const auto second = est::platform::instance().now();
   REQUIRE(second >= first);
+}
+
+TEST_CASE("hosted_linux's sleep_until() returns once the deadline has passed", "[platform]") {
+  // A tiny (1ms) real deadline, not a fake clock: this exercises
+  // hosted_linux::sleep_until()'s actual std::this_thread::sleep_until()
+  // call - est::loop's own tests (est/tests/loop_tests.cpp) exclusively
+  // use a fake, instant sleep_until() instead, which never touches this
+  // real implementation at all.
+  const auto deadline = est::platform::instance().now() + std::chrono::milliseconds(1);
+  est::platform::instance().sleep_until(deadline);
+  REQUIRE(est::platform::instance().now() >= deadline);
 }
 
 // hosted_linux::assert_failure()'s formatting isn't separately unit-tested:

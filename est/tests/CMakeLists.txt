@@ -20,6 +20,7 @@ add_executable(est_tests
   check_tests.cpp
   mutex_tests.cpp
   timer_tests.cpp
+  loop_tests.cpp
   future_tests.cpp
   scope_exit_tests.cpp
   shared_ptr_tests.cpp
