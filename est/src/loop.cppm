@@ -79,6 +79,13 @@ export namespace est {
 // swap), a loop carries real mutable state (the ready-queue, pending
 // timers) a shared global would accumulate cross-test contamination in -
 // every test that needs one constructs its own.
+//
+// Precondition: a loop must outlive every future_state<T> (and therefore
+// every promise<T>/future<T>/then()-chain) built against it via
+// make_promise_future() - est:future's future_state<T> holds a bare
+// loop&, not shared ownership, and there is no way to check a dangling
+// reference at runtime. See future_state<T>'s own doc comment (est:future)
+// for the same precondition from that side.
 class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
@@ -121,7 +128,23 @@ public:
   // higher-level timer-driven future builds on (est::sleep_for(),
   // est:promise); :loop itself never names est::future/est::promise (see
   // this file's own top comment on why).
+  //
+  // reserve() before schedule_at(), not after: this method touches two
+  // separate containers (timers_, pending_timers_) with no way to roll
+  // back a partial update, so the ordering has to guarantee that once
+  // timers_ knows about `deadline`, recording it in pending_timers_ can't
+  // fail. reserve() can throw (bad_alloc) - but if it does, schedule_at()
+  // was never called, so timers_ and pending_timers_ stay in sync. Once
+  // reserve() succeeds, push_back() below is guaranteed not to reallocate
+  // and pending_entry is a trivial two-member struct, so it can't itself
+  // throw. Without this, a push_back() failure *after* a successful
+  // schedule_at() would leave a timer id in timers_ with no matching
+  // pending_timers_ entry - fire_ready_timers()'s check() below exists
+  // exactly to catch that, but check() compiles away entirely under
+  // NDEBUG (est:check), turning the desync into a dereference of
+  // pending_timers_.end() instead of a caught precondition violation.
   void schedule_timer(detail::timer_node& node, clock::time_point deadline) {
+    pending_timers_.reserve(pending_timers_.size() + 1);
     const auto id = timers_.schedule_at(deadline);
     pending_timers_.push_back(pending_entry{.id = id, .node = &node});
   }
@@ -153,7 +176,21 @@ private:
     detail::timer_node* node;
   };
 
+  // Precondition: not already inside a run()/run_until_idle() call on
+  // this same loop. Checked, not silently tolerated: reentering would
+  // otherwise reset stop_requested_ back to false out from under the
+  // outer, still-in-progress call (e.g. a continuation that calls
+  // loop.stop() and then loop.run_until_idle() again before returning) -
+  // the outer call's `if (stop_requested_) return;` would then never
+  // trip, silently losing the stop() request instead of failing loudly.
+  // No coroutine machinery exists yet (M4) to make nested pumping a real,
+  // supported use case - same debug-checked-precondition stance this
+  // codebase already takes elsewhere (est:check) rather than building
+  // real reentrant-stop() bookkeeping nothing currently needs.
   void run_impl() {
+    check(!running_, "est::loop::run()/run_until_idle() called reentrantly");
+    running_ = true;
+    scope_exit const not_running_guard{[this]() noexcept { running_ = false; }};
     stop_requested_ = false;
     for (;;) {
       drain_ready();
@@ -179,6 +216,21 @@ private:
     }
   }
 
+  // Returns a guard that destroys `node` via this loop's allocator when
+  // it goes out of scope, however that happens - the "always destroy
+  // after running/firing" pattern both run_one() and fire_ready_timers()
+  // need, factored out so a future change to it only has one place to
+  // make. Returned by value as a genuine prvalue (never bound to a named
+  // variable and then moved) so this compiles despite scope_exit's
+  // deleted move constructor - the same guaranteed-copy-elision pattern
+  // est::platform::override_instance() already relies on. Defined ahead
+  // of run_one()/fire_ready_timers() below, not just declared: a deduced
+  // (auto) return type has to be resolved from the function's own body
+  // before any caller earlier in the class can use it.
+  template <class Node> [[nodiscard]] auto destroy_guard(Node& node) noexcept {
+    return scope_exit([&node, this]() noexcept { node.destroy(allocator_); });
+  }
+
   // Runs one ready continuation, timing it against long_running_threshold
   // (docs/PLAN.md, M3's "long-running-callback detection"). Single-
   // threaded means one slow continuation blocks everything else this
@@ -189,7 +241,7 @@ private:
   // matter in practice (same stance this codebase already takes on other
   // debug-only/best-effort details, docs/PLAN.md).
   void run_one(detail::ready_node& node) {
-    scope_exit const guard{[&node, this]() noexcept { node.destroy(allocator_); }};
+    const auto guard = destroy_guard(node);
     const auto start = platform::instance().now();
     node.run();
     const auto elapsed = platform::instance().now() - start;
@@ -211,7 +263,7 @@ private:
       check(it != pending_timers_.end(), "loop: fired timer id missing from pending_timers_");
       auto* node = it->node;
       pending_timers_.erase(it);
-      scope_exit const guard{[node, this]() noexcept { node->destroy(allocator_); }};
+      const auto guard = destroy_guard(*node);
       node->fire();
     }
   }
@@ -223,6 +275,7 @@ private:
   timer_queue<allocator_type> timers_;
   std::pmr::vector<pending_entry> pending_timers_;
   bool stop_requested_ = false;
+  bool running_ = false;
 };
 
 } // namespace est

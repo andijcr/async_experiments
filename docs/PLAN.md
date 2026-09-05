@@ -1967,6 +1967,77 @@ callback body a test explicitly asserts *never runs* (`loop_tests.cpp`'s
 `stop()` test — the uncovered line is the point of the test, not a gap in
 it).
 
+#### Review follow-ups (PR #28)
+
+Two rounds of review found real, worthwhile fixes, applied on top of the
+implementation above:
+
+- **`platform::printdbg()`.** `loop::run_one()`'s long-running-callback
+  warning originally formatted and printed for itself, duplicating
+  `hosted_linux::assert_failure()`'s own "format, print to `std::cerr`,
+  swallow whatever `std::println` itself could throw" pattern. Per
+  review, factored into `est::platform::printdbg(std::format_string<Ts...>,
+  Ts&&...)` — a plain function template, not a virtual `interface`
+  method (C++ has no virtual function templates: a vtable can't have an
+  entry per instantiation), so unlike `now()`/`sleep_until()`/
+  `assert_failure()` it isn't backend-swappable. `hosted_linux::
+  assert_failure()`'s own pre-existing try/catch was deliberately left
+  as is (out of scope for what was asked).
+- **A standalone code-review pass** (this session's own `code-review`
+  skill, verified manually before any fix) found four more issues, all
+  fixed:
+  1. `future_state<T>`'s bare `loop&` had no documented precondition that
+     the loop must outlive everything built against it — an easy first-use
+     mistake (e.g. returning a future from a function whose loop is
+     local) with no way to check a dangling reference at runtime. Fixed
+     by documenting the precondition explicitly on both `future_state<T>`
+     (`est:future`) and `loop` (`est:loop`) — there's no code fix possible
+     beyond making the requirement impossible to miss.
+  2. `loop::schedule_timer()` updated `timers_` and `pending_timers_` in
+     two separate steps with no rollback: if the second allocation threw,
+     a timer id would exist in `timers_` with no matching
+     `pending_timers_` entry, and `fire_ready_timers()`'s `check()` that
+     would catch this compiles away entirely under `NDEBUG` — real UB in
+     a release build. Fixed by `reserve()`-ing `pending_timers_` *before*
+     calling `schedule_at()`: if `reserve()` throws, `schedule_at()` was
+     never called (no desync); once it succeeds, the following
+     `push_back()` can't reallocate and `pending_entry` is a trivial
+     two-member struct, so it can't itself throw.
+  3. `run_impl()` unconditionally reset `stop_requested_ = false` on
+     entry, so a continuation that called `stop()` and then reentered
+     `run()`/`run_until_idle()` on the same loop before returning would
+     silently wipe out the still-pending `stop()` request. No coroutine
+     machinery exists yet (M4) to make nested pumping a real, supported
+     use case, so fixed the same way this codebase treats every other
+     precondition it doesn't yet need to actively support: a debug-
+     checked `check(!running_, ...)` guard (via a new `running_` member)
+     turns silently-wrong behavior into a loud, checked precondition
+     violation instead of building real reentrant-`stop()` bookkeeping
+     nothing currently needs.
+  4. `run_one()` and `fire_ready_timers()` each hand-rolled an identical
+     `scope_exit`-based "destroy this node via the loop's allocator no
+     matter how we exit" guard. Factored into one `destroy_guard<Node>()`
+     helper, returned by value as a genuine prvalue (guaranteed copy
+     elision, same as `platform::override_instance()` already relies on)
+     despite `scope_exit`'s deleted move constructor. Had to be defined
+     *before* `run_one()`/`fire_ready_timers()` in the class body, not
+     just declared: a deduced (`auto`) return type needs the function's
+     own body resolved before an earlier caller in the same class can use
+     it - caught immediately by a real compile error, not a subtle bug.
+
+None of the four got a dedicated regression test: (1) is a documentation-
+only fix (nothing to assert on); (2) would need a throwing-on-the-second-
+allocation-only test allocator, judged not worth the complexity for an
+edge this narrow (same stance PR #24's own flatten-`catch`-body gap
+already took); (3)'s failure path is a `check()` abort, untestable-by-
+construction without process-isolation tooling this project doesn't have
+(same precedent as every other `check()` failure path in this codebase);
+(4) is a pure refactor with no behavior change, already covered by every
+existing test that exercises `run_one()`/`fire_ready_timers()`. Verified
+in the pinned Docker devenv after both rounds: 63/63 tests pass,
+`clang-format`/`clang-tidy` clean, new-code coverage 95% against
+`origin/main`.
+
 ### M4 — coroutine adapters
 - `est::task<T>` coroutine type with a `promise_type` that binds to
   `est::promise<T>`/`est::future<T>` under the hood.

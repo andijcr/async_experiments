@@ -135,6 +135,18 @@ namespace est {
 // singleton like est::platform::instance(): unlike platform, a loop
 // carries real mutable state (its ready-queue, pending timers) a shared
 // global would accumulate cross-test contamination in.
+//
+// Precondition, for the lifetime of every future_state (and therefore
+// every promise<T>/future<T>/then()-chain) built against a given loop:
+// that loop must outlive all of them. There is no way to check this at
+// runtime the way est::check() guards other preconditions elsewhere in
+// this codebase (a dangling reference can't be tested for validity) - a
+// caller returning a future/promise from a function whose loop is a
+// local variable, or otherwise letting one outlive its loop, gets
+// undefined behavior on the very next touch of loop_ (allocator(),
+// set_continuation(), even this class's own destructor). Callers must
+// arrange loop lifetime themselves; est::loop's own doc comment
+// (est:loop) describes the same dependency from the loop's side.
 template <class T> class future_state : public enable_shared_from_this<future_state<T>> {
 public:
   using continuation_node = detail::continuation_node<T>;
