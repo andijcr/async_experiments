@@ -340,6 +340,23 @@ public:
   }
 
 private:
+  // Returns the stored exception_ptr directly, without going through
+  // get()'s throw/rethrow - precondition: failed(). Only used by
+  // invoke()'s unwrapped-mode auto-propagate path below: once failed()
+  // has already told us there's an exception waiting, fetching it here
+  // is a plain pointer copy, not a throw/catch round-trip, to forward
+  // into the downstream future - cheaper than the alternative even
+  // though this is deliberately not the happy path. std::get<...> would
+  // throw std::bad_variant_access if the precondition were violated,
+  // which - escaping this noexcept function - terminates instead of
+  // continuing on bad state; that's the intended fail-fast behavior for
+  // a violated precondition on this single, controlled call site, not
+  // something to route around.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
+  [[nodiscard]] auto get_exception() const noexcept -> std::exception_ptr {
+    return std::get<std::exception_ptr>(result_);
+  }
+
   // Fn's raw (pre-flatten) result type, dispatching wrapped-vs-unwrapped
   // exactly as then() itself does above. A plain (non-consteval-required,
   // never actually called - only ever named inside decltype()) function
@@ -384,13 +401,17 @@ private:
           // alive on its own account.
           future<T> view(state.shared_from_this());
           invoke_and_fulfill(view);
+        } else if (state.failed()) {
+          // Unwrapped mode's auto-propagate-on-failure, fn_ not called:
+          // failed() already tells us there's an exception waiting, so
+          // fetching it via get_exception() is a plain pointer copy -
+          // cheaper than the alternative of calling get() purely to
+          // have it rethrow into the catch below, even though this
+          // isn't the happy path either way.
+          downstream_->set_exception(state.get_exception());
         } else if constexpr (std::is_void_v<T>) {
-          state.get(); // rethrows on failure, caught below - fn_ is not called
           invoke_and_fulfill();
         } else {
-          // state.get() rethrows on failure (caught below, fn_ not
-          // called) before fn_ ever sees a value - the argument
-          // expression is evaluated before invoke_and_fulfill() runs.
           invoke_and_fulfill(state.get());
         }
       } catch (...) {

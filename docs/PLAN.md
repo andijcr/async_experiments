@@ -1776,6 +1776,46 @@ specifically *because* of the module-privacy change two follow-ups back,
 not in spite of it. Verified end to end: 50/50 tests unchanged,
 `clang-format`/`clang-tidy` clean, no call site needed updating.
 
+Two more review comments landed on this PR after the above:
+
+**Seventh, a design question left open:** whether `future<T>::then()`
+could pass a `future<T>` clone of itself down into `then()`/the
+continuation node, instead of `future_state<T>` needing
+`enable_shared_from_this` (the fourth follow-up) at all. Worked through
+it: making that actually save anything (not just move the cost)
+requires the clone to be conditional on `Fn` needing the wrapped shape,
+which means `future<T>::then()` needs its own copy of the
+`std::invocable<Fn&, future<T>&>` check (a 5th occurrence of the same
+predicate, after the concept, `raw_result_type_tag()`, and `invoke()`),
+plus splitting `future_state::then()` into two overloads (with/without
+a `future<T>` parameter) sharing most of their body. Weighed against
+that: `enable_shared_from_this` costs `future_state` one `void*` (8
+bytes) and a vtable-free CRTP base, and `shared_from_this()` itself is
+already only ever called lazily, once per *wrapped* continuation that
+actually runs - never for unwrapped ones. Posted the trade-off and left
+it to the repo owner to decide whether the per-instance bytes are worth
+the added overload/duplication; not changed pending their answer.
+
+**Eighth, a real optimization:** `invoke()`'s unwrapped-mode
+auto-propagate-on-failure path (`state.get()`, relying on its rethrow to
+land in the surrounding `catch (...)`) was doing an actual C++
+throw/catch round-trip purely to retrieve an exception `failed()` could
+already tell us was there. Added a private `get_exception()` - a plain
+`std::get<std::exception_ptr>(result_)`, no rethrow - and restructured
+`invoke()` to check `state.failed()` directly first, calling
+`get_exception()` instead of relying on `get()`'s throw for the *known*
+propagate-on-failure case. `catch (...)` around the whole function stays
+exactly as needed for genuine exceptions `fn_` itself throws - only the
+"we already know it failed" path stopped paying for an exception
+round-trip it didn't need. `get_exception()` needed one
+`NOLINTNEXTLINE(bugprone-exception-escape)`: `std::get` would throw
+`std::bad_variant_access` if the (unchecked, internal-only) precondition
+were ever violated, which - escaping this `noexcept` function -
+terminates instead of continuing on bad state; intended fail-fast
+behavior for this single, controlled call site, not something to route
+around. Verified end to end: 50/50 tests unchanged,
+`clang-format`/`clang-tidy` clean.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until
