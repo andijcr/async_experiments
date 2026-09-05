@@ -3,7 +3,7 @@ import est;
 #include <catch2/catch_test_macros.hpp>
 
 // est::check()'s failure path terminates the process
-// (platform::hosted_linux::assert_failure() is [[noreturn]], calling
+// (platform::hosted_stdcpp::assert_failure() is [[noreturn]], calling
 // std::abort()) - same as the <cassert> macro it replaces, there's no
 // practical way to unit-test that path without process-isolation
 // tooling this project doesn't have. Only the pass-through (condition

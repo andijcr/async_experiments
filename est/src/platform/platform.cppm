@@ -3,10 +3,10 @@ export module est:platform;
 import std;
 import :util.scope_exit;
 
-// The hosted-Linux platform backend, and the runtime-polymorphic seam it
+// The hosted-stdcpp platform backend, and the runtime-polymorphic seam it
 // plugs into. `interface` is what est::check()/est::timer_queue actually
 // need from "the platform" - a monotonic clock, and an answer to "what
-// happens when a check fails." `hosted_linux` is the only implementation
+// happens when a check fails." `hosted_stdcpp` is the only implementation
 // that exists so far.
 //
 // This is virtual dispatch through a single global object, not a
@@ -48,7 +48,7 @@ public:
                                            std::source_location location) const noexcept = 0;
 };
 
-class hosted_linux final : public interface {
+class hosted_stdcpp final : public interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
     return std::chrono::steady_clock::now();
@@ -116,14 +116,14 @@ public:
 // this module, not assignable by any `import est;` consumer bypassing
 // instance()/override_instance() below.
 namespace est::platform::detail {
-inline hosted_linux default_instance{};
+inline hosted_stdcpp default_instance{};
 inline interface* current_instance = &default_instance;
 } // namespace est::platform::detail
 
 export namespace est::platform {
 
 // The globally accessible platform object est::check()/est::timer_queue
-// actually call through - defaults to hosted_linux. Tests retarget it for
+// actually call through - defaults to hosted_stdcpp. Tests retarget it for
 // a scope via override_instance(), below; a future bare-metal backend
 // would install its own implementation here at startup instead.
 [[nodiscard]] inline auto instance() noexcept -> interface& {
@@ -150,7 +150,7 @@ export namespace est::platform {
 // A best-effort, nothrow debug diagnostic straight to std::cerr - the
 // platform-level home for the "format and print a line, swallow whatever
 // std::println itself could throw (a format error, or an I/O failure)"
-// pattern this module's own hosted_linux::assert_failure() already needs
+// pattern this module's own hosted_stdcpp::assert_failure() already needs
 // around its own std::println call, factored out so a caller like
 // est::loop (its long-running-callback warning, docs/PLAN.md M3) doesn't
 // have to duplicate that try/catch locally. A plain function template,

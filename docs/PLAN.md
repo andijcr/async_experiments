@@ -926,6 +926,32 @@ oversight.
 
 ---
 
+### Rename: `hosted_linux` → `hosted_stdcpp` (done)
+
+`platform::hosted_linux` (`est/src/platform/platform.cppm`) never actually
+did anything Linux-specific — `now()` is `std::chrono::steady_clock::now()`,
+`sleep_until()` is `std::this_thread::sleep_until()`, and
+`assert_failure()` is `std::println`/`std::abort()`, all pure Standard
+Library calls with no `<unistd.h>`/syscall/POSIX dependency anywhere in the
+class. The name overstated what the backend actually is: a hosted backend
+built entirely on the C++ standard library, not a Linux-specific one.
+Renamed the class (and its `default_instance` global, and every comment
+referencing it by name) to `hosted_stdcpp` across `platform.cppm`,
+`platform_tests.cpp`, `check_tests.cpp`, and `loop_tests.cpp` — a pure
+identifier rename, no behavior change.
+
+Deliberately left untouched: the CMake toolchain file
+(`cmake/toolchain-hosted-linux.cmake`), `CMakePresets.json`,
+`docker/Dockerfile`, and every generic "hosted-Linux"/"hosted Linux" prose
+phrase describing the actual deployment target (this project only builds
+and tests on Linux right now, which is a true statement independent of
+what the C++ class is named) — including `est/src/sync/mutex.cppm`'s own
+comment about why its waiter-list protection isn't built speculatively
+"into a hosted-Linux backend that has nothing to guard against," the
+docs/wiki pages, and every historical mention of `hosted_linux` earlier in
+this document, which record what the code was actually called at the time
+and aren't rewritten after the fact.
+
 ## Roadmap
 
 ### M0 — Repo scaffolding (done: this commit)

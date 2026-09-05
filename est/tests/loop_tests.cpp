@@ -222,7 +222,7 @@ TEST_CASE(
   // Exercises loop::run_one()'s long-running-callback warning path
   // (docs/PLAN.md, M3) without asserting on the printed diagnostic's
   // content - not separately unit-tested, same stance this codebase
-  // already takes on platform::hosted_linux::assert_failure()'s own
+  // already takes on platform::hosted_stdcpp::assert_failure()'s own
   // best-effort diagnostic (est/tests/check_tests.cpp).
   jumping_platform fake;
   const auto guard = est::platform::override_instance(fake);
