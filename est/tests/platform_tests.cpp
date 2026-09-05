@@ -97,6 +97,20 @@ TEST_CASE("hosted_stdcpp's clock is monotonically non-decreasing", "[platform]")
   REQUIRE(second >= first);
 }
 
+TEST_CASE("hosted_stdcpp's vprintdbg() writes via std::vprint_unicode without throwing",
+          "[platform]") {
+  // Every other printdbg()/vprintdbg() test above overrides the instance
+  // with stub_platform, so none of them ever exercise hosted_stdcpp's own
+  // vprintdbg() override - this is the one test that does, through the
+  // real (default, non-overridden) instance. Not asserting on the actual
+  // std::cerr content written - same not-practically-unit-testable stance
+  // as hosted_stdcpp::assert_failure()'s own diagnostic (this file's
+  // closing comment) - just confirming the real std::vprint_unicode()
+  // call path runs to completion without throwing.
+  est::platform::printdbg("hosted_stdcpp vprintdbg test: {}", 1);
+  SUCCEED("printdbg() returned without throwing");
+}
+
 TEST_CASE("hosted_stdcpp's sleep_until() returns once the deadline has passed", "[platform]") {
   // A tiny (1ms) real deadline, not a fake clock: this exercises
   // hosted_stdcpp::sleep_until()'s actual std::this_thread::sleep_until()
