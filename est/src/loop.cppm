@@ -222,7 +222,7 @@ private:
     return scope_exit([&node, this]() noexcept { node.destroy(allocator_); });
   }
 
-  // Runs one ready continuation, timing it against long_running_threshold
+  // Runs one ready continuation, checking it against long_running_threshold
   // (docs/PLAN.md, M3's "long-running-callback detection"). Single-
   // threaded means one slow continuation blocks everything else this
   // loop owns, with nothing to preempt it, so a runaway handler should at
@@ -231,20 +231,20 @@ private:
   // tuned against any real workload - easy to revisit if it turns out to
   // matter in practice (same stance this codebase already takes on other
   // debug-only/best-effort details, docs/PLAN.md).
+  //
+  // The actual timing/measuring/printing is platform::interface's job,
+  // not this loop's (reset_loop_stall_detection()/detect_loop_stall(),
+  // platform.cppm) - this loop only calls the two bracketing hooks and
+  // owns the threshold value itself, same division of responsibility as
+  // sleep_until() already has: est::loop decides *what* it needs, the
+  // installed platform decides *how* to provide it. A future backend
+  // could watch for a stall on its own background thread instead of only
+  // checking synchronously here, without this call site changing at all.
   void run_one(detail::ready_node& node) {
     const auto guard = destroy_guard(node);
-    const auto start = platform::instance().now();
+    platform::instance().reset_loop_stall_detection();
     node.run();
-    const auto elapsed = platform::instance().now() - start;
-    if (elapsed > long_running_threshold) {
-      // Formatting and printing itself is platform::printdbg()'s job, not
-      // this loop's - it already owns the "best-effort, nothrow diagnostic
-      // straight to std::cerr" pattern (see its own doc comment).
-      platform::printdbg(
-          "est::loop: a continuation took {}ms (> {}ms threshold) to run",
-          std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
-          std::chrono::duration_cast<std::chrono::milliseconds>(long_running_threshold).count());
-    }
+    platform::instance().detect_loop_stall(long_running_threshold);
   }
 
   void fire_ready_timers() {

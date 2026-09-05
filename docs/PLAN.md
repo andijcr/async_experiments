@@ -2279,6 +2279,64 @@ Verified in the pinned Docker devenv: 70/70 tests pass (2 new);
 `clang-format`/`clang-tidy` clean; full suite also passes under the
 `sanitize` preset (ASan+UBSan).
 
+### Refactor: loop-stall detection moved to `platform::interface` (done)
+
+Requested by the repo owner: `loop::run_one()`'s long-running-callback
+detection (M3, "the looper" section above) measured a node's runtime
+itself, bracketing `node.run()` with two `platform::instance().now()`
+calls and printing straight from `run_one()` if the gap exceeded
+`long_running_threshold`. Moved onto `platform::interface` instead, as two
+new methods:
+
+- **`reset_loop_stall_detection()`** — called immediately before running a
+  node, marking the start of a fresh measurement window.
+- **`detect_loop_stall(std::chrono::steady_clock::duration threshold)`** —
+  called immediately after, checking whether the gap since the matching
+  `reset_loop_stall_detection()` call exceeded `threshold` and reporting a
+  diagnostic via `platform::printdbg()` if so.
+
+`run_one()` itself shrinks to just the two bracketing calls plus
+`node.run()` in between — the actual timing/measuring/printing is now
+`platform::interface`'s job, for the same reason `now()`/`sleep_until()`
+are already platform hooks rather than `est::loop` calling
+`std::chrono`/`std::this_thread` directly: "how do we know a callback ran
+long" is a policy question a backend should get to answer for itself. The
+repo owner's own framing: today's synchronous, measure-after-the-fact
+approach is the only strategy that makes sense for a single-threaded
+backend, but a future backend could use a background thread to detect a
+stall in parallel — watching for one *while* the callback is still
+running, rather than only finding out once it returns — without
+`run_one()`'s own call site changing at all.
+
+Unlike `now()`/`sleep_until()`/`assert_failure()` (pure virtual - every
+backend must answer for itself), the two new methods are virtual *with a
+default body* in `interface` itself: the default just records `now()` on
+reset and compares against it on detect, printing via `platform::
+printdbg()` — exactly the old `run_one()` logic, relocated rather than
+rewritten. This means every existing concrete `interface` — `hosted_stdcpp`
+and every test fake in `est/tests/` (`fake_platform`/`jumping_platform` in
+`loop_tests.cpp`, `fake_platform` in `timer_tests.cpp`, `stub_platform` in
+`platform_tests.cpp`) — inherits working stall detection for free, with
+zero changes needed to any of them; only a backend that actually wants
+different behavior (the hypothetical background-thread one) would need to
+override both. `printdbg()` itself moved earlier in `platform.cppm` (before
+`class interface`, instead of down near `override_instance()`) purely so
+`detect_loop_stall()`'s default body can call it — no behavior change.
+
+`loop_tests.cpp`'s existing `jumping_platform`-based test (exploiting a
+`now()` that advances on every call to make a continuation's timing appear
+to exceed the threshold without a real delay) needed no changes to keep
+passing: the default `detect_loop_stall()` still calls `now()` exactly
+twice bracketing `node.run()` (once via `reset_loop_stall_detection()`,
+once via `detect_loop_stall()` itself), the same two-calls-bracketing-run()
+shape `run_one()` used to have directly.
+
+Verified in the pinned Docker devenv: full test suite passes unchanged
+(no test additions or removals - the existing long-running-callback test
+already exercises this path end-to-end, platform-relocated or not);
+`clang-format`/`clang-tidy` clean; full suite also passes under the
+`sanitize` preset (ASan+UBSan).
+
 ### M5 — polish + hello-world
 - Flesh out `examples/hello_world` into something that actually exercises
   the stack meaningfully (e.g. a coroutine that awaits a timer, prints,

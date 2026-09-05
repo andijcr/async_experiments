@@ -59,7 +59,7 @@ run.
 
 | Concept | File |
 |---|---|
-| Platform seam (clock, `sleep_until`, `assert_failure`, `printdbg`) | `est/src/platform/platform.cppm` |
+| Platform seam (clock, `sleep_until`, `assert_failure`, loop-stall detection, `printdbg`) | `est/src/platform/platform.cppm` |
 | `est::check()` | `est/src/check.cppm` |
 | `est::shared_ptr<T>`, `enable_shared_from_this<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |

@@ -57,10 +57,15 @@ public:
 };
 
 // A platform whose now() advances by `step` on every single call - used
-// to make a continuation's before/after timing in loop::run_one() appear
-// to exceed the long-running-callback threshold without an actual real
-// delay, so that code path gets exercised (docs/PLAN.md, M3's
-// "long-running-callback detection").
+// to make a continuation's runtime appear to exceed the long-running-
+// callback threshold without an actual real delay, so that code path gets
+// exercised (docs/PLAN.md, M3's "long-running-callback detection"). Relies
+// on inheriting interface::reset_loop_stall_detection()/
+// detect_loop_stall()'s default implementation unchanged (docs/PLAN.md's
+// "loop-stall detection moved to platform::interface" refactor) - it still
+// calls now() exactly twice bracketing node.run(), the same shape
+// loop::run_one() used to do directly before that logic moved onto
+// platform::interface itself.
 class jumping_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {

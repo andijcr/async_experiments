@@ -64,12 +64,9 @@ arbitrarily deep, purely synchronous chain resolves inside one
 ```cpp
 void run_one(detail::ready_node& node) {
   const auto guard = destroy_guard(node);          // always destroy, however this exits
-  const auto start = platform::instance().now();
+  platform::instance().reset_loop_stall_detection();
   node.run();
-  const auto elapsed = platform::instance().now() - start;
-  if (elapsed > long_running_threshold) {
-    platform::printdbg("est::loop: a continuation took {}ms (> {}ms threshold) to run", ...);
-  }
+  platform::instance().detect_loop_stall(long_running_threshold);
 }
 ```
 
@@ -80,11 +77,26 @@ void run_one(detail::ready_node& node) {
   guarantee, not something the happy path relies on.
 - **Long-running-callback detection**: single-threaded means one slow
   continuation blocks everything else the loop owns — timers, other ready
-  work, all of it — with nothing able to preempt it. `run_one()` times every
-  invocation against a threshold (currently 50ms, a starting point, not
-  tuned against a real workload) and prints a diagnostic via
-  `platform::printdbg()` if it's exceeded, so a runaway handler shows up as
-  a clear signal instead of "the whole program mysteriously stalled."
+  work, all of it — with nothing able to preempt it. An earlier version
+  timed each invocation itself, bracketing `node.run()` with two
+  `platform::instance().now()` calls and printing straight from
+  `run_one()` if the gap exceeded a threshold (currently 50ms, a starting
+  point, not tuned against a real workload). That measuring/printing now
+  lives on `platform::interface` instead —
+  `reset_loop_stall_detection()`/`detect_loop_stall(threshold)` — for the
+  same reason `now()`/`sleep_until()` are platform hooks rather than
+  `est::loop` calling `std::chrono`/`std::this_thread` directly: "how do
+  we know a callback ran long" is a policy a backend should get to answer
+  for itself. `est::loop` only calls the two bracketing hooks and owns the
+  threshold value; `platform::interface`'s default implementation of both
+  (inherited by `hosted_stdcpp` and every test fake unchanged) just
+  records `now()` on reset and compares against it on detect, printing via
+  `platform::printdbg()` if exceeded — the same synchronous, single-
+  threaded behavior as before. A future backend could override both to run
+  a watchdog on a background thread instead, catching (and reporting) a
+  stall in parallel while the callback is still running, rather than only
+  finding out once it returns — without `run_one()` itself changing at
+  all.
 
 ## Timers: `schedule_timer()`, and the `future<void>` bridge
 

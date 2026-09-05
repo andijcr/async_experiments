@@ -19,6 +19,26 @@ import :util.scope_exit;
 // global instance at startup, not a framework redesign.
 export namespace est::platform {
 
+// A best-effort, nothrow debug diagnostic straight to std::cerr - shared
+// by interface::detect_loop_stall()'s default implementation below and
+// hosted_stdcpp::assert_failure(), so neither has to duplicate the
+// "format and print a line, swallow whatever std::println itself could
+// throw (a format error, or an I/O failure)" pattern locally. Declared
+// ahead of interface (rather than in its usual spot further down, next
+// to override_instance()) specifically so detect_loop_stall() can call
+// it. A plain function template, not a virtual interface method: C++ has
+// no virtual function templates (a vtable can't have an entry per
+// possible instantiation), so this can't be swapped per backend the way
+// now()/sleep_until()/assert_failure() are - every backend gets the same
+// std::cerr behavior.
+template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
+  try {
+    std::println(std::cerr, fmt, std::forward<Ts>(args)...);
+    // NOLINTNEXTLINE(bugprone-empty-catch)
+  } catch (...) {
+  }
+}
+
 class interface {
 public:
   interface() = default;
@@ -46,6 +66,54 @@ public:
   // debug break, ...) without est::check() itself changing.
   [[noreturn]] virtual void assert_failure(std::string_view message,
                                            std::source_location location) const noexcept = 0;
+
+  // Marks the start of a fresh "how long does the next node/timer
+  // callback take" measurement window - est::loop::run_one() calls this
+  // immediately before running one, and detect_loop_stall() below
+  // immediately after, instead of measuring the gap itself with two
+  // now() calls the way an earlier version did. Moved here, onto
+  // platform, for the same reason now()/sleep_until() are platform
+  // hooks rather than est::loop calling std::chrono/std::this_thread
+  // directly: "how do we know a callback ran long" is a policy a backend
+  // should get to answer for itself. The default implementation just
+  // records now() into a member for detect_loop_stall() to compare
+  // against - the only strategy that makes sense for a single-threaded,
+  // synchronous-checkpoint backend like hosted_stdcpp. A future backend
+  // could override both this and detect_loop_stall() to run a watchdog on
+  // a background thread instead, checking for (and reporting) a stall in
+  // parallel while the callback is still running, rather than only
+  // finding out once it returns.
+  //
+  // Virtual with a default body, not pure: unlike now()/sleep_until()/
+  // assert_failure() (which every backend must answer for itself),
+  // reset_loop_stall_detection()/detect_loop_stall() have one sensible
+  // default nearly every backend can just inherit - hosted_stdcpp does,
+  // and so does every test fake in est/tests/ that only overrides now()/
+  // sleep_until()/assert_failure() (unaffected by this addition).
+  virtual void reset_loop_stall_detection() noexcept { stall_start_ = now(); }
+
+  // Checked by est::loop::run_one() right after a node/timer callback
+  // returns: has it been longer than `threshold` since the matching
+  // reset_loop_stall_detection() call? If so, reports a best-effort
+  // diagnostic via printdbg() above - single-threaded means one slow
+  // continuation blocks everything else a loop owns, with nothing to
+  // preempt it, so a runaway handler should at least show up as a clear
+  // diagnostic instead of "the whole program mysteriously stalled."
+  // `threshold` is passed in here rather than baked into
+  // reset_loop_stall_detection(), so est::loop's own
+  // long_running_threshold (docs/PLAN.md, M3) stays the single source of
+  // truth for the value, unchanged by which backend is installed.
+  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept {
+    const auto elapsed = now() - stall_start_;
+    if (elapsed > threshold) {
+      printdbg("est::loop: a continuation took {}ms (> {}ms threshold) to run",
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+               std::chrono::duration_cast<std::chrono::milliseconds>(threshold).count());
+    }
+  }
+
+private:
+  std::chrono::steady_clock::time_point stall_start_;
 };
 
 class hosted_stdcpp final : public interface {
@@ -116,6 +184,16 @@ public:
 // this module, not assignable by any `import est;` consumer bypassing
 // instance()/override_instance() below.
 namespace est::platform::detail {
+// False positive below: bugprone-throwing-static-initialization flags
+// hosted_stdcpp's implicit default constructor as "possibly throwing"
+// purely because interface (its base) now has a non-static data member
+// (stall_start_, added for loop-stall detection) - it doesn't actually
+// analyze whether that member's own default construction can throw
+// (std::chrono::steady_clock::time_point's is trivial/noexcept), it just
+// treats "no longer a literally empty class" as enough to warn. Confirmed
+// by testing: any non-static member on interface at all triggers the
+// identical warning, regardless of its type.
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 inline hosted_stdcpp default_instance{};
 inline interface* current_instance = &default_instance;
 } // namespace est::platform::detail
@@ -145,25 +223,6 @@ export namespace est::platform {
 [[nodiscard]] inline auto override_instance(interface& replacement) noexcept {
   interface* const previous = std::exchange(detail::current_instance, &replacement);
   return scope_exit([previous]() noexcept { detail::current_instance = previous; });
-}
-
-// A best-effort, nothrow debug diagnostic straight to std::cerr - the
-// platform-level home for the "format and print a line, swallow whatever
-// std::println itself could throw (a format error, or an I/O failure)"
-// pattern this module's own hosted_stdcpp::assert_failure() already needs
-// around its own std::println call, factored out so a caller like
-// est::loop (its long-running-callback warning, docs/PLAN.md M3) doesn't
-// have to duplicate that try/catch locally. A plain function template,
-// not a virtual interface method: C++ has no virtual function templates
-// (a vtable can't have an entry per possible instantiation), so this
-// can't be swapped per backend the way now()/sleep_until()/
-// assert_failure() are - every backend gets the same std::cerr behavior.
-template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
-  try {
-    std::println(std::cerr, fmt, std::forward<Ts>(args)...);
-    // NOLINTNEXTLINE(bugprone-empty-catch)
-  } catch (...) {
-  }
 }
 
 } // namespace est::platform
