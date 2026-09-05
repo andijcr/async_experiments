@@ -1745,6 +1745,37 @@ allocation overhead already reported and discussed earlier on this PR
 `future.cppm`) - not a new finding, still not chased per that earlier
 discussion.
 
+**Sixth follow-up, a simplification suggested in review:** `get()`'s
+lvalue branch explicitly cast its result to `const T&`
+(`static_cast<const T&>(std::get<T>(self.result_))`) rather than just
+forwarding `self` uniformly and letting `std::get<T>`'s own overload set
+pick the reference category - the reviewer suspected the explicit
+`const` cast might no longer be necessary but asked to check before
+changing it. Traced every call site of `future_state::get()`
+(`then()`'s unwrapped dispatch, the flatten forwarding lambda,
+`future<T>::get()` itself) - none read the result more than once or
+mutate through it; each either discards it immediately (after the
+rethrow-on-failure side effect) or copies/forwards it straight into
+something else. Confirmed the `const` cast was protecting against a
+capability nothing internal to this file ever exercises, and one no
+*external* caller can reach either now that `future_state` is
+module-private (previous follow-up) - the property `const T&` was
+guarding used to matter when `future_state<T>&` was a public `then()`
+callback parameter, and stopped mattering once that parameter type
+became `future<T>&` instead.
+
+Simplified accordingly: the `if constexpr (std::is_lvalue_reference_v
+<Self>)` branch is gone, replaced by a single `return
+std::get<T>(std::forward<Self>(self).result_);` - `decltype(auto)`
+(already in place from the earlier `auto`-vs-`decltype(auto)` follow-up)
+takes whatever `std::get`'s own overload set picks for the forwarded
+value category: `T&` for a mutable lvalue, `const T&` for a const
+lvalue, `T&&` for an rvalue. A mutable lvalue `get()` call now returns a
+genuinely mutable `T&` instead of a forced `const T&` - confirmed safe
+specifically *because* of the module-privacy change two follow-ups back,
+not in spite of it. Verified end to end: 50/50 tests unchanged,
+`clang-format`/`clang-tidy` clean, no call site needed updating.
+
 ### M3 — the looper
 - `est::loop`: single-threaded run loop owning the ready-queue and the
   timer min-heap from M1. `run()` drains ready continuations, sleeps until

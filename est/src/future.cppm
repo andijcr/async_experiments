@@ -226,30 +226,44 @@ public:
 
   // Retrieves the value, or rethrows the stored exception; returns void
   // for future_state<void> (nothing to retrieve, only the rethrow can
-  // happen). Precondition: ready(). Deducing this: called on an lvalue
-  // (or const lvalue), this returns const T& - non-consuming, safe for
-  // the multiple registered then() continuations that each read it
-  // without consuming it. Called on an rvalue (std::move(state).get()),
-  // this returns T&&, an explicit opt-in to move from the stored value -
-  // same caveat as std::optional<T>::value() &&: moving from a value
-  // something else (another queued continuation, or a later then())
-  // still needs is the caller's mistake to avoid, not something this
-  // class defends against.
+  // happen). Precondition: ready(). Deducing this, forwarded straight
+  // into std::get<T> rather than branched by hand: called on an lvalue,
+  // this returns T& (or const T& for a const lvalue) - non-consuming,
+  // safe for the multiple registered then() continuations that each
+  // read it without consuming it. Called on an rvalue
+  // (std::move(state).get()), this returns T&&, an explicit opt-in to
+  // move from the stored value - same caveat as
+  // std::optional<T>::value() &&: moving from a value something else
+  // (another queued continuation, or a later then()) still needs is the
+  // caller's mistake to avoid, not something this class defends
+  // against.
   //
-  // No single trailing return type expresses all three cases (void,
-  // const T&, T&&) without ever naming the ill-formed "const void&"/
+  // A mutable (non-const) lvalue call returning T&, not a forced
+  // const T&, is a deliberate simplification, not an oversight:
+  // future_state is module-private (see this class's own doc comment) -
+  // no code outside :future/:promise can even name it, let alone obtain
+  // a mutable reference to one and try to mutate result_ through get().
+  // Every internal caller (then()'s unwrapped dispatch, future<T>::get()
+  // itself) only ever reads the result once and copies or forwards it
+  // immediately, so there's nothing left to protect against by forcing
+  // const here specifically - unlike, say, a public accessor on a type
+  // multiple unrelated callers can reach.
+  //
+  // No single trailing return type expresses all three cases (void, T&
+  // or const T&, T&&) without ever naming the ill-formed "const void&"/
   // "void&&" for T=void, even inside an untaken branch of
   // std::conditional_t (which - unlike if constexpr - instantiates both
   // of its type arguments unconditionally) - so the return type is
-  // deduced, and each live alternative is spelled out under its own if
-  // constexpr instead. decltype(auto), not plain auto: plain auto
-  // deduction strips references from the return expression's type (the
-  // same rule as `auto x = expr;`), which would silently turn the
-  // lvalue branch's intended non-consuming const T& into a full copy of
-  // T on every call - decltype(auto) instead takes the return
-  // expression's exact type, reference and all, the same way the
-  // explicit `-> get_result_t<Self>` trailing return type this replaced
-  // used to.
+  // deduced, and the void case is spelled out under its own if constexpr
+  // instead. decltype(auto), not plain auto: plain auto deduction strips
+  // references from the return expression's type (the same rule as
+  // `auto x = expr;`), which would silently turn the intended
+  // non-consuming reference into a full copy of T on every call -
+  // decltype(auto) instead takes the return expression's exact type,
+  // reference and all, letting std::get<T>'s own overload set (on
+  // variant&/const variant&/variant&&) pick the right category straight
+  // from std::forward<Self>(self)'s value category - no manual branching
+  // needed on top of it.
   //
   // check(self.ready()) above is this function's only *documented*
   // guard, and - like every other est::check() call - compiles away
@@ -271,10 +285,8 @@ public:
     if constexpr (std::is_void_v<T>) {
       (void)std::get<stored_t>(self.result_);
       return;
-    } else if constexpr (std::is_lvalue_reference_v<Self>) {
-      return static_cast<const T&>(std::get<T>(self.result_));
     } else {
-      return static_cast<T&&>(std::get<T>(std::forward<Self>(self).result_));
+      return std::get<T>(std::forward<Self>(self).result_);
     }
   }
 
