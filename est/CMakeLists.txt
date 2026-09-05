@@ -22,6 +22,7 @@ target_sources(est
 target_compile_features(est PUBLIC cxx_std_23)
 est_set_warnings(est)
 est_enable_coverage(est)
+est_enable_sanitizers(est)
 
 if(EST_BUILD_TESTS)
   add_subdirectory(tests)

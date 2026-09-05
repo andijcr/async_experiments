@@ -29,6 +29,7 @@ add_executable(est_tests
 target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2WithMain)
 est_set_warnings(est_tests)
 est_enable_coverage(est_tests)
+est_enable_sanitizers(est_tests)
 
 # Catch2's TEST_CASE expands to code using __COUNTER__ (a long-standing,
 # widely-supported extension, but not yet standard - Clang 22 added
