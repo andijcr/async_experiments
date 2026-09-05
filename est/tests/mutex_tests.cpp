@@ -3,6 +3,37 @@ import std;
 
 #include <catch2/catch_test_macros.hpp>
 
+namespace {
+
+using std::pmr::memory_resource;
+
+// Wraps the default resource, counting allocate()/deallocate() calls -
+// the same small helper future_tests.cpp's own copy is, kept local to
+// this file rather than shared, matching the existing convention of
+// each test file being self-contained.
+class counting_resource : public memory_resource {
+public:
+  int allocations = 0;
+  int deallocations = 0;
+
+private:
+  auto do_allocate(std::size_t bytes, std::size_t alignment) -> void* override {
+    ++allocations;
+    return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+  }
+
+  void do_deallocate(void* ptr, std::size_t bytes, std::size_t alignment) override {
+    ++deallocations;
+    std::pmr::new_delete_resource()->deallocate(ptr, bytes, alignment);
+  }
+
+  [[nodiscard]] auto do_is_equal(const memory_resource& other) const noexcept -> bool override {
+    return this == &other;
+  }
+};
+
+} // namespace
+
 // est::mutex::lock() is awaitable-only (M4, docs/PLAN.md): it can no
 // longer be called synchronously the way earlier versions of this file
 // did (`m.lock();` as a plain statement) - the only way to acquire it is
@@ -178,4 +209,40 @@ TEST_CASE("unlock() resumes queued waiters in LIFO order", "[mutex]") {
   REQUIRE(fut1.ready());
   REQUIRE(fut2.ready());
   REQUIRE(fut3.ready());
+}
+
+TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks nothing", "[mutex]") {
+  // Regression test (found in review): est::mutex's destructor used to be
+  // `= default`, which simply discarded waiters_ without draining it -
+  // a coroutine still queued in mutex::waiters_ when the mutex is
+  // destroyed was never resumed *or* destroyed, permanently leaking both
+  // its lock_resume_node and its entire coroutine frame.
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+    est::mutex m(loop);
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto holder = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
+      co_await mutex_ref.lock();
+      co_return; // never unlocks - holds the lock forever, deliberately
+    };
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto waiter = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
+      co_await mutex_ref.lock();
+      co_return; // never reached - the holder above never unlocks
+    };
+
+    holder(loop, m);
+    loop.run_until_idle(); // holder acquires the lock and finishes, still holding it
+
+    auto waiter_fut = waiter(loop, m);
+    loop.run_until_idle(); // waiter finds it locked, suspends, queued in m's waiters_
+
+    REQUIRE(m.has_waiters());
+    // `m` (and `loop`) are destroyed at the end of this scope with
+    // `waiter`'s coroutine still queued, never resumed.
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
 }

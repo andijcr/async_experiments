@@ -34,7 +34,18 @@ public:
   auto operator=(const mutex&) -> mutex& = delete;
   mutex(mutex&&) = delete;
   auto operator=(mutex&&) -> mutex& = delete;
-  ~mutex() = default;
+
+  // Destroys (without resuming) any coroutine still waiting on lock() -
+  // mirrors future_state<T>::~future_state() and loop::~loop() (both
+  // drain their own pending lists the same way, for the same reason).
+  // Without this, a coroutine still queued in waiters_ when *this is
+  // destroyed would simply be unreachable - its lock_resume_node leaked,
+  // and the coroutine itself never resumed *or* destroyed, permanently
+  // hung and leaking its own frame (found in review - an earlier version
+  // of this destructor was simply `= default`).
+  ~mutex() {
+    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator()); });
+  }
 
   [[nodiscard]] auto locked() const noexcept -> bool { return state_ != 0; }
 
@@ -94,14 +105,29 @@ class mutex::lock_resume_node final : public detail::ready_node {
 public:
   explicit lock_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
 
-  void run() final { handle_.resume(); }
+  void run() final {
+    ran_ = true;
+    handle_.resume();
+  }
 
+  // See est:future's own detail::coroutine_resume_node::destroy() for the
+  // full "why check ran_ before touching handle_" reasoning - identical
+  // here: if run() never happened (this node was still queued in
+  // mutex::waiters_ when the mutex itself was destroyed), the waiting
+  // coroutine is still fully intact and untouched, so this is the only
+  // chance to free its frame; if run() did happen, the coroutine either
+  // already self-destroyed or suspended again on something that now owns
+  // it, and touching handle_ again here would be wrong either way.
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
+    if (!ran_) {
+      handle_.destroy();
+    }
     allocator.delete_object(this);
   }
 
 private:
   std::coroutine_handle<> handle_;
+  bool ran_ = false;
 };
 
 // Awaiter returned by mutex::lock(). *this is a coroutine-frame subobject

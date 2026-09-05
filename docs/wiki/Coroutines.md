@@ -229,21 +229,38 @@ sequenceDiagram
   participant est_loop as est::loop
 
   coro->>awaiter: co_await someFuture
-  awaiter->>state: await_ready(): state.ready()?
+  awaiter->>awaiter: await_ready(): always false
+  awaiter->>node: await_suspend(handle): allocate
+  awaiter->>state: set_continuation(node)
+  Note over coro: suspended
   alt already ready
-    awaiter->>coro: await_resume(): get() the value immediately
-  else not ready
-    awaiter->>node: await_suspend(handle): allocate
-    awaiter->>state: set_continuation(node)
-    Note over coro: suspended
-    state->>state: (later) set_value()/set_exception() -> complete()
+    state->>est_loop: enqueue_ready(node) right away
+  else not ready yet
+    state->>state: waiters_.enqueue(node)
+    Note over state,node: (later) set_value()/set_exception() -> complete()
     state->>est_loop: enqueue_ready(node)
-    est_loop->>est_loop: drain_ready(): ready_.dequeue()
-    est_loop->>node: run() -> invoke() -> handle.resume()
-    Note over coro: resumes here
-    coro->>awaiter: await_resume(): get() the value (or rethrow)
   end
+  est_loop->>est_loop: drain_ready(): ready_.dequeue()
+  est_loop->>node: run() -> invoke() -> handle.resume()
+  Note over coro: resumes here
+  coro->>awaiter: await_resume(): get() the value (or rethrow)
 ```
+
+`await_ready()` always returns `false`, even when the awaited future is
+already ready - a first version of this returned `future_.ready()`
+directly, which broke a real, tested invariant this codebase already
+holds `then()` to: even an already-ready `then()` registration defers
+through `est::loop` rather than running inline
+(`future_tests.cpp`, *"then() registered on an already-ready future still
+defers to the loop"*). Skipping suspension for an already-ready `co_await`
+would run the rest of the awaiting coroutine inline instead, right there
+on whatever call stack reached that `co_await` - a chain of several such
+awaits could then run to completion synchronously, starving any other
+work already queued on that loop. `future_state<T>::set_continuation()`
+(called from `await_suspend()`) already handles the "already ready" case
+correctly on its own - enqueueing straight onto `est::loop`'s ready-queue
+instead of invoking inline, exactly the branch the diagram's `alt` shows -
+so `await_ready()` doesn't need to, and must not, special-case it.
 
 `future_awaiter<T>` needs its resumption node to satisfy
 `future_state<T>::set_continuation()`'s signature — `detail::continuation_node<T>&`,
@@ -256,12 +273,19 @@ just resumes:
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
-  void invoke(future_state<T>&) override { handle_.resume(); }
+  void invoke(future_state<T>&) override {
+    invoked_ = true;
+    handle_.resume();
+  }
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    if (!invoked_) {
+      handle_.destroy();   // see "Abandoned coroutines are destroyed, not leaked" below
+    }
     allocator.delete_object(this);
   }
 private:
   std::coroutine_handle<> handle_;
+  bool invoked_ = false;
 };
 ```
 
@@ -303,18 +327,48 @@ coro(loop, std::move(chained));
 Neither `inner`'s caller nor `chained`'s consumer needs to know or care that
 the other side is a coroutine.
 
-### Abandoned coroutines leak their frame
+### Abandoned coroutines are destroyed, not leaked
 
 Both resumption nodes' `destroy()` are called two ways: after a successful
 `run()`/`invoke()` (the normal case, described above), or by
 `future_state<T>::~future_state()`/`loop::~loop()` draining whatever's left
 when a `future_state`/`loop` is torn down without ever completing/draining
 (the abandoned-future scenario `docs/PLAN.md`'s M2 section already
-describes for `then()`). In that second case the coroutine handle was never
-resumed, so its frame simply leaks — a coroutine, unlike a plain
-`concrete_continuation<Fn, U>` node, has no other lifecycle event to free it
-through. This mirrors the accepted cost of an abandoned `then()` chain, just
-manifesting as a leaked frame instead of a harmless heap deallocation.
+describes for `then()`). A first version of this code got the second case
+wrong — `destroy()` freed only the resumption node itself, never the
+coroutine frame the handle pointed to, permanently leaking it (caught in
+code review, before merging, not after). The fix: each resumption node
+tracks whether it ever actually ran -
+
+```cpp
+class coroutine_resume_node final : public ready_node {
+public:
+  void run() final {
+    ran_ = true;
+    handle_.resume();
+  }
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
+    if (!ran_) {
+      handle_.destroy();   // never resumed - still fully intact; this is
+                            // the only chance to free its frame
+    }
+    allocator.delete_object(this);
+  }
+  ...
+};
+```
+
+If `run()`/`invoke()` never happened, the coroutine is still exactly where
+`await_suspend()` left it - fully intact, suspended, never touched -
+so destroying it here is both safe and necessary. If `run()`/`invoke()`
+*did* happen, this `destroy()` call must not touch `handle_` again: the
+coroutine either already self-destroyed (`promise_type::final_suspend()`'s
+`std::suspend_never` - `handle_` is now dangling, so even calling `.done()`
+on it would be a use-after-free) or suspended again on something else
+entirely, which now owns resuming (and eventually destroying) it. The
+`ran_` flag is what lets one `destroy()` implementation tell those two
+completely different situations apart without ever having to safely query
+a handle that might already be gone.
 
 ## `est::mutex::lock()` becomes awaitable
 
@@ -374,3 +428,11 @@ This is a breaking change from `est::mutex`'s earlier, synchronous
 one just constructs and discards an awaiter without acquiring anything.
 `mutex` also now holds an `est::loop&` (the same M3 convention as
 `future_state<T>`), needed to enqueue a waiter's resumption.
+
+`~mutex()` drains `waiters_` the same way `future_state<T>`'s and
+`est::loop`'s own destructors drain theirs (`lock_resume_node` uses the
+identical `ran_`-tracking `destroy()` shown above) — a mutex destroyed
+with a coroutine still queued on `lock()` destroys that coroutine's frame
+too, rather than leaking it and leaving the coroutine permanently hung (an
+earlier version of this destructor was simply `= default`, missing this
+entirely - caught in the same review pass as the frame-leak fix above).

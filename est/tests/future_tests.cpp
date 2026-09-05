@@ -711,3 +711,87 @@ TEST_CASE("a coroutine's frame and resume nodes are all freed through the loop's
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
+
+TEST_CASE("co_await on an already-ready future still defers to the loop", "[future][coroutine]") {
+  // Regression test (found in review): future_awaiter<T>::await_ready()
+  // must not return future_.ready() directly - doing so lets co_await
+  // skip suspension and run the rest of the awaiting coroutine inline,
+  // right there on whatever call stack reached this co_await, instead of
+  // yielding back to est::loop - unlike then(), which this codebase
+  // already tests always defers even when already ready (see "then()
+  // registered on an already-ready future still defers to the loop"
+  // above). Observed here the same way that test does: nothing runs
+  // until run_until_idle() is called, even though the awaited future is
+  // already complete by the time co_await evaluates it.
+  est::loop loop;
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  promise.set_value(5);
+
+  bool resumed = false;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&, est::future<int> fut, bool& resumed_ref) -> est::future<int> {
+    const int value = co_await std::move(fut); // already ready - must still defer
+    resumed_ref = true;
+    co_return value;
+  };
+
+  auto fut = coro(loop, std::move(future), resumed);
+  REQUIRE_FALSE(resumed); // deferred - initial_suspend() alone doesn't run the co_await either
+  loop.run_until_idle();
+  REQUIRE(resumed);
+  REQUIRE(fut.get() == 5);
+}
+
+TEST_CASE("an abandoned coroutine, destroyed with its loop before ever running, leaks nothing",
+          "[future][coroutine]") {
+  // Regression test (found in review): coroutine_resume_node::destroy()
+  // used to free only the small trampoline node, never the coroutine
+  // frame itself, leaking it permanently whenever the frame was
+  // abandoned before ever running (initial_suspend()'s resume node still
+  // sitting in est::loop's ready_ when the loop is destroyed).
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
+    auto fut = coro(loop);
+    // Deliberately never call loop.run_until_idle(): the coroutine never
+    // runs at all before `loop` (and `fut`) go out of scope below.
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
+
+TEST_CASE("dropping an awaited future_state destroys the still-suspended coroutine, no leak",
+          "[future][coroutine]") {
+  // Regression test (found in review): future_resume_node<T>::destroy()
+  // had the identical gap - if the future_state a coroutine is suspended
+  // awaiting is dropped without ever completing (the abandoned-future
+  // scenario docs/PLAN.md's M2 section already describes for then()),
+  // the coroutine's frame used to leak instead of being destroyed.
+  //
+  // The coroutine takes its future by reference, not by value, so this
+  // test controls that future_state's lifetime independently of the
+  // coroutine's own frame - std::optional::reset() below drops the only
+  // two owning handles (promise and future) while the coroutine is still
+  // suspended awaiting it.
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+    auto pair = std::optional(est::make_promise_future<int>(loop));
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop&, est::future<int>& fut) -> est::future<int> {
+      const int value = co_await fut;
+      co_return value;
+    };
+
+    auto result = coro(loop, pair->second);
+    loop.run_until_idle(); // coro starts, suspends awaiting pair->second by reference
+
+    pair.reset(); // drops promise and future - future_state is destroyed
+                  // while the coroutine is still suspended awaiting it
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}

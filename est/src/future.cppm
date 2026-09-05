@@ -128,14 +128,34 @@ class coroutine_resume_node final : public ready_node {
 public:
   explicit coroutine_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
 
-  void run() final { handle_.resume(); }
+  void run() final {
+    ran_ = true;
+    handle_.resume();
+  }
 
+  // If run() was never called - this node was still sitting in
+  // est::loop's ready_ when the loop itself was destroyed, never
+  // drained by a real drain_ready() pass - the coroutine is still fully
+  // intact and untouched, so destroying it here is both safe and
+  // necessary: nothing else will ever get a chance to free its frame
+  // otherwise, a real, permanent leak (found in review, before this node
+  // tracked ran_ at all). If run() *was* called, this node's job is done
+  // either way, and touching handle_ again here would be wrong: the
+  // coroutine either already self-destroyed via
+  // promise_type::final_suspend()'s std::suspend_never (handle_ is now
+  // dangling - calling anything on it is a use-after-free) or suspended
+  // again on something else entirely, which now owns resuming (and
+  // eventually destroying) it.
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
+    if (!ran_) {
+      handle_.destroy();
+    }
     allocator.delete_object(this);
   }
 
 private:
   std::coroutine_handle<> handle_;
+  bool ran_ = false;
 };
 
 // The "not yet started" half of a coroutine returning est::future<T> (see
@@ -974,14 +994,30 @@ public:
   // future_state<T>& /*unused*/: continuation_node<T>::invoke() must take
   // one - this node doesn't need it for anything beyond satisfying that
   // signature.
-  void invoke(future_state<T>& /*unused*/) override { handle_.resume(); }
+  void invoke(future_state<T>& /*unused*/) override {
+    invoked_ = true;
+    handle_.resume();
+  }
 
+  // See coroutine_resume_node::destroy()'s own doc comment for the full
+  // "why check invoked_ before touching handle_" reasoning - identical
+  // here: if invoke() never ran (the future_state this node was
+  // registered on was dropped without ever completing - docs/PLAN.md,
+  // M2's abandoned-future design), the awaiting coroutine is still fully
+  // intact and untouched, so this is the only chance to free its frame;
+  // if invoke() did run, the coroutine either already self-destroyed or
+  // suspended again on something else that now owns it, and touching
+  // handle_ again here would be wrong either way.
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    if (!invoked_) {
+      handle_.destroy();
+    }
     allocator.delete_object(this);
   }
 
 private:
   std::coroutine_handle<> handle_;
+  bool invoked_ = false;
 };
 
 // Awaiter for `co_await someFuture` on any est::future<T> - see
@@ -1004,7 +1040,29 @@ public:
   auto operator=(future_awaiter&&) -> future_awaiter& = delete;
   ~future_awaiter() = default;
 
-  [[nodiscard]] auto await_ready() const noexcept -> bool { return future_.ready(); }
+  // Always suspends, even when future_.ready() is already true: matching
+  // future_state<T>::then()'s own tested invariant that even an
+  // already-ready registration defers through est::loop rather than
+  // running inline (future_tests.cpp, "then() registered on an
+  // already-ready future still defers to the loop"). A plain `return
+  // future_.ready();` here would let co_await behave differently from
+  // then() on the exact same already-ready future - running the rest of
+  // the awaiting coroutine inline, on whatever call stack reached this
+  // co_await, instead of yielding back to est::loop::drain_ready(). A
+  // chain of several such co_awaits (each already ready - e.g. values set
+  // directly via promise.set_value() rather than through the loop) would
+  // then run to completion synchronously, starving any other work already
+  // queued on that loop. future_state<T>::set_continuation() (called from
+  // await_suspend() below) already handles the "already ready" case
+  // correctly on its own - enqueueing straight onto est::loop's
+  // ready-queue instead of invoking inline - so await_ready() doesn't
+  // need to (and must not) special-case it here.
+  // NOLINTNEXTLINE(readability-convert-member-functions-to-static) - see
+  // detail::coroutine_start_awaiter::await_ready()'s own doc comment on
+  // why not: every co_await call site would otherwise trade this one
+  // finding for a readability-static-accessed-through-instance finding
+  // there instead.
+  [[nodiscard]] auto await_ready() const noexcept -> bool { return false; }
 
   void await_suspend(std::coroutine_handle<> handle) {
     auto* node = future_.state_->allocator().template new_object<future_resume_node<T>>(handle);

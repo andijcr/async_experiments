@@ -2306,6 +2306,52 @@ function handling doesn't attribute cleanly - not worth chasing given the
 overall margin); full suite also passes under the `sanitize` preset
 (ASan+UBSan).
 
+#### Code review round (3 bugs found, fixed before merging)
+
+A `/code-review` pass against the M4 PR (matching M3's own "do a code
+review" → "fix the automatic code review findings" cycle) found and — after
+independent verification against the actual source — fixed three more real
+bugs, none caught by the sanitizer pass above (all three are leaks/inline-
+execution issues, not memory corruption, so ASan/UBSan had nothing to
+flag):
+
+1. **`coroutine_resume_node`/`future_resume_node<T>`/`mutex::lock_resume_node`
+   `destroy()` leaked abandoned coroutine frames.** The heap-allocated-node
+   fix above solved the crash, but its first `destroy()` only ever freed the
+   small trampoline node itself — never `handle_.destroy()` on the coroutine
+   frame the handle pointed to. A coroutine abandoned before ever running
+   (its owning `future_state<T>`/`loop`/`mutex` torn down while it was still
+   only queued, never resumed) leaked its entire frame permanently. Fixed
+   with a `ran_`/`invoked_` flag each node now tracks: `destroy()` calls
+   `handle_.destroy()` only when `run()`/`invoke()` never actually happened
+   — see [docs/wiki/Coroutines.md](wiki/Coroutines.md)'s "Abandoned
+   coroutines are destroyed, not leaked" section for the full reasoning
+   (importantly, this doesn't need `final_suspend()` to change — it stays
+   `std::suspend_never`).
+2. **`~mutex()` was simply `= default`**, never draining `waiters_` — a
+   coroutine still queued on `lock()` when its `mutex` was destroyed was
+   both leaked and left permanently hung (never resumed, never destroyed).
+   Fixed by draining `waiters_` in the destructor, the same pattern
+   `future_state<T>`/`loop` already use for their own pending queues.
+3. **`future_awaiter<T>::await_ready()` returned `future_.ready()`
+   directly**, letting an already-ready `co_await` skip suspension and run
+   the rest of the awaiting coroutine inline on whatever call stack reached
+   it — silently violating this codebase's own tested "never run inline"
+   invariant (`future_tests.cpp`'s *"then() registered on an already-ready
+   future still defers to the loop"*). Fixed by making `await_ready()`
+   unconditionally return `false`; `future_state<T>::set_continuation()`
+   already handles the ready-vs-not branching correctly on its own, so
+   `await_ready()` doesn't need to and must not special-case it.
+
+Verified in the pinned Docker devenv: 81/81 tests pass (4 new regression
+tests — an already-ready `co_await` still deferring, an abandoned
+coroutine's frame not leaking, a still-suspended coroutine destroyed with
+its awaited `future_state` not leaking, and a mutex destroyed with a
+coroutine still queued on `lock()` not leaking — each checking balanced
+allocation/deallocation counts against a counting `memory_resource`);
+`clang-format`/`clang-tidy` clean; full suite also re-passes under the
+`sanitize` preset (ASan+UBSan) after the fix.
+
 ### Issue #25: flatten path's throwaway allocation (done)
 
 Found by a `code-review` pass on the issue #23 PR (see that section above)
