@@ -225,20 +225,21 @@ sequenceDiagram
   participant coro as awaiting coroutine
   participant awaiter as future_awaiter&lt;T&gt;
   participant state as awaited future_state&lt;T&gt;
-  participant loop as est::loop
+  participant node as future_resume_node&lt;T&gt;
+  participant est_loop as est::loop
 
   coro->>awaiter: co_await someFuture
   awaiter->>state: await_ready(): state.ready()?
   alt already ready
     awaiter->>coro: await_resume(): get() the value immediately
   else not ready
-    awaiter->>awaiter: await_suspend(handle): allocate future_resume_node&lt;T&gt;
+    awaiter->>node: await_suspend(handle): allocate
     awaiter->>state: set_continuation(node)
     Note over coro: suspended
     state->>state: (later) set_value()/set_exception() -> complete()
-    state->>loop: enqueue_ready(node)
-    loop->>loop: drain_ready(): ready_.dequeue()
-    loop->>node: run() -> invoke() -> handle.resume()
+    state->>est_loop: enqueue_ready(node)
+    est_loop->>est_loop: drain_ready(): ready_.dequeue()
+    est_loop->>node: run() -> invoke() -> handle.resume()
     Note over coro: resumes here
     coro->>awaiter: await_resume(): get() the value (or rethrow)
   end
