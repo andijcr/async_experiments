@@ -2194,7 +2194,9 @@ a new `est:util.intrusive_list` partition, alongside `:util.scope_exit`/
 Verified in the pinned Docker devenv: 68/68 tests pass (5 new), `clang-
 format`/`clang-tidy` clean, new-code coverage 98% against `origin/main`.
 
-### M4 — coroutine adapters
+### M4 — coroutine adapters (done)
+
+Original plan, as written before implementation:
 - `est::task<T>` coroutine type with a `promise_type` that binds to
   `est::promise<T>`/`est::future<T>` under the hood.
 - `operator co_await` on `est::future<T>`, suspending into a continuation
@@ -2216,9 +2218,93 @@ format`/`clang-tidy` clean, new-code coverage 98% against `origin/main`.
   waiter. Needs coroutine machinery to suspend/resume, so it lands here
   rather than in M1.
 
-M4 itself is still in progress on a separate branch/PR (`feature/coroutines`,
-PR #37) as of this section - not yet merged into `main` - so its own
-"Implementation" write-up lives there, not here.
+#### Implementation
+
+Two design forks, both settled with the repo owner via `AskUserQuestion`
+before writing code, changed the plan above in ways expensive to walk back
+once tests were built around an answer:
+
+1. **No `est::task<T>`.** The repo owner's own framing: "an homogeneous
+   interface — the caller should not know if a computation is built from
+   chained futures or a coroutine function." `est::future<T>` itself is now
+   the coroutine return type, via a `future<T>::promise_type` nested class
+   — see [docs/wiki/Coroutines.md](wiki/Coroutines.md) for the full design.
+   This is a real simplification over the planned `task<T>`, not just a
+   rename: `promise_type` builds a `shared_ptr<future_state<T>>` directly
+   and talks to it through `return_value()`/`return_void()`/
+   `unhandled_exception()`, with no intermediate `est::promise<T>` needed
+   for the coroutine path at all (`est::promise<T>` is unchanged, still the
+   producer type for non-coroutine code like `sleep_for()`).
+2. **`est::mutex::lock()` is awaitable-only**, not awaitable-plus-a-
+   synchronous-fallback. This is a breaking API change: the old synchronous
+   `lock()`/`unlock()` toggle is gone, `mutex` now holds an `est::loop&`
+   (needed to defer a waiter's resumption), and every caller must be a
+   coroutine using `co_await mutex.lock();`. `mutex_tests.cpp` was rewritten
+   in full to drive its scenarios through small coroutines instead of
+   calling `lock()` directly, matching the same "existing tests get
+   rewritten, flagged as a coming cost, not a surprise" pattern M3's own
+   loop-deferral change went through.
+
+The coroutine calling convention settled on: every `est::future<T>`-
+returning coroutine takes `est::loop&` as its first parameter (not the
+originally-planned `std::allocator_arg_t` + allocator pair) — simpler at
+every call site, with the coroutine frame's own allocator derived from
+`loop_ref.allocator()` inside `promise_type` rather than threaded through
+explicitly. `operator co_await()` on `est::future<T>` was built as planned
+(the "using symmetric transfer where the standard allows it" phrasing from
+the original plan didn't end up applying in practice — this codebase defers
+every resumption through `est::loop`'s ready-queue rather than nested
+coroutine-to-coroutine handle transfer, so there's no deep synchronous
+resumption chain for symmetric transfer to protect against; see the wiki
+page for why).
+
+**A real bug, caught before merging, not after:** the first version of the
+coroutine-resumption machinery tried to avoid a heap allocation by having
+an awaiter (`initial_suspend()`'s, and `future<T>::operator co_await()`'s)
+double as the `ready_node`/`continuation_node<T>` registered with
+`est::loop`/`future_state<T>`, reasoning that an awaiter object persists
+across its own suspension. That's true only for the duration of *that one*
+`co_await` expression — once `run()` resumes the coroutine *past* it, the
+compiler is free to reuse that exact frame storage for whatever the
+coroutine's later code constructs, and `est::loop::run_one()`'s
+`destroy_guard` calls `destroy()` on the same node *after* `run()` already
+returned. Reproduced directly as `libc++abi: Pure virtual function called!`
+— a virtual dispatch through a vtable pointer already clobbered by the
+coroutine's own subsequent frame activity. Fixed by falling back to this
+codebase's already-proven pattern: a small, separately heap-allocated
+resumption node (`coroutine_resume_node`, `future_resume_node<T>`,
+`mutex::lock_resume_node`), exactly like `concrete_continuation<Fn, U>`
+and `concrete_timer_node<Fn>` already are, with the frame-embedded awaiter
+only responsible for allocating it and never touched again afterward. See
+[docs/wiki/Coroutines.md](wiki/Coroutines.md) for the full account — the
+ASan+UBSan sanitizer gate added just before this milestone (see its own
+section above) confirmed the fix clean, though the bug itself was actually
+caught the old-fashioned way first (a debug-build crash under `ctest`),
+before sanitizers were even run against this code.
+
+**Verified in the pinned Docker devenv:** 77/77 tests pass (7 new
+coroutine tests in `future_tests.cpp` including a leak-check against a
+counting `memory_resource`, plus a full rewrite of `mutex_tests.cpp`'s 4
+tests to drive `lock()`/`unlock()` through real coroutines, one exercising
+LIFO waiter-resumption order); `clang-format`/`clang-tidy` clean (several
+real, non-generic findings fixed along the way — deleted copy/move for
+every new frame-embedded awaiter type, matching `est::scope_exit`'s own
+established "returned as a guaranteed-elided prvalue, never actually
+copied/moved" pattern; NOLINT'd the handful of findings that are
+either false positives for this codebase's own accepted conventions
+(`est::loop&` reference parameters, matching `future_state<T>`/`est::mutex`
+already-accepted lifetime-precondition stance) or would have scattered a
+single contained finding across every call site instead (making
+`await_ready()` `static` moves one `readability-` finding in `future.cppm`
+into a `readability-static-accessed-through-instance` finding at every
+`co_await` call site instead, since the compiler's own generated code
+calls it through an instance regardless — worse, not fixed)); new-code
+coverage 99% against `origin/main` (the two lines missed - one
+`return_value()` overload never hit by this PR's own tests, one line
+inside a coroutine body whose exception path llvm-cov's coroutine-split
+function handling doesn't attribute cleanly - not worth chasing given the
+overall margin); full suite also passes under the `sanitize` preset
+(ASan+UBSan).
 
 ### Issue #25: flatten path's throwaway allocation (done)
 

@@ -561,3 +561,153 @@ TEST_CASE("flattening a chained then() frees every node involved, no leak", "[fu
   // here would mean that overhead came back.
   REQUIRE(resource.allocations == 5);
 }
+
+// M4 (docs/PLAN.md): est::future<T> itself is a coroutine's return type -
+// no separate task<T> wrapper - via future<T>::promise_type. Every
+// coroutine below is a plain lambda taking est::loop& as its first
+// parameter; est::future<T>'s own doc comment on promise_type explains
+// why that first parameter is required (it's what promise_type's own
+// constructor/operator new pattern-match against) and why a plain
+// function (a lambda's non-static call operator included - confirmed
+// empirically against the pinned toolchain) works as a coroutine here
+// with no extra ceremony. None of these capture anything - state a
+// coroutine needs crosses in as an ordinary by-value/by-reference
+// parameter instead, since a capturing lambda's closure lives outside
+// the coroutine frame it starts and isn't guaranteed to outlive it
+// (clang-tidy's cppcoreguidelines-avoid-capturing-lambda-coroutines
+// flags exactly this - real advice, followed here rather than
+// suppressed, even though every capture below happens to be provably
+// safe within its own test's scope). est::loop& itself is the one
+// unavoidable reference parameter (required by the calling convention
+// above) - NOLINT'd per declaration below, matching this codebase's
+// already-accepted "a loop& is safe given its own documented lifetime
+// precondition" stance (est::future_state<T>, est::mutex, ...).
+
+TEST_CASE("a coroutine returning est::future<int> can co_return a value", "[future][coroutine]") {
+  est::loop loop;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
+
+  auto fut = coro(loop);
+  REQUIRE_FALSE(fut.ready()); // deferred - initial_suspend() never runs inline
+  loop.run_until_idle();
+  REQUIRE(fut.ready());
+  REQUIRE(fut.get() == 42);
+}
+
+TEST_CASE("a coroutine returning est::future<void> can co_return with no value",
+          "[future][coroutine][void]") {
+  est::loop loop;
+  bool ran = false;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&, bool& ran_ref) -> est::future<void> {
+    ran_ref = true;
+    co_return;
+  };
+
+  auto fut = coro(loop, ran);
+  REQUIRE_FALSE(ran);
+  loop.run_until_idle();
+  REQUIRE(ran);
+  REQUIRE(fut.ready());
+  fut.get();
+}
+
+TEST_CASE("an exception thrown in a coroutine's body surfaces through get()",
+          "[future][coroutine]") {
+  est::loop loop;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&) -> est::future<int> {
+    throw std::runtime_error("boom");
+    co_return 0; // unreachable - co_return is only here to make this body a coroutine
+  };
+
+  auto fut = coro(loop);
+  loop.run_until_idle();
+  REQUIRE(fut.ready());
+  REQUIRE(fut.failed());
+  REQUIRE_THROWS_AS(fut.get(), std::runtime_error);
+}
+
+TEST_CASE("a coroutine can co_await another coroutine's future, chaining values",
+          "[future][coroutine]") {
+  est::loop loop;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto inner = [](est::loop&, int x) -> est::future<int> { co_return x * 2; };
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto outer = [](est::loop& loop_ref, decltype(inner)& inner_coro) -> est::future<int> {
+    const int value = co_await inner_coro(loop_ref, 21);
+    co_return value + 1;
+  };
+
+  auto fut = outer(loop, inner);
+  loop.run_until_idle();
+  REQUIRE(fut.ready());
+  REQUIRE(fut.get() == 43);
+}
+
+TEST_CASE("a coroutine can co_await a future built from a then() chain, genuinely suspending",
+          "[future][coroutine]") {
+  est::loop loop;
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  auto chained = future.then([](int v) { return v + 1; });
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&, est::future<int> fut) -> est::future<int> {
+    const int value = co_await std::move(fut);
+    co_return value * 10;
+  };
+
+  auto fut = coro(loop, std::move(chained));
+  loop.run_until_idle(); // coro starts, suspends waiting on its future (not ready yet)
+  REQUIRE_FALSE(fut.ready());
+
+  promise.set_value(4);
+  loop.run_until_idle(); // then()'s callback computes 5, resumes coro, coro finishes with 50
+
+  REQUIRE(fut.ready());
+  REQUIRE(fut.get() == 50);
+}
+
+TEST_CASE("an exception in the awaited future propagates across co_await", "[future][coroutine]") {
+  est::loop loop;
+  auto [promise, awaited] = est::make_promise_future<int>(loop);
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&, est::future<int> fut) -> est::future<int> {
+    const int value = co_await std::move(fut); // rethrows once `fut` fails
+    co_return value;
+  };
+
+  auto fut = coro(loop, std::move(awaited));
+  loop.run_until_idle(); // coro starts, suspends waiting on its future
+
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("nope")));
+  loop.run_until_idle(); // resumes into the rethrow, uncaught -> unhandled_exception()
+
+  REQUIRE(fut.ready());
+  REQUIRE(fut.failed());
+  REQUIRE_THROWS_AS(fut.get(), std::runtime_error);
+}
+
+TEST_CASE("a coroutine's frame and resume nodes are all freed through the loop's allocator, "
+          "no leak",
+          "[future][coroutine]") {
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+    auto [promise, awaited] = est::make_promise_future<int>(loop);
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop&, est::future<int> fut) -> est::future<int> {
+      const int value = co_await std::move(fut);
+      co_return value + 1;
+    };
+
+    auto result = coro(loop, std::move(awaited));
+    loop.run_until_idle(); // coro's frame is allocated, then suspends on `fut`
+    promise.set_value(9);
+    loop.run_until_idle(); // resumes, completes - frame and resume nodes freed
+
+    REQUIRE(result.get() == 10);
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}

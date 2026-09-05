@@ -33,6 +33,11 @@ than duplicating it.
 - **[The Loop and Timers](Loop-And-Timers.md)** — how `est::loop` actually
   schedules and runs continuations, how `sleep_for()`/`sleep_until()` bridge
   timers into futures, and the long-running-callback / reentrancy guards.
+- **[Coroutines](Coroutines.md)** — why `est::future<T>` itself is the
+  coroutine return type (no separate `task<T>`), the `promise_type`/
+  `operator co_await()` machinery behind it, a real use-after-reuse bug it
+  took to get right, and how `est::mutex::lock()` became awaitable on the
+  same pieces.
 
 ## The five-second architecture summary
 
@@ -40,14 +45,15 @@ than duplicating it.
 est::platform   — a monotonic clock + "what happens when a check fails" seam,
                    swappable per backend (hosted Linux today; bare metal later)
 est::shared_ptr — a single-allocation, non-atomic reference-counted pointer
-est::mutex      — an intrusive waiter list + lock word (bookkeeping only —
-                   nothing is concurrent yet)
+est::mutex      — an intrusive waiter list + lock word; lock() is awaitable,
+                   guarding a critical section across a coroutine suspension
 est::timer_queue — a min-heap of deadlines, driven by est::platform's clock
 est::loop       — owns a ready-queue and the timer_queue; the only thing that
                    ever actually invokes a continuation or fires a timer
 est::future<T>/
 est::promise<T> — a thin, shared_ptr-backed producer/consumer pair; .then()
-                   chains defer through est::loop instead of running inline
+                   chains defer through est::loop instead of running inline;
+                   future<T> is also a coroutine's return type (no task<T>)
 ```
 
 Every future/promise pair is built via `est::make_promise_future<T>(loop&)` —
@@ -63,8 +69,8 @@ run.
 | `est::check()` | `est/src/check.cppm` |
 | `est::shared_ptr<T>`, `enable_shared_from_this<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
-| `est::mutex`, `mutex_waiter` | `est/src/sync/mutex.cppm` |
+| `est::mutex`, `mutex::lock_awaiter`, `mutex::lock_resume_node` | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
-| `est::future_state<T>`, `est::future<T>`, `continuation_node<T>` | `est/src/future.cppm` |
+| `est::future_state<T>`, `est::future<T>`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `sleep_for()`/`sleep_until()` | `est/src/promise.cppm` |
