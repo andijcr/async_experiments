@@ -2352,6 +2352,59 @@ allocation/deallocation counts against a counting `memory_resource`);
 `clang-format`/`clang-tidy` clean; full suite also re-passes under the
 `sanitize` preset (ASan+UBSan) after the fix.
 
+#### PR review round: alignment simplification, `mutex::acquire()`
+
+Four more review rounds on the M4 PR itself (PR #37), after it was rebased
+onto `main` post-issue-#25/#39/loop-stall-detection:
+
+- **`coroutine_frame_alloc()`/`coroutine_frame_dealloc()`'s alignment**
+  simplified from `std::max(alignof(resource_ptr), alignof(std::max_align_t))`
+  to `alignof(std::max_align_t)` alone, per a review comment pointing out
+  the `std::max` was dead code (the standard guarantees `max_align_t`'s
+  alignment already dominates any scalar type's, pointers included).
+  `std::min` — the review comment's own first guess — would have been a
+  real bug: `align` also stands in for the coroutine frame's own alignment
+  requirement, which this code can't query directly, and `std::min` would
+  silently under-align any frame needing more than pointer alignment.
+- **A regression test added**: a plain `.then()` continuation registered
+  directly on a coroutine-returned `future<T>`, exercising the "caller
+  can't tell a future came from a coroutine or a then() chain" homogeneity
+  through `then()` as well as `co_await`.
+- **`initial_suspend()` kept as always-suspend**, after a design
+  discussion: the repo owner's instinct was that a coroutine's synchronous
+  prefix (up to its first real suspension point) is conceptually the same
+  as a plain function's work before returning a future, and so shouldn't
+  need to defer through the loop first. The concrete cost of the current
+  design is real but narrow: exactly one extra `coroutine_resume_node`
+  allocation/deallocation and one ready-queue round trip per coroutine
+  call, regardless of how many real suspension points it has (every actual
+  `co_await` already allocates its own resume node either way, unaffected
+  by this). Weighed against reintroducing the same "might already be
+  resolved with side effects applied before the caller ever sees it"
+  hazard the `await_ready()` fix (above) deliberately closed for
+  `co_await` itself - left as-is for consistency with that fix and with
+  `then()`'s own "never run inline" guarantee.
+- **`est::mutex::acquire()` added**: `lock()`/`unlock()` stay exactly as
+  they were (awaitable-only, manual), and a new `acquire() -> future<
+  lock_guard>` sits alongside them - `lock_guard` is a move-only RAII
+  handle that calls `unlock()` from its own destructor (suppressed after a
+  move), so a caller doesn't have to remember to unlock manually. Not a
+  coroutine itself: built directly on `est::promise<lock_guard>`, the same
+  "producer without co_await" pattern `sleep_until()` (`est:promise`)
+  already uses on top of `est::loop`'s timer queue - `acquire()`'s fast
+  path (mutex unlocked) completes the promise immediately, mirroring
+  `lock_awaiter::await_ready()`'s own fast path exactly; its slow path
+  queues a new `acquire_resume_node` (parallel to `lock_resume_node`, but
+  completing a promise instead of resuming a coroutine handle) in the same
+  `waiters_` list `lock()`'s own waiters already share.
+
+Verified in the pinned Docker devenv: 93/93 tests pass (7 new `acquire()`
+tests in `mutex_tests.cpp` — fast path, RAII unlock on drop, move transfers
+ownership, slow path deferring until the holder's guard is dropped,
+`co_await`-ability, and a no-leak check against a counting
+`memory_resource`); `clang-format`/`clang-tidy` clean; full suite also
+passes under the `sanitize` preset (ASan+UBSan).
+
 ### Issue #25: flatten path's throwaway allocation (done)
 
 Found by a `code-review` pass on the issue #23 PR (see that section above)

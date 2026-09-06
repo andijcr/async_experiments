@@ -211,6 +211,110 @@ TEST_CASE("unlock() resumes queued waiters in LIFO order", "[mutex]") {
   REQUIRE(fut3.ready());
 }
 
+TEST_CASE("acquire() on an unlocked mutex returns an already-ready future", "[mutex]") {
+  est::loop loop;
+  est::mutex m(loop);
+
+  auto fut = m.acquire();
+  REQUIRE(fut.ready()); // fast path - no different from lock_awaiter's own
+  REQUIRE(m.locked());
+
+  auto guard = std::move(fut).get();
+  REQUIRE(m.locked()); // still held - guard is alive
+  (void)guard;
+}
+
+TEST_CASE("dropping the lock_guard unlocks the mutex", "[mutex]") {
+  est::loop loop;
+  est::mutex m(loop);
+
+  {
+    auto guard = m.acquire().get();
+    REQUIRE(m.locked());
+  }
+  REQUIRE_FALSE(m.locked());
+}
+
+TEST_CASE("moving a lock_guard transfers ownership of the unlock", "[mutex]") {
+  est::loop loop;
+  est::mutex m(loop);
+
+  auto first = m.acquire().get();
+  {
+    auto second = std::move(first);
+    REQUIRE(m.locked());
+    // `second` goes out of scope here and unlocks - `first`, moved-from,
+    // must not also try to (it would be a double-unlock, handing the lock
+    // to a waiter twice or clearing an already-clear state_).
+  }
+  REQUIRE_FALSE(m.locked());
+}
+
+TEST_CASE("acquire() on a locked mutex defers until the holder's guard is dropped", "[mutex]") {
+  est::loop loop;
+  est::mutex m(loop);
+
+  auto holder = m.acquire().get();
+  auto fut = m.acquire();
+  REQUIRE_FALSE(fut.ready()); // queued - unlike the fast path above
+  REQUIRE(m.has_waiters());
+
+  loop.run_until_idle(); // nothing to drain yet - unlock() hasn't run
+  REQUIRE_FALSE(fut.ready());
+
+  // Moving `holder` into a block-scoped variable and letting it go out of
+  // scope is the point: its destructor is what calls unlock() and hands
+  // the lock to the waiter above.
+  {
+    auto dropped = std::move(holder);
+  }
+  loop.run_until_idle(); // the waiter's acquire_resume_node runs, completing `fut`
+
+  REQUIRE(fut.ready());
+  auto second = std::move(fut).get();
+  REQUIRE(m.locked());
+  (void)second;
+}
+
+TEST_CASE("acquire() can be co_await'ed from inside a coroutine", "[mutex]") {
+  est::loop loop;
+  est::mutex m(loop);
+
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<bool> {
+    auto guard = co_await mutex_ref.acquire();
+    const bool locked_while_held = mutex_ref.locked();
+    co_return locked_while_held;
+  };
+
+  auto fut = coro(loop, m);
+  loop.run_until_idle();
+  REQUIRE(fut.ready());
+  REQUIRE(fut.get());
+  REQUIRE_FALSE(m.locked()); // the coroutine's guard was dropped on return
+}
+
+TEST_CASE("destroying a mutex with a future<lock_guard> still queued on acquire() leaks nothing",
+          "[mutex]") {
+  // The acquire()-based twin of the lock()-based leak test below: a waiter
+  // queued via acquire() rather than lock() must be freed the same way.
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+    est::mutex m(loop);
+
+    auto holder = m.acquire().get(); // never dropped - holds the lock forever
+    auto waiter_fut = m.acquire();
+    REQUIRE_FALSE(waiter_fut.ready());
+    REQUIRE(m.has_waiters());
+    // `m` (and `loop`) are destroyed at the end of this scope with
+    // `waiter_fut`'s acquire_resume_node still queued, never resumed.
+    (void)holder;
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
+
 TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks nothing", "[mutex]") {
   // Regression test (found in review): est::mutex's destructor used to be
   // `= default`, which simply discarded waiters_ without draining it -

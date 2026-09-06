@@ -14,7 +14,7 @@ graph BT
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
-  mutex[":sync.mutex<br/>mutex, mutex::lock_awaiter"]
+  mutex[":sync.mutex<br/>mutex, mutex::lock_awaiter, mutex::acquire, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]
@@ -24,6 +24,8 @@ graph BT
   shared_ptr --> check
   mutex --> intrusive_list
   mutex --> loop
+  mutex --> future
+  mutex --> promise
   timer --> platform
   loop --> check
   loop --> platform
@@ -47,7 +49,12 @@ key to understanding how the continuation mechanism is split across files.
 `:sync.mutex` depends on `:loop` too (M4, [Coroutines](Coroutines.md)) — an
 awaitable `lock()` needs somewhere to defer a waiter's resumption to, and
 `est::loop::enqueue_ready()` is that somewhere; `:loop` still knows nothing
-about `:sync.mutex` in return.
+about `:sync.mutex` in return. `:sync.mutex` also depends on `:future`/
+`:promise` (PR #37 review follow-up) for `acquire() -> future<lock_guard>`
+— an alternative to `lock()`/`unlock()` returning a move-only RAII handle
+instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
+rather than a coroutine of its own, the same "producer without co_await"
+pattern `sleep_until()` (`:promise`) already uses.
 
 ## Design philosophy
 

@@ -436,3 +436,56 @@ with a coroutine still queued on `lock()` destroys that coroutine's frame
 too, rather than leaking it and leaving the coroutine permanently hung (an
 earlier version of this destructor was simply `= default`, missing this
 entirely - caught in the same review pass as the frame-leak fix above).
+
+### `acquire()`: the same lock, packaged as a RAII `future<lock_guard>`
+
+`lock()`/`unlock()` stay exactly as shown above — a deliberately low-level,
+manual pair (repo owner's own call on a PR review). `acquire()` sits
+alongside them for a caller who'd rather not have to remember the matching
+`unlock()` call:
+
+```cpp
+[[nodiscard]] auto acquire() -> future<lock_guard> {
+  auto [prom, fut] = make_promise_future<lock_guard>(loop_);
+  if (state_ == 0) {
+    state_ = 1;
+    prom.set_value(lock_guard(*this));
+    return std::move(fut);
+  }
+  auto* node = loop_.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
+  waiters_.enqueue(*node);
+  return std::move(fut);
+}
+```
+
+`lock_guard` is a move-only handle (`future<T>`/`promise<T>`'s own
+convention) whose destructor calls `unlock()` — suppressed after a move,
+the same "empty after move" contract `shared_ptr<T>` already documents.
+`acquire()` is deliberately *not* a coroutine itself: every `future<T>`-
+returning coroutine in this codebase takes `est::loop&` as an explicit
+first parameter (the calling-convention section above), which would make
+`co_await mutex.acquire()` an oddly-shaped call for something `mutex`
+already has its own `loop&` for internally. Instead it's built directly on
+`est::promise<lock_guard>`, the same "producer without `co_await`" pattern
+`sleep_until()` (`:promise`) already uses on top of `est::loop`'s timer
+queue — no coroutine frame, no `promise_type`, just a plain function that
+either completes the promise immediately (the fast path, mirroring
+`lock_awaiter::await_ready()`'s own fast path exactly) or queues a waiter
+node that completes it later.
+
+That waiter node, `acquire_resume_node`, sits in the exact same
+`waiters_` list `lock_resume_node` does (`intrusive_list<detail::ready_node>`
+doesn't care which concrete type it holds) - `unlock()` hands the lock to
+whichever one is next in LIFO order without needing to know which kind it
+got. Unlike `lock_resume_node`, it has no `ran_` flag to track: there's no
+coroutine frame it might need to destroy on an abandoned path, only an
+`est::promise<lock_guard>` member whose own destructor already does the
+right thing if it's ever dropped without completing (a "broken promise" -
+the `future<lock_guard>` simply never becomes ready, same contract every
+other `est::promise<T>` in this codebase already has) - so its `destroy()`
+is a plain deallocation, nothing more.
+
+Because `future<T>` is awaitable from *any* coroutine (the `operator
+co_await()` section above), `acquire()`'s result can still be `co_await`ed
+from inside one - `auto guard = co_await mutex.acquire();` - it just isn't
+required to be.

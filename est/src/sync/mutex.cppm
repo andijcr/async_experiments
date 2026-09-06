@@ -1,7 +1,9 @@
 export module est:sync.mutex;
 
 import std;
+import :future;
 import :loop;
+import :promise;
 import :util.intrusive_list;
 
 export namespace est {
@@ -19,7 +21,10 @@ export namespace est {
 // that, built entirely on primitives this codebase already has -
 // est::detail::ready_node (est:loop) for the waiter/resume queue,
 // est::intrusive_list for the queue itself - needing nothing new besides
-// the awaiter, below.
+// the awaiter, below. acquire() (below) packages the same lock()/unlock()
+// pair as a future<lock_guard> instead, for a caller that would rather
+// have the lock released automatically (RAII) than remember to call
+// unlock() itself.
 //
 // Holds a `loop&` (M3's convention, same as future_state<T> - see that
 // class's own doc comment) rather than its own allocator: it needs
@@ -35,14 +40,16 @@ public:
   mutex(mutex&&) = delete;
   auto operator=(mutex&&) -> mutex& = delete;
 
-  // Destroys (without resuming) any coroutine still waiting on lock() -
-  // mirrors future_state<T>::~future_state() and loop::~loop() (both
-  // drain their own pending lists the same way, for the same reason).
-  // Without this, a coroutine still queued in waiters_ when *this is
-  // destroyed would simply be unreachable - its lock_resume_node leaked,
-  // and the coroutine itself never resumed *or* destroyed, permanently
-  // hung and leaking its own frame (found in review - an earlier version
-  // of this destructor was simply `= default`).
+  // Destroys (without resuming) any waiter still queued on lock() or
+  // acquire() - mirrors future_state<T>::~future_state() and loop::~loop()
+  // (both drain their own pending lists the same way, for the same
+  // reason). Without this, a waiter still queued in waiters_ when *this
+  // is destroyed would simply be unreachable: a lock()-registered
+  // lock_resume_node would leak its coroutine's frame, never resumed *or*
+  // destroyed (found in review - an earlier version of this destructor
+  // was simply `= default`); an acquire()-registered acquire_resume_node
+  // would leak the node itself and permanently strand its future<lock_guard>
+  // not-ready.
   ~mutex() {
     waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator()); });
   }
@@ -53,6 +60,8 @@ public:
 
   class lock_awaiter;
   class lock_resume_node;
+  class lock_guard;
+  class acquire_resume_node;
 
   // Returns an awaiter: `co_await mutex.lock();` acquires the lock,
   // suspending the calling coroutine first if it's already held. Only
@@ -78,6 +87,28 @@ public:
     }
     state_ = 0;
   }
+
+  // acquire() is lock()/unlock() packaged as a future<lock_guard> instead
+  // of a co_await-only primitive (repo owner's own framing, PR #37 review:
+  // "keep lock/unlock void, add acquire() -> future<lock_guard>, lock_guard
+  // is move only") - a caller that doesn't want to remember to call
+  // unlock() itself gets a RAII handle instead, exactly like every other
+  // guard type in this codebase's own ecosystem (est::scope_exit). Not a
+  // coroutine itself - see acquire_resume_node's own doc comment for why
+  // it's built directly on est::promise<lock_guard>, the same "producer
+  // built without co_await" pattern sleep_until() (est:promise) already
+  // uses on top of est::loop's timer queue.
+  //
+  // Mirrors lock_awaiter::await_ready()'s own fast path exactly: an
+  // unlocked mutex is acquired immediately and returns an already-ready
+  // future, no different from any other producer that calls set_value()
+  // before ever handing back its future (e.g. make_promise_future() +
+  // an immediate set_value()) - this is not the "run a registered
+  // continuation inline" hazard this codebase otherwise forbids (M3,
+  // docs/PLAN.md), since nothing is registered against this future yet.
+  // Defined out-of-line, below lock_guard/acquire_resume_node - both
+  // need to be complete types first.
+  [[nodiscard]] auto acquire() -> future<lock_guard>;
 
 private:
   friend class lock_awaiter;
@@ -183,6 +214,86 @@ private:
 
 inline auto mutex::lock() noexcept -> lock_awaiter {
   return lock_awaiter(*this);
+}
+
+// RAII handle returned by mutex::acquire(): the mutex is held for as long
+// as one of these is alive, unlocked automatically from the destructor -
+// no separate unlock() call for a caller to remember, unlike lock()/
+// unlock() themselves (deliberately left as the lower-level, manual
+// primitive - repo owner's own call, PR #37 review). Move-only, matching
+// every other single-owner handle in this codebase (future<T>, promise<T>):
+// copying would let two guards each believe they owned unlocking the same
+// mutex, double-unlocking it once both were destroyed.
+class mutex::lock_guard {
+public:
+  explicit lock_guard(mutex& mutex_ref) noexcept : mutex_(&mutex_ref) {}
+  lock_guard(const lock_guard&) = delete;
+  auto operator=(const lock_guard&) -> lock_guard& = delete;
+
+  // mutex_ set to nullptr on the moved-from side so its own destructor
+  // becomes a no-op - the same "empty after move" contract shared_ptr<T>
+  // (est:util.shared_ptr) already documents for exactly this reason.
+  lock_guard(lock_guard&& other) noexcept : mutex_(std::exchange(other.mutex_, nullptr)) {}
+  auto operator=(lock_guard&& other) noexcept -> lock_guard& {
+    if (this != &other) {
+      if (mutex_ != nullptr) {
+        mutex_->unlock();
+      }
+      mutex_ = std::exchange(other.mutex_, nullptr);
+    }
+    return *this;
+  }
+
+  ~lock_guard() {
+    if (mutex_ != nullptr) {
+      mutex_->unlock();
+    }
+  }
+
+private:
+  mutex* mutex_;
+};
+
+// The waiter node behind acquire()'s slow path (mutex already locked):
+// queued in mutex::waiters_ exactly like lock_resume_node, but completes a
+// est::promise<lock_guard> instead of resuming a coroutine handle - no
+// coroutine frame is involved on this path at all, so there's no
+// "abandoned, still fully intact" case to guard against the way
+// lock_resume_node's ran_ flag does: promise_'s own destructor already
+// handles being dropped without ever completing correctly (a "broken
+// promise" - the future simply never becomes ready - the same contract
+// every other est::promise<T> in this codebase already has), so destroy()
+// here is a plain deallocation, nothing more.
+class mutex::acquire_resume_node final : public detail::ready_node {
+public:
+  acquire_resume_node(mutex& mutex_ref, promise<lock_guard> prom) noexcept
+      : mutex_(mutex_ref), promise_(std::move(prom)) {}
+
+  // Called only once unlock() has already handed this waiter the lock
+  // (mutex::unlock() hands off rather than clearing state_ - see its own
+  // doc comment), so constructing the lock_guard here doesn't need to
+  // touch state_ itself at all.
+  void run() final { promise_.set_value(lock_guard(mutex_)); }
+
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
+    allocator.delete_object(this);
+  }
+
+private:
+  mutex& mutex_;
+  promise<lock_guard> promise_;
+};
+
+inline auto mutex::acquire() -> future<lock_guard> {
+  auto [prom, fut] = make_promise_future<lock_guard>(loop_);
+  if (state_ == 0) {
+    state_ = 1;
+    prom.set_value(lock_guard(*this));
+    return std::move(fut);
+  }
+  auto* node = loop_.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
+  waiters_.enqueue(*node);
+  return std::move(fut);
 }
 
 } // namespace est
