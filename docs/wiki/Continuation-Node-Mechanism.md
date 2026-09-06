@@ -277,98 +277,124 @@ instantiation.
 ## Flattening is not a special case
 
 When `Fn`'s result is itself a `future<V>`, `then()` doesn't special-case
-the node hierarchy at all — `fulfill()`'s `is_future_v` branch registers an
-ordinary forwarding callback on the inner future that reports its eventual
-value or exception straight into the outer `downstream_`:
+the node hierarchy at all — `fulfill()`'s `is_future_v` branch registers a
+small forwarding node directly on the inner future's own `future_state<U>`,
+which reports that inner future's eventual value or exception straight into
+the outer `downstream_`:
 
 ```cpp
 template <class R> void fulfill(R&& result) {
   if constexpr (detail::is_future_v<std::decay_t<R>>) {
-    using inner_value_type = detail::unwrap_future_t<std::decay_t<R>>;
-    auto downstream_copy = downstream_;
-    std::forward<R>(result).on_ready([downstream_copy](future<inner_value_type>& inner_future) {
-      if (inner_future.failed()) {
-        downstream_copy->set_exception(inner_future.get_exception());
-        return;
-      }
-      // ...forward the value (moved, not copied) or a thrown exception...
-    });
+    auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
+        downstream_);
+    result.state_->set_continuation(*node);
   } else {
     downstream_->set_value(std::forward<R>(result));
   }
 }
 ```
 
-An earlier version of this called `.then()` here instead of `.on_ready()`
-(issue #25). That's the more obvious way to register a callback, and it
-worked — but `then()` exists to hand the *caller* a `future<U>` to chain
-onward from, and this call site had nowhere to put one: the forwarding
-lambda already reports straight into the real `downstream_`, and the
-`future<void>` `.then()` handed back was discarded the instant it was
-created. Paying for that anyway meant a throwaway `future_state<void>`
-plus a full `concrete_continuation<Fn, void>` — with its own
-wrapped/unwrapped dispatch and `fulfill()`/`invoke_and_fulfill()`
-machinery, none of which the forwarding lambda (always wrapped, always
-`void`-returning) ever needed — for every single flattening `.then()`
-call, allocated and freed without anything ever observing either one.
+`result.state_` — `future<U>`'s private `shared_ptr<future_state<U>>`
+member — is reached directly, not through any public `future<U>` method:
+`future<T>` grants every `future_state<X>` instantiation friendship
+(`template <class> friend class future_state;`) precisely so this one call
+site, itself nested inside a `future_state<T>` instantiation, can register a
+continuation on an *inner* future's state without `future<U>` needing to
+expose a method for it at all.
 
-### `on_ready()`: `then()` without a downstream
+An earlier version of this called `.then()` here (issue #25). That's the
+more obvious way to register a callback, and it worked — but `then()`
+exists to hand the *caller* a `future<U>` to chain onward from, and this
+call site had nowhere to put one: the forwarding logic already reports
+straight into the real `downstream_`, and the `future<void>` `.then()`
+handed back was discarded the instant it was created. Paying for that
+anyway meant a throwaway `future_state<void>` plus a full
+`concrete_continuation<Fn, void>` — with its own wrapped/unwrapped dispatch
+and `fulfill()`/`invoke_and_fulfill()` machinery none of it ever needed —
+for every single flattening `.then()` call, allocated and freed without
+anything ever observing either one.
 
-`on_ready()` is `then()`'s registration mechanism (`set_continuation()`)
-with the downstream-future half removed:
+A first fix (still issue #25) replaced that `.then()` call with a lower-level
+`on_ready()`/`raw_continuation<Fn>` primitive: `then()`'s registration
+mechanism (`set_continuation()`) with the downstream-future half removed,
+but still templated on the callback's own closure type `Fn`, and still built
+by wrapping the forwarding logic in a lambda closed over a copy of
+`downstream_`. That was smaller than a full `concrete_continuation<Fn,
+void>`, but still one node instantiation — and one lambda closure type — per
+`(T, Fn, U)` call site, and `on_ready()` had to be a public method on both
+`future_state<T>` and `future<T>` for `fulfill()` to reach it at all, even
+though nothing outside this one internal call site ever had a legitimate
+reason to call it.
+
+### `detail::flatten_forwarder<T>`: degeneralized further
+
+A follow-up simplification (still issue #25) removed `on_ready()` and
+`raw_continuation<Fn>` entirely, in favor of `detail::flatten_forwarder<T>`
+— a free class template in `est::detail`, alongside `continuation_node<T>`,
+not nested inside `future_state<T>` at all:
 
 ```cpp
-template <class Fn>
-  requires std::invocable<Fn&, future<T>&>
-void on_ready(Fn&& fn) {
-  using decayed_fn = std::decay_t<Fn>;
-  auto* node = loop_.allocator().template new_object<raw_continuation<decayed_fn>>(
-      std::forward<Fn>(fn));
-  set_continuation(*node);
-}
-```
-
-Its node, `raw_continuation<Fn>`, is templated on `Fn` alone — no `U`, no
-`downstream_` member, no dispatch:
-
-```cpp
-template <class Fn> class raw_continuation final : public continuation_node {
+template <class T> class flatten_forwarder final : public continuation_node<T> {
 public:
-  explicit raw_continuation(Fn fn) : fn_(std::move(fn)) {}
-  void invoke(future_state& state) override {
-    future<T> view(state.shared_from_this());
-    fn_(view);
+  explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
+      : downstream_(std::move(downstream)) {}
+
+  void invoke(future_state<T>& state) override {
+    if (state.failed()) {
+      downstream_->set_exception(state.get_exception());
+      return;
+    }
+    try {
+      if constexpr (std::is_void_v<T>) {
+        downstream_->set_value();
+      } else {
+        downstream_->set_value(std::move(state).get());
+      }
+    } catch (...) {
+      downstream_->set_exception(std::current_exception());
+    }
   }
+
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
     allocator.delete_object(this);
   }
+
 private:
-  Fn fn_;
+  shared_ptr<future_state<T>> downstream_;
 };
 ```
 
-`invoke()` builds the same `future<T>` view `then()`'s own wrapped mode
-builds (`state.shared_from_this()`) and calls `fn_` with it — always
-wrapped, since `on_ready()` has exactly one calling convention, not two.
-Whatever `fn` returns is discarded, and an exception `fn` throws is not
-caught here: unlike `then()`, there's no downstream to route it into, so
-`fn` owns its own error handling — `fulfill()`'s forwarding lambda already
-wraps its own logic in a `try`/`catch` for exactly this reason.
+The key observation behind this: `on_ready()` was only ever a private
+abstraction built to support one caller (`fulfill()`'s flatten branch), and
+that caller's forwarding logic is fixed — it never varies by closure, only
+by `T`. Templating the node on an arbitrary `Fn` was over-generalizing a
+primitive with exactly one real shape. `flatten_forwarder<T>` bakes that one
+shape in directly: no `Fn` member, no lambda, no `future<T>` view built via
+`shared_from_this()` (it operates on the `future_state<T>&` `invoke()`
+already receives, which already exposes `failed()`/`get_exception()`/`get()`
+publicly — the view was only ever needed for `on_ready()`'s generic,
+arbitrary-callback shape). It's also no longer public anywhere:
+`future<T>::on_ready()` is gone, and `future_state<T>::on_ready()` is gone,
+replaced by the direct `result.state_->set_continuation(*node)` call above.
 
-The net effect for a flattening `.then()` call: one fewer allocated
-`future_state`, one fewer allocated node (a smaller one, at that, with no
-wrapped/unwrapped branching or `fulfill()` recursion baked into its
-`invoke()`), and — because `fulfill()`'s forwarding lambda also switched
-from a copying `inner_future.get()` to `std::move(inner_future).get()` in
-the same change — one copy turned into a move. That move isn't just
-faster: `inner_future` is a fresh, single-owner `future<U>` (`fn`'s own
-return value, not a stored one), so copying it forced `U` to be
-copy-constructible even for a purely internal forwarding step a caller
-never sees — a `future<std::unique_ptr<T>>` returned from a `then()`
-callback couldn't be flattened at all under the old code, since
-`std::unique_ptr` has no copy constructor to select. `future_tests.cpp`'s
-own regression test for this fix exists specifically because it would not
-have compiled before it.
+The main compile-time benefit: every flattening `.then()` at the same inner
+value type `T` now reuses the *same* `flatten_forwarder<T>` instantiation,
+instead of minting a fresh node type (and a fresh lambda closure type) per
+`(T, Fn, U)` call site the way `raw_continuation<Fn>` did — fewer template
+instantiations overall for a codebase with many distinct flattening call
+sites sharing the same inner future type.
+
+The net effect for a flattening `.then()` call, versus the original
+`.then()`-based version: one fewer allocated `future_state`, one fewer
+allocated node (a smaller one, at that, with no wrapped/unwrapped branching
+or `fulfill()` recursion baked into its `invoke()`), and a move instead of a
+copy of the inner value — `std::move(state).get()`, not a copying `.get()` —
+since `state` is a fresh, single-owner future_state (`fn`'s own return
+value, not a stored one). That move isn't just faster: a
+`future<std::unique_ptr<T>>` returned from a `then()` callback couldn't be
+flattened at all under the original code, since `std::unique_ptr` has no
+copy constructor to select. `future_tests.cpp`'s own regression test for
+this fix exists specifically because it would not have compiled before it.
 
 [Allocation Patterns](Allocation-Patterns.md#flattening-costs-one-extra-allocation)
 has the same story from that page's own angle (total allocation counts per

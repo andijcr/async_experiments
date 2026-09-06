@@ -55,6 +55,47 @@ private:
   shared_ptr<future_state<T>> owner_;
 };
 
+// The node behind then()'s monadic-flatten path
+// (future_state<T>::concrete_continuation<Fn, U>::fulfill(), below): once
+// registered directly on an inner future_state<T> (via set_continuation(),
+// bypassing future<T>/then() entirely), forwards that inner future's
+// result - or exception - into a downstream future_state<T> with no
+// callback, no closure, and no wrapped/unwrapped dispatch to pick between:
+// the inner future's exact value type T is already known and fixed by the
+// call site, so there's nothing left to genericize over. Templated on T
+// alone (issue #25's own follow-up simplification, replacing an earlier
+// on_ready()/raw_continuation<Fn> pair that were templated on an arbitrary
+// callback type instead) - every flatten at the same T reuses this one
+// instantiation instead of minting a fresh one per (T, Fn, U) call site.
+template <class T> class flatten_forwarder final : public continuation_node<T> {
+public:
+  explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
+      : downstream_(std::move(downstream)) {}
+
+  void invoke(future_state<T>& state) override {
+    if (state.failed()) {
+      downstream_->set_exception(state.get_exception());
+      return;
+    }
+    try {
+      if constexpr (std::is_void_v<T>) {
+        downstream_->set_value();
+      } else {
+        downstream_->set_value(std::move(state).get());
+      }
+    } catch (...) {
+      downstream_->set_exception(std::current_exception());
+    }
+  }
+
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    allocator.delete_object(this);
+  }
+
+private:
+  shared_ptr<future_state<T>> downstream_;
+};
+
 // A placeholder "success" alternative for future_state<void>'s result_
 // variant: void itself can't be a variant alternative, and reusing
 // std::monostate for both "not yet ready" and "ready with no value" would
@@ -388,33 +429,6 @@ public:
     return future<downstream_value_type>(std::move(downstream));
   }
 
-  // A lower-level primitive then() is itself built on top of (via
-  // set_continuation()), for a caller that needs to react to *this
-  // becoming ready but has nowhere to hand a downstream future<U> - and
-  // gains nothing from one. then() always allocates a fresh
-  // future_state<U> plus a concrete_continuation<Fn, U> node to hold it;
-  // on_ready() skips both, registering fn directly with no downstream at
-  // all (issue #25 - found via a then() call whose only purpose was
-  // registering a side-effecting forwarding callback, discarding the
-  // future<U> that then() handed back the moment it was created).
-  //
-  // fn is called exactly once, ready or not, with a fresh future<T> view
-  // of *this - the same "wrapped" shape then()'s own wrapped calling
-  // convention uses (see that method's own doc comment) and for the same
-  // reason: future_state is a detail, not what a callback should see.
-  // Whatever fn returns is discarded. Unlike then(), an exception fn
-  // throws is not caught here - there's no downstream to route it into,
-  // so fn owns its own error handling (fulfill()'s one caller below
-  // already wraps its own logic in a try/catch for exactly this reason).
-  template <class Fn>
-    requires std::invocable<Fn&, future<T>&>
-  void on_ready(Fn&& fn) {
-    using decayed_fn = std::decay_t<Fn>;
-    auto* node =
-        loop_.allocator().template new_object<raw_continuation<decayed_fn>>(std::forward<Fn>(fn));
-    set_continuation(*node);
-  }
-
 private:
   // Fn's raw (pre-flatten) result type, dispatching wrapped-vs-unwrapped
   // exactly as then() itself does above. A plain (non-consteval-required,
@@ -444,33 +458,6 @@ private:
     }
   }
   template <class Fn> using raw_result_t = decltype(raw_result_type_tag<Fn>())::type;
-
-  // The node behind on_ready() above (issue #25): templated on Fn alone,
-  // not (Fn, U) like concrete_continuation below - there's no downstream
-  // future_state<U> to hold or report into, so invoke() just builds the
-  // same future<T> view then()'s wrapped mode builds and calls fn_ with
-  // it, nothing else. Deliberately smaller than concrete_continuation<Fn,
-  // U> per instantiation - no wrapped/unwrapped dispatch, no
-  // fulfill()/set_value() reporting machinery - since this exists purely
-  // to avoid paying for that machinery (and the downstream future_state/
-  // future it would create) for a caller that has nowhere to put a
-  // downstream future anyway.
-  template <class Fn> class raw_continuation final : public continuation_node {
-  public:
-    explicit raw_continuation(Fn fn) : fn_(std::move(fn)) {}
-
-    void invoke(future_state& state) override {
-      future<T> view(state.shared_from_this());
-      fn_(view);
-    }
-
-    void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
-      allocator.delete_object(this);
-    }
-
-  private:
-    Fn fn_;
-  };
 
   // Wraps a then() callback together with the downstream future_state it
   // reports its result (or exception) to. U is the downstream's value
@@ -540,42 +527,23 @@ private:
     }
 
     // Reports a non-void fn_ result to downstream_: directly via
-    // set_value() if it's a plain U, or - if it's itself a future<U> -
-    // by registering a forwarding callback via on_ready() (not then() -
-    // issue #25: registering fn_'s forwarding logic was the only reason
-    // to call then() here, but then() also allocates a fresh
-    // future_state<void> and hands back a future<void> this code
-    // immediately discarded, pure overhead nothing ever observed).
-    // on_ready()'s callback checks failed()/get_exception() directly for
-    // the known-failure case (same reason invoke() above does: avoids a
-    // throw/catch round-trip to retrieve an exception_ptr already known
-    // to be there), keeping try/catch only around the success path, for
-    // whatever unexpected exception moving the value itself might throw.
-    // std::move(inner_future).get(), not a plain .get(): result (and
-    // therefore inner_future, the future<U> view on_ready() builds
-    // around it) is a fresh future nobody else can reach - fn_'s own
-    // return value, not a stored one - so moving its value directly into
-    // downstream_ is exactly as safe as any other single-consumer
-    // future<T>::get() call, and skips a copy get() would otherwise make.
+    // set_value() if it's a plain U, or - if it's itself a future<U> - by
+    // registering a detail::flatten_forwarder<U> node directly on the
+    // inner future's own future_state<U> (issue #25's own follow-up
+    // simplification: no callback, no closure, and no intermediate
+    // future<U>/future_state<U> pair to allocate and immediately discard -
+    // result.state_ is reached directly via future<U>'s
+    // `template <class> friend class future_state;` declaration, since
+    // this code is itself nested inside a future_state<T> instantiation
+    // and nested-class members share their enclosing class's access
+    // rights). U, not inner_value_type, throughout: then() already
+    // computed downstream_'s value type by unwrapping Fn's raw future<U>
+    // result, so the two are always the same type here.
     template <class R> void fulfill(R&& result) {
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
-        using inner_value_type = detail::unwrap_future_t<std::decay_t<R>>;
-        auto downstream_copy = downstream_; // copy: the forwarding lambda keeps its own reference
-        std::forward<R>(result).on_ready([downstream_copy](future<inner_value_type>& inner_future) {
-          if (inner_future.failed()) {
-            downstream_copy->set_exception(inner_future.get_exception());
-            return;
-          }
-          try {
-            if constexpr (std::is_void_v<inner_value_type>) {
-              downstream_copy->set_value();
-            } else {
-              downstream_copy->set_value(std::move(inner_future).get());
-            }
-          } catch (...) {
-            downstream_copy->set_exception(std::current_exception());
-          }
-        });
+        auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
+            downstream_);
+        result.state_->set_continuation(*node);
       } else {
         downstream_->set_value(std::forward<R>(result));
       }
@@ -679,13 +647,19 @@ public:
   // node allocation and registration live there now, not here.
   template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn)); }
 
-  // Forwards to future_state<T>::on_ready() (see its own doc comment) -
-  // then() without a downstream future<U>, for a caller that only needs
-  // to react to *this becoming ready and has nowhere to chain onward
-  // from anyway.
-  template <class Fn> void on_ready(Fn&& fn) { state_->on_ready(std::forward<Fn>(fn)); }
-
 private:
+  // Grants every future_state<U> instantiation access to state_ below -
+  // specifically for detail::flatten_forwarder<T>'s one caller,
+  // future_state<T>::concrete_continuation<Fn, U>::fulfill() (:future's
+  // own future_state<T> definition, above), which needs to register a
+  // continuation directly on an inner future<T>'s own future_state<T>
+  // without going through any future<T> method (there is deliberately no
+  // public one for this - see fulfill()'s own doc comment). A nested
+  // class shares its enclosing class's access rights, so this one
+  // `friend` declaration is all every future_state<T> instantiation
+  // needs, not one per (T, U) pair.
+  template <class> friend class future_state;
+
   shared_ptr<future_state<T>> state_;
 };
 

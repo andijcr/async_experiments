@@ -2297,6 +2297,63 @@ preset (ASan+UBSan). Docs updated:
 flattening-cost section, both rewritten for the new allocation count and
 `on_ready()` mechanism.
 
+#### Follow-up: `on_ready()` degeneralized to `detail::flatten_forwarder<T>` (done)
+
+The repo owner's own follow-up review of the above: "if we believe that
+`on_ready` is only a private abstraction built to support a continuation
+returning a function, then we should: ensure that it's not a public method
+of `future`, degeneralize and pass the raw_continuation node only the
+downstream_copy, skipping the lambda altogether."
+
+Correct on both counts. `on_ready()` had exactly one real caller
+(`fulfill()`'s flatten branch) with one fixed shape of forwarding logic -
+templating its node on an arbitrary `Fn` and exposing it publicly on both
+`future_state<T>` and `future<T>` was generality nothing needed, paid for
+with a fresh node type (and lambda closure type) per `(T, Fn, U)` call
+site instead of one shared instantiation per inner value type `T`.
+
+Fixed:
+
+- **`future<T>::on_ready()` and `future_state<T>::on_ready()` removed
+  entirely**, along with the nested `raw_continuation<Fn>` class.
+- **`detail::flatten_forwarder<T>`** added in its place: a free class
+  template in `est::detail`, alongside `detail::continuation_node<T>` -
+  not nested inside `future_state<T>`, since it needs nothing private to
+  `future_state<T>` beyond what `future_state<T>`'s own public interface
+  (`failed()`, `get_exception()`, `get()`, `set_value()`,
+  `set_exception()`) already exposes. Templated on the inner value type
+  alone, with the forwarding logic (fail → propagate exception; succeed →
+  move the value or catch-and-propagate) hardcoded directly into
+  `invoke()` - no `Fn` member, no closure, no `future<T>` view built via
+  `shared_from_this()` (the earlier design's `on_ready()`/wrapped shape
+  needed that view only to hand a generic callback something to call;
+  `flatten_forwarder<T>` has no callback to call, so it never needs one).
+- **`fulfill()`'s flatten branch** now allocates a `flatten_forwarder<U>`
+  directly and registers it via `result.state_->set_continuation(*node)`,
+  reaching `result`'s private `state_` (a `future<U>`) through a new
+  `template <class> friend class future_state;` declaration on
+  `future<T>` - nested-class members share their enclosing class's access
+  rights, so this one friend declaration on `future<T>` is all every
+  `future_state<T>` instantiation's nested `concrete_continuation` needs,
+  not one per `(T, U)` pair.
+
+No observable behavior changed - same allocation count, same move (not
+copy) of the flattened value - only the mechanism: a lower-codegen,
+non-public node replacing a public, per-closure-type primitive that only
+ever had one legitimate caller.
+
+**Verified in the pinned Docker devenv:** full test suite still passes
+unchanged (the flatten tests, including the `std::unique_ptr` move-only
+regression and the exact-allocation-count assertion, exercise `.then()`'s
+observable behavior, not `on_ready()` directly, so none needed updating);
+`clang-format`/`clang-tidy` clean; full suite also passes under the
+`sanitize` preset (ASan+UBSan). Docs updated:
+[docs/wiki/Continuation-Node-Mechanism.md](wiki/Continuation-Node-Mechanism.md)'s
+flattening section (now covering all three iterations: `.then()`,
+`on_ready()`, `flatten_forwarder<T>`) and
+[docs/wiki/Allocation-Patterns.md](wiki/Allocation-Patterns.md)'s
+flattening-cost section.
+
 ### Issue #39: `then()`'s wrapped-vs-unwrapped precedence, flipped (done)
 
 Reported by the repo owner against issue #23's original design (see that

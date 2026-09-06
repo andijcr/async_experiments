@@ -37,7 +37,7 @@ complex `.then()` chain actually cost."
 | `make_promise_future<T>(loop)` | **1** | `future_state<T>`'s control block |
 | `future<T>::then(fn)` (plain, non-flattening) | **2** | the downstream `future_state<U>`'s control block, plus the `concrete_continuation<Fn, U>` node |
 | `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`'s control block, plus the `concrete_timer_node<Fn>` node |
-| `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 1 more when it runs** | the usual 2 for the visible registration, plus 1 more, *invisible to the caller*, for `on_ready()`'s forwarding node — see below |
+| `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 1 more when it runs** | the usual 2 for the visible registration, plus 1 more, *invisible to the caller*, for `detail::flatten_forwarder<V>`'s forwarding node — see below |
 
 A plain chain of `N` `.then()` calls off one `make_promise_future` therefore
 costs **`1 + 2N`** allocations, full stop — regardless of how deep the chain
@@ -47,25 +47,30 @@ is, each link is exactly 2 allocations, known statically at the call site.
 
 [Continuation Node Mechanism](Continuation-Node-Mechanism.md#flattening-is-not-a-special-case)
 covers *why*: a `.then()` callback returning `future<V>` doesn't get special
-node-hierarchy treatment. `fulfill()` registers an ordinary forwarding
-callback via `on_ready()` (not `then()`) on the inner future:
+node-hierarchy treatment. `fulfill()` allocates a `detail::flatten_forwarder<U>`
+node directly on the inner future's own `future_state<U>`, reached through
+`future<U>`'s private `state_` member (`future<T>` friends every
+`future_state<X>` instantiation for exactly this one internal call site):
 
 ```cpp
-std::forward<R>(result).on_ready([downstream_copy](future<inner_value_type>& inner_future) {
-  // ...forwards inner_future's value (moved) or exception into downstream_copy...
-});
+auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
+    downstream_);
+result.state_->set_continuation(*node);
 ```
 
-`on_ready()` (issue #25) is `then()`'s registration mechanism with the
-downstream-future half removed: it allocates one `raw_continuation<Fn>`
-node — templated on `Fn` alone, with no `downstream_` member and no
-wrapped/unwrapped dispatch — and registers it directly, with no
-`future_state<U>`/`future<U>` created for anyone to read. An earlier version
-of this called `.then()` here instead, which worked (the discarded
-`future<void>` it returned was never wrong, just wasted) but paid for a
-second, throwaway `future_state<void>` plus a full `concrete_continuation`
-node every single time, for a caller — `fulfill()`, the only one that
-exists — with nowhere to put a downstream future in the first place.
+`flatten_forwarder<T>` (issue #25) is templated on the inner value type
+alone — no `Fn`, no closure, no `future<T>` view built via
+`shared_from_this()`, no wrapped/unwrapped dispatch — and every flattening
+`.then()` at the same inner type reuses the same instantiation. Two earlier,
+now-removed designs paid more for the same one call site: first a plain
+`.then()` call, which worked (the discarded `future<void>` it returned was
+never wrong, just wasted) but paid for a second, throwaway
+`future_state<void>` plus a full `concrete_continuation` node every single
+time; then a lower-level `on_ready()`/`raw_continuation<Fn>` pair that
+dropped the throwaway `future_state<void>` but still minted a fresh node
+(and closure) type per `(T, Fn, U)` call site, and had to be public on both
+`future_state<T>` and `future<T>` for `fulfill()` to reach — even though
+`fulfill()` was its only legitimate caller.
 
 ## Worked example: a three-link chain
 
