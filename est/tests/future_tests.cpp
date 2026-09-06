@@ -552,12 +552,12 @@ TEST_CASE("flattening a chained then() frees every node involved, no leak", "[fu
   REQUIRE(resource.allocations == resource.deallocations);
   // Exact count, not just "balanced" (issue #25): outer future_state<int>,
   // then()'s downstream future_state<int> + concrete_continuation node,
-  // inner future_state<int>, and fulfill()'s on_ready() raw_continuation
-  // node - 5 total. Before on_ready() existed, fulfill()'s flatten path
-  // called then() on the inner future purely to register its forwarding
-  // callback, which allocated a throwaway future_state<void> plus a
-  // concrete_continuation<Fn, void> node - 2 more, for 7 total - even
-  // though nothing ever observed either one. A regression back to 7 here
-  // would mean that overhead came back.
+  // inner future_state<int>, and fulfill()'s detail::flatten_forwarder<int>
+  // node - 5 total. Before flatten_forwarder<T> existed, fulfill()'s
+  // flatten path called then() on the inner future purely to register its
+  // forwarding callback, which allocated a throwaway future_state<void>
+  // plus a concrete_continuation<Fn, void> node - 2 more, for 7 total -
+  // even though nothing ever observed either one. A regression back to 7
+  // here would mean that overhead came back.
   REQUIRE(resource.allocations == 5);
 }
