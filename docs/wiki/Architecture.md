@@ -14,15 +14,18 @@ graph BT
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
-  mutex[":sync.mutex<br/>mutex_waiter, mutex"]
+  mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::acquire, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
-  future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;"]
+  future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
 
   check --> platform
   shared_ptr --> check
   mutex --> intrusive_list
+  mutex --> loop
+  mutex --> future
+  mutex --> promise
   timer --> platform
   loop --> check
   loop --> platform
@@ -43,17 +46,28 @@ The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
 above them** — even though a loop's whole job is running futures'
 continuations. See "Why `:loop` doesn't depend on `:future`" below; it's the
 key to understanding how the continuation mechanism is split across files.
+`:sync.mutex` depends on `:loop` too (M4, [Coroutines](Coroutines.md)) — an
+awaitable `lock()` needs somewhere to defer a waiter's resumption to, and
+`est::loop::enqueue_ready()` is that somewhere; `:loop` still knows nothing
+about `:sync.mutex` in return. `:sync.mutex` also depends on `:future`/
+`:promise` (PR #37 review follow-up) for `acquire() -> future<lock_guard>`
+— an alternative to `lock()`/`unlock()` returning a move-only RAII handle
+instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
+rather than a coroutine of its own, the same "producer without co_await"
+pattern `sleep_until()` (`:promise`) already uses.
 
 ## Design philosophy
 
-- **Single-threaded, no atomics, no real concurrency protection — yet.**
-  `est::shared_ptr`'s ref count is a plain `int`, `est::mutex` is bookkeeping
-  only (`lock()`/`unlock()` just toggle a word), and `est::loop` is driven
+- **Single-threaded, no atomics, no OS-level concurrency protection — yet.**
+  `est::shared_ptr`'s ref count is a plain `int`, and `est::loop` is driven
   from exactly one call stack. This isn't an oversight to fix later; it's a
   deliberate scope boundary recorded early in `docs/PLAN.md` ("Revised:
-  critical sections removed") — protection gets added when a backend that
-  actually needs it exists (bare-metal interrupts, or a future multi-loop),
-  not speculatively.
+  critical sections removed") — real interrupt-context protection gets added
+  when a backend that actually needs it exists (bare-metal interrupts, or a
+  future multi-loop), not speculatively. `est::mutex::lock()` *is* real
+  protection against a different, still-single-threaded hazard though
+  (M4, [Coroutines](Coroutines.md)): two coroutines interleaving at a
+  `co_await` while both hold a reference to the same structure.
 - **Allocator-first.** Every owned object — `shared_ptr<T>`'s control block,
   a continuation node, `timer_queue`'s storage, `loop`'s own containers — is
   built through a `std::pmr::polymorphic_allocator<std::byte>`, threaded in
@@ -111,12 +125,17 @@ This is also *why* `est::loop`'s ready-queue, `est::future_state<T>`'s
 "not yet ready" queue, and `est::mutex`'s own waiter list all share one
 root node type and one list container - `est::intrusive_list_node` and
 `est::intrusive_list<T>` (`est:util.intrusive_list`), a genuinely generic
-utility rather than something borrowed from `est::mutex`: `ready_node :
-public intrusive_list_node` directly, so the same enqueue/dequeue
-mechanics `est::mutex` uses for its own waiters are reused, unmodified,
-for both queues, with none of the three depending on either of the
-others. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md)
-for the full type hierarchy this produces.
+utility, not something borrowed from `est::mutex` (`mutex_waiter` used to
+live there, back when `est::mutex` was its only user - it's since moved
+here and been generalized, see that file's own doc comment). `ready_node :
+public intrusive_list_node` directly, and (M4) `est::mutex`'s own waiter
+queue is now typed `intrusive_list<detail::ready_node>` too - the same
+type `est::loop`'s ready-queue and `est::future_state<T>`'s continuation
+queue already use, not just a sibling built on the same base - so the same
+enqueue/dequeue mechanics serve all three, with none of them depending on
+either of the others. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md)
+for the full type hierarchy this produces, and [Coroutines](Coroutines.md)
+for how `est::mutex`'s waiters became `ready_node`s in the first place.
 
 ## The producer/consumer split: `promise<T>` / `future<T>` / `future_state<T>`
 

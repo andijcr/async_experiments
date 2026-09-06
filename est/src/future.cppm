@@ -96,6 +96,78 @@ private:
   shared_ptr<future_state<T>> downstream_;
 };
 
+// Forward declaration only: future_awaiter<T> (the type future<T>::operator
+// co_await() below returns) needs future<T> itself complete - to call
+// get() on it in await_resume() - so its own definition has to come after
+// future<T>'s, further down this file. This forward declaration is enough
+// for future<T> to name it in a friend declaration.
+template <class T> class future_awaiter;
+
+// Coroutine frame allocation via a std::pmr::polymorphic_allocator<std::byte>
+// - the same allocator convention every other allocation in this codebase
+// uses (est::shared_ptr, est::loop's continuation/timer nodes), applied to
+// the one allocation this codebase doesn't otherwise control: the
+// compiler-generated coroutine frame itself, for a coroutine returning
+// est::future<T> (future<T>::promise_type's operator new/delete, below).
+// Not templated on T - neither the frame's size nor the allocator depend
+// on it, so one shared implementation covers every T.
+//
+// operator delete only ever gets the frame's size back, never the
+// allocator that built it, so the memory_resource* actually used has to
+// be stashed somewhere operator delete can still find it - immediately
+// past the frame itself, the pattern cppreference's own coroutine page
+// documents for a stateful allocator ("Dynamic memory allocation for
+// coroutine state").
+[[nodiscard]] inline auto
+coroutine_frame_alloc(std::size_t size, std::pmr::polymorphic_allocator<std::byte> allocator)
+    -> void* {
+  using resource_ptr = std::pmr::memory_resource*;
+  // alignof(std::max_align_t), not std::max()'d (or std::min()'d) with
+  // anything: the standard guarantees max_align_t's alignment is at least
+  // as strict as every scalar type's, resource_ptr (a plain pointer)
+  // included, so it alone already covers the trailing resource_ptr's
+  // alignment. It also has to stand in for the coroutine frame's own
+  // alignment requirement, which this function has no way to query
+  // directly (the compiler passes only size, not alignment, to a custom
+  // promise_type::operator new) - std::min(alignof(resource_ptr), ...)
+  // would silently under-align the frame itself relative to whatever the
+  // compiler assumes, undefined behavior for any frame needing more than
+  // pointer alignment (which is the common case).
+  constexpr std::size_t align = alignof(std::max_align_t);
+  const std::size_t padded_size = (size + align - 1) / align * align;
+  auto* const resource = allocator.resource();
+  void* const frame = resource->allocate(padded_size + sizeof(resource_ptr), align);
+  // Placement-news the resource pointer into the padding just past the
+  // frame - the pointer arithmetic below is exactly the documented
+  // layout this pair of functions establishes, not an out-of-bounds risk
+  // (padded_size + sizeof(resource_ptr) bytes were just allocated for
+  // precisely this).
+  // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
+  ::new (static_cast<std::byte*>(frame) + padded_size) resource_ptr(resource);
+  return frame;
+}
+
+inline void coroutine_frame_dealloc(void* frame, std::size_t size) noexcept {
+  using resource_ptr = std::pmr::memory_resource*;
+  // Must recompute the identical align/padded_size coroutine_frame_alloc()
+  // used - see that function's own comment on why this is
+  // alignof(std::max_align_t) alone, not std::max()'d or std::min()'d with
+  // anything.
+  constexpr std::size_t align = alignof(std::max_align_t);
+  const std::size_t padded_size = (size + align - 1) / align * align;
+  // Reads back the memory_resource* coroutine_frame_alloc() stashed just
+  // past the frame - safe by construction, not by RTTI (the
+  // reinterpret_cast) or out of bounds (the pointer arithmetic): every
+  // frame ever handed back by coroutine_frame_alloc() has one there, at
+  // exactly this offset.
+  // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast,cppcoreguidelines-pro-bounds-pointer-arithmetic)
+  auto* const resource_addr =
+      reinterpret_cast<resource_ptr*>(static_cast<std::byte*>(frame) + padded_size);
+  // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast,cppcoreguidelines-pro-bounds-pointer-arithmetic)
+  std::pmr::memory_resource* const resource = *resource_addr;
+  resource->deallocate(frame, padded_size + sizeof(resource_ptr), align);
+}
+
 // A placeholder "success" alternative for future_state<void>'s result_
 // variant: void itself can't be a variant alternative, and reusing
 // std::monostate for both "not yet ready" and "ready with no value" would
@@ -592,6 +664,46 @@ private:
 
 } // namespace est
 
+namespace est::detail {
+
+// The return_value()/return_void() half of future<T>::promise_type
+// (below), split into its own base so a coroutine returning
+// est::future<T> gets exactly one of the two - a promise_type providing
+// both is a compile error, and which one a `co_return` needs depends on
+// whether T is void, exactly the fork future_state<T>::stored_t/
+// set_value() already resolves via std::conditional_t/if constexpr
+// rather than this file duplicating future<T>'s entire promise_type as
+// two near-identical T/void specializations.
+template <class T> class future_promise_result {
+public:
+  void return_value(const T& value) { state_->set_value(value); }
+  void return_value(T&& value) { state_->set_value(std::move(value)); }
+
+protected:
+  explicit future_promise_result(shared_ptr<future_state<T>> state) : state_(std::move(state)) {}
+  // Protected, not private-with-an-accessor: this base exists solely for
+  // future<T>::promise_type (below) to inherit from, and promise_type
+  // itself needs direct access to state_ (get_return_object(),
+  // unhandled_exception(), operator new/delete all touch it) - the
+  // accessor a private member would need is exactly this field, with
+  // extra ceremony and no actual encapsulation gained, since promise_type
+  // is this class's only ever derived type.
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  shared_ptr<future_state<T>> state_;
+};
+
+template <> class future_promise_result<void> {
+public:
+  void return_void() { state_->set_value(); }
+
+protected:
+  explicit future_promise_result(shared_ptr<future_state<void>> state) : state_(std::move(state)) {}
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  shared_ptr<future_state<void>> state_;
+};
+
+} // namespace est::detail
+
 export namespace est {
 
 // Consumer handle: a thin, move-only view over a future_state<T>, backed
@@ -647,6 +759,110 @@ public:
   // node allocation and registration live there now, not here.
   template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn)); }
 
+  // Suspends the calling coroutine until *this becomes ready, resuming
+  // with its value (or rethrowing its exception) - the primitive that
+  // lets one coroutine `co_await` any est::future<T>, whatever produced
+  // it: est::sleep_for()/sleep_until(), a then() chain, or another
+  // coroutine returning est::future<U> (this class's own promise_type,
+  // below). Defined out of line, after detail::future_awaiter<T> - see
+  // that class's own doc comment on why.
+  //
+  // No ref-qualifier: callable whether *this is a named lvalue
+  // (`co_await someFuture;`) or a prvalue temporary (`co_await
+  // sleep_for(...);`) - the language extends the latter's lifetime
+  // across the whole co_await expression, including through suspension,
+  // so a reference to `*this` stays valid inside the returned awaiter
+  // either way.
+  [[nodiscard]] auto operator co_await() noexcept -> detail::future_awaiter<T>;
+
+  // The compiler-generated glue for a coroutine whose return type is
+  // est::future<T> - `est::future<int> foo(est::loop& loop_ref, ...) {
+  // co_await ...; co_return 42; }`. Deliberately not a separate task<T>
+  // wrapper type: the whole point is that a caller of foo() gets back a
+  // plain est::future<int>, indistinguishable from one built out of
+  // sleep_for()/then() chains - nothing about future<T>'s own interface
+  // changes; this class only exists for the compiler's coroutine
+  // machinery to find via the standard promise_type protocol.
+  //
+  // Requires the coroutine function's first parameter to be exactly
+  // est::loop& - both this constructor and operator new below are
+  // templated to match it (plus however many further parameters the
+  // actual coroutine function takes) via the standard's "promise
+  // constructor arguments"/allocator-argument matching, which tries
+  // building promise_type from the coroutine call's own argument list
+  // before ever falling back to a default constructor. There is
+  // deliberately no default constructor here: a future<T>-returning
+  // coroutine that doesn't take est::loop& first fails to compile with
+  // "no matching constructor for promise_type" instead of silently
+  // misbehaving.
+  class promise_type : public detail::future_promise_result<T> {
+  public:
+    // Args&... /*unused*/: only loop_ref is ever read - the pack exists
+    // purely so this constructor matches whatever further parameters the
+    // actual coroutine function declares, per the "promise constructor
+    // arguments" rule this whole design relies on (see this class's own
+    // doc comment above). loop_ref itself isn't stored - it's only ever
+    // needed here, to build state_ - now that initial_suspend() no longer
+    // needs a loop& of its own to build a coroutine_start_awaiter from
+    // (PR #37 review follow-up), nothing in this class touches it again
+    // after construction.
+    template <class... Args>
+    explicit promise_type(loop& loop_ref, Args&... /*unused*/)
+        : detail::future_promise_result<T>(
+              shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)) {}
+    promise_type(const promise_type&) = delete;
+    auto operator=(const promise_type&) -> promise_type& = delete;
+    promise_type(promise_type&&) = delete;
+    auto operator=(promise_type&&) -> promise_type& = delete;
+    ~promise_type() = default;
+
+    auto get_return_object() -> future { return future(this->state_); }
+
+    // Never suspends at the start: the coroutine's synchronous prefix (up
+    // to its first genuine suspension point, if any) runs immediately, on
+    // the caller's own stack, exactly like the work an ordinary function
+    // does before handing back a future - see future_awaiter<T>::
+    // await_ready()'s own doc comment (below) for the matching decision
+    // on the other end of a co_await, and PR #37's own review discussion
+    // for why this replaced an earlier, always-deferred design (a
+    // coroutine_start_awaiter that unconditionally suspended into
+    // est::loop's ready-queue before running anything, at the cost of one
+    // extra heap-allocated resume node and ready-queue round trip per
+    // coroutine call, even for one that never awaits anything at all).
+    auto initial_suspend() noexcept -> std::suspend_never { return {}; }
+
+    // Never suspends at the end either: nothing outside this coroutine
+    // holds (or needs) a coroutine_handle to it - only the future<T>
+    // returned by get_return_object() (a shared_ptr<future_state<T>>
+    // underneath), which by now already has its result via
+    // return_value()/return_void()/unhandled_exception(). std::suspend_never
+    // here lets the compiler destroy the coroutine frame immediately and
+    // automatically once the body finishes. Safe to do so unconditionally
+    // (unlike an earlier version of this design, which tried resuming
+    // through a ready_node embedded *in* the frame being destroyed - see
+    // future_resume_node<T>'s own doc comment for why that didn't work):
+    // every node that ever resumes this coroutine (future_resume_node<T>
+    // below, mutex::lock_resume_node/acquire_resume_node) is separately
+    // heap-allocated, entirely independent of the frame this suspend
+    // point destroys, so there is nothing left in this frame for anything
+    // to touch afterward.
+    auto final_suspend() noexcept -> std::suspend_never { return {}; }
+
+    void unhandled_exception() { this->state_->set_exception(std::current_exception()); }
+
+    // pmr-aware coroutine frame allocation - see
+    // detail::coroutine_frame_alloc()/coroutine_frame_dealloc()'s own
+    // doc comment.
+    template <class... Args>
+    static auto operator new(std::size_t size, loop& loop_ref, Args&... /*unused*/) -> void* {
+      return detail::coroutine_frame_alloc(size, loop_ref.allocator());
+    }
+
+    static void operator delete(void* ptr, std::size_t size) noexcept {
+      detail::coroutine_frame_dealloc(ptr, size);
+    }
+  };
+
 private:
   // Grants every future_state<U> instantiation access to state_ below -
   // specifically for detail::flatten_forwarder<T>'s one caller,
@@ -660,7 +876,136 @@ private:
   // needs, not one per (T, U) pair.
   template <class> friend class future_state;
 
+  friend class detail::future_awaiter<T>;
   shared_ptr<future_state<T>> state_;
 };
+
+} // namespace est
+
+namespace est::detail {
+
+// A plain resumption trampoline for a coroutine awaiting an est::future<T>,
+// used only on the genuinely-not-ready path (future_awaiter<T>::
+// await_ready() below returns true, skipping this node entirely, when the
+// awaited future is already resolved by the time co_await evaluates it).
+// Separately heap-allocated via an allocator (like every other ready_node
+// this codebase queues - concrete_continuation<Fn, U>,
+// concrete_timer_node<Fn>), *not* embedded inside the coroutine frame it
+// resumes, for a subtle but real reason a first version of this class got
+// wrong: an awaiter object embedded in a coroutine's own frame only lives
+// for the duration of *its own* co_await expression - once run() resumes
+// the coroutine past that point, the compiler is free to reuse that exact
+// frame storage for whatever the coroutine's later code constructs (its
+// next awaiter, a local variable, ...), since their lifetimes don't
+// overlap. est::loop::run_one() (est:loop) calls destroy() on this same
+// node *after* run() already returned - by then, for a frame-embedded
+// node, that storage may already have been overwritten, and calling a
+// virtual function through it is undefined behavior - confirmed the hard
+// way (libc++abi: "Pure virtual function called!", a dispatch through a
+// vtable pointer that had already been clobbered by the coroutine's own
+// later frame activity) before landing on this heap-allocated design
+// instead. A separately allocated node has its own real, independent
+// lifetime, so run()-then-destroy() is exactly as safe here as it already
+// is for every other ready_node in this codebase.
+template <class T> class future_resume_node final : public continuation_node<T> {
+public:
+  explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
+
+  // future_state<T>& /*unused*/: continuation_node<T>::invoke() must take
+  // one - this node doesn't need it for anything beyond satisfying that
+  // signature.
+  void invoke(future_state<T>& /*unused*/) override {
+    invoked_ = true;
+    handle_.resume();
+  }
+
+  // If invoke() never ran (the future_state this node was registered on
+  // was dropped without ever completing - docs/PLAN.md, M2's
+  // abandoned-future design), the awaiting coroutine is still fully
+  // intact and untouched, so this is the only chance to free its frame;
+  // if invoke() did run, the coroutine either already self-destroyed or
+  // suspended again on something else that now owns it, and touching
+  // handle_ again here would be wrong either way.
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    if (!invoked_) {
+      handle_.destroy();
+    }
+    allocator.delete_object(this);
+  }
+
+private:
+  std::coroutine_handle<> handle_;
+  bool invoked_ = false;
+};
+
+// Awaiter for `co_await someFuture` on any est::future<T> - see
+// future<T>::operator co_await() above. *this itself is a coroutine-frame
+// subobject - fine here for the identical reason future_resume_node<T>'s
+// own doc comment gives for *not* being one itself: await_suspend()
+// below hands the actual resumption off to a separately heap-allocated
+// future_resume_node<T> before this awaiter's own co_await expression
+// ends, and nothing reaches back into *this afterward.
+template <class T> class future_awaiter {
+public:
+  explicit future_awaiter(future<T>& fut) noexcept : future_(fut) {}
+  // Deleted, not defaulted - never actually invoked: every use of this
+  // class returns a genuine prvalue future<T>::operator co_await()
+  // elides into place, the same guaranteed-elision pattern
+  // est::scope_exit's own doc comment (est:util.scope_exit) already
+  // documents relying on.
+  future_awaiter(const future_awaiter&) = delete;
+  auto operator=(const future_awaiter&) -> future_awaiter& = delete;
+  future_awaiter(future_awaiter&&) = delete;
+  auto operator=(future_awaiter&&) -> future_awaiter& = delete;
+  ~future_awaiter() = default;
+
+  // Skips suspension entirely when the awaited future is already
+  // resolved - the same "don't wait for something that isn't being
+  // waited for" reasoning promise_type::initial_suspend() (above) now
+  // uses at the other end of a coroutine's lifetime (PR #37's own review
+  // discussion). An earlier version of this unconditionally returned
+  // `false`, deliberately matching future_state<T>::then()'s own "never
+  // run inline, even when already ready" invariant - found, at the time,
+  // to be the more defensible default (a caller of a coroutine-returning
+  // function couldn't otherwise assume a `co_await` never ran some of the
+  // awaited producer's own logic inline on an unexpected call stack).
+  // That tradeoff was revisited once initial_suspend() itself adopted the
+  // same "skip a suspend that isn't needed" stance: paying for a
+  // future_resume_node<T> allocation and a full ready-queue round trip
+  // purely to resume something that was never actually going to wait for
+  // anything stopped being worth it, for the identical reason it stopped
+  // being worth it there. future_state<T>::set_continuation() (called
+  // from await_suspend() below) still handles the "not yet ready" case
+  // correctly either way - this only changes whether that call, and the
+  // node it needs, happens at all.
+  [[nodiscard]] auto await_ready() const noexcept -> bool { return future_.ready(); }
+
+  void await_suspend(std::coroutine_handle<> handle) {
+    auto* node = future_.state_->allocator().template new_object<future_resume_node<T>>(handle);
+    future_.state_->set_continuation(*node);
+  }
+
+  // Moves the value out rather than copying it: co_await is inherently a
+  // single-consumption use of whatever it's awaiting (the awaited value
+  // only exists at this one point in the awaiting coroutine's control
+  // flow) - the same reasoning future<T>::get()'s own && overload
+  // already documents. Propagates (rather than returning) a stored
+  // exception: get() rethrows on failure, which - thrown from inside
+  // await_resume() - the language defines as equivalent to throwing from
+  // the co_await expression itself, so it surfaces in the awaiting
+  // coroutine exactly like any other exception crossing a co_await.
+  auto await_resume() -> T { return std::move(future_).get(); }
+
+private:
+  future<T>& future_;
+};
+
+} // namespace est::detail
+
+namespace est {
+
+template <class T> auto future<T>::operator co_await() noexcept -> detail::future_awaiter<T> {
+  return detail::future_awaiter<T>(*this);
+}
 
 } // namespace est

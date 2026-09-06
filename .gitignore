@@ -64,6 +64,11 @@ vcpkg_installed/
 # debug information files
 *.dwo
 
+# Clang source-based coverage profiles - written to the repo root by
+# est_tests if run directly outside the "ci" preset's own
+# LLVM_PROFILE_FILE path (build/ci/profraw/...)
+*.profraw
+
 # test output & cache
 Testing/
 .cache/
