@@ -2569,6 +2569,45 @@ retimed paths. Docs updated: `docs/wiki/Coroutines.md`'s `initial_suspend()`,
 all rewritten to describe the current (and, where relevant, prior)
 behavior.
 
+#### Follow-up code review, after the `initial_suspend()`/`await_ready()` reversal above (done, one finding fixed, one finding reverted and documented)
+
+A further `code-review` pass, requested once the `initial_suspend()`/
+`await_ready()` reversal (above) and the earlier `mutex::acquire()`/
+`lock_guard` addition had both landed on the same branch, found two
+issues:
+
+1. **`promise_type::loop_` dead member.** Once `initial_suspend()` no
+   longer needed a `loop&` of its own to build a `coroutine_start_awaiter`
+   from (removed in the reversal above), nothing in `promise_type` read
+   `loop_` again after construction - it was still being stored, unused.
+   Fixed by dropping the member and its initializer, keeping the
+   constructor parameter (still needed to build `state_`).
+2. **Dangling `mutex&` in `acquire_resume_node::run()`.** Confirmed real:
+   `unlock()` hands a dequeued waiter to `loop_.enqueue_ready()`, deferring
+   its actual `run()` to a later loop drain; if the mutex is destroyed in
+   the gap between that hand-off and the drain (possible whenever the loop
+   outlives the mutex and keeps running), `run()` constructs a `lock_guard`
+   over an already-dangling `mutex&`. The straightforward fix - complete
+   the waiter synchronously inside `unlock()` instead of deferring it -
+   was implemented, and then reverted after the `sanitize` preset caught a
+   *worse* regression it introduced (a stack-use-after-scope in an
+   already-established, deliberately-supported "abandoned coroutine"
+   scenario). See `docs/wiki/Coroutines.md`'s new "`unlock()`: deferred
+   through the loop, not completed inline - and a known, open limitation"
+   section for the full trace of both the original hazard and why the
+   fix traded it for a different one. Left as a documented precondition
+   (loop must outlive every mutex constructed against it; no waiter left
+   queued across a mutex's destruction while the loop keeps running)
+   rather than "solved" with the flawed fix.
+
+**Verified in the pinned Docker devenv:** 93/93 tests pass; `clang-format`/
+`clang-tidy` clean; full suite passes under the `sanitize` preset
+(ASan+UBSan) both before attempting the `unlock()` fix and again after
+reverting it - the sanitizer is what caught the regression in the first
+place, and re-running it after the revert is what confirmed the revert
+actually restored the previously-clean state rather than just looking
+right on inspection.
+
 ### Issue #25: flatten path's throwaway allocation (done)
 
 Found by a `code-review` pass on the issue #23 PR (see that section above)

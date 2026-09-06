@@ -801,12 +801,15 @@ public:
     // purely so this constructor matches whatever further parameters the
     // actual coroutine function declares, per the "promise constructor
     // arguments" rule this whole design relies on (see this class's own
-    // doc comment above).
+    // doc comment above). loop_ref itself isn't stored - it's only ever
+    // needed here, to build state_ - now that initial_suspend() no longer
+    // needs a loop& of its own to build a coroutine_start_awaiter from
+    // (PR #37 review follow-up), nothing in this class touches it again
+    // after construction.
     template <class... Args>
     explicit promise_type(loop& loop_ref, Args&... /*unused*/)
         : detail::future_promise_result<T>(
-              shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)),
-          loop_(loop_ref) {}
+              shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)) {}
     promise_type(const promise_type&) = delete;
     auto operator=(const promise_type&) -> promise_type& = delete;
     promise_type(promise_type&&) = delete;
@@ -858,9 +861,6 @@ public:
     static void operator delete(void* ptr, std::size_t size) noexcept {
       detail::coroutine_frame_dealloc(ptr, size);
     }
-
-  private:
-    loop& loop_;
   };
 
 private:

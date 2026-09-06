@@ -266,13 +266,11 @@ TEST_CASE("acquire() on a locked mutex defers until the holder's guard is droppe
   REQUIRE_FALSE(fut.ready());
 
   // Moving `holder` into a block-scoped variable and letting it go out of
-  // scope is the point: its destructor is what calls unlock() and hands
-  // the lock to the waiter above.
+  // scope is the point: its destructor is what calls unlock().
   {
     auto dropped = std::move(holder);
   }
   loop.run_until_idle(); // the waiter's acquire_resume_node runs, completing `fut`
-
   REQUIRE(fut.ready());
   auto second = std::move(fut).get();
   REQUIRE(m.locked());

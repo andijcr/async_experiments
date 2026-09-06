@@ -44,11 +44,12 @@ export namespace est {
 // removed as dead weight once that stopped being true.
 //
 // Holds a `loop&` (M3's convention, same as future_state<T> - see that
-// class's own doc comment) rather than its own allocator: it needs
-// somewhere to enqueue a waiter's resumption once unlock() hands the
-// lock to it, and est::loop::enqueue_ready() is that somewhere. Same
-// lifetime precondition as every other loop-holding type in this
-// codebase: the loop must outlive every mutex constructed against it.
+// class's own doc comment) rather than its own allocator: `lock()`/
+// `acquire()` each build a `future_state<T>` against it
+// (`make_promise_future<T>(loop_)`), and `unlock()`/`~mutex()` need its
+// allocator to destroy a waiter node. Same lifetime precondition as every
+// other loop-holding type in this codebase: the loop must outlive every
+// mutex constructed against it.
 class mutex {
 public:
   explicit mutex(loop& loop_ref) noexcept : loop_(loop_ref) {}
@@ -91,15 +92,51 @@ public:
   // it instead of clearing state_ - the resumed waiter becomes the new
   // holder without any window where the lock reads as free, so a third
   // party couldn't legally lock() in between even in a hypothetical
-  // multi-loop future. Resumption is deferred through
-  // est::loop::enqueue_ready() rather than completing the waiter's
-  // promise inline here, the same "never inline, always deferred through
-  // the loop" invariant every other producer in this codebase keeps
-  // (future_state<T>::complete(), a fired timer) - completing it inline
-  // would otherwise run the next waiter's entire remaining coroutine body
-  // (for a lock()-based waiter resumed via co_await) nested inside this
-  // call, unbounded in depth for a chain of coroutines that each
-  // lock/unlock in turn.
+  // multi-loop future.
+  //
+  // Deferred through est::loop::enqueue_ready() rather than completed
+  // directly here. An earlier, coroutine-handle-based design had to defer
+  // for a different reason - run() used to be handle_.resume(), which
+  // executes an arbitrary, possibly deeply nested amount of the resumed
+  // coroutine's own body synchronously (including, for a chain of
+  // coroutines that each lock/unlock in turn, a nested call right back
+  // into this same unlock()), so completing inline would have meant
+  // unbounded call-stack growth. Now that lock_resume_node/
+  // acquire_resume_node's run() only ever calls promise_.set_value(...),
+  // that specific hazard is gone.
+  //
+  // A synchronous-completion version was tried anyway (PR #37 review
+  // follow-up, reasoning that set_value()'s own complete() never invokes
+  // anything synchronously, so calling run() directly here still wouldn't
+  // run the waiter's own downstream code on this stack) and reverted
+  // after the sanitize preset caught a *worse* use-after-free it
+  // introduced: acquire_resume_node::run() would then always construct a
+  // real lock_guard synchronously inside unlock(), even for a waiter that
+  // is a coroutine later abandoned (destroyed without ever consuming its
+  // future<lock_guard>). Abandonment is only safe because destroy()
+  // (never run()) completes with an exception instead of a real value -
+  // see lock_resume_node's own doc comment - and that guard rail stopped
+  // applying once run() always ran here, unconditionally, regardless of
+  // whether the waiter would ever be consumed. Deferring through the loop
+  // keeps that guard rail intact: whether a queued waiter is later run()
+  // (the loop drains it normally) or destroy()'d (the loop or this mutex
+  // is torn down first) is decided at drain time, not decided in advance
+  // here.
+  //
+  // KNOWN LIMITATION left open by keeping this deferred:
+  // acquire_resume_node::run() still needs a live mutex& to construct the
+  // lock_guard it completes with. If this mutex is destroyed after
+  // unlock() enqueues a waiter but before the loop actually drains it -
+  // only possible if the loop outlives this mutex and keeps running
+  // during that gap, since ~mutex() itself drains waiters_ via destroy(),
+  // never run() - that waiter's run() would construct a lock_guard over
+  // an already-dangling mutex&. Not fixed here: the straightforward fix
+  // (complete synchronously, described above) trades this for the worse,
+  // more-easily-triggered abandoned-coroutine regression instead, so it
+  // is left as a documented precondition rather than "solved" with a
+  // flawed approach: the loop must outlive every mutex constructed
+  // against it, and a caller must not let the loop keep running past a
+  // mutex's destruction while a waiter is still queued on it.
   void unlock() noexcept {
     if (auto* waiter = waiters_.dequeue()) {
       loop_.enqueue_ready(*waiter);
@@ -158,11 +195,14 @@ private:
 // and keeps running) or safely destroyed, never run, by est::loop's own
 // destructor-time drain (loop::~loop()) - either way, the frame is no
 // longer stranded. `ran_` (same pattern as est:future's own
-// future_resume_node<T>) is what stops this from
-// double-completing an already-successfully-completed promise: run() and
-// destroy() are always both called, in that order, for any node the loop
-// actually processes (see Continuation-Node-Mechanism.md) - destroy()
-// must recognize that case and do nothing beyond deallocating.
+// future_resume_node<T>) is what stops this from double-completing an
+// already-successfully-completed promise: `destroy()` here can run in
+// two different circumstances - after the loop has already drained this
+// node via `run()` (unlock() handed it the lock - see `unlock()`'s own
+// doc comment), or, for a node still sitting in `waiters_` or still
+// queued on the loop's own ready_ list, from `~mutex()`'s or `~loop()`'s
+// own drain without `run()` ever having been called at all. `ran_` is
+// what tells `destroy()` which of the two just happened.
 class mutex::lock_resume_node final : public detail::ready_node {
 public:
   explicit lock_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
@@ -244,6 +284,14 @@ private:
 // comment for why destroy() also needs the same ran_-guarded
 // exception-completion on the abandoned (never handed the lock) path -
 // identical reasoning, unrelated to what value type the promise carries.
+// mutex_ staying valid for run()'s use relies on the precondition
+// unlock()'s own doc comment documents as a known, open limitation (the
+// loop must outlive every mutex constructed against it, and a caller
+// must not let the loop keep running past a mutex's destruction while a
+// waiter is still queued) - not enforced here, since enforcing it would
+// require either a lifetime-tracking mechanism this codebase doesn't
+// have yet or reintroducing the worse regression unlock()'s doc comment
+// describes.
 class mutex::acquire_resume_node final : public detail::ready_node {
 public:
   acquire_resume_node(mutex& mutex_ref, promise<lock_guard> prom) noexcept

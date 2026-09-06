@@ -601,3 +601,72 @@ a `lock_guard` value on success, which needs a `mutex&` to construct.
 Because `future<T>` is awaitable from *any* coroutine, `acquire()`'s
 result can be `co_await`ed from inside one - `auto guard = co_await
 mutex.acquire();` - exactly like `lock()`, it just isn't required to be.
+
+### `unlock()`: deferred through the loop, not completed inline - and a known, open limitation
+
+`unlock()` hands a dequeued waiter to `est::loop::enqueue_ready()` rather
+than calling `run()`/`destroy()` on it directly:
+
+```cpp
+void unlock() noexcept {
+  if (auto* waiter = waiters_.dequeue()) {
+    loop_.enqueue_ready(*waiter);
+    return;
+  }
+  state_ = 0;
+}
+```
+
+A later PR #37 review pass flagged a real hazard in this: `acquire_resume_
+node::run()` needs a live `mutex&` to construct the `lock_guard` it
+completes with, and deferring that construction to a later loop drain
+leaves a window - between `unlock()` enqueuing the node and the loop
+actually draining it - during which the mutex could be destroyed (nothing
+about "the loop outlives the mutex" precondition rules this out; a mutex
+is free to have a shorter lifetime than its loop). A queued waiter drained
+by `run()` after that point would construct a `lock_guard` over an
+already-dangling `mutex&`.
+
+The obvious fix - have `unlock()` call `run()` (then `destroy()`) on the
+waiter directly, reasoning that `set_value()`'s own `complete()`
+(`est:future`) never runs anything synchronously, so completing here
+still wouldn't run the waiter's own downstream code on this stack - was
+implemented and then reverted after the `sanitize` preset (ASan+UBSan)
+caught a *worse* regression it introduced. With that change,
+`acquire_resume_node::run()` always constructed a real `lock_guard`
+synchronously inside `unlock()`, even for a waiter that turned out to be
+a coroutine later abandoned (destroyed without ever consuming its
+`future<lock_guard>`, e.g. via `~loop()`'s own destructor-time drain of a
+still-suspended frame). Abandonment is only safe because `destroy()`
+(never `run()`) completes with an exception instead of a real value - see
+the previous section - and that guard rail stopped applying once `run()`
+ran unconditionally inside `unlock()`, ahead of whether the waiter would
+ever actually be consumed: the resulting `lock_guard`, now stored inside a
+`future_state<lock_guard>` with no consumer, would eventually have its
+destructor run by the abandoned frame's own teardown and call `unlock()`
+on a `mutex` that, in the failing test, had already been destroyed. ASan
+reported this as a stack-use-after-scope in
+"destroying a mutex with a coroutine co_await-ing acquire() still pending
+leaks nothing" - a scenario this codebase already deliberately supports
+for every other `future<T>`, and one considerably easier to hit in
+practice than the original "loop outlives a shorter-lived mutex" hazard
+the fix targeted. Deferring through the loop keeps abandonment's guard
+rail intact: whether a queued waiter is later `run()` (drained normally)
+or `destroy()`'d (the loop or the mutex is torn down first) is decided at
+drain time by whichever actually happens first, not decided in advance
+inside `unlock()`.
+
+Neither design is airtight - each protects one abandonment/lifetime
+scenario at the cost of the other - so this was kept as a documented,
+open limitation rather than "solved" with the fix that traded one
+confirmed use-after-free for a different one:
+
+> **Known limitation.** `acquire_resume_node::run()` needs a live
+> `mutex&`. If a mutex is destroyed after `unlock()` enqueues a waiter but
+> before the loop actually drains it - only reachable if the loop
+> outlives that mutex and keeps running during the gap, since `~mutex()`
+> itself drains `waiters_` via `destroy()`, never `run()` - that waiter's
+> eventual `run()` constructs a `lock_guard` over an already-dangling
+> `mutex&`. Precondition instead of a fix: the loop must outlive every
+> mutex constructed against it, and a caller must not let the loop keep
+> running past a mutex's destruction while a waiter is still queued on it.
