@@ -67,9 +67,12 @@ TEST_CASE("co_await lock() acquires immediately when unlocked", "[mutex]") {
     co_return;
   };
 
+  // No suspension anywhere in this coroutine: initial_suspend() never
+  // suspends, and lock()'s uncontended fast path returns an already-ready
+  // future, which co_await also resumes inline for (future_awaiter<T>::
+  // await_ready()). The whole thing runs synchronously - no
+  // run_until_idle() needed to observe any of it.
   auto fut = coro(loop, m);
-  REQUIRE_FALSE(m.locked()); // deferred - nothing has run yet
-  loop.run_until_idle();
   REQUIRE(fut.ready());
   REQUIRE(m.locked());
   REQUIRE_FALSE(m.has_waiters());

@@ -589,8 +589,9 @@ TEST_CASE("a coroutine returning est::future<int> can co_return a value", "[futu
   auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
 
   auto fut = coro(loop);
-  REQUIRE_FALSE(fut.ready()); // deferred - initial_suspend() never runs inline
-  loop.run_until_idle();
+  // No co_await inside - initial_suspend() never suspends (PR #37 review
+  // follow-up), so this runs synchronously to completion, like a plain
+  // function, with no loop involvement at all.
   REQUIRE(fut.ready());
   REQUIRE(fut.get() == 42);
 }
@@ -624,8 +625,9 @@ TEST_CASE("a coroutine returning est::future<void> can co_return with no value",
   };
 
   auto fut = coro(loop, ran);
-  REQUIRE_FALSE(ran);
-  loop.run_until_idle();
+  // No co_await inside - runs synchronously to completion, same reason
+  // as "a coroutine returning est::future<int> can co_return a value"
+  // above.
   REQUIRE(ran);
   REQUIRE(fut.ready());
   fut.get();
@@ -640,8 +642,9 @@ TEST_CASE("an exception thrown in a coroutine's body surfaces through get()",
     co_return 0; // unreachable - co_return is only here to make this body a coroutine
   };
 
+  // No co_await inside - runs synchronously, so unhandled_exception()
+  // already ran by the time coro() returns.
   auto fut = coro(loop);
-  loop.run_until_idle();
   REQUIRE(fut.ready());
   REQUIRE(fut.failed());
   REQUIRE_THROWS_AS(fut.get(), std::runtime_error);
@@ -658,8 +661,10 @@ TEST_CASE("a coroutine can co_await another coroutine's future, chaining values"
     co_return value + 1;
   };
 
+  // Both coroutines run synchronously to completion here: `inner`'s
+  // co_return never suspends, so the future outer's co_await sees is
+  // already ready by the time it evaluates it, and skips suspension too.
   auto fut = outer(loop, inner);
-  loop.run_until_idle();
   REQUIRE(fut.ready());
   REQUIRE(fut.get() == 43);
 }
@@ -730,17 +735,21 @@ TEST_CASE("a coroutine's frame and resume nodes are all freed through the loop's
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-TEST_CASE("co_await on an already-ready future still defers to the loop", "[future][coroutine]") {
-  // Regression test (found in review): future_awaiter<T>::await_ready()
-  // must not return future_.ready() directly - doing so lets co_await
-  // skip suspension and run the rest of the awaiting coroutine inline,
-  // right there on whatever call stack reached this co_await, instead of
-  // yielding back to est::loop - unlike then(), which this codebase
-  // already tests always defers even when already ready (see "then()
-  // registered on an already-ready future still defers to the loop"
-  // above). Observed here the same way that test does: nothing runs
-  // until run_until_idle() is called, even though the awaited future is
-  // already complete by the time co_await evaluates it.
+TEST_CASE("co_await on an already-ready future resumes inline, no loop round-trip needed",
+          "[future][coroutine]") {
+  // future_awaiter<T>::await_ready() returns future_.ready() directly
+  // (PR #37 review follow-up) - unlike then(), which always defers even
+  // for an already-ready registration (see "then() registered on an
+  // already-ready future still defers to the loop" above), co_await on
+  // an already-ready future skips suspension entirely: the rest of the
+  // awaiting coroutine's body runs immediately, right there on whatever
+  // call stack reached this co_await, the same "don't wait for something
+  // that isn't being waited for" stance promise_type::initial_suspend()
+  // now takes at the other end of a coroutine's lifetime. An earlier
+  // version of this test (and of await_ready() itself) asserted the
+  // opposite, when deferring unconditionally was this codebase's
+  // deliberate policy; see future_awaiter<T>::await_ready()'s own doc
+  // comment for the full history of that reversal.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
   promise.set_value(5);
@@ -748,36 +757,14 @@ TEST_CASE("co_await on an already-ready future still defers to the loop", "[futu
   bool resumed = false;
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, est::future<int> fut, bool& resumed_ref) -> est::future<int> {
-    const int value = co_await std::move(fut); // already ready - must still defer
+    const int value = co_await std::move(fut); // already ready - resumes inline
     resumed_ref = true;
     co_return value;
   };
 
   auto fut = coro(loop, std::move(future), resumed);
-  REQUIRE_FALSE(resumed); // deferred - initial_suspend() alone doesn't run the co_await either
-  loop.run_until_idle();
-  REQUIRE(resumed);
+  REQUIRE(resumed); // no loop round-trip needed - already true by the time coro() returns
   REQUIRE(fut.get() == 5);
-}
-
-TEST_CASE("an abandoned coroutine, destroyed with its loop before ever running, leaks nothing",
-          "[future][coroutine]") {
-  // Regression test (found in review): coroutine_resume_node::destroy()
-  // used to free only the small trampoline node, never the coroutine
-  // frame itself, leaking it permanently whenever the frame was
-  // abandoned before ever running (initial_suspend()'s resume node still
-  // sitting in est::loop's ready_ when the loop is destroyed).
-  counting_resource resource;
-  {
-    est::loop loop{&resource};
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-    auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
-    auto fut = coro(loop);
-    // Deliberately never call loop.run_until_idle(): the coroutine never
-    // runs at all before `loop` (and `fut`) go out of scope below.
-  }
-  REQUIRE(resource.allocations > 0);
-  REQUIRE(resource.allocations == resource.deallocations);
 }
 
 TEST_CASE("dropping an awaited future_state destroys the still-suspended coroutine, no leak",

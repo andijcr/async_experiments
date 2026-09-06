@@ -106,25 +106,48 @@ exactly the right one — the same "resolve the void fork once, in a small
 dedicated place" approach `future_state<T>::stored_t` already uses (see
 [Continuation Node Mechanism](Continuation-Node-Mechanism.md)).
 
-## Never running inline: `initial_suspend()`
-
-Consistent with `future_state<T>::complete()` deferring every continuation
-through `est::loop` instead of running it inline (M3), a coroutine's *first*
-slice of work is deferred too. `initial_suspend()` always suspends and hands
-resumption off to `est::loop`'s ready-queue:
+## `initial_suspend()`: running synchronously up to the first real suspension
 
 ```cpp
-auto initial_suspend() noexcept -> detail::coroutine_start_awaiter {
-  return detail::coroutine_start_awaiter(loop_);
-}
+auto initial_suspend() noexcept -> std::suspend_never { return {}; }
 ```
 
-Calling a coroutine function therefore never executes any of its body on the
-caller's own stack — it returns a not-yet-ready `future<T>` immediately, and
-the body only starts running once `loop.run_until_idle()`/`run()` drains the
-ready-queue. This is exactly what makes coroutine-produced and
-`then()`-chain-produced futures behave identically from a caller's
-perspective.
+Calling a coroutine function runs its body immediately, on the caller's own
+stack, up to its first genuine suspension point (a real `co_await` on
+something not yet ready) or all the way to `co_return`/an uncaught
+exception if it never awaits anything at all — exactly like an ordinary
+function computing a value before handing back a `future<T>`. A
+`[](loop&) -> future<int> { co_return 42; }` coroutine, for instance, never
+touches `est::loop` at all: the call returns an already-`ready()` future
+directly, no `run_until_idle()` needed to observe it.
+
+This wasn't the original design. An earlier version had `initial_suspend()`
+always suspend, deferring even a coroutine's very first slice of work
+through `est::loop`'s ready-queue - consistent, at the time, with
+`future_state<T>::complete()` deferring every continuation instead of
+running it inline (M3), and with the matching stance `operator co_await()`
+(below) took on the *awaiting* side. A PR review discussion (PR #37)
+revisited that: the repo owner's framing was that a coroutine's synchronous
+prefix, up to its first real suspension point, is conceptually the same as
+the work an ordinary function does before returning a future - and paying
+for a heap-allocated resume node plus a full ready-queue round trip to kick
+off that prefix, when there's nothing to actually interleave with, wasn't
+worth what it bought. The concrete cost was traced precisely before making
+the change: exactly one allocation and one round trip per coroutine call,
+regardless of how much real work or how many suspension points the
+coroutine has - every actual `co_await` still allocates its own resume
+node independently, unaffected by what `initial_suspend()` does. Once
+`operator co_await()` (below) adopted the same "don't wait for something
+that isn't being waited for" stance for the identical reason, keeping
+`initial_suspend()` on the older, always-deferred policy would have been
+the inconsistent choice, not the safe one.
+
+One real consequence: a caller of a coroutine-returning function can no
+longer assume the `future<T>` it gets back is never already resolved, with
+side effects already applied, before it was ever inspected - a plain
+function call already carries that same property (nothing stops an
+ordinary function from doing arbitrary work before returning), so this
+isn't a new kind of risk, just coroutines no longer being exempt from it.
 
 ## The bug: an awaiter can't safely resume-then-be-destroyed from inside its own frame
 
@@ -211,6 +234,17 @@ flavor (a design that looked right until traced through an object's actual
 lifetime) — this is that pattern again, one layer up, in coroutine frames
 instead of `future_state<T>` ownership.
 
+`coroutine_start_awaiter`/`coroutine_resume_node` themselves no longer
+exist in the current code - once `initial_suspend()` stopped needing an
+awaiter at all (it just returns `std::suspend_never` directly now, per the
+section above), there was nothing left for them to do. The lesson they
+were built to demonstrate still applies directly, unchanged, to
+`future_awaiter<T>`/`future_resume_node<T>` (below) and to
+`mutex::lock_resume_node`/`acquire_resume_node` (further down this page) -
+every one of them keeps the identical "awaiter stays a frame subobject,
+resumption node is separately heap-allocated" split, for exactly this
+reason.
+
 ## `operator co_await` — awaiting *any* `future<T>`
 
 The other half of the design: a coroutine can `co_await` any
@@ -229,45 +263,48 @@ sequenceDiagram
   participant est_loop as est::loop
 
   coro->>awaiter: co_await someFuture
-  awaiter->>awaiter: await_ready(): always false
-  awaiter->>node: await_suspend(handle): allocate
-  awaiter->>state: set_continuation(node)
-  Note over coro: suspended
+  awaiter->>state: await_ready(): future_.ready()
   alt already ready
-    state->>est_loop: enqueue_ready(node) right away
+    Note over coro: resumes inline, no suspension at all
   else not ready yet
+    awaiter->>node: await_suspend(handle): allocate
+    awaiter->>state: set_continuation(node)
+    Note over coro: suspended
     state->>state: waiters_.enqueue(node)
     Note over state,node: (later) set_value()/set_exception() -> complete()
     state->>est_loop: enqueue_ready(node)
+    est_loop->>est_loop: drain_ready(): ready_.dequeue()
+    est_loop->>node: run() -> invoke() -> handle.resume()
+    Note over coro: resumes here
   end
-  est_loop->>est_loop: drain_ready(): ready_.dequeue()
-  est_loop->>node: run() -> invoke() -> handle.resume()
-  Note over coro: resumes here
   coro->>awaiter: await_resume(): get() the value (or rethrow)
 ```
 
-`await_ready()` always returns `false`, even when the awaited future is
-already ready - a first version of this returned `future_.ready()`
-directly, which broke a real, tested invariant this codebase already
-holds `then()` to: even an already-ready `then()` registration defers
-through `est::loop` rather than running inline
-(`future_tests.cpp`, *"then() registered on an already-ready future still
-defers to the loop"*). Skipping suspension for an already-ready `co_await`
-would run the rest of the awaiting coroutine inline instead, right there
-on whatever call stack reached that `co_await` - a chain of several such
-awaits could then run to completion synchronously, starving any other
-work already queued on that loop. `future_state<T>::set_continuation()`
-(called from `await_suspend()`) already handles the "already ready" case
-correctly on its own - enqueueing straight onto `est::loop`'s ready-queue
-instead of invoking inline, exactly the branch the diagram's `alt` shows -
-so `await_ready()` doesn't need to, and must not, special-case it.
+`await_ready()` returns `future_.ready()` directly - `co_await` on an
+already-ready future skips suspension entirely, resuming the rest of the
+awaiting coroutine's body immediately, right there on whatever call stack
+reached that `co_await`. This wasn't the original design: an earlier
+version unconditionally returned `false`, deliberately matching a
+tested invariant this codebase held `then()` to at the time - even an
+already-ready `then()` registration defers through `est::loop` rather
+than running inline (`future_tests.cpp`, *"then() registered on an
+already-ready future still defers to the loop"*, still true and
+unchanged). That was reversed in the same PR #37 review round that
+changed `initial_suspend()` (above), for the identical reasoning: paying
+for a `future_resume_node<T>` allocation and a full ready-queue round
+trip purely to resume something that was never actually going to wait for
+anything stopped being worth it, once `initial_suspend()` itself had
+already made the same call at the other end of a coroutine's lifetime.
+`future_state<T>::set_continuation()` (called from `await_suspend()`)
+still handles the "not yet ready" case exactly as before - this only
+changes whether that call, and the node it needs, happens at all, which
+is what the diagram's `alt` now shows.
 
 `future_awaiter<T>` needs its resumption node to satisfy
-`future_state<T>::set_continuation()`'s signature — `detail::continuation_node<T>&`,
-not the T-independent `ready_node` `coroutine_resume_node` derives — so it
-gets its own tiny, otherwise-identical heap-allocated trampoline,
-`future_resume_node<T>`, that ignores the `future_state<T>&` it's handed and
-just resumes:
+`future_state<T>::set_continuation()`'s signature —
+`detail::continuation_node<T>&` — so it gets its own tiny heap-allocated
+trampoline, `future_resume_node<T>`, that ignores the `future_state<T>&`
+it's handed and just resumes:
 
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
@@ -329,7 +366,7 @@ the other side is a coroutine.
 
 ### Abandoned coroutines are destroyed, not leaked
 
-Both resumption nodes' `destroy()` are called two ways: after a successful
+Every resumption node's `destroy()` is called two ways: after a successful
 `run()`/`invoke()` (the normal case, described above), or by
 `future_state<T>::~future_state()`/`loop::~loop()` draining whatever's left
 when a `future_state`/`loop` is torn down without ever completing/draining
@@ -341,14 +378,14 @@ code review, before merging, not after). The fix: each resumption node
 tracks whether it ever actually ran -
 
 ```cpp
-class coroutine_resume_node final : public ready_node {
+template <class T> class future_resume_node final : public continuation_node<T> {
 public:
-  void run() final {
-    ran_ = true;
+  void invoke(future_state<T>&) override {
+    invoked_ = true;
     handle_.resume();
   }
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
-    if (!ran_) {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    if (!invoked_) {
       handle_.destroy();   // never resumed - still fully intact; this is
                             // the only chance to free its frame
     }
@@ -411,20 +448,36 @@ built the same way `acquire()` (below) is:
 
 `co_await mutex.lock();` still works exactly as before, syntactically -
 `future<T>` is awaitable from any coroutine (`operator co_await()`,
-above) - but now, unlike the old `lock_awaiter`, *every* `co_await` on it
-genuinely suspends and defers through the loop, uncontended or not
-(`future_awaiter<T>::await_ready()` is unconditionally `false`). The cost
-of that consistency, concretely: an uncontended `lock()` goes from 0
-allocations/0 loop round-trips to 2 allocations (the `future_state<void>`
-control block, plus the `future_resume_node<T>` `await_suspend()` must
-allocate regardless of readiness) and 1 round-trip; a contended `lock()`
-goes from 1 allocation/1 round-trip (`lock_resume_node` resuming the
-handle directly) to 3 allocations and 2 round-trips (`unlock()` completes
-the promise, which resumes the future's own registered continuation,
-which *then* finally resumes the coroutine). `lock()` is also no longer
-awaitable-*only*: since it returns a plain `future<void>`, it can be used
-from ordinary, non-coroutine code too (polled via `ready()`/`get()`, or
-chained with `then()`), not just via `co_await`.
+above). What actually happens underneath shifted twice across this same
+PR review, in opposite directions:
+
+1. At the point `lock()` was first converted to `future<void>`,
+   `future_awaiter<T>::await_ready()` still unconditionally returned
+   `false` (its own review-round fix, above, hadn't been revisited yet) -
+   so *every* `co_await mutex.lock()` genuinely suspended and deferred
+   through the loop, uncontended or not. Concretely: an uncontended
+   `lock()` went from 0 allocations/0 loop round-trips (`lock_awaiter`'s
+   old fast path) to 2 allocations (the `future_state<void>` control
+   block, plus the `future_resume_node<T>` `await_suspend()` must
+   allocate regardless of readiness) and 1 round-trip; a contended
+   `lock()` went from 1 allocation/1 round-trip (`lock_resume_node`
+   resuming the handle directly) to 3 allocations and 2 round-trips.
+2. Once `future_awaiter<T>::await_ready()` itself was changed to check
+   `future_.ready()` directly (same section above), `lock()`'s fast path
+   got most of that back *for free*, with no `lock_awaiter` needed at
+   all: an uncontended `co_await mutex.lock()` resumes inline, no
+   `future_resume_node<T>` allocated and no loop round-trip, since
+   `await_suspend()` never runs when `await_ready()` already returns
+   `true`. The one allocation `lock_awaiter`'s original fast path avoided
+   that this version still pays is the `future_state<void>` control block
+   itself, from `make_promise_future<void>()` - `lock()` builds one
+   unconditionally, fast path or not, since it has no way to hand back a
+   `future<void>` without one.
+
+`lock()` is also no longer awaitable-*only*: since it returns a plain
+`future<void>`, it can be used from ordinary, non-coroutine code too
+(polled via `ready()`/`get()`, or chained with `then()`), not just via
+`co_await`.
 
 `unlock()` hands the lock directly to the next queued waiter (via
 `loop.enqueue_ready()`, never completing its promise inline here — the
@@ -493,9 +546,9 @@ exactly like any other failure propagating across `co_await`, per
 "an exception in the awaited future propagates across `co_await`" above)
 or safely destroyed, never run, by `est::loop`'s own destructor-time
 drain - either way, the frame is no longer stranded. `ran_` (the same
-pattern as `est:future`'s own `coroutine_resume_node`/
-`future_resume_node<T>`) is what stops this from double-completing an
-already-successfully-completed promise: `run()` and `destroy()` are
+pattern as `est:future`'s own `future_resume_node<T>`) is what stops this
+from double-completing an already-successfully-completed promise: `run()`
+and `destroy()` are
 always both called, in that order, for any node the loop actually
 processes (see [Continuation Node Mechanism](Continuation-Node-Mechanism.md)).
 

@@ -27,19 +27,21 @@ export namespace est {
 // have the lock released automatically (RAII) than remember to call
 // unlock() itself.
 //
-// lock() itself is deliberately *not* built on a bespoke awaiter type,
-// even though that would let an uncontended lock() skip both an
-// allocation and a genuine suspension (PR #37 review discussion) - a
-// custom awaiter's fast path would be the one remaining place in this
-// codebase where "already resolved" is allowed to skip a real suspend/
-// resume cycle, inconsistent with every other producer here (`then()`,
-// `future_awaiter<T>` after its own review-round fix, and
-// `promise_type::initial_suspend()`, all of which pay a fixed allocation
-// cost specifically so a caller never has to wonder whether a given
-// `future<T>` might already be resolved with side effects applied before
-// it was ever inspected). `lock()` returning a plain `future<void>`
-// keeps that guarantee uniform, at the cost of the allocations a custom
-// awaiter's fast path would have avoided.
+// lock() itself is deliberately *not* built on a bespoke awaiter type
+// (PR #37 review discussion) - it returns a plain `future<void>`, built
+// the same way `acquire()` is. An earlier version of this PR had a
+// custom `lock_awaiter` specifically to give an uncontended `lock()` a
+// zero-allocation, non-suspending fast path, back when `future<T>`'s own
+// `operator co_await()` always genuinely suspended regardless of
+// readiness - `lock_awaiter` would then have been the one place left
+// where "already resolved" was allowed to skip a real suspend/resume
+// cycle. Once `future_awaiter<T>::await_ready()` itself started skipping
+// suspension for an already-ready future (see that class's own doc
+// comment, `est:future`), a bespoke awaiter stopped buying `lock()`
+// anything: `co_await mutex.lock()` on an uncontended mutex already
+// resumes immediately, with no extra node, through the same path any
+// other `co_await`-of-an-already-ready-future takes - `lock_awaiter` was
+// removed as dead weight once that stopped being true.
 //
 // Holds a `loop&` (M3's convention, same as future_state<T> - see that
 // class's own doc comment) rather than its own allocator: it needs
@@ -156,7 +158,7 @@ private:
 // and keeps running) or safely destroyed, never run, by est::loop's own
 // destructor-time drain (loop::~loop()) - either way, the frame is no
 // longer stranded. `ran_` (same pattern as est:future's own
-// coroutine_resume_node/future_resume_node<T>) is what stops this from
+// future_resume_node<T>) is what stops this from
 // double-completing an already-successfully-completed promise: run() and
 // destroy() are always both called, in that order, for any node the loop
 // actually processes (see Continuation-Node-Mechanism.md) - destroy()
