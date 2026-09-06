@@ -37,42 +37,40 @@ complex `.then()` chain actually cost."
 | `make_promise_future<T>(loop)` | **1** | `future_state<T>`'s control block |
 | `future<T>::then(fn)` (plain, non-flattening) | **2** | the downstream `future_state<U>`'s control block, plus the `concrete_continuation<Fn, U>` node |
 | `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`'s control block, plus the `concrete_timer_node<Fn>` node |
-| `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 2 more when it runs** | the usual 2 for the visible registration, plus 2 more, *invisible to the caller*, for a throwaway forwarding continuation — see below |
+| `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 1 more when it runs** | the usual 2 for the visible registration, plus 1 more, *invisible to the caller*, for `detail::flatten_forwarder<V>`'s forwarding node — see below |
 
 A plain chain of `N` `.then()` calls off one `make_promise_future` therefore
 costs **`1 + 2N`** allocations, full stop — regardless of how deep the chain
 is, each link is exactly 2 allocations, known statically at the call site.
 
-## Flattening costs two extra allocations
+## Flattening costs one extra allocation
 
 [Continuation Node Mechanism](Continuation-Node-Mechanism.md#flattening-is-not-a-special-case)
 covers *why*: a `.then()` callback returning `future<V>` doesn't get special
-node-hierarchy treatment. `fulfill()` just calls `.then()` *again*, on the
-inner future, registering an ordinary forwarding continuation:
+node-hierarchy treatment. `fulfill()` allocates a `detail::flatten_forwarder<U>`
+node directly on the inner future's own `future_state<U>`, reached through
+`future<U>`'s private `state_` member (`future<T>` friends every
+`future_state<X>` instantiation for exactly this one internal call site):
 
 ```cpp
-std::forward<R>(result).then([downstream_copy](future<inner_value_type>& inner_future) {
-  // ...forwards inner_future's value/exception into downstream_copy...
-});
+auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
+    downstream_);
+result.state_->set_continuation(*node);
 ```
 
-That nested `.then()` call is a completely ordinary one — it costs the usual
-2 allocations (a throwaway `future_state<void>` downstream, since the
-forwarding lambda returns `void`, plus its own `concrete_continuation` node)
-— except **nobody ever reads the `future<void>` it returns**. `fulfill()`
-discards it immediately. Both the throwaway downstream and its node are
-allocated, used for exactly one purpose (observing the inner future's
-completion once), and freed — pure overhead that produces no observable
-value.
-
-This is a real, known inefficiency, filed as
-[issue #25](https://github.com/andijcr/async_experiments/issues/25)
-("`then()` flatten path allocates a throwaway `future_state` + continuation
-node per call") rather than silently accepted — the fix would need a
-lower-level "register a raw callback, no downstream future needed" primitive
-on `future_state<T>` that `fulfill()`'s flatten branch could use instead of
-going through the full `then()` machinery. Not implemented yet: it's a real
-internal-API addition, not a local tweak.
+`flatten_forwarder<T>` (issue #25) is templated on the inner value type
+alone — no `Fn`, no closure, no `future<T>` view built via
+`shared_from_this()`, no wrapped/unwrapped dispatch — and every flattening
+`.then()` at the same inner type reuses the same instantiation. Two earlier,
+now-removed designs paid more for the same one call site: first a plain
+`.then()` call, which worked (the discarded `future<void>` it returned was
+never wrong, just wasted) but paid for a second, throwaway
+`future_state<void>` plus a full `concrete_continuation` node every single
+time; then a lower-level `on_ready()`/`raw_continuation<Fn>` pair that
+dropped the throwaway `future_state<void>` but still minted a fresh node
+(and closure) type per `(T, Fn, U)` call site, and had to be public on both
+`future_state<T>` and `future<T>` for `fulfill()` to reach — even though
+`fulfill()` was its only legitimate caller.
 
 ## Worked example: a three-link chain
 

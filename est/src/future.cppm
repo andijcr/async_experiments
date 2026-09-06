@@ -55,6 +55,47 @@ private:
   shared_ptr<future_state<T>> owner_;
 };
 
+// The node behind then()'s monadic-flatten path
+// (future_state<T>::concrete_continuation<Fn, U>::fulfill(), below): once
+// registered directly on an inner future_state<T> (via set_continuation(),
+// bypassing future<T>/then() entirely), forwards that inner future's
+// result - or exception - into a downstream future_state<T> with no
+// callback, no closure, and no wrapped/unwrapped dispatch to pick between:
+// the inner future's exact value type T is already known and fixed by the
+// call site, so there's nothing left to genericize over. Templated on T
+// alone (issue #25's own follow-up simplification, replacing an earlier
+// on_ready()/raw_continuation<Fn> pair that were templated on an arbitrary
+// callback type instead) - every flatten at the same T reuses this one
+// instantiation instead of minting a fresh one per (T, Fn, U) call site.
+template <class T> class flatten_forwarder final : public continuation_node<T> {
+public:
+  explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
+      : downstream_(std::move(downstream)) {}
+
+  void invoke(future_state<T>& state) override {
+    if (state.failed()) {
+      downstream_->set_exception(state.get_exception());
+      return;
+    }
+    try {
+      if constexpr (std::is_void_v<T>) {
+        downstream_->set_value();
+      } else {
+        downstream_->set_value(std::move(state).get());
+      }
+    } catch (...) {
+      downstream_->set_exception(std::current_exception());
+    }
+  }
+
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    allocator.delete_object(this);
+  }
+
+private:
+  shared_ptr<future_state<T>> downstream_;
+};
+
 // A placeholder "success" alternative for future_state<void>'s result_
 // variant: void itself can't be a variant alternative, and reusing
 // std::monostate for both "not yet ready" and "ready with no value" would
@@ -486,34 +527,23 @@ private:
     }
 
     // Reports a non-void fn_ result to downstream_: directly via
-    // set_value() if it's a plain U, or - if it's itself a future<U> -
-    // by registering a wrapped (no-unwrap) continuation on it that
-    // forwards its eventual value/exception into downstream_ once it
-    // resolves. That forwarding continuation checks failed()/
-    // get_exception() directly for the known-failure case (same reason
-    // invoke() above does: avoids a throw/catch round-trip to retrieve
-    // an exception_ptr already known to be there), keeping try/catch
-    // only around the success path, for whatever unexpected exception
-    // copying/moving the value itself might throw.
+    // set_value() if it's a plain U, or - if it's itself a future<U> - by
+    // registering a detail::flatten_forwarder<U> node directly on the
+    // inner future's own future_state<U> (issue #25's own follow-up
+    // simplification: no callback, no closure, and no intermediate
+    // future<U>/future_state<U> pair to allocate and immediately discard -
+    // result.state_ is reached directly via future<U>'s
+    // `template <class> friend class future_state;` declaration, since
+    // this code is itself nested inside a future_state<T> instantiation
+    // and nested-class members share their enclosing class's access
+    // rights). U, not inner_value_type, throughout: then() already
+    // computed downstream_'s value type by unwrapping Fn's raw future<U>
+    // result, so the two are always the same type here.
     template <class R> void fulfill(R&& result) {
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
-        using inner_value_type = detail::unwrap_future_t<std::decay_t<R>>;
-        auto downstream_copy = downstream_; // copy: the forwarding lambda keeps its own reference
-        std::forward<R>(result).then([downstream_copy](future<inner_value_type>& inner_future) {
-          if (inner_future.failed()) {
-            downstream_copy->set_exception(inner_future.get_exception());
-            return;
-          }
-          try {
-            if constexpr (std::is_void_v<inner_value_type>) {
-              downstream_copy->set_value();
-            } else {
-              downstream_copy->set_value(inner_future.get());
-            }
-          } catch (...) {
-            downstream_copy->set_exception(std::current_exception());
-          }
-        });
+        auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
+            downstream_);
+        result.state_->set_continuation(*node);
       } else {
         downstream_->set_value(std::forward<R>(result));
       }
@@ -618,6 +648,18 @@ public:
   template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn)); }
 
 private:
+  // Grants every future_state<U> instantiation access to state_ below -
+  // specifically for detail::flatten_forwarder<T>'s one caller,
+  // future_state<T>::concrete_continuation<Fn, U>::fulfill() (:future's
+  // own future_state<T> definition, above), which needs to register a
+  // continuation directly on an inner future<T>'s own future_state<T>
+  // without going through any future<T> method (there is deliberately no
+  // public one for this - see fulfill()'s own doc comment). A nested
+  // class shares its enclosing class's access rights, so this one
+  // `friend` declaration is all every future_state<T> instantiation
+  // needs, not one per (T, U) pair.
+  template <class> friend class future_state;
+
   shared_ptr<future_state<T>> state_;
 };
 

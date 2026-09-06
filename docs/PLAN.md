@@ -2220,6 +2220,140 @@ M4 itself is still in progress on a separate branch/PR (`feature/coroutines`,
 PR #37) as of this section - not yet merged into `main` - so its own
 "Implementation" write-up lives there, not here.
 
+### Issue #25: flatten path's throwaway allocation (done)
+
+Found by a `code-review` pass on the issue #23 PR (see that section above)
+and deliberately deferred at the time: when a `then()` callback returns a
+`future<V>` (monadic flattening), `fulfill()`'s forwarding logic only
+needed to *register a callback* on the inner future - but the only way to
+do that was `.then()` itself, which always allocates a fresh downstream
+`future_state<U>` and `concrete_continuation<Fn, U>` node to hand the
+caller a `future<U>` to chain onward from. Nobody chains onward from the
+inner forwarding step - `fulfill()` discarded the `future<void>` `.then()`
+returned immediately - so that downstream `future_state`/node pair was
+pure overhead, allocated and freed for nothing every single flattening
+`.then()` call.
+
+The repo owner's own comment on the issue proposed an alternative: "a
+special future_state that points to a future, so that once the future is
+fulfilled the state can be fulfilled without having to allocate another T,
+only a pointer." Evaluated against the issue's own originally-suggested
+fix (a lower-level "register a raw callback, no downstream future needed"
+primitive) with an eye on template-codegen cost, not just allocation
+count:
+
+- The pointer/delegate idea still needs *some* registered callback on the
+  inner future to know when to notify the outer future's own waiters - it
+  doesn't remove a node, it only changes what the node does (adopt a
+  pointer instead of copying a value).
+- It adds a second internal representation (own storage vs. delegate to
+  another live `future_state`) to every accessor - `ready()`, `failed()`,
+  `get()` - of `future_state<T>`, the single most-instantiated type in the
+  library (one instantiation per `T` used anywhere, not per `(T, Fn)` or
+  `(T, Fn, U)` combination the way continuation nodes are).
+- The actual benefit it targets (avoiding a copy of the flattened value)
+  was available far more cheaply: the forwarding callback was calling the
+  copying `inner_future.get()` instead of `std::move(inner_future).get()`,
+  even though `inner_future` is always a fresh, single-owner future
+  nobody else can reach.
+
+Settled (repo owner agreed) on the originally-suggested primitive instead,
+plus the move fix:
+
+- **`future_state<T>::on_ready(Fn)`**: `then()`'s registration mechanism
+  (`set_continuation()`) with the downstream-future half removed - no
+  `future_state<U>`, no `future<U>` handed back, nothing to discard. Its
+  node, `raw_continuation<Fn>`, is templated on `Fn` alone (not `(Fn, U)`
+  like `concrete_continuation`) - no `downstream_` member, no
+  wrapped/unwrapped dispatch, no `fulfill()`/`invoke_and_fulfill()`
+  recursion baked into its `invoke()`. Exposed on `future<T>` too
+  (`future<T>::on_ready()`), forwarding the same way `then()` does.
+- `fulfill()`'s flatten branch now calls `on_ready()` instead of `then()`,
+  and its forwarding lambda calls `std::move(inner_future).get()` instead
+  of `inner_future.get()`.
+
+The move fix turned out to matter beyond performance: forwarding a
+move-only value through the old copying path required `U` to be
+copy-constructible purely for this internal step, even though nothing
+outside `fulfill()` ever touched the copy - a `then()` callback returning
+`future<std::unique_ptr<T>>` could not be flattened at all under the old
+code (`std::unique_ptr` has no copy constructor for `set_value(const U&)`
+to select). A new regression test confirms flattening a
+`future<std::unique_ptr<int>>`-returning callback compiles and works
+under the fix; it would not have compiled before it.
+
+**Verified in the pinned Docker devenv:** 71/71 tests pass (2 new - the
+move-only flatten regression above, plus an exact-allocation-count
+assertion added to the existing flatten leak test: 5 allocations for the
+worked example in [docs/wiki/Allocation-Patterns.md](wiki/Allocation-Patterns.md),
+down from 7 before this fix); `clang-format`/`clang-tidy` clean (one
+`bugprone-use-after-move` false positive NOLINT'd - clang-tidy flags
+`std::move(x).get()` as a "use after move" of `x` even when it's the
+expression's only use); full suite also passes under the `sanitize`
+preset (ASan+UBSan). Docs updated:
+[docs/wiki/Continuation-Node-Mechanism.md](wiki/Continuation-Node-Mechanism.md)'s
+"Flattening is not a special case" section and
+[docs/wiki/Allocation-Patterns.md](wiki/Allocation-Patterns.md)'s
+flattening-cost section, both rewritten for the new allocation count and
+`on_ready()` mechanism.
+
+#### Follow-up: `on_ready()` degeneralized to `detail::flatten_forwarder<T>` (done)
+
+The repo owner's own follow-up review of the above: "if we believe that
+`on_ready` is only a private abstraction built to support a continuation
+returning a function, then we should: ensure that it's not a public method
+of `future`, degeneralize and pass the raw_continuation node only the
+downstream_copy, skipping the lambda altogether."
+
+Correct on both counts. `on_ready()` had exactly one real caller
+(`fulfill()`'s flatten branch) with one fixed shape of forwarding logic -
+templating its node on an arbitrary `Fn` and exposing it publicly on both
+`future_state<T>` and `future<T>` was generality nothing needed, paid for
+with a fresh node type (and lambda closure type) per `(T, Fn, U)` call
+site instead of one shared instantiation per inner value type `T`.
+
+Fixed:
+
+- **`future<T>::on_ready()` and `future_state<T>::on_ready()` removed
+  entirely**, along with the nested `raw_continuation<Fn>` class.
+- **`detail::flatten_forwarder<T>`** added in its place: a free class
+  template in `est::detail`, alongside `detail::continuation_node<T>` -
+  not nested inside `future_state<T>`, since it needs nothing private to
+  `future_state<T>` beyond what `future_state<T>`'s own public interface
+  (`failed()`, `get_exception()`, `get()`, `set_value()`,
+  `set_exception()`) already exposes. Templated on the inner value type
+  alone, with the forwarding logic (fail → propagate exception; succeed →
+  move the value or catch-and-propagate) hardcoded directly into
+  `invoke()` - no `Fn` member, no closure, no `future<T>` view built via
+  `shared_from_this()` (the earlier design's `on_ready()`/wrapped shape
+  needed that view only to hand a generic callback something to call;
+  `flatten_forwarder<T>` has no callback to call, so it never needs one).
+- **`fulfill()`'s flatten branch** now allocates a `flatten_forwarder<U>`
+  directly and registers it via `result.state_->set_continuation(*node)`,
+  reaching `result`'s private `state_` (a `future<U>`) through a new
+  `template <class> friend class future_state;` declaration on
+  `future<T>` - nested-class members share their enclosing class's access
+  rights, so this one friend declaration on `future<T>` is all every
+  `future_state<T>` instantiation's nested `concrete_continuation` needs,
+  not one per `(T, U)` pair.
+
+No observable behavior changed - same allocation count, same move (not
+copy) of the flattened value - only the mechanism: a lower-codegen,
+non-public node replacing a public, per-closure-type primitive that only
+ever had one legitimate caller.
+
+**Verified in the pinned Docker devenv:** full test suite still passes
+unchanged (the flatten tests, including the `std::unique_ptr` move-only
+regression and the exact-allocation-count assertion, exercise `.then()`'s
+observable behavior, not `on_ready()` directly, so none needed updating);
+`clang-format`/`clang-tidy` clean; full suite also passes under the
+`sanitize` preset (ASan+UBSan). Docs updated:
+[docs/wiki/Continuation-Node-Mechanism.md](wiki/Continuation-Node-Mechanism.md)'s
+flattening section (now covering all three iterations: `.then()`,
+`on_ready()`, `flatten_forwarder<T>`) and
+[docs/wiki/Allocation-Patterns.md](wiki/Allocation-Patterns.md)'s
+flattening-cost section.
+
 ### Issue #39: `then()`'s wrapped-vs-unwrapped precedence, flipped (done)
 
 Reported by the repo owner against issue #23's original design (see that

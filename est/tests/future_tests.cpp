@@ -465,6 +465,36 @@ TEST_CASE("then() returning a future<U> flattens into future<U>, not future<futu
   REQUIRE(chained.get() == 40);
 }
 
+// Regression test for issue #25: fulfill()'s flatten branch used to
+// forward the inner future's value with a plain (copying) get() call,
+// which didn't just cost an extra copy - it made flattening a
+// move-only-valued future<T> outright fail to compile, since
+// forwarding a move-only value through the copying set_value(const T&)
+// overload requires copy-constructing T. std::unique_ptr<int> can't be
+// copied at all, so this test would not have compiled before the fix
+// (std::move(inner_future).get() now feeds the move-taking
+// set_value(T&&) overload instead).
+TEST_CASE("flattening a then() that returns a future<unique_ptr<T>> moves, not copies, the value",
+          "[future]") {
+  est::loop loop;
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  auto chained = future.then([&loop](int value) {
+    auto [inner_promise, inner_future] = est::make_promise_future<std::unique_ptr<int>>(loop);
+    inner_promise.set_value(std::make_unique<int>(value + 1));
+    // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
+    // move-on-return
+    return std::move(inner_future);
+  });
+  promise.set_value(1);
+  loop.run_until_idle();
+  // False positive below: chained is used exactly once, moved directly
+  // into the .get() call it's cast for - clang-tidy flags the .get()
+  // itself as a "use after move" rather than recognizing it as the one
+  // and only use.
+  // NOLINTNEXTLINE(bugprone-use-after-move)
+  REQUIRE(*std::move(chained).get() == 2);
+}
+
 TEST_CASE("flattening propagates the inner future's failure into the outer future", "[future]") {
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
@@ -520,4 +550,14 @@ TEST_CASE("flattening a chained then() frees every node involved, no leak", "[fu
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
+  // Exact count, not just "balanced" (issue #25): outer future_state<int>,
+  // then()'s downstream future_state<int> + concrete_continuation node,
+  // inner future_state<int>, and fulfill()'s detail::flatten_forwarder<int>
+  // node - 5 total. Before flatten_forwarder<T> existed, fulfill()'s
+  // flatten path called then() on the inner future purely to register its
+  // forwarding callback, which allocated a throwaway future_state<void>
+  // plus a concrete_continuation<Fn, void> node - 2 more, for 7 total -
+  // even though nothing ever observed either one. A regression back to 7
+  // here would mean that overhead came back.
+  REQUIRE(resource.allocations == 5);
 }
