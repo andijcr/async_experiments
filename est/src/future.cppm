@@ -236,7 +236,18 @@ private:
 coroutine_frame_alloc(std::size_t size, std::pmr::polymorphic_allocator<std::byte> allocator)
     -> void* {
   using resource_ptr = std::pmr::memory_resource*;
-  constexpr std::size_t align = std::max(alignof(resource_ptr), alignof(std::max_align_t));
+  // alignof(std::max_align_t), not std::max()'d (or std::min()'d) with
+  // anything: the standard guarantees max_align_t's alignment is at least
+  // as strict as every scalar type's, resource_ptr (a plain pointer)
+  // included, so it alone already covers the trailing resource_ptr's
+  // alignment. It also has to stand in for the coroutine frame's own
+  // alignment requirement, which this function has no way to query
+  // directly (the compiler passes only size, not alignment, to a custom
+  // promise_type::operator new) - std::min(alignof(resource_ptr), ...)
+  // would silently under-align the frame itself relative to whatever the
+  // compiler assumes, undefined behavior for any frame needing more than
+  // pointer alignment (which is the common case).
+  constexpr std::size_t align = alignof(std::max_align_t);
   const std::size_t padded_size = (size + align - 1) / align * align;
   auto* const resource = allocator.resource();
   void* const frame = resource->allocate(padded_size + sizeof(resource_ptr), align);
@@ -252,7 +263,11 @@ coroutine_frame_alloc(std::size_t size, std::pmr::polymorphic_allocator<std::byt
 
 inline void coroutine_frame_dealloc(void* frame, std::size_t size) noexcept {
   using resource_ptr = std::pmr::memory_resource*;
-  constexpr std::size_t align = std::max(alignof(resource_ptr), alignof(std::max_align_t));
+  // Must recompute the identical align/padded_size coroutine_frame_alloc()
+  // used - see that function's own comment on why this is
+  // alignof(std::max_align_t) alone, not std::max()'d or std::min()'d with
+  // anything.
+  constexpr std::size_t align = alignof(std::max_align_t);
   const std::size_t padded_size = (size + align - 1) / align * align;
   // Reads back the memory_resource* coroutine_frame_alloc() stashed just
   // past the frame - safe by construction, not by RTTI (the

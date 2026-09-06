@@ -595,6 +595,24 @@ TEST_CASE("a coroutine returning est::future<int> can co_return a value", "[futu
   REQUIRE(fut.get() == 42);
 }
 
+TEST_CASE("then() can be chained onto a future returned by a coroutine", "[future][coroutine]") {
+  // A coroutine-produced future is a plain est::future<T> like any other
+  // (M4, docs/PLAN.md) - a caller can't tell it apart from one built out
+  // of a then() chain, so registering an ordinary then() continuation on
+  // it must work exactly the same way, homogeneity this test exercises
+  // directly rather than only through co_await (already covered by "a
+  // coroutine can co_await another coroutine's future, chaining values"
+  // above).
+  est::loop loop;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
+
+  auto chained = coro(loop).then([](int value) { return value + 1; });
+  loop.run_until_idle();
+  REQUIRE(chained.ready());
+  REQUIRE(chained.get() == 43);
+}
+
 TEST_CASE("a coroutine returning est::future<void> can co_return with no value",
           "[future][coroutine][void]") {
   est::loop loop;
