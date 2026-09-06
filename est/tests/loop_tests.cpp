@@ -304,3 +304,38 @@ TEST_CASE("a loop dropped with ready work and pending timers still queued frees 
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
+
+TEST_CASE("destroying a loop with a coroutine co_await-ing yield_execution() still pending "
+          "leaks nothing",
+          "[loop]") {
+  // Same hazard as mutex's acquire_resume_node (est/tests/mutex_tests.cpp,
+  // "destroying a mutex with a coroutine co_await-ing acquire() still
+  // pending leaks nothing") - a coroutine suspended via co_await holds
+  // its own reference to yield_execution()'s future_state<void> (the
+  // future<void> temporary co_await awaits is spilled into the
+  // coroutine's own frame across the suspension), so dropping only
+  // detail::yield_resume_node's own reference (via ~loop()'s drain of
+  // ready_) would leave that future_state - and the coroutine frame
+  // keeping it alive - with nowhere left to go, unless destroy() actually
+  // completes the promise instead of silently dropping it. See
+  // detail::yield_resume_node's own doc comment (est/src/promise.cppm)
+  // for the full reasoning.
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop& loop_ref) -> est::future<void> {
+      co_await est::yield_execution(loop_ref);
+      co_return; // never reached - loop is destroyed before this ever drains
+    };
+    auto fut = coro(loop);
+
+    REQUIRE_FALSE(fut.ready());
+    (void)fut;
+    // `loop` is destroyed at the end of this scope with the coroutine
+    // still suspended in co_await yield_execution(loop), never resumed.
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}

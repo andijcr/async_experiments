@@ -119,17 +119,43 @@ this split exists):
 }
 ```
 
-`yield_execution(loop&)` (issue #45) is one line of sugar on top of
-`sleep_for()`, not a third code path: `sleep_for(loop_ref, loop::clock::
-duration::zero())`. Landing in `pending_timers_` rather than `ready_` is
-the point - `run_impl()`'s own loop (below) always fully drains `ready_`
-via `drain_ready()` before it ever looks at `pending_timers_`, so
-`co_await yield_execution(loop);` lets whatever's already ready run first
-(however many rounds that takes - `drain_ready()` loops until `ready_` is
-actually empty, not just once), then resumes the caller - "give the loop
-a chance to run other ready work" without inventing any new abandonment/
-lifetime story of its own, since it inherits `sleep_for()`'s already-
-established one unchanged.
+`yield_execution(loop&)` (issue #45) gives `loop_ref` the chance to run
+whatever else is already ready before the calling coroutine resumes.
+Originally sugar over `sleep_for(loop_ref, loop::clock::duration::zero())`
+- landing in `pending_timers_` rather than `ready_` meant `run_impl()`'s
+own loop (below) always fully drained `ready_` first, giving the right
+ordering "for free," at the cost of a real timer round-trip
+(`schedule_timer()`'s heap insert, `fire_ready_timers()`'s linear
+search+erase, and the `platform::sleep_until()` call `run_impl()` makes
+before it ever checks `pending_timers_`) for something with no actual
+deadline to track.
+
+Replaced once `est::intrusive_list<T>` became FIFO (below) with a direct
+`detail::yield_resume_node` handed straight to `loop_ref.enqueue_ready()`
+- a plain `ready_node` holding a `promise<void>`, no timer machinery at
+all:
+
+```cpp
+[[nodiscard]] inline auto yield_execution(loop& loop_ref) -> future<void> {
+  auto [prom, fut] = make_promise_future<void>(loop_ref);
+  auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
+  loop_ref.enqueue_ready(*node);
+  return std::move(fut);
+}
+```
+
+FIFO is what makes this safe: `enqueue_ready()` appends at the tail, so
+everything already queued when `yield_execution()` is called runs first
+- the identical trick under this list's original LIFO policy would have
+cut the new node in line ahead of everything else instead (see
+[Architecture](Architecture.md) and `intrusive_list<T>`'s own doc
+comment for that history). `yield_resume_node::destroy()` completes its
+promise with an exception on abandonment rather than silently dropping
+it, for the same reason `mutex::lock_resume_node`'s own doc comment
+gives (`docs/wiki/Coroutines.md`) - a coroutine suspended via `co_await
+yield_execution(loop);` holds the only other reference to its
+`future_state<void>`, so silently dropping the promise would strand that
+coroutine's frame forever if the loop is destroyed first.
 
 `schedule_timer()` records the deadline in the M1 `est::timer_queue`
 min-heap *and* the node in `loop`'s own `pending_timers_` list, keyed by the

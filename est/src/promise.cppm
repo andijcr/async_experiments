@@ -89,6 +89,56 @@ private:
   Fn fn_;
 };
 
+// The node behind yield_execution() (below): a plain ready_node holding
+// a promise<void>, handed straight to loop_ref.enqueue_ready() instead
+// of routed through schedule_timer() - yield_execution() has no deadline
+// to track, so the timer_queue heap insert, pending_timers_'s own linear
+// search+erase on fire, and the platform::sleep_until() call run_impl()
+// makes before it ever checks pending_timers_ are all pure overhead for
+// something that only ever needs "run after whatever's already ready."
+// est::intrusive_list<T>'s FIFO order (not this class's original policy -
+// see its own doc comment) is what makes handing this straight to
+// ready_ safe: enqueue_ready() appends at the tail, so everything
+// already queued when yield_execution() was called runs first - the
+// same trick under the old LIFO policy would have cut this node in
+// line ahead of everything else instead.
+//
+// run()/destroy() completing the promise with an exception on
+// abandonment (rather than silently dropping it, the "broken promise,
+// future simply never becomes ready" default every other est::promise<T>
+// in this codebase otherwise has) matters for the identical reason
+// mutex::lock_resume_node's own doc comment gives (est:sync.mutex): a
+// coroutine doing `co_await yield_execution(loop);` holds the resulting
+// future<void> as a temporary spilled into its own frame across the
+// suspension - the only other reference to that future_state<void>,
+// besides this node. Silently dropping the promise on abandonment (this
+// loop destroyed before ever draining this node) would leave that
+// future_state permanently "not yet ready," which is also the only
+// thing keeping the awaiting coroutine's own pending resume node
+// reachable - neither side would ever free the other. Completing here
+// breaks that, the same way it does for mutex's own resume nodes.
+class yield_resume_node final : public ready_node {
+public:
+  explicit yield_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
+
+  void run() final {
+    ran_ = true;
+    promise_.set_value();
+  }
+
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
+    if (!ran_) {
+      promise_.set_exception(std::make_exception_ptr(
+          std::runtime_error("loop destroyed while yield_execution() was pending")));
+    }
+    allocator.delete_object(this);
+  }
+
+private:
+  promise<void> promise_;
+  bool ran_ = false;
+};
+
 } // namespace est::detail
 
 export namespace est {
@@ -122,16 +172,23 @@ export namespace est {
 // the ready-queue with back-to-back synchronous resumes (every
 // `co_await` on an already-ready future skips suspension entirely,
 // est:future's own `future_awaiter<T>::await_ready()`) lets other
-// pending work interleave instead. Sugar over sleep_for()'s own
-// zero-duration case rather than a bespoke ready_node: a zero-duration
-// timer already lands in pending_timers_, so fire_ready_timers() only
-// ever reaches it once run_impl()'s own drain_ready() call has fully
-// emptied the ready-queue first (est:loop's own run_impl()) - exactly
-// "run everything already ready, then me" - with none of sleep_for()'s
-// existing behavior (abandonment included) needing to be re-derived for
-// a second, parallel code path.
+// pending work interleave instead.
+//
+// Originally sugar over sleep_for(loop_ref, 0) - a zero-duration timer
+// lands in pending_timers_, only reached once drain_ready() has fully
+// emptied ready_ first, giving exactly the right ordering "for free."
+// Replaced with a direct detail::yield_resume_node once
+// est::intrusive_list<T> became FIFO (PR #49): re-entering ready_
+// directly is now just as correctly ordered, without paying for a
+// timer_queue heap insert/pop, pending_timers_'s own linear search+erase
+// on fire, or the platform::sleep_until() call run_impl() makes before
+// it ever checks pending_timers_ - none of which yield_execution() ever
+// needed, having no real deadline to track.
 [[nodiscard]] inline auto yield_execution(loop& loop_ref) -> future<void> {
-  return sleep_for(loop_ref, loop::clock::duration::zero());
+  auto [prom, fut] = make_promise_future<void>(loop_ref);
+  auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
+  loop_ref.enqueue_ready(*node);
+  return std::move(fut);
 }
 
 } // namespace est
