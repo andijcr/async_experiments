@@ -152,17 +152,17 @@ TEST_CASE("stop() interrupts the current drain pass before further ready work ru
   promise_a.set_value(1);
   promise_b.set_value(2);
 
-  // Registered in this order, so - est::waiter_list's documented LIFO
+  // Registered in this order, so - est::waiter_list's documented FIFO
   // order - the stop()-calling continuation for future_b is the one
   // est::loop's ready-queue actually dequeues and runs first.
   bool a_ran = false;
-  auto chained_a = future_a.then([&](est::future<int>&) {
-    a_ran = true;
-    return 0;
-  });
   auto chained_b = future_b.then([&](est::future<int>& state) {
     loop.stop();
     return state.get();
+  });
+  auto chained_a = future_a.then([&](est::future<int>&) {
+    a_ran = true;
+    return 0;
   });
 
   loop.run_until_idle();

@@ -22,7 +22,7 @@ TEST_CASE("a freshly constructed list is empty", "[intrusive_list]") {
   REQUIRE(list.dequeue() == nullptr);
 }
 
-TEST_CASE("enqueue/dequeue is LIFO", "[intrusive_list]") {
+TEST_CASE("enqueue/dequeue is FIFO", "[intrusive_list]") {
   est::intrusive_list<tagged_node> list;
   tagged_node a;
   tagged_node b;
@@ -33,10 +33,29 @@ TEST_CASE("enqueue/dequeue is LIFO", "[intrusive_list]") {
   list.enqueue(c);
   REQUIRE_FALSE(list.empty());
 
-  REQUIRE(list.dequeue() == &c);
-  REQUIRE(list.dequeue() == &b);
   REQUIRE(list.dequeue() == &a);
+  REQUIRE(list.dequeue() == &b);
+  REQUIRE(list.dequeue() == &c);
   REQUIRE(list.dequeue() == nullptr);
+  REQUIRE(list.empty());
+}
+
+TEST_CASE("a node enqueued after a dequeue that emptied the list is still reachable",
+          "[intrusive_list]") {
+  // Regression test for the tail_ pointer FIFO needs: dequeuing the last
+  // node must reset tail_ back to nullptr, or a later enqueue() would
+  // append onto a dangling tail_ instead of correctly becoming the new
+  // sole head_.
+  est::intrusive_list<tagged_node> list;
+  tagged_node a;
+  tagged_node b;
+
+  list.enqueue(a);
+  REQUIRE(list.dequeue() == &a);
+  REQUIRE(list.empty());
+
+  list.enqueue(b);
+  REQUIRE(list.dequeue() == &b);
   REQUIRE(list.empty());
 }
 
@@ -69,7 +88,7 @@ TEST_CASE("drain() visits every remaining node in dequeue order and empties the 
   std::vector<int> visited;
   list.drain([&](tagged_node& node) { visited.push_back(node.tag); });
 
-  REQUIRE(visited == std::vector{3, 2, 1});
+  REQUIRE(visited == std::vector{1, 2, 3});
   REQUIRE(list.empty());
 }
 

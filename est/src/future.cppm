@@ -641,7 +641,7 @@ private:
   // (normally at most one - future is meant to be a single-consumer
   // handle - but nothing stops a caller from registering more than one
   // via then(), and the underlying list already supports it; drained in
-  // est::intrusive_list's documented LIFO order). Called by each setter
+  // est::intrusive_list's documented FIFO order). Called by each setter
   // after it has already stored the result into result_ - this function
   // only drains, it doesn't know or care what was stored. Each node
   // binds a fresh shared_ptr back to this future_state right before

@@ -2938,6 +2938,65 @@ both example binaries still run correctly.
 - Real I/O reactor (epoll/io_uring on hosted; interrupt-driven peripheral
   I/O on bare metal) integration into the loop.
 
+### `est::intrusive_list<T>` switched from LIFO to FIFO (done)
+
+Motivated by a design discussion on a separate, not-yet-merged branch
+adding `est::yield_execution(loop&) -> future<void>` (issue #45): a
+cheaper alternative to routing it through `est::loop`'s timer queue was
+raised - return an already-ready future with an empty continuation, or a
+bespoke node handed straight to `loop_ref.enqueue_ready()`, to re-enter
+`est::loop`'s own ready-queue directly instead of going through
+`pending_timers_` at all. Both ideas turned out to be broken by
+`intrusive_list<T>`'s
+*original* policy: LIFO (`enqueue()`/`dequeue()` both at `head_`,
+documented as deliberate - "nothing built on any of those queues needs
+FIFO fairness"). Re-entering `ready_` directly under LIFO means the
+newly-enqueued node runs *next*, cutting ahead of whatever was already
+queued - exactly backwards from "give other ready work a turn first."
+
+Rather than work around that with a second, separately-drained list (the
+other alternative raised, still cheaper than the timer queue but its own
+new `loop` primitive), fixed it at the source: `intrusive_list<T>` is now
+FIFO. A singly-linked list gets O(1) enqueue *and* O(1) dequeue under
+FIFO the same way it did under LIFO - one extra `tail_` pointer,
+`dequeue()` unchanged (still only ever touches `head_`), `enqueue()`
+appends at `tail_` instead of pushing at `head_`.
+
+This is every current user of `intrusive_list<T>` at once, not a
+narrowly-scoped fix - `est::loop`'s `ready_`, `est::future_state<T>`'s
+continuation waiters, and `est::mutex`'s `waiters_` all share the one
+template. The mutex side effect is a genuine improvement, not just
+incidental: waiters are now handed the lock first-come-first-served
+instead of most-recently-queued-first, matching what most callers would
+assume about a mutex without reading this file. Updated to match:
+- `est/tests/intrusive_list_tests.cpp`: the LIFO order test inverted to
+  FIFO; the `drain()` visit-order test's expected sequence flipped;
+  added a regression test for the `tail_` pointer specifically (dequeuing
+  down to empty and then enqueuing again must not leave `tail_` dangling
+  from the emptied list).
+- `est/tests/mutex_tests.cpp`: `"unlock() resumes queued waiters in LIFO
+  order"` renamed and inverted to FIFO order.
+- `est/tests/loop_tests.cpp`: `"stop() interrupts the current drain pass
+  before further ready work runs"` had its two `then()` registrations
+  swapped - the test relies on knowing which of two ready continuations
+  the loop dequeues first, which is now determined by registration order
+  instead of its reverse.
+- `est/src/future.cppm`, `docs/wiki/Coroutines.md`: doc comments
+  asserting LIFO order updated to FIFO.
+- `yield_execution()` itself (issue #45, separate branch/PR) is
+  unaffected by this either way - it goes through `pending_timers_`
+  rather than `ready_` regardless of `ready_`'s own ordering policy,
+  since FIFO fixes the *cheap-trick* idea's correctness but doesn't
+  remove the timer-queue's own overhead (heap insert/pop,
+  `pending_timers_`'s linear search+erase, a `platform::sleep_until()`
+  call); that remains a separate, not-yet-taken optimization.
+
+**Verified in the pinned Docker devenv:** 93/93 tests pass (1 new, 3
+inverted in place - this branch predates issue #45's own 2 new tests,
+still on a separate branch); `clang-format`/`clang-tidy` clean; full
+suite passes under the `sanitize` preset (ASan+UBSan) too; both example
+binaries still run correctly.
+
 ---
 
 ## Verification for M0
