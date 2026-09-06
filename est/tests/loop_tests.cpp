@@ -200,6 +200,38 @@ TEST_CASE("sleep_until() resolves once run_until_idle() advances past the deadli
   REQUIRE(future.ready());
 }
 
+TEST_CASE("yield_execution() resolves once run_until_idle() drains it", "[loop]") {
+  est::loop loop;
+  auto future = est::yield_execution(loop);
+  REQUIRE_FALSE(future.ready());
+
+  loop.run_until_idle();
+  REQUIRE(future.ready());
+}
+
+TEST_CASE("yield_execution() lets already-ready work run first", "[loop]") {
+  // Issue #45: yield_execution() is sugar over a zero-duration sleep_for()
+  // (est:promise) specifically so it lands in pending_timers_ rather than
+  // ready_ - run_impl() (est:loop) always fully drains ready_ before ever
+  // checking pending_timers_, so anything already ready when
+  // yield_execution() is called runs first, however many rounds that
+  // takes (drain_ready() loops until ready_ is empty, not just once).
+  est::loop loop;
+  std::vector<int> order;
+
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  promise.set_value(1);
+  auto already_ready = future.then([&](est::future<int>&) {
+    order.push_back(1);
+    return 0;
+  });
+
+  auto yielded = est::yield_execution(loop).then([&] { order.push_back(2); });
+
+  loop.run_until_idle();
+  REQUIRE(order == std::vector{1, 2});
+}
+
 TEST_CASE("a then() registered on a timer-driven future runs once the timer fires", "[loop]") {
   using namespace std::chrono_literals;
   fake_platform fake;

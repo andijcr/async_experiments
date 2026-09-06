@@ -2938,6 +2938,27 @@ both example binaries still run correctly.
 - Real I/O reactor (epoll/io_uring on hosted; interrupt-driven peripheral
   I/O on bare metal) integration into the loop.
 
+### Issue #45: `yield_execution()` (done)
+
+`est::yield_execution(loop&) -> future<void>` (`est/src/promise.cppm`):
+one line of sugar over `sleep_for(loop_ref, loop::clock::duration::zero())`,
+not a new primitive. Landing in `pending_timers_` rather than `ready_` is
+the whole trick - `loop::run_impl()` always fully drains `ready_` before
+ever looking at `pending_timers_`, so `co_await yield_execution(loop);`
+lets whatever's already ready run first (however many rounds that takes),
+then resumes the caller. Inherits `sleep_for()`'s existing abandonment/
+lifetime behavior unchanged, rather than a bespoke `ready_node` needing
+its own story re-derived from scratch. Two tests added
+(`loop_tests.cpp`): basic readiness (not ready until `run_until_idle()`
+drains it), and an ordering test proving already-ready `then()`-chained
+work actually runs before a `yield_execution()`-chained continuation
+queued at the same point.
+
+**Verified in the pinned Docker devenv:** 95/95 tests pass (2 new);
+`clang-format`/`clang-tidy` clean; full suite passes under the `sanitize`
+preset (ASan+UBSan) too; both example binaries (`hello_world`,
+`sleep_sort`) still run correctly.
+
 ### `est::intrusive_list<T>` switched from LIFO to FIFO (done)
 
 Motivated by a design discussion on a separate, not-yet-merged branch

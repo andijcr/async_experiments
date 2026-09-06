@@ -116,4 +116,22 @@ export namespace est {
   return sleep_until(loop_ref, platform::instance().now() + delay);
 }
 
+// Issue #45: gives `loop_ref` the opportunity to run whatever else is
+// already ready before the calling coroutine resumes - `co_await
+// yield_execution(loop);` inside a loop that would otherwise monopolize
+// the ready-queue with back-to-back synchronous resumes (every
+// `co_await` on an already-ready future skips suspension entirely,
+// est:future's own `future_awaiter<T>::await_ready()`) lets other
+// pending work interleave instead. Sugar over sleep_for()'s own
+// zero-duration case rather than a bespoke ready_node: a zero-duration
+// timer already lands in pending_timers_, so fire_ready_timers() only
+// ever reaches it once run_impl()'s own drain_ready() call has fully
+// emptied the ready-queue first (est:loop's own run_impl()) - exactly
+// "run everything already ready, then me" - with none of sleep_for()'s
+// existing behavior (abandonment included) needing to be re-derived for
+// a second, parallel code path.
+[[nodiscard]] inline auto yield_execution(loop& loop_ref) -> future<void> {
+  return sleep_for(loop_ref, loop::clock::duration::zero());
+}
+
 } // namespace est

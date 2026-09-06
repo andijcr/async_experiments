@@ -119,6 +119,18 @@ this split exists):
 }
 ```
 
+`yield_execution(loop&)` (issue #45) is one line of sugar on top of
+`sleep_for()`, not a third code path: `sleep_for(loop_ref, loop::clock::
+duration::zero())`. Landing in `pending_timers_` rather than `ready_` is
+the point - `run_impl()`'s own loop (below) always fully drains `ready_`
+via `drain_ready()` before it ever looks at `pending_timers_`, so
+`co_await yield_execution(loop);` lets whatever's already ready run first
+(however many rounds that takes - `drain_ready()` loops until `ready_` is
+actually empty, not just once), then resumes the caller - "give the loop
+a chance to run other ready work" without inventing any new abandonment/
+lifetime story of its own, since it inherits `sleep_for()`'s already-
+established one unchanged.
+
 `schedule_timer()` records the deadline in the M1 `est::timer_queue`
 min-heap *and* the node in `loop`'s own `pending_timers_` list, keyed by the
 timer queue's own id:
