@@ -26,6 +26,9 @@ public:
     std::abort();
   }
 
+  // A no-op: nothing in these tests triggers a debug diagnostic.
+  void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
+
   // No `{}` needed: std::chrono::time_point's default constructor is a
   // real, user-provided constructor (time_point() : __d_(duration::zero())
   // {} in libc++'s <chrono>) that always zero-initializes, not a defaulted

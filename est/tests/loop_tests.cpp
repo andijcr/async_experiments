@@ -53,14 +53,22 @@ public:
     std::abort();
   }
 
+  // A no-op: nothing in these tests triggers a debug diagnostic.
+  void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
+
   mutable std::chrono::steady_clock::time_point current;
 };
 
 // A platform whose now() advances by `step` on every single call - used
-// to make a continuation's before/after timing in loop::run_one() appear
-// to exceed the long-running-callback threshold without an actual real
-// delay, so that code path gets exercised (docs/PLAN.md, M3's
-// "long-running-callback detection").
+// to make a continuation's runtime appear to exceed the long-running-
+// callback threshold without an actual real delay, so that code path gets
+// exercised (docs/PLAN.md, M3's "long-running-callback detection"). Relies
+// on inheriting interface::reset_loop_stall_detection()/
+// detect_loop_stall()'s default implementation unchanged (docs/PLAN.md's
+// "loop-stall detection moved to platform::interface" refactor) - it still
+// calls now() exactly twice bracketing node.run(), the same shape
+// loop::run_one() used to do directly before that logic moved onto
+// platform::interface itself.
 class jumping_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
@@ -77,6 +85,14 @@ public:
                                    std::source_location /*location*/) const noexcept override {
     std::abort();
   }
+
+  // A no-op, not a std::cerr write: this fake's whole purpose is
+  // triggering detect_loop_stall()'s default body's diagnostic (see this
+  // class's own doc comment above), which does call this - but the test
+  // using it doesn't assert on the printed content (see its own doc
+  // comment), so silently discarding it here just keeps test output
+  // clean rather than actually writing anything.
+  void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
 
   mutable std::chrono::steady_clock::time_point current;
   std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);

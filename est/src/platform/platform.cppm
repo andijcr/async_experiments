@@ -19,6 +19,35 @@ import :util.scope_exit;
 // global instance at startup, not a framework redesign.
 export namespace est::platform {
 
+class interface;
+
+// Declared here (defined later, once hosted_stdcpp/detail::
+// current_instance exist for its body to reference) purely so printdbg()
+// below - and, transitively, interface::detect_loop_stall()'s default
+// body - can call it. See instance()'s own canonical doc comment further
+// down for what it actually does.
+[[nodiscard]] auto instance() noexcept -> interface&;
+
+// A best-effort, nothrow debug diagnostic. Does the compile-time-checked
+// formatting itself (so a caller gets std::format_string<Ts...>'s usual
+// call-site diagnostics for a mismatched format string) and hands the
+// type-erased result to interface::vprintdbg() below - mirroring
+// std::print()'s own split from std::vprint_unicode(). Declared ahead of
+// interface (rather than in its usual spot further down, next to
+// override_instance()) specifically so detect_loop_stall() can call it -
+// defined only after interface is a complete type, further down (calling
+// vprintdbg() on the reference instance() returns needs a complete type,
+// not just this forward declaration).
+//
+// Unlike an earlier version, this *is* backend-swappable - it's now a
+// thin wrapper deferring to whichever platform::interface is currently
+// installed, per review: "printdbg should defer to the interface." Only
+// the formatting step has to be a template (std::format_string<Ts...>'s
+// compile-time check needs the caller's own argument types); the actual
+// "where does this text go" decision now belongs to vprintdbg(), which
+// isn't.
+template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept;
+
 class interface {
 public:
   interface() = default;
@@ -46,7 +75,92 @@ public:
   // debug break, ...) without est::check() itself changing.
   [[noreturn]] virtual void assert_failure(std::string_view message,
                                            std::source_location location) const noexcept = 0;
+
+  // Emits a formatted debug diagnostic - the "where does this text
+  // actually go" half of printdbg() above (see its own doc comment),
+  // mirroring std::vprint_unicode()'s split from std::print(): printdbg()
+  // does the compile-time-checked formatting and type-erases the
+  // arguments via std::make_format_args(), this decides what happens to
+  // the result. Pure virtual, not defaulted the way
+  // reset_loop_stall_detection()/detect_loop_stall() below are: unlike
+  // "measure wall-clock time" (genuinely backend-agnostic), "where does a
+  // debug line go" has no universal answer - a bare-metal backend may
+  // have no console at all, or want to write somewhere other than a
+  // stream. An implementation must swallow its own failures (an I/O
+  // error, e.g.) internally - printdbg() itself already promises nothrow,
+  // best-effort behavior, and can't do that on this method's behalf
+  // without seeing inside it.
+  virtual void vprintdbg(std::string_view fmt, std::format_args args) const noexcept = 0;
+
+  // Marks the start of a fresh "how long does the next node/timer
+  // callback take" measurement window - est::loop::run_one() calls this
+  // immediately before running one, and detect_loop_stall() below
+  // immediately after, instead of measuring the gap itself with two
+  // now() calls the way an earlier version did. Moved here, onto
+  // platform, for the same reason now()/sleep_until() are platform
+  // hooks rather than est::loop calling std::chrono/std::this_thread
+  // directly: "how do we know a callback ran long" is a policy a backend
+  // should get to answer for itself. The default implementation just
+  // records now() into a member for detect_loop_stall() to compare
+  // against - the only strategy that makes sense for a single-threaded,
+  // synchronous-checkpoint backend like hosted_stdcpp. A future backend
+  // could override both this and detect_loop_stall() to run a watchdog on
+  // a background thread instead, checking for (and reporting) a stall in
+  // parallel while the callback is still running, rather than only
+  // finding out once it returns.
+  //
+  // Virtual with a default body, not pure: unlike now()/sleep_until()/
+  // assert_failure() (which every backend must answer for itself),
+  // reset_loop_stall_detection()/detect_loop_stall() have one sensible
+  // default nearly every backend can just inherit - hosted_stdcpp does,
+  // and so does every test fake in est/tests/ that only overrides now()/
+  // sleep_until()/assert_failure() (unaffected by this addition).
+  virtual void reset_loop_stall_detection() noexcept { stall_start_ = now(); }
+
+  // Checked by est::loop::run_one() right after a node/timer callback
+  // returns: has it been longer than `threshold` since the matching
+  // reset_loop_stall_detection() call? If so, reports a best-effort
+  // diagnostic via printdbg() above - single-threaded means one slow
+  // continuation blocks everything else a loop owns, with nothing to
+  // preempt it, so a runaway handler should at least show up as a clear
+  // diagnostic instead of "the whole program mysteriously stalled."
+  // `threshold` is passed in here rather than baked into
+  // reset_loop_stall_detection(), so est::loop's own
+  // long_running_threshold (docs/PLAN.md, M3) stays the single source of
+  // truth for the value, unchanged by which backend is installed.
+  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept {
+    const auto elapsed = now() - stall_start_;
+    if (elapsed > threshold) {
+      printdbg("est::loop: a continuation took {}ms (> {}ms threshold) to run",
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+               std::chrono::duration_cast<std::chrono::milliseconds>(threshold).count());
+    }
+  }
+
+private:
+  std::chrono::steady_clock::time_point stall_start_;
 };
+
+// The actual body, deferred until here (see the forward declaration's own
+// doc comment above): calling vprintdbg() on the reference instance()
+// returns needs interface to be a complete type, which it only just
+// became.
+//
+// args deliberately isn't std::forward'd below: std::make_format_args()
+// itself takes its arguments by plain lvalue reference (Args&..., not a
+// forwarding reference), storing references into the format_args it
+// returns for vprintdbg() to use immediately afterward - forwarding an
+// rvalue argument here would bind that reference to a temporary about to
+// expire, not extend anything's lifetime the way it might look like it
+// should.
+// NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
+template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
+  try {
+    instance().vprintdbg(fmt.get(), std::make_format_args(args...));
+    // NOLINTNEXTLINE(bugprone-empty-catch)
+  } catch (...) {
+  }
+}
 
 class hosted_stdcpp final : public interface {
 public:
@@ -56,6 +170,26 @@ public:
 
   void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
     std::this_thread::sleep_until(deadline);
+  }
+
+  // std::vprint_unicode(), not std::println(): this is the type-erased
+  // half of the split printdbg()/interface::vprintdbg() (platform.cppm's
+  // own doc comments) exists for - fmt/args already arrive pre-erased via
+  // std::format_args, exactly what std::vprint_unicode() itself takes, so
+  // there's no formatting left for this override to do beyond handing
+  // both straight through to std::cerr.
+  void vprintdbg(std::string_view fmt, std::format_args args) const noexcept override {
+    // Same reasoning as assert_failure()'s own try/catch below:
+    // std::vprint_unicode() can throw (a format error, or an I/O
+    // failure), swallowed here rather than escaping this noexcept
+    // method - printdbg() promises best-effort, nothrow behavior to its
+    // own caller, and this is the one place actually positioned to
+    // fulfill that promise for this backend.
+    try {
+      std::vprint_unicode(std::cerr, fmt, args);
+      // NOLINTNEXTLINE(bugprone-empty-catch)
+    } catch (...) {
+    }
   }
 
   // One std::println call, not several - a reviewer comment on an
@@ -116,6 +250,16 @@ public:
 // this module, not assignable by any `import est;` consumer bypassing
 // instance()/override_instance() below.
 namespace est::platform::detail {
+// False positive below: bugprone-throwing-static-initialization flags
+// hosted_stdcpp's implicit default constructor as "possibly throwing"
+// purely because interface (its base) now has a non-static data member
+// (stall_start_, added for loop-stall detection) - it doesn't actually
+// analyze whether that member's own default construction can throw
+// (std::chrono::steady_clock::time_point's is trivial/noexcept), it just
+// treats "no longer a literally empty class" as enough to warn. Confirmed
+// by testing: any non-static member on interface at all triggers the
+// identical warning, regardless of its type.
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 inline hosted_stdcpp default_instance{};
 inline interface* current_instance = &default_instance;
 } // namespace est::platform::detail
@@ -145,25 +289,6 @@ export namespace est::platform {
 [[nodiscard]] inline auto override_instance(interface& replacement) noexcept {
   interface* const previous = std::exchange(detail::current_instance, &replacement);
   return scope_exit([previous]() noexcept { detail::current_instance = previous; });
-}
-
-// A best-effort, nothrow debug diagnostic straight to std::cerr - the
-// platform-level home for the "format and print a line, swallow whatever
-// std::println itself could throw (a format error, or an I/O failure)"
-// pattern this module's own hosted_stdcpp::assert_failure() already needs
-// around its own std::println call, factored out so a caller like
-// est::loop (its long-running-callback warning, docs/PLAN.md M3) doesn't
-// have to duplicate that try/catch locally. A plain function template,
-// not a virtual interface method: C++ has no virtual function templates
-// (a vtable can't have an entry per possible instantiation), so this
-// can't be swapped per backend the way now()/sleep_until()/
-// assert_failure() are - every backend gets the same std::cerr behavior.
-template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
-  try {
-    std::println(std::cerr, fmt, std::forward<Ts>(args)...);
-    // NOLINTNEXTLINE(bugprone-empty-catch)
-  } catch (...) {
-  }
 }
 
 } // namespace est::platform

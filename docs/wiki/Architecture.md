@@ -9,7 +9,7 @@ each only imports the partitions below it:
 
 ```mermaid
 graph BT
-  platform[":platform<br/>clock, sleep_until, assert_failure, printdbg"]
+  platform[":platform<br/>clock, sleep_until, assert_failure, loop-stall detection, printdbg"]
   check[":check<br/>est::check()"]
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
