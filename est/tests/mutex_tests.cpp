@@ -156,7 +156,7 @@ TEST_CASE("a second co_await lock() suspends until the first coroutine unlocks",
 
 // Same justification as the TEST_CASE above.
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-TEST_CASE("unlock() resumes queued waiters in LIFO order", "[mutex]") {
+TEST_CASE("unlock() resumes queued waiters in FIFO order", "[mutex]") {
   est::loop loop;
   est::mutex m(loop);
   auto [release_promise, release_future] = est::make_promise_future<void>(loop);
@@ -188,7 +188,7 @@ TEST_CASE("unlock() resumes queued waiters in LIFO order", "[mutex]") {
   // time (rather than all three back to back before a single
   // run_until_idle()) so this test's own call order maps directly onto
   // enqueue order into mutex's waiter list, without also having to
-  // reason about est::loop's ready-queue's own LIFO order among several
+  // reason about est::loop's ready-queue's own drain order among several
   // freshly-created, not-yet-started coroutines.
   auto fut1 = waiter(loop, m, order, 1);
   loop.run_until_idle();
@@ -203,10 +203,10 @@ TEST_CASE("unlock() resumes queued waiters in LIFO order", "[mutex]") {
   release_promise.set_value();
   loop.run_until_idle();
 
-  // LIFO: the most recently queued waiter (3) is resumed first, all the
-  // way down to the first queued (1) - est::intrusive_list's documented
-  // order, unchanged by lock handoff.
-  REQUIRE(order == std::vector{3, 2, 1});
+  // FIFO: the first-queued waiter (1) is resumed first, all the way up
+  // to the last queued (3) - est::intrusive_list's documented order,
+  // unchanged by lock handoff.
+  REQUIRE(order == std::vector{1, 2, 3});
   REQUIRE_FALSE(m.locked());
   REQUIRE_FALSE(m.has_waiters());
   REQUIRE(fut1.ready());

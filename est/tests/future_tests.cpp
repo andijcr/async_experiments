@@ -236,11 +236,10 @@ TEST_CASE("a throwing continuation's exception is isolated to its own downstream
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
 
-  // Drain order is LIFO (documented on est::waiter_list): the
-  // second-registered continuation drains first. Register the
-  // must-still-run one first (so it drains last) and the throwing one
-  // second (so it drains first) - proving the throw doesn't stop the
-  // sibling still queued behind it.
+  // Registration order doesn't matter to what this test proves (both
+  // continuations run regardless of which drains first) - the
+  // must-still-run one is simply registered first here, the throwing one
+  // second, to read naturally alongside the assertions below.
   bool should_still_run = false;
   auto normal_chained = future.then([&](est::future<int>& state) {
     should_still_run = true;

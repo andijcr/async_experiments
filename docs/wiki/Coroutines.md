@@ -495,8 +495,8 @@ void unlock() noexcept {
 }
 ```
 
-Waiters resume in `est::intrusive_list`'s documented LIFO order — the most
-recently queued waiter is the first one handed the lock once it's free.
+Waiters resume in `est::intrusive_list`'s documented FIFO order — the
+first-queued waiter is the first one handed the lock once it's free.
 
 ### `lock_resume_node`/`acquire_resume_node`: completing on abandonment, not just dropping
 
@@ -588,7 +588,7 @@ queues a waiter node that completes it later.
 `acquire_resume_node` sits in the exact same `waiters_` list
 `lock_resume_node` does (`intrusive_list<detail::ready_node>` doesn't care
 which concrete type it holds) - `unlock()` hands the lock to whichever
-one is next in LIFO order without needing to know which kind it got. It
+one is next in FIFO order without needing to know which kind it got. It
 needs the same `ran_`-guarded exception-completion `destroy()` that
 `lock_resume_node` does, for the identical reason - a coroutine doing
 `auto guard = co_await mutex.acquire();` holds the same kind of

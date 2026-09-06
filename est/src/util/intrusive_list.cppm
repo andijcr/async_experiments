@@ -18,12 +18,35 @@ public:
   intrusive_list_node* next = nullptr;
 };
 
-// A minimal, singly-linked, LIFO intrusive list - the exact structure
+// A minimal, singly-linked, FIFO intrusive list - the exact structure
 // est::mutex, est::future_state<T>, and est::loop each separately needed
 // for their own waiter/ready-work queues, extracted here once instead of
-// reimplemented three times. LIFO because nothing built on any of those
-// queues needs FIFO fairness among their entries; a singly-linked list
-// makes LIFO the free direction (push and pop both happen at the head).
+// reimplemented three times. FIFO (not LIFO, this class's original
+// policy - review discussion on issue #45's yield_execution()): a node
+// that enqueues itself onto a list it doesn't own (est::loop::ready_,
+// concretely) needs a predictable answer to "does whatever was already
+// queued run before or after me," and LIFO's answer - "after, I cut to
+// the front" - is exactly backwards for that, silently, for any caller
+// who assumed otherwise. Concretely a bug waiting to happen: a bespoke
+// est::loop::enqueue_ready() node meant to "let other ready work go
+// first" would instead run *first* under the old LIFO policy. FIFO gives
+// every current user a more conventional guarantee for free - est::mutex's
+// waiters are now handed the lock in first-come-first-served order rather
+// than most-recently-queued-first, matching what most callers of a mutex
+// would assume without reading this file - not just the one caller that
+// exposed the mismatch.
+//
+// A singly-linked list gets O(1) enqueue *and* O(1) dequeue under FIFO
+// the same way it did under LIFO, just with one more pointer to maintain -
+// no second link field, no doubly-linked list needed. `sentinel_` (repo
+// owner's own suggestion, PR #49 review) is what keeps that second
+// pointer branch-free: `tail_` always points at *some* real node's `next`
+// slot to append onto - either the last enqueued node's, or, when the
+// list is empty, the sentinel's own - so enqueue() never needs to ask
+// "is this the first node" before deciding what to update. The sentinel
+// itself is never a real element (nothing ever enqueue()s it, and
+// dequeue() only ever looks at what `sentinel_.next` points *to*, never
+// treats the sentinel as a return value).
 //
 // Templated on T (constrained to derive from intrusive_list_node) rather
 // than being a fixed intrusive_list_node-typed list: every current user
@@ -40,27 +63,32 @@ template <class T>
 class intrusive_list {
 public:
   void enqueue(T& node) noexcept {
-    node.next = head_;
-    head_ = &node;
+    node.next = nullptr;
+    tail_->next = &node;
+    tail_ = &node;
   }
 
   [[nodiscard]] auto dequeue() noexcept -> T* {
-    auto* head = head_;
+    auto* head = sentinel_.next;
     if (head != nullptr) {
-      head_ = head->next;
+      sentinel_.next = head->next;
+      if (tail_ == head) {
+        tail_ = &sentinel_;
+      }
       head->next = nullptr;
     }
     // Safe by construction, not by RTTI: every node ever linked into
-    // head_ arrived through enqueue(T&) above, so it's always actually a
-    // T - there is no dynamic_cast alternative worth paying for here.
+    // sentinel_.next arrived through enqueue(T&) above, so it's always
+    // actually a T (never the sentinel itself) - there is no
+    // dynamic_cast alternative worth paying for here.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     return static_cast<T*>(head);
   }
 
-  [[nodiscard]] auto empty() const noexcept -> bool { return head_ == nullptr; }
+  [[nodiscard]] auto empty() const noexcept -> bool { return sentinel_.next == nullptr; }
 
   // Dequeues every remaining node and calls fn(T&) on each, in this
-  // list's own dequeue order (LIFO) - the "walk whatever's left and act
+  // list's own dequeue order (FIFO) - the "walk whatever's left and act
   // on it, then it's gone" shape est::loop's and est::future_state<T>'s
   // own destructors (destroying an abandoned node) and
   // est::future_state<T>::complete() (handing every pending continuation
@@ -76,7 +104,8 @@ public:
   }
 
 private:
-  intrusive_list_node* head_ = nullptr;
+  intrusive_list_node sentinel_;
+  intrusive_list_node* tail_ = &sentinel_;
 };
 
 } // namespace est
