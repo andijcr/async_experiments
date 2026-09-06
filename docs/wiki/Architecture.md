@@ -14,7 +14,7 @@ graph BT
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
-  mutex[":sync.mutex<br/>mutex, mutex::lock_awaiter, mutex::acquire, mutex::lock_guard"]
+  mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::acquire, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]

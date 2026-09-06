@@ -34,16 +34,16 @@ private:
 
 } // namespace
 
-// est::mutex::lock() is awaitable-only (M4, docs/PLAN.md): it can no
-// longer be called synchronously the way earlier versions of this file
-// did (`m.lock();` as a plain statement) - the only way to acquire it is
-// `co_await mutex.lock();` from inside a coroutine. Every test below
-// therefore drives its scenario through a small coroutine (an ordinary
-// lambda returning est::future<void> - est::future<T>'s own doc comment
-// on operator co_await()/promise_type explains why a plain function
-// works as a coroutine here) rather than calling lock()/unlock()
-// directly from the TEST_CASE body itself, which - not being a coroutine
-// - cannot co_await anything. None of these lambdas capture anything -
+// est::mutex::lock() returns a plain est::future<void> (M4, docs/PLAN.md;
+// PR #37 review follow-up) - unlike an earlier, awaitable-only version of
+// this API, it can be used from perfectly ordinary, non-coroutine code
+// too (polled via ready()/get(), or chained with then()), not just via
+// co_await. Most tests below still drive their scenario through a small
+// coroutine anyway (an ordinary lambda returning est::future<void> -
+// est::future<T>'s own doc comment on operator co_await()/promise_type
+// explains why a plain function works as a coroutine here), since that's
+// the shape a real caller managing a critical section across a
+// suspension point actually has. None of these lambdas capture anything -
 // see future_tests.cpp's own coroutine section for why (a capturing
 // lambda's closure isn't guaranteed to outlive the coroutine frame it
 // starts). est::loop& is the one unavoidable reference parameter
@@ -216,7 +216,7 @@ TEST_CASE("acquire() on an unlocked mutex returns an already-ready future", "[mu
   est::mutex m(loop);
 
   auto fut = m.acquire();
-  REQUIRE(fut.ready()); // fast path - no different from lock_awaiter's own
+  REQUIRE(fut.ready()); // fast path - completes the promise immediately
   REQUIRE(m.locked());
 
   auto guard = std::move(fut).get();
@@ -310,6 +310,48 @@ TEST_CASE("destroying a mutex with a future<lock_guard> still queued on acquire(
     // `m` (and `loop`) are destroyed at the end of this scope with
     // `waiter_fut`'s acquire_resume_node still queued, never resumed.
     (void)holder;
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
+
+TEST_CASE("destroying a mutex with a coroutine co_await-ing acquire() still pending leaks nothing",
+          "[mutex]") {
+  // A sharper version of the leak test above: there, the pending waiter
+  // was a plain future<lock_guard> checked directly, never co_await'ed -
+  // acquire_resume_node's promise_ was the *only* owner of its
+  // future_state<lock_guard>, so dropping it (via ~mutex()'s drain) was
+  // always enough to free everything. A coroutine suspended via
+  // co_await, by contrast, holds its own reference to that same
+  // future_state (the future<lock_guard> temporary co_await awaits is
+  // spilled into the coroutine's own frame across the suspension) - so
+  // dropping *just* acquire_resume_node's own reference leaves the
+  // future_state (and the coroutine frame keeping it alive) with nowhere
+  // left to go, unless destroy() actually completes the promise (with an
+  // exception, here) instead of silently dropping it - see
+  // acquire_resume_node's own doc comment (est/src/sync/mutex.cppm) for
+  // the full reasoning. Without that fix, this test leaks the waiting
+  // coroutine's entire frame.
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+    est::mutex m(loop);
+
+    auto holder = m.acquire().get(); // never dropped - holds the lock forever
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
+      auto guard = co_await mutex_ref.acquire();
+      co_return; // never reached - holder above never unlocks
+    };
+    auto waiter_fut = coro(loop, m);
+    loop.run_until_idle(); // waiter finds it locked, suspends, queued in m's waiters_
+
+    REQUIRE_FALSE(waiter_fut.ready());
+    REQUIRE(m.has_waiters());
+    (void)holder;
+    // `m` (and `loop`) are destroyed at the end of this scope with the
+    // coroutine still suspended in co_await mutex_ref.acquire(), never resumed.
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);

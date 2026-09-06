@@ -2405,6 +2405,92 @@ ownership, slow path deferring until the holder's guard is dropped,
 `memory_resource`); `clang-format`/`clang-tidy` clean; full suite also
 passes under the `sanitize` preset (ASan+UBSan).
 
+#### Follow-up: `lock()` converted to `future<void>` too, closing a real leak the conversion itself introduced
+
+A further round of review discussion (same PR) walked back the
+"`lock()`/`unlock()` stay exactly as they were" decision above. The repo
+owner's own question - "does your analysis change now that the initial
+suspend is always false?" - pointed out a real inconsistency: keeping
+`lock_awaiter`'s hand-rolled, allocation-free fast path meant `mutex` was
+the *one* remaining place in the codebase where "already resolved" could
+still skip a genuine suspension, contradicting the very consistency
+argument that had just kept `initial_suspend()` always-suspending despite
+its own allocation cost. A third option (specializing `future<T>` for a
+tag-only `mutex_token`, using `state_ == nullptr` to mean "ready, no
+allocation" in the fast case) was raised and rejected: it doesn't remove
+the inconsistency, only relocates it into `future<T>`'s own machinery,
+for substantially more code than the bespoke awaiter it would replace.
+Decision: convert `lock()` to `future<void>`, built exactly like
+`acquire()` - accept the allocation cost, in exchange for `future<T>`'s
+"never skip a suspend, ever" guarantee holding with no exceptions
+anywhere in the codebase. `lock_awaiter` is gone entirely.
+
+**A real bug found while implementing this, before it ever shipped:**
+naively swapping `lock_resume_node` from holding a `coroutine_handle<>`
+directly to holding a `promise<void>` (matching `acquire_resume_node`'s
+existing shape) would have reintroduced a genuine leak - and, worse, a
+latent correctness bug - that the existing `acquire()` leak test (added
+just above) happened not to catch, because it exercised only a
+non-coroutine waiter.
+
+The mechanism: a coroutine doing `co_await mutex.lock();` holds the
+resulting `future<void>` as a temporary spilled into its own frame across
+the suspension - the *only* other reference to that call's
+`future_state<void>`, besides the `lock_resume_node` sitting in
+`mutex::waiters_`. The original, handle-holding `lock_resume_node` didn't
+have this problem: it held the coroutine handle *directly*, so `~mutex()`
+draining `waiters_` was sufficient, on its own, to reach and destroy the
+frame. Once the node instead holds a `promise<void>`, matching the
+established "broken promise, the future simply never becomes ready"
+contract elsewhere in this codebase (e.g. an unfired
+`concrete_timer_node`'s own `destroy()`) and just letting the promise
+drop silently leaves the `future_state<void>` permanently "not yet
+ready," kept alive *only* by the very coroutine frame that can only ever
+be freed once that future_state actually completes - neither side can
+free the other first. Not a `shared_ptr` cycle in the strict sense, but a
+practical one: both the frame and the future_state leak forever. Worse,
+had `run()` naively been left able to reference the mutex on a similar
+path, resuming a coroutine with a fabricated "you got the lock" success
+after the mutex itself no longer exists would have been an active
+use-after-free waiting to happen, not just a leak.
+
+Fixed by having `lock_resume_node`/`acquire_resume_node`'s `destroy()`
+actually *complete* the promise (with an exception - "mutex destroyed
+while lock()/acquire() was pending", the true outcome) when abandoned,
+rather than silently dropping it - gated by the same `ran_` flag pattern
+`est:future`'s own `coroutine_resume_node`/`future_resume_node<T>` already
+use, since `run()` and `destroy()` are always both called, in that order,
+for any node the loop actually processes, and completing an
+already-completed promise a second time would violate
+`future_state<T>::check_not_completed()`. Completing the promise on
+abandonment drains the future_state's own pending continuation onto
+`est::loop`'s `ready_` queue, where it's either genuinely resumed (if the
+loop outlives the mutex and keeps running) or safely destroyed, never
+run, by `est::loop`'s own destructor-time drain - either way, the
+coroutine frame is no longer stranded. See
+[docs/wiki/Coroutines.md](wiki/Coroutines.md)'s own "`lock_resume_node`/
+`acquire_resume_node`: completing on abandonment, not just dropping"
+section for the full trace.
+
+A new regression test - "destroying a mutex with a coroutine co_await-ing
+acquire() still pending leaks nothing" - specifically exercises the gap
+the existing, non-coroutine `acquire()` leak test missed; the existing
+coroutine-based `lock()` leak test (already in the suite, unmodified)
+continues to pass, now for the right reason (verified by deliberately
+checking it would *not* have passed without the `destroy()` fix, before
+adding it).
+
+**Verified in the pinned Docker devenv:** 94/94 tests pass (1 new); full
+suite also passes under the `sanitize` preset (ASan+UBSan) - notably
+significant here given how subtle the bug was (a logical "stuck forever"
+leak, not a use-after-free ASan would catch on its own; the fix was
+verified by hand-tracing every shared_ptr's reference count through the
+exact sequence of destructor calls before ever running the test, then
+confirming the trace against the actual passing result); `clang-format`/
+`clang-tidy` clean. Docs updated: `docs/wiki/Coroutines.md`'s mutex
+section rewritten in full, and `docs/wiki/Architecture.md`'s dependency
+graph node label.
+
 ### Issue #25: flatten path's throwaway allocation (done)
 
 Found by a `code-review` pass on the issue #23 PR (see that section above)
