@@ -37,10 +37,16 @@ public:
 // exposed the mismatch.
 //
 // A singly-linked list gets O(1) enqueue *and* O(1) dequeue under FIFO
-// the same way it did under LIFO, just with one more pointer to maintain:
-// dequeue() still only ever touches head_, and enqueue() appends at
-// tail_ instead of pushing at head_ - no second link field, no doubly-
-// linked list needed.
+// the same way it did under LIFO, just with one more pointer to maintain -
+// no second link field, no doubly-linked list needed. `sentinel_` (repo
+// owner's own suggestion, PR #49 review) is what keeps that second
+// pointer branch-free: `tail_` always points at *some* real node's `next`
+// slot to append onto - either the last enqueued node's, or, when the
+// list is empty, the sentinel's own - so enqueue() never needs to ask
+// "is this the first node" before deciding what to update. The sentinel
+// itself is never a real element (nothing ever enqueue()s it, and
+// dequeue() only ever looks at what `sentinel_.next` points *to*, never
+// treats the sentinel as a return value).
 //
 // Templated on T (constrained to derive from intrusive_list_node) rather
 // than being a fixed intrusive_list_node-typed list: every current user
@@ -58,31 +64,28 @@ class intrusive_list {
 public:
   void enqueue(T& node) noexcept {
     node.next = nullptr;
-    if (tail_ != nullptr) {
-      tail_->next = &node;
-    } else {
-      head_ = &node;
-    }
+    tail_->next = &node;
     tail_ = &node;
   }
 
   [[nodiscard]] auto dequeue() noexcept -> T* {
-    auto* head = head_;
+    auto* head = sentinel_.next;
     if (head != nullptr) {
-      head_ = head->next;
-      if (head_ == nullptr) {
-        tail_ = nullptr;
+      sentinel_.next = head->next;
+      if (tail_ == head) {
+        tail_ = &sentinel_;
       }
       head->next = nullptr;
     }
     // Safe by construction, not by RTTI: every node ever linked into
-    // head_ arrived through enqueue(T&) above, so it's always actually a
-    // T - there is no dynamic_cast alternative worth paying for here.
+    // sentinel_.next arrived through enqueue(T&) above, so it's always
+    // actually a T (never the sentinel itself) - there is no
+    // dynamic_cast alternative worth paying for here.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
     return static_cast<T*>(head);
   }
 
-  [[nodiscard]] auto empty() const noexcept -> bool { return head_ == nullptr; }
+  [[nodiscard]] auto empty() const noexcept -> bool { return sentinel_.next == nullptr; }
 
   // Dequeues every remaining node and calls fn(T&) on each, in this
   // list's own dequeue order (FIFO) - the "walk whatever's left and act
@@ -101,8 +104,8 @@ public:
   }
 
 private:
-  intrusive_list_node* head_ = nullptr;
-  intrusive_list_node* tail_ = nullptr;
+  intrusive_list_node sentinel_;
+  intrusive_list_node* tail_ = &sentinel_;
 };
 
 } // namespace est

@@ -2997,6 +2997,17 @@ still on a separate branch); `clang-format`/`clang-tidy` clean; full
 suite passes under the `sanitize` preset (ASan+UBSan) too; both example
 binaries still run correctly.
 
+**PR #49 review follow-up:** the repo owner suggested a sentinel
+(dummy) node instead of a plain `tail_` pointer that could be null - a
+real `intrusive_list_node sentinel_` member that `tail_` always points
+*through*, either at the last real node's own `next` slot or, when the
+list is empty, at the sentinel's. `enqueue()` drops its branch entirely
+(`tail_->next = &node; tail_ = &node;` works unconditionally - `tail_`
+is never actually null); `dequeue()` reads the real head from
+`sentinel_.next` instead of a separate `head_` field. Re-verified:
+94/94 tests pass, `clang-format`/`clang-tidy` clean, `sanitize` preset
+clean, both examples still run.
+
 ---
 
 ## Verification for M0
