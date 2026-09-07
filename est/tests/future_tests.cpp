@@ -814,6 +814,7 @@ TEST_CASE("dropping an awaited future_state destroys the still-suspended corouti
 
 TEST_CASE("a coroutine with no loop& parameter uses loop::current()", "[future][coroutine]") {
   est::loop loop;
+  const auto guard = loop.make_current();
   auto coro = [](int value) -> est::future<int> { co_return value + 1; };
 
   auto fut = coro(41);
@@ -823,6 +824,7 @@ TEST_CASE("a coroutine with no loop& parameter uses loop::current()", "[future][
 
 TEST_CASE("a coroutine with no parameters at all uses loop::current()", "[future][coroutine]") {
   est::loop loop;
+  const auto guard = loop.make_current();
   auto coro = []() -> est::future<int> { co_return 42; };
 
   auto fut = coro();
@@ -838,6 +840,7 @@ TEST_CASE("a loop-less coroutine genuinely suspends and resumes via loop::curren
   // proving the frame was allocated against the *same* loop
   // loop::current() names, not some other one.
   est::loop loop;
+  const auto guard = loop.make_current();
   auto [promise, future] = est::make_promise_future<int>();
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)

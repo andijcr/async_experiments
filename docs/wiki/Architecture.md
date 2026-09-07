@@ -9,7 +9,8 @@ each only imports the partitions below it:
 
 ```mermaid
 graph BT
-  platform[":platform<br/>clock, sleep_until, assert_failure, loop-stall detection, printdbg"]
+  platform[":platform<br/>interface (pure virtual), instance, override_instance, printdbg"]
+  hosted_stdcpp[":platform.hosted_stdcpp<br/>hosted_stdcpp"]
   check[":check<br/>est::check()"]
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
@@ -40,6 +41,8 @@ graph BT
   promise --> loop
   promise --> platform
   promise --> shared_ptr
+  hosted_stdcpp --> platform
+  hosted_stdcpp --> loop
 ```
 
 The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
@@ -55,6 +58,21 @@ about `:sync.mutex` in return. `:sync.mutex` also depends on `:future`/
 instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
 rather than a coroutine of its own, the same "producer without co_await"
 pattern `sleep_until()` (`:promise`) already uses.
+
+`:platform.hosted_stdcpp` is the other non-obvious edge, and a newer one
+(issue #30): it's the only partition that depends on both `:platform` *and*
+`:loop` at once, sitting strictly above both rather than being one more
+consumer alongside `:check`/`:timer`/`:loop` itself. `platform::interface`
+(`:platform`) is a pure abstract base with no concrete backend of its own —
+`hosted_stdcpp`, the one implementation that exists, needs to name
+`est::loop` (its own "current loop" fallback, [The Loop and
+Timers](Loop-And-Timers.md)), which `:platform` itself can never do without
+inverting the DAG the other way. Being a genuinely separate partition is
+what makes that legal: nothing stops a concrete backend from depending on
+`:loop`, only `:platform`, the abstraction every backend implements,
+doing so. `est/src/est.cppm` is what actually installs `hosted_stdcpp` as
+the process's permanent default (its own comment explains how) — a role
+`:platform` used to fill internally before this split.
 
 ## Design philosophy
 

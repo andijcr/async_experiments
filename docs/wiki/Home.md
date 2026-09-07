@@ -62,14 +62,19 @@ singleton), so a caller owns exactly when and where continuations actually
 run. A caller that doesn't want to thread one through by hand can instead
 rely on `est::loop::current()` (issue #30, [Loop and Timers](Loop-And-Timers.md))
 — every loop-taking function in this codebase has a matching no-`loop&`
-overload built on it, still scoped to one loop's actual lifetime, not a
-global.
+overload built on it. A loop only becomes "current" by an explicit
+`loop.make_current()` call, scoped to that loop's own lifetime, not a
+global — except that the real (`hosted_stdcpp`) backend also falls back to
+a loop of its own, lazily, when nothing has been explicitly registered, so
+`loop::current()` still works for a caller with no loop to register in the
+first place.
 
 ## Where to look in the source
 
 | Concept | File |
 |---|---|
-| Platform seam (clock, `sleep_until`, `assert_failure`, loop-stall detection, `printdbg`) | `est/src/platform/platform.cppm` |
+| Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`) | `est/src/platform/platform.cppm` |
+| `hosted_stdcpp` (the one concrete `platform::interface`) | `est/src/platform/hosted_stdcpp.cppm` |
 | `est::check()` | `est/src/check.cppm` |
 | `est::shared_ptr<T>`, `enable_shared_from_this<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |

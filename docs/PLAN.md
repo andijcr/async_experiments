@@ -681,6 +681,14 @@ flagged the tests' own `.find(x) != npos` idiom in favor of C++23's
   functions with no concrete payoff today - only one platform backend
   exists. Revisit once/if a second backend (the bare-metal stretch goal)
   is actually being built.
+  **Reopened and implemented in the issue #30 PR** (see that section's
+  "Revised a fifth time" below) once a real payoff appeared: not a second
+  *backend*, but `hosted_stdcpp` needing to name `est::loop` for its own
+  "current loop" fallback - something `:platform` itself can never do
+  without inverting the module dependency DAG. `hosted_stdcpp` moved into
+  its own module, `est/src/platform/hosted_stdcpp.cppm`
+  (`:platform.hosted_stdcpp`), free to depend on both `:platform` and
+  `:loop` precisely because it's no longer `:platform` itself.
 - **#11** (`shared_ptr` adopt-a-pointer constructor + a `shared_base`
   mixin for `shared_from_this()` parity) - nothing in the codebase needs
   self-referencing `shared_ptr`s yet; building the mixin now means
@@ -3334,6 +3342,130 @@ failure), not a push/pop RAII stack like `platform::override_instance()`'s
 - simpler to reason about, and nothing in this codebase has a legitimate
 reason to nest loops today.
 
+**Revised a fourth time (repo owner's own PR review): "creating a loop
+and setting it as current should be the caller's responsibility," not
+something `loop`'s own constructor decides unconditionally.** The
+auto-registration above - stores `this` in the constructor, clears it in
+the destructor - got reverted outright: `est::loop`'s constructor and
+destructor are back to knowing nothing about "current" at all. In its
+place, a new method, `make_current()`, does the registration explicitly
+and returns an `est::scope_exit`-based guard, modeled directly on
+`platform::override_instance()`'s own RAII shape:
+
+```cpp
+[[nodiscard]] auto make_current() noexcept {
+  check(!detail::loop_is_current,
+        "est::loop::make_current(): another loop is already current (issue #30) - only one "
+        "loop can be current at a time");
+  detail::loop_is_current = true;
+  platform::instance().set_current_loop_context(this);
+  return scope_exit([]() noexcept {
+    detail::loop_is_current = false;
+    platform::instance().set_current_loop_context(nullptr);
+  });
+}
+```
+
+The nesting-precondition check moved with it, but *not* onto
+`get_current_loop_context() == nullptr` the way the constructor's own
+check used to read it - that question changes meaning under the fifth
+revision below (it becomes "is nothing explicitly registered," not
+"nothing is registered at all," once a fallback exists). A dedicated flag,
+`detail::loop_is_current` (a plain, non-`thread_local` `bool` local to
+`:loop`, same bare-metal reasoning as this section's every other global),
+tracks "has some loop called `make_current()`" independently of whatever
+`:platform`'s own storage returns.
+
+**Revised a fifth time, in the same round of review, to actually deliver
+the ergonomic goal issue #30 was chasing: a caller that never wants to
+think about `est::loop` at all.** Without this, `loop::current()` would
+simply fail its own precondition until *something* called
+`make_current()` - workable, but no more convenient than before for the
+simplest case (a script, an example) that has no loop to register in the
+first place. Per review: **`hosted_stdcpp` should create a loop and
+return it from `get_current_loop_context()`** - lazily, on first use,
+whenever nothing has been explicitly registered:
+
+```cpp
+// est::platform::hosted_stdcpp (now in its own module - see below)
+[[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  if (explicit_loop_ != nullptr) {
+    return explicit_loop_;
+  }
+  if (!default_loop_.has_value()) {
+    default_loop_.emplace();
+  }
+  return &*default_loop_;
+}
+void set_current_loop_context(void* context) noexcept override { explicit_loop_ = context; }
+private:
+  void* explicit_loop_ = nullptr;
+  mutable std::optional<loop> default_loop_;
+```
+
+`explicit_loop_` (whatever a caller most recently registered via
+`make_current()`) takes priority whenever set; `default_loop_` is
+`hosted_stdcpp`'s own fallback, constructed once and kept for as long as
+that `hosted_stdcpp` instance lives - not torn down and rebuilt every time
+an explicit registration comes and goes. A caller using the fallback
+drives it exactly like any other loop: `est::loop::current().run_until_idle();`,
+without ever writing `est::loop loop;` themselves.
+
+This is what actually forced the module split proposed in review:
+`hosted_stdcpp` now has to name `est::loop` to construct its own
+fallback, and `:platform` sits below `:loop` in the module dependency DAG
+specifically so it never has to - naming `est::loop` there would invert
+it. `hosted_stdcpp` moved out of `platform.cppm` entirely, into its own
+module, `est/src/platform/hosted_stdcpp.cppm` (`:platform.hosted_stdcpp`)
+- a *different* partition is free to import `:loop` without inverting
+anything, since only `:platform` itself (the abstraction every backend
+implements) is barred from it. `:platform` itself shrank down to exactly
+what its own class comment now says: `interface` (pure virtual, no
+concrete backend), `instance()`/`override_instance()`, `printdbg()` - and
+`detail::current_instance` now starts `nullptr`, since `:platform` can no
+longer construct a `hosted_stdcpp` to seed it with. `est/src/est.cppm`
+(the umbrella every `import est;` consumer actually triggers) is where
+the real one gets installed instead - a process-lifetime
+`hosted_stdcpp`, installed as the permanent default via the exact same
+`override_instance()` every test already uses to install a *temporary*
+one, just never letting the returned guard go out of scope:
+
+```cpp
+// est.cppm
+namespace est::detail {
+inline platform::hosted_stdcpp default_platform_instance{};
+inline auto default_platform_guard = platform::override_instance(default_platform_instance);
+} // namespace est::detail
+```
+
+Notably, this is the same split **issue #6** once proposed ("split
+`platform.cppm` into a declare-only interface + a link-time
+implementation") and this codebase closed as not planned, reasoning
+"no concrete payoff with only one backend exists" - true at the time, but
+issue #30's own fallback-loop requirement is exactly the concrete payoff
+that was missing then. Revisiting a past "closed as not planned" decision
+once its stated reasoning stops holding is the same stance this codebase
+already took on issue #11 (reopened once a real `shared_from_this()` call
+site appeared) - not a reversal of the earlier judgment, just new
+information the earlier judgment explicitly said would change it
+("revisit once/if a second backend... is actually being built" - the
+`:platform.hosted_stdcpp`/`:platform` split isn't a second *backend*, but
+it's the same underlying module-boundary tradeoff issue #6 was actually
+asking about).
+
+A genuinely new test exercises this fallback specifically:
+`est/tests/loop_tests.cpp`'s "`loop::current()` with nothing explicitly
+registered falls back to hosted_stdcpp's own default loop" - the one test
+in that file with no `make_current()` call and no `override_instance()`
+either, running against the real, default `platform::instance()` on
+purpose. `yield_execution()`, not `sleep_for()`/`sleep_until()`: this
+exercises the real backend, so a timer-based wait would be a genuine (if
+short) wall-clock sleep. Every other issue #30 test that used to rely on
+constructor auto-registration now calls `loop.make_current()` explicitly
+right after constructing its loop - `loop_tests.cpp`, `future_tests.cpp`'s
+three coroutine tests, and `mutex_tests.cpp`'s no-argument-constructor
+test.
+
 Every loop-taking free function gained a matching overload built on
 `loop::current()`: `make_promise_future<T>()`, `sleep_for()`/
 `sleep_until()`, `yield_execution()` (all `est:promise`). `est::mutex`
@@ -3409,17 +3541,31 @@ second loop constructed while one already is) isn't unit-tested, same
 stance as every other checked precondition in this codebase
 (`est/tests/check_tests.cpp`'s own doc comment).
 
+One more test came out of the fourth/fifth revisions above: `hosted_stdcpp`'s
+own lazy-fallback loop (`loop_tests.cpp`'s "`loop::current()` with nothing
+explicitly registered falls back to hosted_stdcpp's own default loop" -
+this section's own fuller description of it) - bringing the total to 8
+new tests, not 7.
+
 Docs updated: `docs/wiki/Coroutines.md`'s calling-convention section
 (also fixed a small pre-existing staleness there - the shown
 `promise_type` code snippet still had a `loop_` member removed in an
 earlier PR #37 follow-up), `docs/wiki/Loop-And-Timers.md`'s own new
-`loop::current()` section, `docs/wiki/Home.md`'s quick overview.
+`loop::current()` section (rewritten again for the fourth/fifth
+revisions), `docs/wiki/Home.md`'s quick overview, `docs/wiki/
+Architecture.md`'s module-DAG diagram (added `:platform.hosted_stdcpp`
+and the edge explaining why it's the one partition depending on both
+`:platform` and `:loop` at once).
 
-**Verified in the pinned Docker devenv:** 105/105 tests pass (7 new);
-`clang-format`/`clang-tidy` clean; full suite passes under the `sanitize`
-preset (ASan+UBSan) too - a meaningful check here given how much of this
-change is new overload-resolution surface, not just new runtime behavior;
-both example binaries still run correctly.
+**Verified in the pinned Docker devenv:** 106/106 tests pass (8 new);
+`clang-format`/`clang-tidy` clean (the module split needed its own
+`bugprone-throwing-static-initialization` NOLINT at the new
+`hosted_stdcpp` construction site in `est.cppm`, matching the one that
+used to sit where `platform.cppm`'s own `default_instance` was); full
+suite passes under the `sanitize` preset (ASan+UBSan) too - a meaningful
+check here given how much of this change is new overload-resolution
+surface and a genuinely new module-initialization-order dependency, not
+just new runtime behavior; both example binaries still run correctly.
 
 ---
 

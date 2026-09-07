@@ -396,6 +396,7 @@ TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks noth
 
 TEST_CASE("mutex() with no loop argument uses loop::current()", "[mutex]") {
   est::loop loop;
+  const auto guard = loop.make_current();
   est::mutex m;
   REQUIRE_FALSE(m.locked());
 
