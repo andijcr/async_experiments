@@ -61,6 +61,14 @@ template <class T> auto make_promise_future(loop& loop_ref) -> std::pair<promise
   return {promise<T>(std::move(state)), future<T>(std::move(state_for_future))};
 }
 
+// Issue #30: sugar over the overload above using est::loop::current()
+// (est:loop) instead of a caller-supplied loop& - for a caller that
+// doesn't want to thread a loop& through by hand and is content relying
+// on whichever loop is current on this thread.
+template <class T> auto make_promise_future() -> std::pair<promise<T>, future<T>> {
+  return make_promise_future<T>(loop::current());
+}
+
 } // namespace est
 
 namespace est::detail {
@@ -157,11 +165,23 @@ export namespace est {
   return std::move(fut);
 }
 
+// Issue #30: sugar over the overload above using est::loop::current()
+// instead of a caller-supplied loop&.
+[[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
+  return sleep_until(loop::current(), deadline);
+}
+
 // Returns a future<void> that becomes ready once `delay` elapses from
 // now (est::platform::instance().now(), the same clock est::timer_queue
 // itself is built on, docs/PLAN.md M1) - sugar over sleep_until() above.
 [[nodiscard]] inline auto sleep_for(loop& loop_ref, loop::clock::duration delay) -> future<void> {
   return sleep_until(loop_ref, platform::instance().now() + delay);
+}
+
+// Issue #30: sugar over the overload above using est::loop::current()
+// instead of a caller-supplied loop&.
+[[nodiscard]] inline auto sleep_for(loop::clock::duration delay) -> future<void> {
+  return sleep_for(loop::current(), delay);
 }
 
 // Issue #45: gives `loop_ref` the opportunity to run whatever else is
@@ -187,6 +207,12 @@ export namespace est {
   auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
+}
+
+// Issue #30: sugar over the overload above using est::loop::current()
+// instead of a caller-supplied loop&.
+[[nodiscard]] inline auto yield_execution() -> future<void> {
+  return yield_execution(loop::current());
 }
 
 } // namespace est

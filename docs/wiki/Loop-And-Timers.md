@@ -32,6 +32,48 @@ very next touch of the loop. This is documented explicitly on both
 it's an easy first-use mistake with no compiler or runtime defense against
 it.
 
+## `loop::current()`: implicit, not global (issue #30)
+
+A caller can still avoid threading a `loop&` through by hand, without
+reopening the global-singleton problem the section above rules out:
+`est::loop`'s own constructor sets a `thread_local loop*` (`current_loop`,
+a private static member) to itself, and its destructor clears it back to
+`nullptr`. `loop::current()` reads it back:
+
+```cpp
+[[nodiscard]] static auto current() -> loop& {
+  check(current_loop != nullptr, "est::loop::current(): no loop is current on this thread ...");
+  return *current_loop;
+}
+```
+
+The issue's own original suggestion was `platform::get_loop()` - a method
+on `est::platform`, mirroring how `platform::instance()` already works.
+Deliberately not done that way: `platform::interface` is safe to make a
+global, swappable pointer specifically *because* it's stateless policy (the
+"why an explicit `loop&`" section above) - bolting a mutable `loop*` onto
+it would reintroduce exactly the shared, cross-test-contaminating state
+that section rules out for `loop` itself. Scoping the pointer to `loop`'s
+own constructor/destructor instead keeps the guarantee intact: it's still
+one loop's lifetime, made implicitly reachable rather than always passed
+by hand.
+
+A single slot with a checked precondition against nesting, not a
+push/pop stack like `platform::override_instance()`'s: constructing a
+second loop while one is already current on the same thread is treated
+as a programming error (an `est::check()` failure - see
+`est/tests/check_tests.cpp`'s own doc comment on why that failure path
+isn't unit-tested here), not "the inner one temporarily shadows the
+outer." Every
+free function that takes an explicit `loop&` today gained a matching
+overload that pulls `loop::current()` instead - `make_promise_future<T>()`,
+`sleep_for()`/`sleep_until()`, `yield_execution()` (all `est:promise`) -
+and `est::mutex` gained a matching no-argument constructor. A coroutine
+returning `est::future<T>` can drop the `est::loop&` parameter the same
+way - see [Coroutines](Coroutines.md)'s own calling-convention section
+for how `promise_type` resolves that without ambiguity against the
+original, loop-taking convention.
+
 ## The ready-queue
 
 `loop::enqueue_ready(detail::ready_node&)` pushes onto `ready_`, an

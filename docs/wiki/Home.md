@@ -59,7 +59,11 @@ est::promise<T> — a thin, shared_ptr-backed producer/consumer pair; .then()
 Every future/promise pair is built via `est::make_promise_future<T>(loop&)` —
 an explicit `est::loop&` is threaded through everything (not a global
 singleton), so a caller owns exactly when and where continuations actually
-run.
+run. A caller that doesn't want to thread one through by hand can instead
+rely on `est::loop::current()` (issue #30, [Loop and Timers](Loop-And-Timers.md))
+— every loop-taking function in this codebase has a matching no-`loop&`
+overload built on it, still scoped to one loop's actual lifetime, not a
+global.
 
 ## Where to look in the source
 

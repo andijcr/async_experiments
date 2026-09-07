@@ -375,3 +375,45 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
+
+// Issue #30: est::loop::current() and the no-loop sugar built on it.
+// est::check()'s own failure path (constructing a second loop while one
+// is already current, or calling current() with none) isn't unit-
+// testable in this codebase - it terminates the process, same as every
+// other checked precondition (est/tests/check_tests.cpp's own doc
+// comment) - so only the happy path is covered here.
+
+TEST_CASE("loop::current() returns the loop constructed on this thread", "[loop]") {
+  est::loop loop;
+  REQUIRE(&est::loop::current() == &loop);
+}
+
+TEST_CASE("make_promise_future<T>() with no loop argument uses loop::current()", "[loop]") {
+  est::loop loop;
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_value(42);
+  REQUIRE(future.ready());
+  REQUIRE(future.get() == 42);
+}
+
+TEST_CASE("sleep_for()/sleep_until()/yield_execution() with no loop argument use "
+          "loop::current()",
+          "[loop]") {
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto guard = est::platform::override_instance(fake);
+
+  est::loop loop;
+
+  auto slept_for = est::sleep_for(10s);
+  auto slept_until = est::sleep_until(fake.current + 5s);
+  auto yielded = est::yield_execution();
+  REQUIRE_FALSE(slept_for.ready());
+  REQUIRE_FALSE(slept_until.ready());
+  REQUIRE_FALSE(yielded.ready());
+
+  loop.run_until_idle();
+  REQUIRE(slept_for.ready());
+  REQUIRE(slept_until.ready());
+  REQUIRE(yielded.ready());
+}

@@ -393,3 +393,13 @@ TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks noth
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
+
+TEST_CASE("mutex() with no loop argument uses loop::current()", "[mutex]") {
+  est::loop loop;
+  est::mutex m;
+  REQUIRE_FALSE(m.locked());
+
+  auto fut = m.lock();
+  REQUIRE(fut.ready());
+  REQUIRE(m.locked());
+}

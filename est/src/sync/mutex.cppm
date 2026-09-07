@@ -53,6 +53,11 @@ export namespace est {
 class mutex {
 public:
   explicit mutex(loop& loop_ref) noexcept : loop_(loop_ref) {}
+
+  // Issue #30: sugar over the constructor above using est::loop::current()
+  // (est:loop) instead of a caller-supplied loop&.
+  mutex() noexcept : mutex(loop::current()) {}
+
   mutex(const mutex&) = delete;
   auto operator=(const mutex&) -> mutex& = delete;
   mutex(mutex&&) = delete;

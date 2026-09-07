@@ -103,17 +103,65 @@ export namespace est {
 // loop&, not shared ownership, and there is no way to check a dangling
 // reference at runtime. See future_state<T>'s own doc comment (est:future)
 // for the same precondition from that side.
+//
+// Issue #30's own "current loop" - a thread_local loop*, set by this
+// constructor and cleared by the destructor, that make_promise_future(),
+// sleep_for()/sleep_until()/yield_execution(), and a coroutine's own
+// promise_type (est:future) all fall back to when called without an
+// explicit loop& - lives here as a static member, deliberately *not*
+// routed through est::platform (the issue's own original suggestion,
+// "add a platform method"). platform::interface is stateless policy, a
+// vtable swap safe to make global precisely because it carries no
+// mutable state of its own (see this class's own doc comment above,
+// "unlike platform... a loop carries real mutable state") - bolting a
+// mutable loop* onto it would be the exact kind of shared, cross-test-
+// contaminating global state that comment already rules out for `loop`
+// itself. A single thread_local pointer scoped to `loop`'s own
+// constructor/destructor keeps that guarantee: it's still one loop's
+// lifetime, just made implicitly reachable instead of always threaded
+// through by hand.
+//
+// Deliberately a single slot with a checked precondition against
+// nesting, not a push/pop RAII stack like est::platform::
+// override_instance()'s: two loops briefly coexisting on one thread
+// (one constructed while another is still current) is treated as a
+// programming error here rather than "the inner one temporarily shadows
+// the outer" - simpler to reason about, and nothing in this codebase
+// today has a legitimate reason to nest loops on one thread. Revisit if
+// that turns out to matter in practice, same stance this codebase
+// already takes elsewhere on not building for a hypothetical need
+// (docs/PLAN.md).
 class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
   using clock = std::chrono::steady_clock;
 
   explicit loop(allocator_type allocator = {})
-      : allocator_(allocator), timers_(allocator), pending_timers_(allocator) {}
+      : allocator_(allocator), timers_(allocator), pending_timers_(allocator) {
+    check(current_loop == nullptr,
+          "est::loop: another loop is already current on this thread (issue #30) - "
+          "constructing a second loop while one is still current on the same thread isn't "
+          "supported, even briefly");
+    current_loop = this;
+  }
   loop(const loop&) = delete;
   auto operator=(const loop&) -> loop& = delete;
   loop(loop&&) = delete;
   auto operator=(loop&&) -> loop& = delete;
+
+  // The thread's current loop (issue #30) - what make_promise_future(),
+  // sleep_for()/sleep_until()/yield_execution(), and a loop-less
+  // coroutine's own promise_type (est:future) each fall back to when
+  // called without an explicit loop&. Precondition (checked): a loop
+  // must actually be current on this thread - construct one first, or
+  // keep passing a loop& explicitly if none is meant to be implicit
+  // here.
+  [[nodiscard]] static auto current() -> loop& {
+    check(current_loop != nullptr,
+          "est::loop::current(): no loop is current on this thread (issue #30) - construct "
+          "one first, or pass a loop& explicitly instead of relying on the implicit one");
+    return *current_loop;
+  }
 
   // Destroys (without running) anything still queued - mirrors
   // future_state<T>'s own destructor: a loop dropped mid-program simply
@@ -141,6 +189,13 @@ public:
   // this order is sufficient - not just "first, then second" but
   // "whichever can feed the other must drain after it."
   ~loop() {
+    // Cleared first, ahead of the draining below: nothing today calls
+    // current() from inside a destroy() call, but if anything ever did,
+    // failing loudly (no loop current at all) is a better outcome than
+    // silently handing back a reference to this half-destroyed object.
+    // Always this exact loop - the constructor's own check rules out
+    // ever having a different loop current while this one is alive.
+    current_loop = nullptr;
     for (const auto& entry : pending_timers_) {
       entry.node->destroy(allocator_, false);
     }
@@ -310,6 +365,11 @@ private:
   std::pmr::vector<pending_entry> pending_timers_;
   bool stop_requested_ = false;
   bool running_ = false;
+
+  // See this class's own doc comment (above current()'s declaration) for
+  // why this lives here, as a single thread_local slot, rather than on
+  // est::platform or as a push/pop stack.
+  static inline thread_local loop* current_loop = nullptr;
 };
 
 } // namespace est

@@ -3199,6 +3199,104 @@ tests, being otherwise a pure refactor of already-tested behavior);
 `clang-format`/`clang-tidy` clean; full suite passes under the `sanitize`
 preset (ASan+UBSan) too; both example binaries still run correctly.
 
+### Issue #30: `loop::current()` - user-visible types no longer require an explicit `loop&` (done)
+
+The issue's own original suggestion was `platform::get_loop()`, a method
+on `est::platform` mirroring `platform::instance()`. Implemented
+differently, deliberately: `platform::interface` is safe as a global,
+swappable pointer specifically because it's stateless policy (see
+`docs/wiki/Loop-And-Timers.md`'s own "why an explicit `loop&`, not a
+global singleton" section) - bolting a mutable `loop*` onto it would
+reintroduce exactly the shared, cross-test-contaminating state that
+section already rules out for `loop` itself. Implemented instead as a
+`thread_local loop*` scoped to `loop`'s own constructor (sets itself
+current) and destructor (clears back to `nullptr`), exposed as
+`loop::current()`:
+
+```cpp
+[[nodiscard]] static auto current() -> loop& {
+  check(current_loop != nullptr, "est::loop::current(): no loop is current on this thread ...");
+  return *current_loop;
+}
+```
+
+A single slot with a checked precondition against nesting (constructing
+a second loop while one is already current on the same thread is an
+`est::check()` failure), not a push/pop RAII stack like `platform::
+override_instance()`'s - simpler to reason about, and nothing in this
+codebase has a legitimate reason to nest loops on one thread today.
+
+Every loop-taking free function gained a matching overload built on
+`loop::current()`: `make_promise_future<T>()`, `sleep_for()`/
+`sleep_until()`, `yield_execution()` (all `est:promise`). `est::mutex`
+gained a matching no-argument constructor.
+
+**A coroutine returning `est::future<T>` can drop the `est::loop&`
+parameter too** - the issue's own "at least for user-visible types"
+framing extended to cover this, not just the free-function helpers.
+`promise_type` gained two more constructor/`operator new` pairs beyond
+the original loop-taking one:
+
+```cpp
+template <class First, class... Rest>
+  requires(!std::same_as<std::remove_cvref_t<First>, loop>)
+explicit promise_type(First& /*unused*/, Rest&... /*unused*/)
+    : detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(
+          loop::current().allocator(), loop::current())) {}
+
+promise_type()
+    : detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(
+          loop::current().allocator(), loop::current())) {}
+```
+
+The `requires` clause is load-bearing: without it, this constructor and
+the original `promise_type(loop&, Args&...)` would be genuinely ambiguous
+for a call that *does* pass a loop first - a bare parameter pack happily
+absorbs a leading `loop&` into its own pack, so both candidates deduce to
+the identical actual parameter list for such a call, a tie conversion
+ranking alone can't break (confirmed by reasoning through the standard's
+partial-ordering rules before writing this, not just by testing - the
+constrained-SFINAE approach was chosen specifically to not have to *rely*
+on partial ordering, since it's a genuinely easy corner of overload
+resolution to get subtly wrong). A coroutine with no parameters at all
+needs its own non-template overload, since the constrained one still
+requires at least one `First`. `operator new` gained the identical three-
+way split, matched against the same argument list by the same "promise
+constructor arguments" rule, so whichever constructor is chosen and
+whichever `operator new` is chosen always agree on which loop to use.
+
+`est::future<T>::get_promise()`, the issue's other original suggestion
+(let a bare `future<T>` be constructed and a matching `promise<T>`
+extracted from it later), wasn't implemented - it doesn't add anything
+`make_promise_future<T>()`'s own no-argument overload doesn't already
+cover for the same underlying goal ("create a promise/future pair
+without an explicit loop"), and would be a second, redundant way to
+reach it.
+
+Tests added: `loop::current()`'s happy path (returns the loop actually
+constructed on this thread); each new no-`loop&` overload
+(`make_promise_future<T>()`, `sleep_for()`/`sleep_until()`/
+`yield_execution()`, `mutex()`); three coroutine shapes (some parameters
+but no `loop&`, no parameters at all, and one that genuinely suspends and
+resumes through `loop::current()` rather than just running synchronously
+to completion, to prove the frame was actually allocated against the
+right loop). `est::check()`'s own failure path (no loop current, or a
+second loop constructed while one already is) isn't unit-tested, same
+stance as every other checked precondition in this codebase
+(`est/tests/check_tests.cpp`'s own doc comment).
+
+Docs updated: `docs/wiki/Coroutines.md`'s calling-convention section
+(also fixed a small pre-existing staleness there - the shown
+`promise_type` code snippet still had a `loop_` member removed in an
+earlier PR #37 follow-up), `docs/wiki/Loop-And-Timers.md`'s own new
+`loop::current()` section, `docs/wiki/Home.md`'s quick overview.
+
+**Verified in the pinned Docker devenv:** 105/105 tests pass (7 new);
+`clang-format`/`clang-tidy` clean; full suite passes under the `sanitize`
+preset (ASan+UBSan) too - a meaningful check here given how much of this
+change is new overload-resolution surface, not just new runtime behavior;
+both example binaries still run correctly.
+
 ---
 
 ## Verification for M0
