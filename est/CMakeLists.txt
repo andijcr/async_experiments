@@ -15,6 +15,7 @@ target_sources(est
       src/sync/mutex.cppm
       src/timer.cppm
       src/loop.cppm
+      src/util/current_loop.cppm
       src/future.cppm
       src/promise.cppm
 )

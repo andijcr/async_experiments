@@ -17,6 +17,7 @@ graph BT
   mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::acquire, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
+  current_loop[":util.current_loop<br/>make_current_loop(loop&amp;), current_loop()"]
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
 
@@ -26,20 +27,27 @@ graph BT
   mutex --> loop
   mutex --> future
   mutex --> promise
+  mutex --> current_loop
   timer --> platform
   loop --> check
   loop --> platform
   loop --> intrusive_list
   loop --> timer
   loop --> scope_exit
+  current_loop --> check
+  current_loop --> loop
+  current_loop --> platform
+  current_loop --> scope_exit
   future --> check
   future --> loop
   future --> intrusive_list
   future --> shared_ptr
+  future --> current_loop
   promise --> future
   promise --> loop
   promise --> platform
   promise --> shared_ptr
+  promise --> current_loop
 ```
 
 The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
@@ -55,6 +63,20 @@ about `:sync.mutex` in return. `:sync.mutex` also depends on `:future`/
 instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
 rather than a coroutine of its own, the same "producer without co_await"
 pattern `sleep_until()` (`:promise`) already uses.
+
+`:util.current_loop` is the other partition worth calling out - the
+free functions `est::make_current_loop(loop&)`/`est::current_loop()`
+behind issue #30's "current loop" convenience (registering a loop as the
+one `make_promise_future()`/`sleep_for()`/a loop-less coroutine's
+`promise_type` fall back to, [The Loop and Timers](Loop-And-Timers.md)).
+Deliberately free functions in their own partition, not methods on
+`est::loop` itself: per review, `loop.cppm` shouldn't carry this
+mechanism's own diff at all, since the two concerns - a primitive
+ready-queue-and-timers type, and an opt-in convenience for not threading a
+`loop&` by hand - have nothing to do with each other. Nothing unusual
+about where this partition sits, unlike `estext` below: it's an ordinary
+partition of `est` itself, free to `import :loop` directly (only
+`:platform`, and anything that must stay *below* `:loop`, can't).
 
 ## `estext`: a second, separate module for concrete backends
 

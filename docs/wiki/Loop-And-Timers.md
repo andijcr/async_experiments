@@ -32,34 +32,36 @@ very next touch of the loop. This is documented explicitly on both
 it's an easy first-use mistake with no compiler or runtime defense against
 it.
 
-## `loop::current()`: opt-in, not automatic, and not `thread_local` (issue #30)
+## `est::current_loop()`: opt-in, not automatic, and not `thread_local` (issue #30)
 
 A caller can still avoid threading a `loop&` through by hand, without
 reopening the global-singleton problem the section above rules out -
-`loop::make_current()` registers *this* loop as the one
+`est::make_current_loop(loop&)` registers that loop as the one
 `make_promise_future()`, `sleep_for()`/`sleep_until()`/`yield_execution()`,
 and a loop-less coroutine's own `promise_type` (all consuming
-`loop::current()`) fall back to, until the returned guard is destroyed:
+`est::current_loop()`) fall back to, until the returned guard is
+destroyed:
 
 ```cpp
-[[nodiscard]] auto make_current() noexcept {
-  check(!detail::loop_is_current, "est::loop::make_current(): another loop is already current...");
+// est:util.current_loop - free functions, not methods on est::loop itself
+[[nodiscard]] auto make_current_loop(loop& loop_ref) noexcept {
+  check(!detail::loop_is_current, "est::make_current_loop(): another loop is already current...");
   detail::loop_is_current = true;
-  platform::instance().set_current_loop_context(this);
+  platform::instance().set_current_loop_context(&loop_ref);
   return scope_exit([]() noexcept {
     detail::loop_is_current = false;
     platform::instance().set_current_loop_context(nullptr);
   });
 }
 
-[[nodiscard]] static auto current() -> loop& {
+[[nodiscard]] auto current_loop() -> loop& {
   auto* const context = platform::instance().get_current_loop_context();
-  check(context != nullptr, "est::loop::current(): no loop is current (issue #30) ...");
-  return *static_cast<loop*>(context);
+  check(context != nullptr, "est::current_loop(): no loop is current (issue #30) ...");
+  return *context;
 }
 ```
 
-This took four revisions to land on. The issue's own original suggestion
+This took eight revisions to land on. The issue's own original suggestion
 was a method on `est::platform` - `platform::get_loop()`.
 
 1. The first version rejected any platform involvement at all, in favor of
@@ -163,42 +165,65 @@ was a method on `est::platform` - `platform::get_loop()`.
    `loop::current()`/`make_current()` themselves changed - only where the
    one concrete `get_current_loop_context()` implementation that offers a
    fallback loop happens to live.
+8. **Last: `loop.cppm` itself shouldn't be touched by this issue at all -
+   the registration mechanism belongs in a free function somewhere else,
+   maybe alongside the other utilities.** Everything from point 4 onward
+   had lived as two methods on `est::loop` itself - `make_current()`
+   (instance method) and `current()` (static method) - meaning `est::loop`
+   carried this issue's entire diff, even though the two concerns (a
+   primitive ready-queue-and-timers type; an opt-in convenience for not
+   threading a `loop&` by hand) have nothing to do with each other. Moved
+   out into their own partition, `est/src/util/current_loop.cppm`
+   (`:util.current_loop`) - free functions `est::make_current_loop(loop&)`
+   and `est::current_loop()`, not methods on `loop`. `loop.cppm` itself is
+   now byte-for-byte identical to what it was before this PR: no new
+   methods, no new members, no new imports. The new partition sits above
+   both `:loop` (needs the type) and `:platform` (needs `instance()`) in
+   the dependency DAG, same shape as `estext` one level up - nothing about
+   *this* move needed a forward declaration or a separate module, though,
+   since a partition of `est` itself is free to import `:loop` directly
+   (only `:platform` itself, and anything that must stay *below* `:loop`,
+   can't). `detail::loop_is_current` (the nesting flag) moved into this
+   new file too, still non-exported and still scoped to just this one
+   partition.
 
 The actual storage is a genuinely typed `est::loop*`, not an opaque
 `void*` (point 6 above) - `:platform` names the type via an exported
 forward declaration without needing to complete it; only the concrete
 backend that implements `get_current_loop_context()` needs the complete
 type, to actually construct one. No cast needed on either side anymore.
-The only call sites that ever write into this slot are `make_current()`'s
-own guard and, for `estext::hosted_stdcpp` specifically, its own
-lazily-constructed fallback loop. `get_current_loop_context()`/
-`set_current_loop_context()` are virtual (point 3 above) - not because
-"hold a pointer and hand it back" is backend-specific (it still isn't),
-but because `interface` no longer special-cases *any* method as
-non-overridable state-holding, now that it holds no state for any of
-them; a bare-metal backend might reasonably want to answer this
-differently too (a fixed static slot, say, with no global initialization
-order to worry about).
+The only call sites that ever write into this slot are
+`make_current_loop()`'s own guard and, for `estext::hosted_stdcpp`
+specifically, its own lazily-constructed fallback loop.
+`get_current_loop_context()`/`set_current_loop_context()` are virtual
+(point 3 above) - not because "hold a pointer and hand it back" is
+backend-specific (it still isn't), but because `interface` no longer
+special-cases *any* method as non-overridable state-holding, now that it
+holds no state for any of them; a bare-metal backend might reasonably
+want to answer this differently too (a fixed static slot, say, with no
+global initialization order to worry about).
 
 A single slot with a checked precondition against nesting, not a
 push/pop stack like `platform::override_instance()`'s: two loops both
-current at once (one calling `make_current()` while another's guard is
-still alive) is treated as a programming error (an `est::check()` failure
-- see `est/tests/check_tests.cpp`'s own doc comment on why that failure
-path isn't unit-tested here), not "the inner one temporarily shadows the
-outer."
+current at once (one calling `make_current_loop()` while another's guard
+is still alive) is treated as a programming error (an `est::check()`
+failure - see `est/tests/check_tests.cpp`'s own doc comment on why that
+failure path isn't unit-tested here), not "the inner one temporarily
+shadows the outer."
 
 Every free function that takes an explicit `loop&` today gained a
-matching overload that pulls `loop::current()` instead -
+matching overload that pulls `est::current_loop()` instead -
 `make_promise_future<T>()`, `sleep_for()`/`sleep_until()`,
 `yield_execution()` (all `est:promise`) - and `est::mutex` gained a
 matching no-argument constructor. A coroutine returning `est::future<T>`
 can drop the `est::loop&` parameter the same way - see
 [Coroutines](Coroutines.md)'s own calling-convention section for how
 `promise_type` resolves that without ambiguity against the original,
-loop-taking convention. None of these needed to change across any of the
-five revisions above - they only ever consume `loop::current()`, never
-`make_current()` itself, so only the registration side moved.
+loop-taking convention. None of these needed to change shape across any
+of the eight revisions above (only the names `loop::current()` →
+`est::current_loop()` at the very end, point 8) - they only ever consume
+the "current loop" query, never `make_current_loop()`/`make_current()`
+itself, so only the registration side ever moved.
 
 ## The ready-queue
 

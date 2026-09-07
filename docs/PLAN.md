@@ -3629,8 +3629,71 @@ introduced, not just an incremental rebuild) - 106/106 tests still pass,
 `sanitize` preset (also reconfigured from clean) too, both example
 binaries still run correctly.
 
+**Revised an eighth time, the last: `loop.cppm` shouldn't be touched by
+this issue at all.** Per review: "the code to set it as the current
+belongs maybe to a free function somewhere else, maybe in the util."
+Every revision from the fourth onward had put this mechanism directly on
+`est::loop` itself - `make_current()` (an instance method) and `current()`
+(a static method) - meaning the class's own diff carried this entire
+issue, even though "a primitive ready-queue-and-timers type" and "an
+opt-in convenience for not threading a `loop&` by hand" are unrelated
+concerns. Moved both into a new partition, `est/src/util/current_loop.cppm`
+(`:util.current_loop`), as free functions instead of methods:
+
+```cpp
+// est:util.current_loop
+[[nodiscard]] auto make_current_loop(loop& loop_ref) noexcept {
+  check(!detail::loop_is_current, "est::make_current_loop(): ...");
+  detail::loop_is_current = true;
+  platform::instance().set_current_loop_context(&loop_ref);
+  return scope_exit([]() noexcept {
+    detail::loop_is_current = false;
+    platform::instance().set_current_loop_context(nullptr);
+  });
+}
+
+[[nodiscard]] auto current_loop() -> loop& {
+  auto* const context = platform::instance().get_current_loop_context();
+  check(context != nullptr, "est::current_loop(): ...");
+  return *context;
+}
+```
+
+`detail::loop_is_current` (the nesting flag) moved into this same new
+file, still non-exported and scoped to just this one partition.
+`est/src/loop.cppm` itself is now byte-for-byte identical to `main` -
+confirmed directly (`git diff origin/main -- est/src/loop.cppm` produces
+no output) rather than just eyeballed. This partition needed no forward-
+declaration trick the way `:platform` did (previous revision): it's an
+ordinary partition of `est`, free to `import :loop` and `:platform`
+directly, sitting above both in the dependency DAG - only `:platform`
+itself (and anything that must stay *below* `:loop`) is barred from
+importing it.
+
+Every call site using the old member-method names updated to the free
+functions: `promise.cppm` (`make_promise_future()`'s no-arg overload,
+`sleep_until()`/`sleep_for()`/`yield_execution()`'s no-arg overloads),
+`future.cppm` (`promise_type`'s two delegating constructors and two
+`operator new` overloads), `sync/mutex.cppm` (`mutex()`'s no-arg
+constructor), and every test that used to call `loop.make_current()`/
+`est::loop::current()` directly (`loop_tests.cpp`, `future_tests.cpp`,
+`mutex_tests.cpp`). Each of these files already needed `import
+:util.current_loop;` added (or, for `mutex.cppm`, added even though it
+already transitively depended on `:promise` - a private `import` in one
+partition doesn't propagate visibility to that partition's own
+importers, so `current_loop()` needed its own direct import there too).
+
+No test behavior changed - this was a pure rename plus a relocation, not
+a design change. Verified in the pinned Docker devenv: reconfigured `ci`
+from scratch (nothing had reason to affect configure-time behavior, but
+checked anyway) - 106/106 tests still pass, `clang-format`/`clang-tidy`
+clean across every touched file (one `clang-format -i` needed afterward,
+for a `TEST_CASE` title string that grew past the column limit when
+renamed), full suite passes under `sanitize` too, both examples still run
+correctly.
+
 Every loop-taking free function gained a matching overload built on
-`loop::current()`: `make_promise_future<T>()`, `sleep_for()`/
+`current_loop()`: `make_promise_future<T>()`, `sleep_for()`/
 `sleep_until()`, `yield_execution()` (all `est:promise`). `est::mutex`
 gained a matching no-argument constructor.
 
@@ -3714,22 +3777,23 @@ Docs updated: `docs/wiki/Coroutines.md`'s calling-convention section
 (also fixed a small pre-existing staleness there - the shown
 `promise_type` code snippet still had a `loop_` member removed in an
 earlier PR #37 follow-up), `docs/wiki/Loop-And-Timers.md`'s own new
-`loop::current()` section (rewritten again across the fourth through
-seventh revisions), `docs/wiki/Home.md`'s quick overview, `docs/wiki/
-Architecture.md`'s module-DAG diagram and its new `estext` section
-(replacing the sixth revision's `:platform.hosted_stdcpp` partition/edge
-with the seventh's wholly separate `estext` module, plus the
-`est::loop*`-not-`void*` and no-auto-install notes carried over from the
-sixth).
+`current_loop()` section (rewritten again across the fourth through
+eighth revisions), `docs/wiki/Home.md`'s quick overview, `docs/wiki/
+Architecture.md`'s module-DAG diagram (added `:util.current_loop`, its
+own short section, and its new `estext` section - replacing the sixth
+revision's `:platform.hosted_stdcpp` partition/edge with the seventh's
+wholly separate `estext` module, plus the `est::loop*`-not-`void*` and
+no-auto-install notes carried over from the sixth).
 
-**Verified in the pinned Docker devenv, after the seventh revision
+**Verified in the pinned Docker devenv, after the eighth revision
 above:** reconfigured from a clean build directory for both the `ci` and
-`sanitize` presets (not just an incremental rebuild), to catch anything
-the new CMake target/ordering wrinkle could have introduced - 106/106
-tests pass (8 new, unchanged since the fifth revision); `clang-format`/
-`clang-tidy` clean across every touched and new file (`estext/src/
-hosted_stdcpp.cppm`, `est/src/est.cppm`, both examples' `main.cpp`,
-`est/tests/test_main.cpp`); full suite passes under the `sanitize` preset
+`sanitize` presets (not just an incremental rebuild) - 106/106 tests pass
+(8 new, unchanged since the fifth revision); `clang-format`/`clang-tidy`
+clean across every touched and new file (`est/src/util/current_loop.cppm`,
+`estext/src/hosted_stdcpp.cppm`, `est/src/est.cppm`, `est/src/promise.cppm`,
+`est/src/future.cppm`, `est/src/sync/mutex.cppm`, both examples'
+`main.cpp`, `est/tests/test_main.cpp`); `est/src/loop.cppm` confirmed
+byte-identical to `main`; full suite passes under the `sanitize` preset
 (ASan+UBSan) too; both example binaries still run correctly.
 
 ---

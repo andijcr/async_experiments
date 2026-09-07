@@ -22,21 +22,6 @@ import :util.scope_exit;
 // to another partition that imports :loop.
 namespace est::detail {
 
-// est::loop::make_current()'s own nesting guard (issue #30), below -
-// deliberately *not* the same signal as platform::interface::
-// get_current_loop_context()/set_current_loop_context() (the pair
-// current() itself reads from): hosted_stdcpp's own implementation of
-// that pair (:platform.hosted_stdcpp) legitimately falls back to a loop
-// of its own whenever nothing has been explicitly registered, so "is
-// get_current_loop_context() non-null" can no longer answer "has some
-// loop already called make_current()?" - that fallback makes it always
-// non-null. Only this flag, tracked independently of :platform's own
-// storage, can still answer that question. A plain (deliberately not
-// thread_local) bool, for the identical bare-metal-target reasoning
-// est::platform's own current_instance/current_loop_context have
-// (docs/PLAN.md's stretch goal).
-inline bool loop_is_current = false;
-
 // One entry in est::loop's ready-queue: something already known to be
 // ready to run, whatever produced it - a fulfilled future_state<T>'s
 // continuation today, a resumed coroutine handle eventually (M4).
@@ -118,19 +103,6 @@ export namespace est {
 // loop&, not shared ownership, and there is no way to check a dangling
 // reference at runtime. See future_state<T>'s own doc comment (est:future)
 // for the same precondition from that side.
-//
-// make_current() (below) is issue #30's own opt-in "current loop"
-// mechanism - what make_promise_future(), sleep_for()/sleep_until()/
-// yield_execution(), and a loop-less coroutine's own promise_type
-// (est:future) all fall back to when called without an explicit loop&.
-// Deliberately *not* wired into this constructor/destructor: an earlier
-// version of this design auto-registered every loop as current the
-// moment it was constructed (and cleared it on destruction) - reverted
-// per review, since creating a loop and deciding whether it should become
-// "the" current one are two separate concerns, and only the caller
-// genuinely knows which it wants. Most loops in this codebase's own tests
-// are never meant to be "the" current loop at all; make_current() is the
-// explicit, scoped way to opt one in when that's actually wanted.
 class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
@@ -142,68 +114,6 @@ public:
   auto operator=(const loop&) -> loop& = delete;
   loop(loop&&) = delete;
   auto operator=(loop&&) -> loop& = delete;
-
-  // Marks *this* as the loop make_promise_future()/sleep_for()/
-  // sleep_until()/yield_execution()/a loop-less coroutine's promise_type
-  // (all consuming current(), below) fall back to, until the returned
-  // guard is destroyed - modeled directly on est::platform::
-  // override_instance()'s own RAII shape (est::scope_exit built the same
-  // way), not the "auto-register in the constructor, auto-clear in the
-  // destructor" mechanism an earlier version of this class used instead
-  // (this class's own top comment explains why that was reverted).
-  //
-  // A single slot with a checked precondition against nesting, not a
-  // push/pop RAII stack like override_instance()'s: two loops both
-  // current at once (one calling make_current() while another's guard is
-  // still alive) is treated as a programming error here rather than "the
-  // inner one temporarily shadows the outer" - simpler to reason about,
-  // and nothing in this codebase today has a legitimate reason to nest
-  // this way. Revisit if that turns out to matter in practice, same
-  // stance this codebase already takes elsewhere on not building for a
-  // hypothetical need (docs/PLAN.md). The precondition is tracked via
-  // detail::loop_is_current (this file's own top comment on why that's a
-  // separate flag, not "is get_current_loop_context() non-null" - the
-  // latter is always non-null once hosted_stdcpp's own fallback loop
-  // exists, :platform.hosted_stdcpp).
-  //
-  // The returned guard's cleanup lambda captures nothing (not even
-  // `this`): it unconditionally clears the slot back to nullptr rather
-  // than reading anything off of `*this`, so it stays correct even if the
-  // guard somehow outlived the loop it was made from.
-  [[nodiscard]] auto make_current() noexcept {
-    check(!detail::loop_is_current,
-          "est::loop::make_current(): another loop is already current (issue #30) - only one "
-          "loop can be current at a time");
-    detail::loop_is_current = true;
-    platform::instance().set_current_loop_context(this);
-    return scope_exit([]() noexcept {
-      detail::loop_is_current = false;
-      platform::instance().set_current_loop_context(nullptr);
-    });
-  }
-
-  // The current loop (issue #30) - what make_promise_future(),
-  // sleep_for()/sleep_until()/yield_execution(), and a loop-less
-  // coroutine's own promise_type (est:future) each fall back to when
-  // called without an explicit loop&. Precondition (checked): a loop must
-  // actually be current - call make_current() on one first, or keep
-  // passing a loop& explicitly if none is meant to be implicit here. In
-  // practice, hosted_stdcpp's own get_current_loop_context()
-  // (:platform.hosted_stdcpp) never actually fails this check: it falls
-  // back to a loop of its own when nothing has been explicitly
-  // registered, rather than returning nullptr - but a test fake
-  // (est/tests/) generally doesn't provide that fallback, so this stays a
-  // real, reachable precondition under one. No cast needed here, unlike
-  // an earlier version - get_current_loop_context() returns a genuinely
-  // typed est::loop* (platform.cppm's own doc comment on how), not an
-  // opaque void*.
-  [[nodiscard]] static auto current() -> loop& {
-    auto* const context = platform::instance().get_current_loop_context();
-    check(context != nullptr,
-          "est::loop::current(): no loop is current (issue #30) - call make_current() on one "
-          "first, or pass a loop& explicitly instead of relying on the implicit one");
-    return *context;
-  }
 
   // Destroys (without running) anything still queued - mirrors
   // future_state<T>'s own destructor: a loop dropped mid-program simply

@@ -4,6 +4,7 @@ import std;
 import :future;
 import :loop;
 import :promise;
+import :util.current_loop;
 import :util.intrusive_list;
 
 export namespace est {
@@ -54,9 +55,9 @@ class mutex {
 public:
   explicit mutex(loop& loop_ref) noexcept : loop_(loop_ref) {}
 
-  // Issue #30: sugar over the constructor above using est::loop::current()
-  // (est:loop) instead of a caller-supplied loop&.
-  mutex() noexcept : mutex(loop::current()) {}
+  // Issue #30: sugar over the constructor above using est::current_loop()
+  // (est:util.current_loop) instead of a caller-supplied loop&.
+  mutex() noexcept : mutex(current_loop()) {}
 
   mutex(const mutex&) = delete;
   auto operator=(const mutex&) -> mutex& = delete;

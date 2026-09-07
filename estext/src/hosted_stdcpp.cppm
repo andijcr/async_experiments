@@ -119,22 +119,23 @@ public:
   // interface::get_current_loop_context()'s own doc comment
   // (platform.cppm) explains what this slot is for and why it's typed
   // `est::loop*` here. `explicit_loop_` is whatever a caller most
-  // recently registered via loop::make_current() (est:loop) - taking
-  // priority whenever set, since a caller that bothered to register a
-  // specific loop clearly wants that one used, not a fallback. When
-  // nothing has been explicitly registered, default_loop_ is lazily
-  // constructed on first use and returned instead - this is *the* payoff
-  // of hosted_stdcpp living in its own module, free to depend on est
-  // (including the complete est::loop) rather than being one of est's
-  // own partitions: a caller that never wants to think about est::loop at
-  // all - the original ergonomic goal of issue #30 - gets a genuinely
-  // working one for free, driven the same way any other
-  // (`est::loop::current().run_until_idle();`), rather than
-  // loop::current() simply failing its own "no loop is current"
+  // recently registered via est::make_current_loop()
+  // (est:util.current_loop) - taking priority whenever set, since a
+  // caller that bothered to register a specific loop clearly wants that
+  // one used, not a fallback. When nothing has been explicitly
+  // registered, default_loop_ is lazily constructed on first use and
+  // returned instead - this is *the* payoff of hosted_stdcpp living in
+  // its own module, free to depend on est (including the complete
+  // est::loop) rather than being one of est's own partitions: a caller
+  // that never wants to think about est::loop at all - the original
+  // ergonomic goal of issue #30 - gets a genuinely working one for free,
+  // driven the same way any other
+  // (`est::current_loop().run_until_idle();`), rather than
+  // current_loop() simply failing its own "no loop is current"
   // precondition until someone constructs one.
   //
-  // Deliberately not the same slot loop::make_current() clears back to
-  // nullptr on: default_loop_, once constructed, lives for as long as
+  // Deliberately not the same slot est::make_current_loop() clears back
+  // to nullptr on: default_loop_, once constructed, lives for as long as
   // whichever hosted_stdcpp instance a consumer installed does - it isn't
   // torn down and rebuilt every time an explicit registration comes and
   // goes, the way a naive single shared slot would force.

@@ -33,7 +33,7 @@ of `sleep_for()`/`then()` chains. A caller genuinely cannot tell, from the
 type alone or from calling-stack behavior, whether a `future<T>` came from a
 coroutine or from ordinary continuation-passing code. That's the point.
 
-## The calling convention: `est::loop&` first, or `est::loop::current()` (issue #30)
+## The calling convention: `est::loop&` first, or `est::current_loop()` (issue #30)
 
 An `est::future<T>`-returning coroutine function can take `est::loop&` as
 its first parameter - what `future<T>::promise_type`'s constructor and
@@ -66,23 +66,25 @@ new` pair matches *whatever else* the actual coroutine function declares
 `loop_ref` itself isn't stored either, only used here to build `state_`.
 
 **Issue #30** added two more ways to write a coroutine, for a caller
-content relying on whichever loop is current (`est::loop::current()`,
-below) instead of threading one through by hand - no `est::loop&`
-parameter at all, or no parameters whatsoever:
+content relying on whichever loop is current (`est::current_loop()`,
+[The Loop and Timers](Loop-And-Timers.md) - a free function, not a method
+on `est::loop` itself, deliberately kept out of `loop.cppm` entirely)
+instead of threading one through by hand - no `est::loop&` parameter at
+all, or no parameters whatsoever:
 
 ```cpp
 template <class First, class... Rest>
   requires(!std::same_as<std::remove_cvref_t<First>, loop>)
-explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(loop::current()) {}
+explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(current_loop()) {}
 
-promise_type() : promise_type(loop::current()) {}
+promise_type() : promise_type(current_loop()) {}
 ```
 
 Both delegate to the `loop&`-taking constructor above rather than
 repeating its initializer - per review, all three constructors should
 share the one place that actually builds `state_`. That constructor is
 already a template accepting an empty `Args...` pack, so
-`promise_type(loop::current())` (a single `loop&` argument) already
+`promise_type(current_loop())` (a single `loop&` argument) already
 matches it directly; the `requires`-constrained constructor is correctly
 excluded from that call by its own clause, since the argument's type
 genuinely is `loop`.

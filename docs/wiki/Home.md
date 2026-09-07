@@ -60,14 +60,15 @@ Every future/promise pair is built via `est::make_promise_future<T>(loop&)` —
 an explicit `est::loop&` is threaded through everything (not a global
 singleton), so a caller owns exactly when and where continuations actually
 run. A caller that doesn't want to thread one through by hand can instead
-rely on `est::loop::current()` (issue #30, [Loop and Timers](Loop-And-Timers.md))
+rely on `est::current_loop()` (issue #30, [Loop and Timers](Loop-And-Timers.md))
 — every loop-taking function in this codebase has a matching no-`loop&`
 overload built on it. A loop only becomes "current" by an explicit
-`loop.make_current()` call, scoped to that loop's own lifetime, not a
-global — except that the real (`estext::hosted_stdcpp`) backend also falls
-back to a loop of its own, lazily, when nothing has been explicitly
-registered, so `loop::current()` still works for a caller with no loop to
-register in the first place.
+`est::make_current_loop(loop)` call (a free function, not a method on
+`est::loop` itself - deliberately kept out of `loop.cppm` entirely),
+scoped to that loop's own lifetime, not a global — except that the real
+(`estext::hosted_stdcpp`) backend also falls back to a loop of its own,
+lazily, when nothing has been explicitly registered, so `current_loop()`
+still works for a caller with no loop to register in the first place.
 
 `import est;` doesn't install a `platform::interface` on its own, either —
 in fact it doesn't even know a concrete backend exists. `estext` is a
@@ -90,5 +91,6 @@ constructs one, and `platform::override_instance()`s it
 | `est::mutex`, `mutex::lock_awaiter`, `mutex::lock_resume_node` | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
+| `est::current_loop()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::future_state<T>`, `est::future<T>`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `sleep_for()`/`sleep_until()` | `est/src/promise.cppm` |

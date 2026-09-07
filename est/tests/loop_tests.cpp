@@ -65,12 +65,12 @@ public:
   void
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
 
-  // A real, working slot, not a no-op: est::loop is actually constructed
-  // under this fake in several tests below, and its constructor/
-  // destructor/current() all go through get_current_loop_context()/
-  // set_current_loop_context() (est::platform::interface's own doc
-  // comment) - a no-op here would silently break loop::current() for
-  // every one of them.
+  // A real, working slot, not a no-op: est::make_current_loop()/
+  // est::current_loop() (est:util.current_loop) are actually exercised
+  // against this fake in several tests below, going through
+  // get_current_loop_context()/set_current_loop_context()
+  // (est::platform::interface's own doc comment) - a no-op here would
+  // silently break current_loop() for every one of them.
   [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
     return current_loop_context;
   }
@@ -421,23 +421,24 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-// Issue #30: est::loop::make_current()/current() and the no-loop sugar
-// built on current(). est::check()'s own failure path
-// (make_current()-ing a second loop while one is already current, or
-// calling current() with none registered and no fallback available)
-// isn't unit-testable in this codebase - it terminates the process, same
-// as every other checked precondition (est/tests/check_tests.cpp's own
-// doc comment) - so only the happy path is covered here.
+// Issue #30: est::make_current_loop()/current_loop()
+// (est:util.current_loop) and the no-loop sugar built on current_loop().
+// est::check()'s own failure path (make_current_loop()-ing a second loop
+// while one is already current, or calling current_loop() with none
+// registered and no fallback available) isn't unit-testable in this
+// codebase - it terminates the process, same as every other checked
+// precondition (est/tests/check_tests.cpp's own doc comment) - so only
+// the happy path is covered here.
 
-TEST_CASE("loop::current() returns whichever loop called make_current()", "[loop]") {
+TEST_CASE("current_loop() returns whichever loop called make_current_loop()", "[loop]") {
   est::loop loop;
-  const auto guard = loop.make_current();
-  REQUIRE(&est::loop::current() == &loop);
+  const auto guard = est::make_current_loop(loop);
+  REQUIRE(&est::current_loop() == &loop);
 }
 
-TEST_CASE("make_promise_future<T>() with no loop argument uses loop::current()", "[loop]") {
+TEST_CASE("make_promise_future<T>() with no loop argument uses est::current_loop()", "[loop]") {
   est::loop loop;
-  const auto guard = loop.make_current();
+  const auto guard = est::make_current_loop(loop);
   auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(42);
   REQUIRE(future.ready());
@@ -445,14 +446,14 @@ TEST_CASE("make_promise_future<T>() with no loop argument uses loop::current()",
 }
 
 TEST_CASE("sleep_for()/sleep_until()/yield_execution() with no loop argument use "
-          "loop::current()",
+          "est::current_loop()",
           "[loop]") {
   using namespace std::chrono_literals;
   fake_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
 
   est::loop loop;
-  const auto loop_guard = loop.make_current();
+  const auto loop_guard = est::make_current_loop(loop);
 
   auto slept_for = est::sleep_for(10s);
   auto slept_until = est::sleep_until(fake.current + 5s);
@@ -467,20 +468,20 @@ TEST_CASE("sleep_for()/sleep_until()/yield_execution() with no loop argument use
   REQUIRE(yielded.ready());
 }
 
-TEST_CASE("loop::current() with nothing explicitly registered falls back to hosted_stdcpp's "
+TEST_CASE("current_loop() with nothing explicitly registered falls back to hosted_stdcpp's "
           "own default loop",
           "[loop]") {
-  // No loop.make_current() call anywhere in this test, and no
+  // No est::make_current_loop() call anywhere in this test, and no
   // override_instance() either - the one test in this file that runs
   // against the real, default platform::instance() (hosted_stdcpp),
   // specifically to exercise its own get_current_loop_context() fallback
-  // (est:platform.hosted_stdcpp) rather than a fake's or an explicitly
-  // registered loop. yield_execution(), not sleep_for()/sleep_until():
-  // this runs against the real backend, so a timer-based wait would be a
-  // genuine (if short) wall-clock sleep - yield_execution() resolves
-  // through the ready-queue alone, no real deadline involved.
+  // (module estext) rather than a fake's or an explicitly registered
+  // loop. yield_execution(), not sleep_for()/sleep_until(): this runs
+  // against the real backend, so a timer-based wait would be a genuine
+  // (if short) wall-clock sleep - yield_execution() resolves through the
+  // ready-queue alone, no real deadline involved.
   auto yielded = est::yield_execution();
   REQUIRE_FALSE(yielded.ready());
-  est::loop::current().run_until_idle();
+  est::current_loop().run_until_idle();
   REQUIRE(yielded.ready());
 }
