@@ -200,6 +200,38 @@ TEST_CASE("sleep_until() resolves once run_until_idle() advances past the deadli
   REQUIRE(future.ready());
 }
 
+TEST_CASE("yield_execution() resolves once run_until_idle() drains it", "[loop]") {
+  est::loop loop;
+  auto future = est::yield_execution(loop);
+  REQUIRE_FALSE(future.ready());
+
+  loop.run_until_idle();
+  REQUIRE(future.ready());
+}
+
+TEST_CASE("yield_execution() lets already-ready work run first", "[loop]") {
+  // Issue #45: yield_execution() is sugar over a zero-duration sleep_for()
+  // (est:promise) specifically so it lands in pending_timers_ rather than
+  // ready_ - run_impl() (est:loop) always fully drains ready_ before ever
+  // checking pending_timers_, so anything already ready when
+  // yield_execution() is called runs first, however many rounds that
+  // takes (drain_ready() loops until ready_ is empty, not just once).
+  est::loop loop;
+  std::vector<int> order;
+
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  promise.set_value(1);
+  auto already_ready = future.then([&](est::future<int>&) {
+    order.push_back(1);
+    return 0;
+  });
+
+  auto yielded = est::yield_execution(loop).then([&] { order.push_back(2); });
+
+  loop.run_until_idle();
+  REQUIRE(order == std::vector{1, 2});
+}
+
 TEST_CASE("a then() registered on a timer-driven future runs once the timer fires", "[loop]") {
   using namespace std::chrono_literals;
   fake_platform fake;
@@ -268,6 +300,41 @@ TEST_CASE("a loop dropped with ready work and pending timers still queued frees 
     auto sleeping = est::sleep_for(loop, 10s); // lands in pending_timers_, never fires
     (void)chained;
     (void)sleeping;
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
+
+TEST_CASE("destroying a loop with a coroutine co_await-ing yield_execution() still pending "
+          "leaks nothing",
+          "[loop]") {
+  // Same hazard as mutex's acquire_resume_node (est/tests/mutex_tests.cpp,
+  // "destroying a mutex with a coroutine co_await-ing acquire() still
+  // pending leaks nothing") - a coroutine suspended via co_await holds
+  // its own reference to yield_execution()'s future_state<void> (the
+  // future<void> temporary co_await awaits is spilled into the
+  // coroutine's own frame across the suspension), so dropping only
+  // detail::yield_resume_node's own reference (via ~loop()'s drain of
+  // ready_) would leave that future_state - and the coroutine frame
+  // keeping it alive - with nowhere left to go, unless destroy() actually
+  // completes the promise instead of silently dropping it. See
+  // detail::yield_resume_node's own doc comment (est/src/promise.cppm)
+  // for the full reasoning.
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop& loop_ref) -> est::future<void> {
+      co_await est::yield_execution(loop_ref);
+      co_return; // never reached - loop is destroyed before this ever drains
+    };
+    auto fut = coro(loop);
+
+    REQUIRE_FALSE(fut.ready());
+    (void)fut;
+    // `loop` is destroyed at the end of this scope with the coroutine
+    // still suspended in co_await yield_execution(loop), never resumed.
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);

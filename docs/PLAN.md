@@ -2938,6 +2938,27 @@ both example binaries still run correctly.
 - Real I/O reactor (epoll/io_uring on hosted; interrupt-driven peripheral
   I/O on bare metal) integration into the loop.
 
+### Issue #45: `yield_execution()` (done)
+
+`est::yield_execution(loop&) -> future<void>` (`est/src/promise.cppm`):
+one line of sugar over `sleep_for(loop_ref, loop::clock::duration::zero())`,
+not a new primitive. Landing in `pending_timers_` rather than `ready_` is
+the whole trick - `loop::run_impl()` always fully drains `ready_` before
+ever looking at `pending_timers_`, so `co_await yield_execution(loop);`
+lets whatever's already ready run first (however many rounds that takes),
+then resumes the caller. Inherits `sleep_for()`'s existing abandonment/
+lifetime behavior unchanged, rather than a bespoke `ready_node` needing
+its own story re-derived from scratch. Two tests added
+(`loop_tests.cpp`): basic readiness (not ready until `run_until_idle()`
+drains it), and an ordering test proving already-ready `then()`-chained
+work actually runs before a `yield_execution()`-chained continuation
+queued at the same point.
+
+**Verified in the pinned Docker devenv:** 95/95 tests pass (2 new);
+`clang-format`/`clang-tidy` clean; full suite passes under the `sanitize`
+preset (ASan+UBSan) too; both example binaries (`hello_world`,
+`sleep_sort`) still run correctly.
+
 ### `est::intrusive_list<T>` switched from LIFO to FIFO (done)
 
 Motivated by a design discussion on a separate, not-yet-merged branch
@@ -3007,6 +3028,65 @@ is never actually null); `dequeue()` reads the real head from
 `sentinel_.next` instead of a separate `head_` field. Re-verified:
 94/94 tests pass, `clang-format`/`clang-tidy` clean, `sanitize` preset
 clean, both examples still run.
+
+### `yield_execution()` optimized: direct `ready_node`, no timer queue (done)
+
+Follow-up to issue #45, once FIFO (above) landed: the original
+`sleep_for(loop_ref, 0)` sugar paid for a full timer round-trip
+(`schedule_timer()`'s `timer_queue` heap insert, `fire_ready_timers()`'s
+linear search+erase against `pending_timers_`, and the
+`platform::sleep_until()` call `run_impl()` makes before it ever checks
+`pending_timers_`) for something with no real deadline to track - it
+only ever needed "run after whatever's already ready," which FIFO now
+gives `ready_` directly.
+
+Replaced with `detail::yield_resume_node` (`est/src/promise.cppm`) - a
+plain `ready_node` holding a `promise<void>`, handed straight to
+`loop_ref.enqueue_ready()`:
+
+```cpp
+[[nodiscard]] inline auto yield_execution(loop& loop_ref) -> future<void> {
+  auto [prom, fut] = make_promise_future<void>(loop_ref);
+  auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
+  loop_ref.enqueue_ready(*node);
+  return std::move(fut);
+}
+```
+
+Re-entering `ready_` directly *before* PR #49's FIFO switch would have
+cut this node in line ahead of everything else (LIFO's answer to "does
+this run before or after what's already queued" is backwards for a
+yield) - exactly the bug the FIFO PR's own motivation described. Safe
+now.
+
+One thing the old `sleep_for()`-based version got for free that a fresh
+`ready_node` doesn't: completing on abandonment. `sleep_for()`/
+`sleep_until()`'s own `concrete_timer_node<Fn>::destroy()` just
+deallocates on abandonment, silently dropping its promise - the "broken
+promise, future simply never becomes ready" default every other
+`est::promise<T>` in this codebase otherwise has, *without* the
+exception-completing fix `mutex::lock_resume_node`/`acquire_resume_node`
+needed (PR #37 review, `docs/wiki/Coroutines.md`). That's latent, real,
+and still present in `sleep_for()`/`sleep_until()` today - a coroutine
+`co_await`-ing either one, abandoned when its loop is destroyed first,
+leaks its own frame, for the identical structural reason mutex's
+resume nodes did before that fix. Out of scope to fix here (not part of
+this optimization's blast radius), but `yield_resume_node` was written
+*without* inheriting that bug: `destroy()` completes its promise with an
+exception when `run()` never happened, matching `lock_resume_node`'s
+pattern. A new regression test proves it -
+`"destroying a loop with a coroutine co_await-ing yield_execution()
+still pending leaks nothing"` (`loop_tests.cpp`), directly mirroring
+mutex's own `"destroying a mutex with a coroutine co_await-ing
+acquire() still pending leaks nothing"`.
+
+**Verified in the pinned Docker devenv:** 97/97 tests pass (3 new -
+the leak test above, plus the two pre-existing `yield_execution()`
+tests carried over unchanged since observable behavior didn't change);
+`clang-format`/`clang-tidy` clean; full suite passes under the
+`sanitize` preset (ASan+UBSan) too - the critical check here, given
+this is exactly the class of bug ASan caught for mutex's own resume
+nodes earlier; both example binaries still run correctly.
 
 ---
 
