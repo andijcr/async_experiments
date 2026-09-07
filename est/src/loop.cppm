@@ -40,7 +40,20 @@ public:
   // reasoning as :future's own former waiter_node::destroy(): deducing
   // through this base's size/alignment instead would be undefined
   // behaviour per memory_resource::deallocate's contract.
-  virtual void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept = 0;
+  //
+  // `ran`: whether run() was actually called on this exact node before
+  // this destroy() call - the caller always knows this statically (every
+  // call site is either "drain without ever running," est::loop's/
+  // est::mutex's/future_state<T>'s own destructors, or "run() then
+  // destroy(), right here, unconditionally," loop::destroy_guard()
+  // below), so it's passed in rather than tracked by each concrete node
+  // with its own bool member. A node whose completion differs on the
+  // abandoned (never run) path - est::mutex's lock_resume_node/
+  // acquire_resume_node, est:future's future_resume_node<T>,
+  // est:promise's sleep_resume_node/yield_resume_node - reads `ran`
+  // once, here, instead of setting and checking a private flag of its
+  // own.
+  virtual void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept = 0;
 };
 
 // One entry in est::loop's pending-timer list: something to run once a
@@ -59,7 +72,11 @@ public:
   virtual ~timer_node() = default;
 
   virtual void fire() = 0;
-  virtual void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept = 0;
+
+  // `ran`: same contract as ready_node::destroy()'s own doc comment -
+  // whether fire() was actually called on this exact node before this
+  // destroy() call.
+  virtual void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept = 0;
 };
 
 } // namespace est::detail
@@ -101,11 +118,33 @@ public:
   // Destroys (without running) anything still queued - mirrors
   // future_state<T>'s own destructor: a loop dropped mid-program simply
   // abandons whatever it hadn't gotten to yet, rather than leaking it.
+  //
+  // pending_timers_ drained *before* ready_, not the more obvious other
+  // way around - a real ordering bug, not a style choice (found via the
+  // `sanitize` preset catching a leak issue #50's fix newly exercised).
+  // A timer node's destroy(allocator_, false) can complete its promise
+  // with an exception (detail::sleep_resume_node, est:promise) - and
+  // that completion, like any other, drains the future_state's own
+  // waiters onto *this* loop's ready_ via enqueue_ready(). Draining
+  // ready_ first, then pending_timers_ (the original order), means
+  // anything cascaded into ready_ during the pending_timers_ loop below
+  // is appended *after* ready_.drain()'s own while-loop has already
+  // finished for good - nothing ever comes back to collect it, a
+  // permanent leak of whatever that cascade was keeping alive (a
+  // coroutine's own frame, concretely). Draining pending_timers_ first
+  // means any such cascade lands in ready_ before ready_.drain() ever
+  // runs - and drain() re-checks after every single node it destroys
+  // (`intrusive_list<T>::drain()`'s own while-loop), so it picks up
+  // anything appended during its own pass, however many rounds deep.
+  // Nothing in this codebase's own node types ever cascades the other
+  // direction (ready_ back into pending_timers_), so a single pass in
+  // this order is sufficient - not just "first, then second" but
+  // "whichever can feed the other must drain after it."
   ~loop() {
-    ready_.drain([this](detail::ready_node& node) { node.destroy(allocator_); });
     for (const auto& entry : pending_timers_) {
-      entry.node->destroy(allocator_);
+      entry.node->destroy(allocator_, false);
     }
+    ready_.drain([this](detail::ready_node& node) { node.destroy(allocator_, false); });
   }
 
   [[nodiscard]] auto allocator() const noexcept -> allocator_type { return allocator_; }
@@ -211,15 +250,19 @@ private:
   // it goes out of scope, however that happens - the "always destroy
   // after running/firing" pattern both run_one() and fire_ready_timers()
   // need, factored out so a future change to it only has one place to
-  // make. Returned by value as a genuine prvalue (never bound to a named
-  // variable and then moved) so this compiles despite scope_exit's
-  // deleted move constructor - the same guaranteed-copy-elision pattern
-  // est::platform::override_instance() already relies on. Defined ahead
-  // of run_one()/fire_ready_timers() below, not just declared: a deduced
-  // (auto) return type has to be resolved from the function's own body
-  // before any caller earlier in the class can use it.
+  // make. Always passes ran=true: both of this guard's only two callers
+  // construct it immediately before unconditionally calling run()/fire()
+  // on the same node, so by the time this guard's destructor runs,
+  // run()/fire() always already has. Returned by value as a genuine
+  // prvalue (never bound to a named variable and then moved) so this
+  // compiles despite scope_exit's deleted move constructor - the same
+  // guaranteed-copy-elision pattern est::platform::override_instance()
+  // already relies on. Defined ahead of run_one()/fire_ready_timers()
+  // below, not just declared: a deduced (auto) return type has to be
+  // resolved from the function's own body before any caller earlier in
+  // the class can use it.
   template <class Node> [[nodiscard]] auto destroy_guard(Node& node) noexcept {
-    return scope_exit([&node, this]() noexcept { node.destroy(allocator_); });
+    return scope_exit([&node, this]() noexcept { node.destroy(allocator_, true); });
   }
 
   // Runs one ready continuation, checking it against long_running_threshold

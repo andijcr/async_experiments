@@ -3088,6 +3088,117 @@ tests carried over unchanged since observable behavior didn't change);
 this is exactly the class of bug ASan caught for mutex's own resume
 nodes earlier; both example binaries still run correctly.
 
+### `ready_node`/`timer_node::destroy()` takes `ran` as a parameter; issue #50 fixed (done)
+
+Follow-up observation on the pattern above: every node needing different
+abandoned-vs-completed `destroy()` behavior (`mutex::lock_resume_node`/
+`acquire_resume_node`, `future_resume_node<T>`, `yield_resume_node`) was
+tracking that with its own private `bool ran_`/`invoked_` member, set
+`true` at the top of `run()`/`invoke()` and read back inside `destroy()`.
+But every call site that ever invokes `destroy()` already knows, statically,
+which situation it's in - `loop::destroy_guard()` (used by `run_one()`/
+`fire_ready_timers()`) always calls `run()`/`fire()` immediately before
+constructing the guard, and `~loop()`/`~mutex()`/`~future_state()`'s own
+drains never call `run()`/`invoke()`/`fire()` at all. There's no third
+call shape. So the flag was redundant per-node state duplicating
+information the caller already had - moved it into `destroy()`'s own
+signature instead:
+
+```cpp
+virtual void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept = 0;
+```
+
+`destroy_guard()` passes `true` (unconditionally - both its callers just
+ran/fired the node); every destructor-time drain (`~loop()`'s `ready_`/
+`pending_timers_`, `~mutex()`'s `waiters_`, `~future_state()`'s `waiters_`)
+passes `false`. Every concrete node with abandonment logic reads the
+parameter instead of a member - `ran_`/`invoked_` and the `= true`
+assignment at the top of `run()`/`invoke()` both disappear entirely from
+`mutex::lock_resume_node`, `mutex::acquire_resume_node`, and
+`future_resume_node<T>`. `concrete_continuation<Fn, U>` and
+`flatten_forwarder<T>` (`.then()`'s own nodes) take the parameter too but
+currently ignore it (`bool /*ran*/`) - whether a coroutine `co_await`-ing
+a `.then()`-chained future can be stranded the same way if the *upstream*
+future_state is dropped first is a real, separate question, not addressed
+here (same shape as issue #50, below, but not the same fix - noted for a
+future pass, not filed as its own issue yet).
+
+**Issue #50 fixed as part of this**: `sleep_for()`/`sleep_until()`'s
+`concrete_timer_node<Fn>` couldn't complete its promise on abandonment at
+all - `Fn` was a type-erased closure, giving `destroy()` no way to know
+it held a `promise<void>`, let alone call `set_exception()` on it, so a
+coroutine `co_await`-ing a pending `sleep_for()`/`sleep_until()`,
+abandoned when its loop is destroyed first, leaked its own frame.
+`concrete_timer_node<Fn>` is removed entirely (nothing else instantiated
+it) and replaced with `detail::sleep_resume_node` - holding the
+`promise<void>` directly, same shape as `yield_resume_node`:
+
+```cpp
+class sleep_resume_node final : public timer_node {
+public:
+  explicit sleep_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
+  void fire() override { promise_.set_value(); }
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
+    if (!ran) {
+      promise_.set_exception(std::make_exception_ptr(
+          std::runtime_error("loop destroyed while sleep_for()/sleep_until() was pending")));
+    }
+    allocator.delete_object(this);
+  }
+private:
+  promise<void> promise_;
+};
+```
+
+`sleep_until()` now constructs this directly instead of wrapping a
+capturing lambda in a generic node - no closure type to name, one fewer
+layer of indirection. A new regression test mirrors the two already
+written for mutex/`yield_execution()` -
+`"destroying a loop with a coroutine co_await-ing sleep_for() still
+pending leaks nothing"` (`loop_tests.cpp`).
+
+**A second, real bug found while verifying that test** (not present
+before this PR - genuinely introduced by `sleep_resume_node` completing
+its promise on abandonment for the first time): `~loop()` drained
+`ready_` *before* `pending_timers_`. `sleep_resume_node::destroy()`
+completing its promise with an exception cascades into
+`future_state<void>::complete()` draining the coroutine's own pending
+continuation onto `loop_.enqueue_ready()` - the *same* loop currently
+mid-destruction. Since `ready_` had already been fully drained by the
+time the `pending_timers_` loop ran and triggered that cascade, the
+newly-appended node was never collected - a straightforward leak (7
+allocations, 3 deallocations on the first sanitize run of the new test).
+`mutex::lock_resume_node`'s identical abandonment-completion pattern
+never hit this, because `~mutex()` and `~loop()` are different objects:
+the cascade lands on a loop that either isn't being destroyed yet, or -
+when it is, and destructs right after the mutex in the same scope - gets
+picked up by that *loop's own* `ready_.drain()`, which hadn't run yet at
+the time of the cascade. `yield_resume_node` never hit it either, for a
+different reason: it lives in `ready_` directly, and `intrusive_list<T>::
+drain()`'s own `while (dequeue())` loop re-checks after every node it
+destroys, so a cascade back into the very list it's draining is picked
+up within the same pass. `pending_timers_`'s drain, by contrast, is a
+plain `for` loop over a fixed snapshot - blind to anything appended to
+a *different* container (`ready_`) partway through. Fixed by draining
+`pending_timers_` first, so anything it cascades into `ready_` lands
+there before `ready_.drain()` ever starts (and that loop's own re-
+checking absorbs it, however many rounds deep) - documented in `~loop()`'s
+own doc comment as a real ordering invariant (whichever container can
+feed the other must drain after it), not an arbitrary choice.
+
+Docs updated to match (all the places `concrete_timer_node<Fn>` or a bare
+`destroy(allocator)` signature were shown or named):
+`docs/wiki/Coroutines.md`, `Continuation-Node-Mechanism.md`,
+`Allocation-Patterns.md`, `Architecture.md`, `Loop-And-Timers.md`.
+
+**Verified in the pinned Docker devenv:** 98/98 tests pass (1 new - the
+`sleep_for()` abandonment test, which caught the `~loop()` ordering bug
+above on its first sanitize run and passes clean after the reorder; the
+`ready_node`/`timer_node` signature change itself needed no further new
+tests, being otherwise a pure refactor of already-tested behavior);
+`clang-format`/`clang-tidy` clean; full suite passes under the `sanitize`
+preset (ASan+UBSan) too; both example binaries still run correctly.
+
 ---
 
 ## Verification for M0

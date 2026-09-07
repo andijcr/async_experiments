@@ -21,11 +21,11 @@ complex `.then()` chain actually cost."
    already the `make_shared`-equivalent path, always.
 2. **`allocator.new_object<Concrete>(args...)`** — a *direct*, un-shared
    allocation for a continuation or timer node (`concrete_continuation<Fn,
-   U>`, `concrete_timer_node<Fn>`). These are never wrapped in a
-   `shared_ptr` — a node has exactly one owner at a time (first the
-   `future_state` it's pending on, then the loop's ready-queue or
-   pending-timer list), so plain ownership-by-pointer plus an explicit
-   virtual `destroy(allocator)` call is enough; see
+   U>`, `est:promise`'s `sleep_resume_node`/`yield_resume_node`). These
+   are never wrapped in a `shared_ptr` — a node has exactly one owner at a
+   time (first the `future_state` it's pending on, then the loop's
+   ready-queue or pending-timer list), so plain ownership-by-pointer plus
+   an explicit virtual `destroy(allocator, ran)` call is enough; see
    [Continuation Node Mechanism](Continuation-Node-Mechanism.md) for why
    `destroy()` has to be virtual at all (deallocating the *actual* derived
    type through a `ready_node*`/`timer_node*` base pointer).
@@ -36,7 +36,7 @@ complex `.then()` chain actually cost."
 |---|---|---|
 | `make_promise_future<T>(loop)` | **1** | `future_state<T>`'s control block |
 | `future<T>::then(fn)` (plain, non-flattening) | **2** | the downstream `future_state<U>`'s control block, plus the `concrete_continuation<Fn, U>` node |
-| `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`'s control block, plus the `concrete_timer_node<Fn>` node |
+| `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`'s control block, plus the `sleep_resume_node` node |
 | `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 1 more when it runs** | the usual 2 for the visible registration, plus 1 more, *invisible to the caller*, for `detail::flatten_forwarder<V>`'s forwarding node — see below |
 
 A plain chain of `N` `.then()` calls off one `make_promise_future` therefore

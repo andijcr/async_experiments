@@ -111,13 +111,20 @@ this split exists):
 [[nodiscard]] inline auto sleep_until(loop& loop_ref, loop::clock::time_point deadline)
     -> future<void> {
   auto [prom, fut] = make_promise_future<void>(loop_ref);
-  auto fire = [prom = std::move(prom)]() mutable { prom.set_value(); };
-  using node_type = detail::concrete_timer_node<decltype(fire)>;
-  auto* node = loop_ref.allocator().template new_object<node_type>(std::move(fire));
+  auto* node = loop_ref.allocator().template new_object<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }
 ```
+
+`sleep_resume_node` holds the `promise<void>` directly rather than
+wrapping a generic closure (an earlier version, `concrete_timer_node<Fn>`,
+did the latter) - needed so `destroy(allocator, ran)` can complete the
+promise with an exception when `ran` is false (the timer never fired
+before the loop was destroyed), instead of the generic version's silent
+drop, which had exactly the stranded-coroutine-frame hazard described in
+[Coroutines](Coroutines.md)'s `lock_resume_node`/`acquire_resume_node`
+section - fixed here the same way (issue #50).
 
 `yield_execution(loop&)` (issue #45) gives `loop_ref` the chance to run
 whatever else is already ready before the calling coroutine resumes.

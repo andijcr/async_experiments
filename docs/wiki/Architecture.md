@@ -110,14 +110,15 @@ import each other in C++20 modules (or in any sane build), so one direction
 has to give.
 
 The fix: `:loop` defines its *own* minimal type-erased bases —
-`est::detail::ready_node` (a `run()` + `destroy(allocator)` pair, the ready-
-queue's element type) and `est::detail::timer_node` (`fire()` +
-`destroy(allocator)`, the pending-timer list's element type) — and knows
-nothing about futures, promises, or continuations at all.
+`est::detail::ready_node` (a `run()` + `destroy(allocator, ran)` pair, the
+ready-queue's element type) and `est::detail::timer_node` (`fire()` +
+`destroy(allocator, ran)`, the pending-timer list's element type) — and
+knows nothing about futures, promises, or continuations at all.
 `:future`'s `continuation_node<T>` then *inherits* `ready_node` (adding the
 one T-dependent thing it needs, `invoke(future_state<T>&)`), and
-`:promise`'s `sleep_for()`/`sleep_until()` build a `concrete_timer_node<Fn>`
-on top of `timer_node` to bridge a raw timer callback into a
+`:promise`'s `sleep_for()`/`sleep_until()` build a `sleep_resume_node`
+directly on top of `timer_node` (no generic callback-wrapping layer - it
+holds the `promise<void>` itself) to bridge a fired timer into a
 `future<void>`. Dependency direction stays a clean DAG: `:loop` → `:future`
 → `:promise`.
 

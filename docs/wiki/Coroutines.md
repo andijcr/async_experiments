@@ -223,7 +223,8 @@ private:
 A separately allocated node has its own independent lifetime, entirely
 unrelated to the coroutine frame it resumes — `run()`-then-`destroy()` is
 exactly as safe here as it already is for every other `ready_node` in this
-codebase (`concrete_continuation<Fn, U>`, `concrete_timer_node<Fn>`). This
+codebase (`concrete_continuation<Fn, U>`, `est:promise`'s `sleep_resume_node`/
+`yield_resume_node`). This
 is also why `final_suspend()` safely uses plain `std::suspend_never` (the
 coroutine frame self-destructs immediately on completion): nothing that
 ever resumes the coroutine lives inside the frame being destroyed.
@@ -311,11 +312,10 @@ template <class T> class future_resume_node final : public continuation_node<T> 
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
   void invoke(future_state<T>&) override {
-    invoked_ = true;
     handle_.resume();
   }
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
-    if (!invoked_) {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
+    if (!ran) {
       handle_.destroy();   // see "Abandoned coroutines are destroyed, not leaked" below
     }
     allocator.delete_object(this);
@@ -374,18 +374,17 @@ when a `future_state`/`loop` is torn down without ever completing/draining
 describes for `then()`). A first version of this code got the second case
 wrong — `destroy()` freed only the resumption node itself, never the
 coroutine frame the handle pointed to, permanently leaking it (caught in
-code review, before merging, not after). The fix: each resumption node
-tracks whether it ever actually ran -
+code review, before merging, not after). The fix: each resumption node's
+`destroy()` is told whether it ever actually ran -
 
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
   void invoke(future_state<T>&) override {
-    invoked_ = true;
     handle_.resume();
   }
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
-    if (!invoked_) {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
+    if (!ran) {
       handle_.destroy();   // never resumed - still fully intact; this is
                             // the only chance to free its frame
     }
@@ -402,10 +401,13 @@ so destroying it here is both safe and necessary. If `run()`/`invoke()`
 coroutine either already self-destroyed (`promise_type::final_suspend()`'s
 `std::suspend_never` - `handle_` is now dangling, so even calling `.done()`
 on it would be a use-after-free) or suspended again on something else
-entirely, which now owns resuming (and eventually destroying) it. The
-`ran_` flag is what lets one `destroy()` implementation tell those two
-completely different situations apart without ever having to safely query
-a handle that might already be gone.
+entirely, which now owns resuming (and eventually destroying) it. `ran` is
+what lets one `destroy()` implementation tell those two completely
+different situations apart without ever having to safely query a handle
+that might already be gone - passed in by the caller (`ready_node::
+destroy()`'s own doc comment, est:loop) rather than tracked with a private
+flag each node sets on its own `run()`/`invoke()`, since every call site
+already knows statically which situation it's in.
 
 ## `est::mutex::lock()` becomes awaitable
 
@@ -512,8 +514,7 @@ Once `lock_resume_node` holds a `promise<void>` instead of a
 `coroutine_handle<>`, that direct line is gone, and naively deallocating
 an abandoned node (matching the "broken promise, the future simply never
 becomes ready" contract every other dropped `est::promise<T>` in this
-codebase otherwise has - e.g. an unfired `concrete_timer_node`'s own
-`destroy()`) reopens a real leak: a coroutine doing `co_await
+codebase otherwise has by default) reopens a real leak: a coroutine doing `co_await
 mutex.lock();` holds the resulting `future<void>` as a temporary spilled
 into its own frame across the suspension - the *only* other reference to
 that `future_state<void>`, besides the node in `mutex::waiters_`. Drop
@@ -529,8 +530,8 @@ exception, since the true outcome is "this waiter never got the lock, and
 the mutex it was queued on no longer exists") before deallocating:
 
 ```cpp
-void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
-  if (!ran_) {
+void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
+  if (!ran) {
     promise_.set_exception(std::make_exception_ptr(
         std::runtime_error("mutex destroyed while lock() was pending")));
   }
@@ -545,9 +546,11 @@ mutex and keeps running - the coroutine then observes the exception
 exactly like any other failure propagating across `co_await`, per
 "an exception in the awaited future propagates across `co_await`" above)
 or safely destroyed, never run, by `est::loop`'s own destructor-time
-drain - either way, the frame is no longer stranded. `ran_` (the same
-pattern as `est:future`'s own `future_resume_node<T>`) is what stops this
-from double-completing an already-successfully-completed promise: `run()`
+drain - either way, the frame is no longer stranded. `ran` (the same
+parameter `est:future`'s own `future_resume_node<T>` reads, passed in by
+the caller rather than tracked with a private flag - `ready_node::
+destroy()`'s own doc comment, est:loop) is what stops this from
+double-completing an already-successfully-completed promise: `run()`
 and `destroy()` are
 always both called, in that order, for any node the loop actually
 processes (see [Continuation Node Mechanism](Continuation-Node-Mechanism.md)).
@@ -589,7 +592,7 @@ queues a waiter node that completes it later.
 `lock_resume_node` does (`intrusive_list<detail::ready_node>` doesn't care
 which concrete type it holds) - `unlock()` hands the lock to whichever
 one is next in FIFO order without needing to know which kind it got. It
-needs the same `ran_`-guarded exception-completion `destroy()` that
+needs the same `ran`-guarded exception-completion `destroy()` that
 `lock_resume_node` does, for the identical reason - a coroutine doing
 `auto guard = co_await mutex.acquire();` holds the same kind of
 frame-spilled `future<lock_guard>` temporary across its own suspension,
