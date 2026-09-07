@@ -66,7 +66,7 @@ public:
   // itself silently - see lock_resume_node's own doc comment for why
   // that matters beyond just freeing the node itself.
   ~mutex() {
-    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator()); });
+    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator(), false); });
   }
 
   [[nodiscard]] auto locked() const noexcept -> bool { return state_ != 0; }
@@ -194,26 +194,23 @@ private:
 // where it's either genuinely resumed (if the loop outlives this mutex
 // and keeps running) or safely destroyed, never run, by est::loop's own
 // destructor-time drain (loop::~loop()) - either way, the frame is no
-// longer stranded. `ran_` (same pattern as est:future's own
-// future_resume_node<T>) is what stops this from double-completing an
-// already-successfully-completed promise: `destroy()` here can run in
-// two different circumstances - after the loop has already drained this
-// node via `run()` (unlock() handed it the lock - see `unlock()`'s own
-// doc comment), or, for a node still sitting in `waiters_` or still
-// queued on the loop's own ready_ list, from `~mutex()`'s or `~loop()`'s
-// own drain without `run()` ever having been called at all. `ran_` is
-// what tells `destroy()` which of the two just happened.
+// longer stranded. `destroy()`'s own `ran` parameter (est::detail::
+// ready_node's own doc comment, est:loop) is what stops this from
+// double-completing an already-successfully-completed promise:
+// `destroy()` here can run in two different circumstances - after the
+// loop has already drained this node via `run()` (unlock() handed it
+// the lock - see `unlock()`'s own doc comment, `ran` true), or, for a
+// node still sitting in `waiters_` or still queued on the loop's own
+// ready_ list, from `~mutex()`'s or `~loop()`'s own drain without
+// `run()` ever having been called at all (`ran` false).
 class mutex::lock_resume_node final : public detail::ready_node {
 public:
   explicit lock_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
-  void run() final {
-    ran_ = true;
-    promise_.set_value();
-  }
+  void run() final { promise_.set_value(); }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
-    if (!ran_) {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
+    if (!ran) {
       promise_.set_exception(
           std::make_exception_ptr(std::runtime_error("mutex destroyed while lock() was pending")));
     }
@@ -222,7 +219,6 @@ public:
 
 private:
   promise<void> promise_;
-  bool ran_ = false;
 };
 
 inline auto mutex::lock() -> future<void> {
@@ -281,7 +277,7 @@ private:
 // real difference between the two. Needs a mutex& (lock_resume_node
 // doesn't) purely to construct that lock_guard once run() knows unlock()
 // has actually handed it the lock; see lock_resume_node's own doc
-// comment for why destroy() also needs the same ran_-guarded
+// comment for why destroy() also needs the same `ran`-guarded
 // exception-completion on the abandoned (never handed the lock) path -
 // identical reasoning, unrelated to what value type the promise carries.
 // mutex_ staying valid for run()'s use relies on the precondition
@@ -301,13 +297,10 @@ public:
   // (mutex::unlock() hands off rather than clearing state_ - see its own
   // doc comment), so constructing the lock_guard here doesn't need to
   // touch state_ itself at all.
-  void run() final {
-    ran_ = true;
-    promise_.set_value(lock_guard(mutex_));
-  }
+  void run() final { promise_.set_value(lock_guard(mutex_)); }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
-    if (!ran_) {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
+    if (!ran) {
       promise_.set_exception(std::make_exception_ptr(
           std::runtime_error("mutex destroyed while acquire() was pending")));
     }
@@ -317,7 +310,6 @@ public:
 private:
   mutex& mutex_;
   promise<lock_guard> promise_;
-  bool ran_ = false;
 };
 
 inline auto mutex::acquire() -> future<lock_guard> {

@@ -65,28 +65,40 @@ template <class T> auto make_promise_future(loop& loop_ref) -> std::pair<promise
 
 namespace est::detail {
 
-// Wraps a nullary Fn (invoked once when the timer it's registered
-// against fires) so est::loop::schedule_timer() has a concrete,
-// allocator-destroyable detail::timer_node to hold - the same intrusive-
-// virtual-node pattern est:future's own concrete_continuation<Fn, U>
-// already uses (see that class's own doc comment), rather than a type-
-// erased std::move_only_function that would bypass this codebase's own
-// pmr-allocator plumbing.
-template <class Fn> class concrete_timer_node final : public timer_node {
+// The node behind sleep_for()/sleep_until() (below): holds a
+// promise<void> directly rather than a generic Fn - an earlier version
+// (concrete_timer_node<Fn>, wrapping a closure that itself captured the
+// promise) couldn't complete that promise on abandonment (destroy()
+// called without fire() ever having run), because a type-erased Fn
+// gives destroy() no way to know it's holding a promise at all, let
+// alone call set_exception() on it. That was a real, latent bug (issue
+// #50): a coroutine doing `co_await sleep_for(loop, 10s);`, abandoned
+// when its loop is destroyed before the timer ever fires, would leak
+// its own frame forever - the exact shape of hazard `ran`-guarded
+// exception-completion already fixed for mutex::lock_resume_node/
+// acquire_resume_node (PR #37 review) and detail::yield_resume_node
+// below, for the identical reason: the awaiting coroutine holds the
+// only other reference to this promise's future_state<void> (the
+// future<void> temporary co_await awaits is spilled into the
+// coroutine's own frame across the suspension), so silently dropping
+// the promise instead of completing it would strand that frame with
+// nothing left to free it.
+class sleep_resume_node final : public timer_node {
 public:
-  explicit concrete_timer_node(Fn fn) : fn_(std::move(fn)) {}
+  explicit sleep_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
-  void fire() override { fn_(); }
+  void fire() override { promise_.set_value(); }
 
-  // `this` here is concrete_timer_node<Fn>*, so delete_object deallocates
-  // with this type's actual size/alignment - same reasoning as
-  // concrete_continuation<Fn, U>::destroy() (est:future).
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
+    if (!ran) {
+      promise_.set_exception(std::make_exception_ptr(
+          std::runtime_error("loop destroyed while sleep_for()/sleep_until() was pending")));
+    }
     allocator.delete_object(this);
   }
 
 private:
-  Fn fn_;
+  promise<void> promise_;
 };
 
 // The node behind yield_execution() (below): a plain ready_node holding
@@ -107,27 +119,16 @@ private:
 // abandonment (rather than silently dropping it, the "broken promise,
 // future simply never becomes ready" default every other est::promise<T>
 // in this codebase otherwise has) matters for the identical reason
-// mutex::lock_resume_node's own doc comment gives (est:sync.mutex): a
-// coroutine doing `co_await yield_execution(loop);` holds the resulting
-// future<void> as a temporary spilled into its own frame across the
-// suspension - the only other reference to that future_state<void>,
-// besides this node. Silently dropping the promise on abandonment (this
-// loop destroyed before ever draining this node) would leave that
-// future_state permanently "not yet ready," which is also the only
-// thing keeping the awaiting coroutine's own pending resume node
-// reachable - neither side would ever free the other. Completing here
-// breaks that, the same way it does for mutex's own resume nodes.
+// sleep_resume_node's own doc comment (just above) and
+// mutex::lock_resume_node's own doc comment (est:sync.mutex) both give.
 class yield_resume_node final : public ready_node {
 public:
   explicit yield_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
-  void run() final {
-    ran_ = true;
-    promise_.set_value();
-  }
+  void run() final { promise_.set_value(); }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept final {
-    if (!ran_) {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
+    if (!ran) {
       promise_.set_exception(std::make_exception_ptr(
           std::runtime_error("loop destroyed while yield_execution() was pending")));
     }
@@ -136,7 +137,6 @@ public:
 
 private:
   promise<void> promise_;
-  bool ran_ = false;
 };
 
 } // namespace est::detail
@@ -152,9 +152,7 @@ export namespace est {
 [[nodiscard]] inline auto sleep_until(loop& loop_ref, loop::clock::time_point deadline)
     -> future<void> {
   auto [prom, fut] = make_promise_future<void>(loop_ref);
-  auto fire = [prom = std::move(prom)]() mutable { prom.set_value(); };
-  using node_type = detail::concrete_timer_node<decltype(fire)>;
-  auto* node = loop_ref.allocator().template new_object<node_type>(std::move(fire));
+  auto* node = loop_ref.allocator().template new_object<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }

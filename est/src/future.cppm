@@ -88,7 +88,11 @@ public:
     }
   }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+  // bool /*ran*/ unused - see concrete_continuation<Fn, U>'s own doc
+  // comment (further down this file) on why dropping downstream_
+  // unconditionally here is the current behavior, not a settled answer.
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator,
+               bool /*ran*/) noexcept override {
     allocator.delete_object(this);
   }
 
@@ -298,7 +302,7 @@ public:
   // still-pending nodes are simply unreachable once this future_state
   // itself is gone - a permanent leak, not just a skipped notification.
   ~future_state() {
-    waiters_.drain([this](continuation_node& node) { node.destroy(loop_.allocator()); });
+    waiters_.drain([this](continuation_node& node) { node.destroy(loop_.allocator(), false); });
   }
 
   void set_value()
@@ -577,8 +581,16 @@ private:
     // deallocates with this type's actual size/alignment - the whole
     // reason destroy() is virtual instead of the caller deallocating
     // through a detail::ready_node& (see that class's own doc comment,
-    // est:loop).
-    void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+    // est:loop). bool /*ran*/ unused here: downstream_ is currently just
+    // dropped on abandonment either way, unlike est::mutex's resume
+    // nodes or future_resume_node<T> below - whether a coroutine
+    // co_await-ing a `.then()`-chained future can be stranded the same
+    // way if the *upstream* future_state is dropped first is a real,
+    // separate question this class doesn't yet answer either way (not
+    // addressed here - see issue #50's discussion for the identical
+    // shape of hazard in sleep_for()/sleep_until()).
+    void destroy(std::pmr::polymorphic_allocator<std::byte> allocator,
+                 bool /*ran*/) noexcept override {
       allocator.delete_object(this);
     }
 
@@ -890,7 +902,8 @@ namespace est::detail {
 // awaited future is already resolved by the time co_await evaluates it).
 // Separately heap-allocated via an allocator (like every other ready_node
 // this codebase queues - concrete_continuation<Fn, U>,
-// concrete_timer_node<Fn>), *not* embedded inside the coroutine frame it
+// est:promise's sleep_resume_node/yield_resume_node), *not* embedded
+// inside the coroutine frame it
 // resumes, for a subtle but real reason a first version of this class got
 // wrong: an awaiter object embedded in a coroutine's own frame only lives
 // for the duration of *its own* co_await expression - once run() resumes
@@ -914,20 +927,18 @@ public:
   // future_state<T>& /*unused*/: continuation_node<T>::invoke() must take
   // one - this node doesn't need it for anything beyond satisfying that
   // signature.
-  void invoke(future_state<T>& /*unused*/) override {
-    invoked_ = true;
-    handle_.resume();
-  }
+  void invoke(future_state<T>& /*unused*/) override { handle_.resume(); }
 
   // If invoke() never ran (the future_state this node was registered on
   // was dropped without ever completing - docs/PLAN.md, M2's
-  // abandoned-future design), the awaiting coroutine is still fully
-  // intact and untouched, so this is the only chance to free its frame;
-  // if invoke() did run, the coroutine either already self-destroyed or
-  // suspended again on something else that now owns it, and touching
-  // handle_ again here would be wrong either way.
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
-    if (!invoked_) {
+  // abandoned-future design - so `ran` is false, per ready_node::
+  // destroy()'s own doc comment, est:loop), the awaiting coroutine is
+  // still fully intact and untouched, so this is the only chance to free
+  // its frame; if invoke() did run, the coroutine either already
+  // self-destroyed or suspended again on something else that now owns
+  // it, and touching handle_ again here would be wrong either way.
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
+    if (!ran) {
       handle_.destroy();
     }
     allocator.delete_object(this);
@@ -935,7 +946,6 @@ public:
 
 private:
   std::coroutine_handle<> handle_;
-  bool invoked_ = false;
 };
 
 // Awaiter for `co_await someFuture` on any est::future<T> - see

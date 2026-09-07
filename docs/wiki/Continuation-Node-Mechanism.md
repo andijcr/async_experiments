@@ -16,7 +16,7 @@ classDiagram
   }
   class ready_node {
     +run() void
-    +destroy(allocator) void
+    +destroy(allocator, ran) void
   }
   class continuation_node_T {
     -owner_ : shared_ptr_future_state_T
@@ -28,7 +28,7 @@ classDiagram
     -fn_ : Fn
     -downstream_ : shared_ptr_future_state_U
     +invoke(state) void
-    +destroy(allocator) void
+    +destroy(allocator, ran) void
   }
   intrusive_list_node <|-- ready_node
   ready_node <|-- continuation_node_T
@@ -65,7 +65,7 @@ excerpts below for the real, fully-qualified signatures.)
   util partition instead of inside `est:sync.mutex`.
 - **`ready_node`** (`est:loop`) is the type-erased base the loop's
   ready-queue actually holds. It adds exactly two things: `run()` (invoke
-  whatever this is, however it does that) and `destroy(allocator)`
+  whatever this is, however it does that) and `destroy(allocator, ran)`
   (deallocate through the *actual* derived type — see
   [Allocation Patterns](Allocation-Patterns.md) for why this can't just be a
   plain destructor call). `:loop` knows nothing more about what a
@@ -144,7 +144,7 @@ sequenceDiagram
   est_loop->>est_loop: drain_ready(): ready_.dequeue()
   est_loop->>node: run() -> invoke(*owner_)
   node->>node: runs fn_, reports into downstream_
-  est_loop->>node: destroy(allocator) [always, via scope_exit guard]
+  est_loop->>node: destroy(allocator, true) [always, via scope_exit guard]
 ```
 
 Two possible starting states, one converging path:
@@ -165,7 +165,7 @@ holding its own `shared_ptr<future_state<T>>` back to its parent. The loop's
 `drain_ready()` eventually dequeues it, `run_one()` calls `node.run()`
 (dispatching through `continuation_node<T>::run()` to `invoke(*owner_)`),
 and — always, via a `scope_exit`-based guard, whether or not `run()`
-somehow threw — `node.destroy(allocator)` deallocates it.
+somehow threw — `node.destroy(allocator, true)` deallocates it.
 
 ### The `bind_owner()` subtlety
 
@@ -355,7 +355,8 @@ public:
     }
   }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept override {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool /*ran*/) noexcept
+      override {
     allocator.delete_object(this);
   }
 

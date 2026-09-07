@@ -339,3 +339,39 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing yield_execution() sti
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
+
+TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pending leaks "
+          "nothing",
+          "[loop]") {
+  // Issue #50: sleep_for()/sleep_until()'s old node (concrete_timer_node<Fn>,
+  // wrapping a closure that itself captured the promise) couldn't complete
+  // that promise on abandonment - a type-erased Fn gave destroy() no way
+  // to know it held a promise<void> at all. Fixed by detail::
+  // sleep_resume_node, which holds the promise<void> directly - same
+  // hazard, same fix shape as yield_execution()'s own leak test just
+  // above and mutex's "destroying a mutex with a coroutine co_await-ing
+  // acquire() still pending leaks nothing" (est/tests/mutex_tests.cpp).
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto guard = est::platform::override_instance(fake);
+
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop& loop_ref) -> est::future<void> {
+      co_await est::sleep_for(loop_ref, 10s);
+      co_return; // never reached - loop is destroyed before the timer fires
+    };
+    auto fut = coro(loop);
+
+    REQUIRE_FALSE(fut.ready());
+    (void)fut;
+    // `loop` is destroyed at the end of this scope with the coroutine
+    // still suspended in co_await sleep_for(loop, 10s), the timer never
+    // having fired.
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
