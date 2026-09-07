@@ -11,7 +11,6 @@ target_sources(est
       src/util/scope_exit.cppm
       src/util/shared_ptr.cppm
       src/platform/platform.cppm
-      src/platform/hosted_stdcpp.cppm
       src/check.cppm
       src/sync/mutex.cppm
       src/timer.cppm

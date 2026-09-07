@@ -1,4 +1,5 @@
 import est;
+import estext;
 import std;
 
 // EXIT_FAILURE/EXIT_SUCCESS are macros - unlike std::println below, they
@@ -21,13 +22,14 @@ import std;
 auto main() -> int {
   // A concrete platform::interface isn't installed automatically just by
   // `import est;` (per review - that's this program's own decision to
-  // make, not something the library does invisibly). hosted_stdcpp is the
-  // one that exists for a hosted program like this one, and this example
-  // genuinely needs it installed: run_until_idle() below calls through
+  // make, not something the library does invisibly; est itself doesn't
+  // even know estext exists). estext::hosted_stdcpp is the one that
+  // exists for a hosted program like this one, and this example genuinely
+  // needs it installed: run_until_idle() below calls through
   // platform::instance() for real timer waits. platform_instance/
   // platform_guard are declared first, right at the top of main(), so
   // they outlive everything that might touch it.
-  est::platform::hosted_stdcpp platform_instance;
+  estext::hosted_stdcpp platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
 
   try {

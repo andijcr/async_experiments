@@ -688,7 +688,9 @@ flagged the tests' own `.find(x) != npos` idiom in favor of C++23's
   without inverting the module dependency DAG. `hosted_stdcpp` moved into
   its own module, `est/src/platform/hosted_stdcpp.cppm`
   (`:platform.hosted_stdcpp`), free to depend on both `:platform` and
-  `:loop` precisely because it's no longer `:platform` itself.
+  `:loop` precisely because it's no longer `:platform` itself. (Moved
+  again in that same PR's "Revised a seventh time" - out of `est`'s own
+  module entirely, into a wholly separate one, `estext`.)
 - **#11** (`shared_ptr` adopt-a-pointer constructor + a `shared_base`
   mixin for `shared_from_this()` parity) - nothing in the codebase needs
   self-referencing `shared_ptr`s yet; building the mixin now means
@@ -3534,6 +3536,99 @@ No new tests came out of this revision (all pre-existing behavior, same
 106 tests as before) - the entire point was that plumbing which backend
 gets installed, and where, shouldn't change any test's own outcome.
 
+**Revised a seventh time: `hosted_stdcpp` shouldn't be one of `est`'s own
+partitions at all - not even re-exported through `est.cppm`.** The sixth
+revision's own module split (`:platform.hosted_stdcpp`) genuinely solved
+the `:platform`-can't-import-`:loop` problem, but it still left
+`hosted_stdcpp` inside `est`'s own module boundary: `est.cppm` had to
+`export import :platform.hosted_stdcpp;` for `examples/*/main.cpp` and
+`est/tests/test_main.cpp` to name `est::platform::hosted_stdcpp` at all
+(a partition is only visible outside its module if the primary module
+interface unit re-exports it), which meant `hosted_stdcpp` was always
+compiled as part of `est` and logically part of its exported surface,
+whether or not a given consumer's program ever touched it.
+
+Per review: move it to `estext`, a wholly separate module with its own
+CMake target (`estext/CMakeLists.txt`, `add_library(estext STATIC)`,
+linked `PUBLIC` against `est::est`), not a partition of `est` at all:
+
+```cpp
+// estext/src/hosted_stdcpp.cppm
+export module estext;
+import est;
+import std;
+
+export namespace estext {
+class hosted_stdcpp final : public est::platform::interface {
+  // ... identical to the :platform.hosted_stdcpp version, just
+  // est::loop/est::platform::printdbg/est::platform::interface qualified
+  // explicitly now, since this is namespace estext, not namespace
+  // est::platform anymore.
+};
+}
+```
+
+`import est;` alone now gives a consumer the complete framework with
+*zero* trace of any concrete backend; a consumer that wants a working one
+opts in with a second, separate import - `import est; import estext;` -
+exactly mirroring how a future bare-metal backend would be its own
+similarly separate module, never touching `estext`. Note what `estext`
+does *not* need that `:platform` itself does: since it's not a partition
+bound by `est`'s own internal module DAG, `import est;` alone already
+hands it the complete, already-defined `est::loop` - no forward
+declaration trick required (that trick stays exactly where it was, inside
+`:platform` itself, purely for `platform::interface`'s own pure virtual
+method signature).
+
+This did surface one real CMake ordering wrinkle, not a design problem so
+much as a consequence of `est/tests/` being a *nested*
+`add_subdirectory()` call inside `est/CMakeLists.txt` itself:
+
+```
+root CMakeLists.txt
+  add_subdirectory(est)       # defines est::est; also processes
+                               # est/tests/ internally (its own
+                               # add_subdirectory(tests) call) - but
+                               # estext::estext doesn't exist yet at
+                               # that point
+  add_subdirectory(estext)    # needs est::est, so can't come first either
+```
+
+`est/tests/CMakeLists.txt` needs `estext::estext` (`test_main.cpp`'s own
+`import estext;`), but by the time it's processed, `add_subdirectory(estext)`
+hasn't run yet - and `estext` itself can't move earlier, since it needs
+`est::est` to already exist. Resolved without restructuring `est/CMakeLists
+.txt`'s existing, self-contained `EST_BUILD_TESTS` handling: the one extra
+link edge is added from the root `CMakeLists.txt` instead, once both
+targets exist (`CMP0079`, default `NEW` under this project's
+`cmake_minimum_required(VERSION 3.28)`, lets a target defined in one
+directory be given more link dependencies from a different directory's
+scope):
+
+```cmake
+# root CMakeLists.txt
+add_subdirectory(est)
+add_subdirectory(estext)
+
+if(EST_BUILD_TESTS)
+  target_link_libraries(est_tests PRIVATE estext::estext)
+endif()
+```
+
+`examples/hello_world/CMakeLists.txt`/`examples/sleep_sort/CMakeLists.txt`
+don't hit this - `add_subdirectory(examples/...)` already runs after both
+`est` and `estext` in the root file, so they link `estext::estext`
+directly, same as `est::est`.
+
+Verified in the pinned Docker devenv: reconfigured from a clean build
+directory (to catch any ordering issue the wrinkle above could have
+introduced, not just an incremental rebuild) - 106/106 tests still pass,
+`clang-format`/`clang-tidy` clean across every touched and new file
+(`estext/src/hosted_stdcpp.cppm`, `est/src/est.cppm`, both examples'
+`main.cpp`, `est/tests/test_main.cpp`), full suite passes under the
+`sanitize` preset (also reconfigured from clean) too, both example
+binaries still run correctly.
+
 Every loop-taking free function gained a matching overload built on
 `loop::current()`: `make_promise_future<T>()`, `sleep_for()`/
 `sleep_until()`, `yield_execution()` (all `est:promise`). `est::mutex`
@@ -3619,25 +3714,23 @@ Docs updated: `docs/wiki/Coroutines.md`'s calling-convention section
 (also fixed a small pre-existing staleness there - the shown
 `promise_type` code snippet still had a `loop_` member removed in an
 earlier PR #37 follow-up), `docs/wiki/Loop-And-Timers.md`'s own new
-`loop::current()` section (rewritten again for the fourth/fifth/sixth
-revisions), `docs/wiki/Home.md`'s quick overview, `docs/wiki/
-Architecture.md`'s module-DAG diagram (added `:platform.hosted_stdcpp`
-and the edge explaining why it's the one partition depending on both
-`:platform` and `:loop` at once, plus the sixth revision's own
-`est::loop*`-not-`void*` and no-auto-install notes).
+`loop::current()` section (rewritten again across the fourth through
+seventh revisions), `docs/wiki/Home.md`'s quick overview, `docs/wiki/
+Architecture.md`'s module-DAG diagram and its new `estext` section
+(replacing the sixth revision's `:platform.hosted_stdcpp` partition/edge
+with the seventh's wholly separate `estext` module, plus the
+`est::loop*`-not-`void*` and no-auto-install notes carried over from the
+sixth).
 
-**Verified in the pinned Docker devenv, after the sixth revision above:**
-106/106 tests pass (8 new, unchanged by this revision - see its own
-closing note on why); `clang-format`/`clang-tidy` clean across every
-touched file, `examples/hello_world/main.cpp`/`examples/sleep_sort/
-main.cpp`/`est/tests/test_main.cpp` included (the
-`bugprone-throwing-static-initialization` NOLINT the previous revision
-needed at `est.cppm`'s own `hosted_stdcpp` construction site is gone
-along with that construction site - `hosted_stdcpp platform_instance` is
-now a local, automatic-storage-duration variable in each entry point's
-own `main()`, which this check doesn't flag at all); full suite passes
-under the `sanitize` preset (ASan+UBSan) too; both example binaries still
-run correctly, now doing their own platform installation first.
+**Verified in the pinned Docker devenv, after the seventh revision
+above:** reconfigured from a clean build directory for both the `ci` and
+`sanitize` presets (not just an incremental rebuild), to catch anything
+the new CMake target/ordering wrinkle could have introduced - 106/106
+tests pass (8 new, unchanged since the fifth revision); `clang-format`/
+`clang-tidy` clean across every touched and new file (`estext/src/
+hosted_stdcpp.cppm`, `est/src/est.cppm`, both examples' `main.cpp`,
+`est/tests/test_main.cpp`); full suite passes under the `sanitize` preset
+(ASan+UBSan) too; both example binaries still run correctly.
 
 ---
 

@@ -10,7 +10,6 @@ each only imports the partitions below it:
 ```mermaid
 graph BT
   platform[":platform<br/>interface (pure virtual), instance, override_instance, printdbg"]
-  hosted_stdcpp[":platform.hosted_stdcpp<br/>hosted_stdcpp"]
   check[":check<br/>est::check()"]
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
@@ -41,8 +40,6 @@ graph BT
   promise --> loop
   promise --> platform
   promise --> shared_ptr
-  hosted_stdcpp --> platform
-  hosted_stdcpp --> loop
 ```
 
 The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
@@ -59,38 +56,68 @@ instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
 rather than a coroutine of its own, the same "producer without co_await"
 pattern `sleep_until()` (`:promise`) already uses.
 
-`:platform.hosted_stdcpp` is the other non-obvious edge, and a newer one
-(issue #30): it's the only partition that depends on both `:platform` *and*
-`:loop` at once, sitting strictly above both rather than being one more
-consumer alongside `:check`/`:timer`/`:loop` itself. `platform::interface`
-(`:platform`) is a pure abstract base with no concrete backend of its own —
-`hosted_stdcpp`, the one implementation that exists, needs to name
-`est::loop` (its own "current loop" fallback, [The Loop and
-Timers](Loop-And-Timers.md)), which `:platform` itself can never do without
-inverting the DAG the other way. Being a genuinely separate partition is
-what makes that legal: nothing stops a concrete backend from depending on
-`:loop`, only `:platform`, the abstraction every backend implements,
-doing so. Also notable: `get_current_loop_context()`/
-`set_current_loop_context()` return a genuinely typed `est::loop*`, not an
-opaque `void*` - `:platform` forward-declares `est::loop` (`export
-namespace est { class loop; }`, `platform.cppm`'s own top comment on why
-an *exported* forward declaration in one partition attaches to the real
-definition in another partition of the same module, confirmed against
-this toolchain), naming the type without needing to complete it.
-`:platform` still never `import`s `:loop` - only `hosted_stdcpp` does, to
-actually construct its own fallback.
+## `estext`: a second, separate module for concrete backends
 
-`import est;` does *not* install a default `platform::interface` as a
-side effect - per review, that decision belongs to the program's own
-entry point, not to the library. `examples/hello_world/main.cpp` and
-`examples/sleep_sort/main.cpp` each construct a `hosted_stdcpp` and
-`platform::override_instance()` it at the top of their own `main()`;
-`est/tests/`'s own Catch2 binary does the same once, in a small custom
-`main()` (`est/tests/test_main.cpp`, linked against `Catch2::Catch2`
-rather than `Catch2::Catch2WithMain`), instead of every individual test
-file. Before this, `est.cppm` installed `hosted_stdcpp` itself as a
-process-lifetime side effect of `import est;` - reverted for the same
-reason.
+`hosted_stdcpp` (`est::check()`/`est::loop`'s one concrete
+`platform::interface` implementation - `std::chrono` for the clock,
+`std::this_thread` for sleeping, `std::cerr` for diagnostics) does *not*
+live inside `est` at all - not as one of the partitions above, not even
+one re-exported for convenience. It's the sole content of a genuinely
+separate module, `estext` (`estext/src/hosted_stdcpp.cppm`, its own CMake
+target linked `PUBLIC` against `est::est`):
+
+```mermaid
+graph BT
+  est["est<br/>the whole module above, as one node"]
+  estext["estext<br/>estext::hosted_stdcpp"]
+  estext --> est
+```
+
+This is an explicit design goal (issue #30's review), not an accident of
+where the file happened to land: `import est;` alone gives a consumer the
+complete framework with *zero* trace of any concrete backend - no
+partition silently re-exporting `hosted_stdcpp`, nothing `std::chrono`/
+`std::cerr`-shaped for a linker to even consider pulling in. A consumer
+that wants a working, ready-to-use backend opts in with a second,
+separate import: `import est; import estext;`. A future bare-metal
+backend would be its own similarly separate module, never touching
+`estext` - `est` itself stays the one thing every backend module depends
+on, never the reverse.
+
+`hosted_stdcpp` needing to name `est::loop` (its own "current loop"
+fallback, [The Loop and Timers](Loop-And-Timers.md)) is exactly why it
+can't be one of `est`'s own partitions in the first place: `:platform`
+sits below `:loop` in `est`'s *internal* DAG above specifically so it
+never has to import `:loop`, and a partition of `est` is bound by that
+same internal DAG. `estext` isn't a partition of `est` at all - it's a
+wholly separate module that simply `import est;`s the finished product,
+so it sees the complete, already-defined `est::loop` with no special
+access needed (unlike `:platform` itself, which forward-declares
+`est::loop` - `export namespace est { class loop; }`, `platform.cppm`'s
+own top comment on why an *exported* forward declaration in one partition
+attaches to the real definition in another partition of the *same*
+module, confirmed against this toolchain - purely so
+`get_current_loop_context()`/`set_current_loop_context()` can return/take
+a genuinely typed `est::loop*` instead of an opaque `void*`, without
+`:platform` ever importing `:loop`).
+
+An earlier version of this design made `hosted_stdcpp` one of `est`'s own
+partitions (`:platform.hosted_stdcpp`, re-exported through `est.cppm`) -
+reverted per review in favor of the fully separate module above, since
+"only `:platform` can't import `:loop`, but a different partition of the
+same module can" still leaves `hosted_stdcpp` inside `est`'s own module
+boundary, always compiled and logically exported as part of it. A
+genuinely separate module makes the boundary real rather than incidental.
+
+`import est;` also does *not* install a default `platform::interface` as
+a side effect - per the same review, that decision belongs to the
+program's own entry point, not to the library. `examples/hello_world/
+main.cpp` and `examples/sleep_sort/main.cpp` each `import estext;`,
+construct a `hosted_stdcpp`, and `platform::override_instance()` it at
+the top of their own `main()`; `est/tests/`'s own Catch2 binary does the
+same once, in a small custom `main()` (`est/tests/test_main.cpp`, linked
+against `Catch2::Catch2` rather than `Catch2::Catch2WithMain`), instead of
+every individual test file.
 
 ## Design philosophy
 

@@ -147,6 +147,22 @@ was a method on `est::platform` - `platform::get_loop()`.
    same once, in a small custom `main()` (`est/tests/test_main.cpp`,
    linked against `Catch2::Catch2` rather than `Catch2::Catch2WithMain`)
    instead of every individual test file.
+7. **One more follow-up, on where exactly `hosted_stdcpp` should live.**
+   Point 5 above made it one of `est`'s own partitions
+   (`:platform.hosted_stdcpp`, re-exported through `est.cppm`) - reachable
+   via plain `import est;`, same as everything else. Per further review,
+   that still leaves a concrete backend inside `est`'s own module
+   boundary, always compiled in and logically part of its exported
+   surface. Moved to `estext`, a wholly separate module
+   (`estext/src/hosted_stdcpp.cppm`, its own CMake target) that
+   `import est;`s the finished framework rather than being one of its
+   partitions - so `import est;` alone now gives zero trace of
+   `hosted_stdcpp`, and a consumer that wants it opts in with a second,
+   explicit `import estext;`. See [Architecture](Architecture.md)'s own
+   `estext` section for the fuller module-boundary picture. Nothing about
+   `loop::current()`/`make_current()` themselves changed - only where the
+   one concrete `get_current_loop_context()` implementation that offers a
+   fallback loop happens to live.
 
 The actual storage is a genuinely typed `est::loop*`, not an opaque
 `void*` (point 6 above) - `:platform` names the type via an exported
@@ -154,7 +170,7 @@ forward declaration without needing to complete it; only the concrete
 backend that implements `get_current_loop_context()` needs the complete
 type, to actually construct one. No cast needed on either side anymore.
 The only call sites that ever write into this slot are `make_current()`'s
-own guard and, for `hosted_stdcpp` specifically, its own
+own guard and, for `estext::hosted_stdcpp` specifically, its own
 lazily-constructed fallback loop. `get_current_loop_context()`/
 `set_current_loop_context()` are virtual (point 3 above) - not because
 "hold a pointer and hand it back" is backend-specific (it still isn't),

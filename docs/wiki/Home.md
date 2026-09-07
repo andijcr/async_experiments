@@ -64,23 +64,26 @@ rely on `est::loop::current()` (issue #30, [Loop and Timers](Loop-And-Timers.md)
 — every loop-taking function in this codebase has a matching no-`loop&`
 overload built on it. A loop only becomes "current" by an explicit
 `loop.make_current()` call, scoped to that loop's own lifetime, not a
-global — except that the real (`hosted_stdcpp`) backend also falls back to
-a loop of its own, lazily, when nothing has been explicitly registered, so
-`loop::current()` still works for a caller with no loop to register in the
-first place.
+global — except that the real (`estext::hosted_stdcpp`) backend also falls
+back to a loop of its own, lazily, when nothing has been explicitly
+registered, so `loop::current()` still works for a caller with no loop to
+register in the first place.
 
 `import est;` doesn't install a `platform::interface` on its own, either —
-a program's own `main()` constructs `hosted_stdcpp` and
-`platform::override_instance()`s it first (`examples/hello_world/main.cpp`,
-`examples/sleep_sort/main.cpp`), same as `est/tests/`'s own test binary
-does once, in `est/tests/test_main.cpp`.
+in fact it doesn't even know a concrete backend exists. `estext` is a
+second, wholly separate module holding `hosted_stdcpp`, the one that does
+([Architecture](Architecture.md) has the full story on why it's not part
+of `est` at all); a program's own `main()` does `import estext;`,
+constructs one, and `platform::override_instance()`s it
+(`examples/hello_world/main.cpp`, `examples/sleep_sort/main.cpp`), same as
+`est/tests/`'s own test binary does once, in `est/tests/test_main.cpp`.
 
 ## Where to look in the source
 
 | Concept | File |
 |---|---|
 | Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`) | `est/src/platform/platform.cppm` |
-| `hosted_stdcpp` (the one concrete `platform::interface`) | `est/src/platform/hosted_stdcpp.cppm` |
+| `hosted_stdcpp` (the one concrete `platform::interface` - a separate module, `estext`, not part of `est`) | `estext/src/hosted_stdcpp.cppm` |
 | `est::check()` | `est/src/check.cppm` |
 | `est::shared_ptr<T>`, `enable_shared_from_this<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
