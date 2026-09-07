@@ -56,19 +56,40 @@ public:
   // A no-op: nothing in these tests triggers a debug diagnostic.
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
 
+  // No-ops: nothing in these tests exercises the long-running-callback
+  // warning path (est/tests/loop_tests.cpp's jumping_platform, below, is
+  // what does) - platform::interface has no data members of its own to
+  // inherit a shared implementation from (per review), so every concrete
+  // backend, this fake included, must answer these itself.
+  void reset_loop_stall_detection() noexcept override {}
+  void
+  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+
+  // A real, working slot, not a no-op: est::loop is actually constructed
+  // under this fake in several tests below, and its constructor/
+  // destructor/current() all go through get_current_loop_context()/
+  // set_current_loop_context() (est::platform::interface's own doc
+  // comment) - a no-op here would silently break loop::current() for
+  // every one of them.
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+    return current_loop_context;
+  }
+  void set_current_loop_context(void* context) noexcept override { current_loop_context = context; }
+
   mutable std::chrono::steady_clock::time_point current;
+  void* current_loop_context = nullptr;
 };
 
 // A platform whose now() advances by `step` on every single call - used
 // to make a continuation's runtime appear to exceed the long-running-
 // callback threshold without an actual real delay, so that code path gets
-// exercised (docs/PLAN.md, M3's "long-running-callback detection"). Relies
-// on inheriting interface::reset_loop_stall_detection()/
-// detect_loop_stall()'s default implementation unchanged (docs/PLAN.md's
-// "loop-stall detection moved to platform::interface" refactor) - it still
-// calls now() exactly twice bracketing node.run(), the same shape
-// loop::run_one() used to do directly before that logic moved onto
-// platform::interface itself.
+// exercised (docs/PLAN.md, M3's "long-running-callback detection"). Its
+// own reset_loop_stall_detection()/detect_loop_stall() below duplicate
+// hosted_stdcpp's own implementation (platform.cppm) rather than
+// inheriting a shared default - platform::interface holds no state of its
+// own to back one (per review) - but the shape is unchanged: still calls
+// now() exactly twice bracketing node.run(), the same measurement
+// loop::run_one() itself triggers via these two calls.
 class jumping_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
@@ -87,15 +108,35 @@ public:
   }
 
   // A no-op, not a std::cerr write: this fake's whole purpose is
-  // triggering detect_loop_stall()'s default body's diagnostic (see this
-  // class's own doc comment above), which does call this - but the test
-  // using it doesn't assert on the printed content (see its own doc
-  // comment), so silently discarding it here just keeps test output
-  // clean rather than actually writing anything.
+  // triggering detect_loop_stall()'s diagnostic below (see this class's
+  // own doc comment above) - but the test using it doesn't assert on the
+  // printed content (see its own doc comment), so silently discarding it
+  // here just keeps test output clean rather than actually writing
+  // anything.
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
+
+  void reset_loop_stall_detection() noexcept override { stall_start = now(); }
+
+  void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+    const auto elapsed = now() - stall_start;
+    if (elapsed > threshold) {
+      est::platform::printdbg(
+          "stall of {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    }
+  }
+
+  // A real, working slot: est::loop is constructed under this fake too
+  // (see get_current_loop_context()'s own doc comment on fake_platform,
+  // above, for why a no-op here isn't an option).
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+    return current_loop_context;
+  }
+  void set_current_loop_context(void* context) noexcept override { current_loop_context = context; }
 
   mutable std::chrono::steady_clock::time_point current;
   std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);
+  mutable std::chrono::steady_clock::time_point stall_start;
+  void* current_loop_context = nullptr;
 };
 
 } // namespace

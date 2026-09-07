@@ -23,9 +23,9 @@ class interface;
 
 // Declared here (defined later, once hosted_stdcpp/detail::
 // current_instance exist for its body to reference) purely so printdbg()
-// below - and, transitively, interface::detect_loop_stall()'s default
-// body - can call it. See instance()'s own canonical doc comment further
-// down for what it actually does.
+// below - and, transitively, hosted_stdcpp::detect_loop_stall() - can
+// call it. See instance()'s own canonical doc comment further down for
+// what it actually does.
 [[nodiscard]] auto instance() noexcept -> interface&;
 
 // A best-effort, nothrow debug diagnostic. Does the compile-time-checked
@@ -48,6 +48,19 @@ class interface;
 // isn't.
 template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept;
 
+// A pure interface, deliberately: every method below is pure virtual and
+// this class holds no data members of its own - per review, "the
+// implementation" (state included) belongs entirely to whichever concrete
+// backend needs it (hosted_stdcpp, below), not to this abstraction. Two
+// methods here (reset_loop_stall_detection()/detect_loop_stall(),
+// get_current_loop_context()/set_current_loop_context()) used to have
+// default bodies backed by members declared right here - moved onto
+// hosted_stdcpp instead, alongside its other overrides, so this class
+// stays what its name says: an interface, not a partial implementation
+// with some state pre-supplied. A future bare-metal backend implements
+// every one of these itself, the same as it already had to for now()/
+// sleep_until()/assert_failure()/vprintdbg(); it just no longer gets two
+// of them "for free."
 class interface {
 public:
   interface() = default;
@@ -81,12 +94,7 @@ public:
   // mirroring std::vprint_unicode()'s split from std::print(): printdbg()
   // does the compile-time-checked formatting and type-erases the
   // arguments via std::make_format_args(), this decides what happens to
-  // the result. Pure virtual, not defaulted the way
-  // reset_loop_stall_detection()/detect_loop_stall() below are: unlike
-  // "measure wall-clock time" (genuinely backend-agnostic), "where does a
-  // debug line go" has no universal answer - a bare-metal backend may
-  // have no console at all, or want to write somewhere other than a
-  // stream. An implementation must swallow its own failures (an I/O
+  // the result. An implementation must swallow its own failures (an I/O
   // error, e.g.) internally - printdbg() itself already promises nothrow,
   // best-effort behavior, and can't do that on this method's behalf
   // without seeing inside it.
@@ -100,22 +108,15 @@ public:
   // platform, for the same reason now()/sleep_until() are platform
   // hooks rather than est::loop calling std::chrono/std::this_thread
   // directly: "how do we know a callback ran long" is a policy a backend
-  // should get to answer for itself. The default implementation just
-  // records now() into a member for detect_loop_stall() to compare
+  // should get to answer for itself. hosted_stdcpp's own override just
+  // records now() into a member for its detect_loop_stall() to compare
   // against - the only strategy that makes sense for a single-threaded,
-  // synchronous-checkpoint backend like hosted_stdcpp. A future backend
-  // could override both this and detect_loop_stall() to run a watchdog on
-  // a background thread instead, checking for (and reporting) a stall in
-  // parallel while the callback is still running, rather than only
-  // finding out once it returns.
-  //
-  // Virtual with a default body, not pure: unlike now()/sleep_until()/
-  // assert_failure() (which every backend must answer for itself),
-  // reset_loop_stall_detection()/detect_loop_stall() have one sensible
-  // default nearly every backend can just inherit - hosted_stdcpp does,
-  // and so does every test fake in est/tests/ that only overrides now()/
-  // sleep_until()/assert_failure() (unaffected by this addition).
-  virtual void reset_loop_stall_detection() noexcept { stall_start_ = now(); }
+  // synchronous-checkpoint backend. A future backend could override both
+  // this and detect_loop_stall() to run a watchdog on a background thread
+  // instead, checking for (and reporting) a stall in parallel while the
+  // callback is still running, rather than only finding out once it
+  // returns.
+  virtual void reset_loop_stall_detection() noexcept = 0;
 
   // Checked by est::loop::run_one() right after a node/timer callback
   // returns: has it been longer than `threshold` since the matching
@@ -128,25 +129,18 @@ public:
   // reset_loop_stall_detection(), so est::loop's own
   // long_running_threshold (docs/PLAN.md, M3) stays the single source of
   // truth for the value, unchanged by which backend is installed.
-  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept {
-    const auto elapsed = now() - stall_start_;
-    if (elapsed > threshold) {
-      printdbg("est::loop: a continuation took {}ms (> {}ms threshold) to run",
-               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
-               std::chrono::duration_cast<std::chrono::milliseconds>(threshold).count());
-    }
-  }
+  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
 
-  // est::loop's own "current loop" slot (issue #30) - held here, as a
-  // plain (deliberately not thread_local) data member of whichever
-  // interface is currently installed, rather than as a second
-  // free-standing global living alongside current_instance below:
-  // :platform already tracks "the current one" for interface itself via
-  // current_instance/instance(), so this reuses that same idea instead of
-  // inventing a parallel piece of global state. See est::loop's own top
-  // comment for why this exists at all, and why it's deliberately not
-  // thread_local (docs/PLAN.md's bare-metal embedded port stretch goal -
-  // freestanding, no OS - may have no well-defined thread_local support).
+  // est::loop's own "current loop" slot (issue #30) - held wherever the
+  // installed interface implementation keeps it (hosted_stdcpp's own
+  // member, below), rather than as a free-standing global living
+  // alongside current_instance further down: :platform already tracks
+  // "the current one" for interface itself via current_instance/
+  // instance(), so this reuses that same idea instead of inventing a
+  // parallel piece of global state. See est::loop's own top comment for
+  // why this exists at all, and why it's deliberately not thread_local
+  // (docs/PLAN.md's bare-metal embedded port stretch goal - freestanding,
+  // no OS - may have no well-defined thread_local support).
   //
   // Opaque void*, not est::loop* - this partition sits below :loop in the
   // module dependency DAG (this file's own top comment) precisely so
@@ -156,20 +150,9 @@ public:
   // sites that ever touch this are est::loop's own constructor (stores
   // `this`) and destructor (stores `nullptr`), so whatever's read back is
   // always either null or a genuinely live est::loop*.
-  //
-  // Plain (non-virtual) methods, unlike now()/sleep_until()/
-  // assert_failure() above: "hold a pointer and hand it back" isn't
-  // backend-specific behavior a future backend would ever need to answer
-  // differently, so there's nothing here for a derived class to override.
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* {
-    return current_loop_context_;
-  }
+  [[nodiscard]] virtual auto get_current_loop_context() const noexcept -> void* = 0;
 
-  void set_current_loop_context(void* context) noexcept { current_loop_context_ = context; }
-
-private:
-  std::chrono::steady_clock::time_point stall_start_;
-  void* current_loop_context_ = nullptr;
+  virtual void set_current_loop_context(void* context) noexcept = 0;
 };
 
 // The actual body, deferred until here (see the forward declaration's own
@@ -269,6 +252,42 @@ public:
     }
     std::abort();
   }
+
+  // interface::reset_loop_stall_detection()'s own doc comment explains
+  // the "why" - this override is the "one sensible default nearly every
+  // backend can just inherit" that comment describes, just no longer
+  // literally inherited (interface itself holds no state to inherit) now
+  // that every implementation, hosted_stdcpp included, provides its own.
+  void reset_loop_stall_detection() noexcept override { stall_start_ = now(); }
+
+  void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+    const auto elapsed = now() - stall_start_;
+    if (elapsed > threshold) {
+      printdbg("est::loop: a continuation took {}ms (> {}ms threshold) to run",
+               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
+               std::chrono::duration_cast<std::chrono::milliseconds>(threshold).count());
+    }
+  }
+
+  // interface::get_current_loop_context()'s own doc comment explains what
+  // this slot is for and why it's an opaque void*. Non-virtual on
+  // interface would have worked identically for this specific backend,
+  // but a bare-metal backend might reasonably want to answer "hold a
+  // pointer, hand it back" differently too (e.g. a fixed static slot with
+  // no heap/global initialization order to worry about) - now that
+  // interface carries no state of its own for any method, there's no
+  // reason to single these two out as the one non-overridable pair.
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+    return current_loop_context_;
+  }
+
+  void set_current_loop_context(void* context) noexcept override {
+    current_loop_context_ = context;
+  }
+
+private:
+  std::chrono::steady_clock::time_point stall_start_;
+  void* current_loop_context_ = nullptr;
 };
 
 } // namespace est::platform
@@ -283,13 +302,14 @@ public:
 namespace est::platform::detail {
 // False positive below: bugprone-throwing-static-initialization flags
 // hosted_stdcpp's implicit default constructor as "possibly throwing"
-// purely because interface (its base) now has a non-static data member
-// (stall_start_, added for loop-stall detection) - it doesn't actually
-// analyze whether that member's own default construction can throw
-// (std::chrono::steady_clock::time_point's is trivial/noexcept), it just
-// treats "no longer a literally empty class" as enough to warn. Confirmed
-// by testing: any non-static member on interface at all triggers the
-// identical warning, regardless of its type.
+// purely because it now has non-static data members of its own
+// (stall_start_/current_loop_context_, holding what interface's own
+// virtual methods describe) - it doesn't actually analyze whether those
+// members' own default construction can throw (a
+// std::chrono::steady_clock::time_point and a void* both trivially/
+// noexcept default-construct), it just treats "no longer a literally
+// empty class" as enough to warn. Confirmed by testing: any non-static
+// member here at all triggers the identical warning, regardless of type.
 // NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 inline hosted_stdcpp default_instance{};
 inline interface* current_instance = &default_instance;

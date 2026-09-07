@@ -40,9 +40,27 @@ public:
     }
   }
 
+  // No-ops: none of these tests exercise est::loop's long-running-callback
+  // detection - platform::interface holds no state of its own to back a
+  // shared default for these (per review), so every concrete backend,
+  // this stub included, must answer them itself.
+  void reset_loop_stall_detection() noexcept override {}
+  void
+  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+
+  // A real, working slot, not a no-op, matching hosted_stdcpp's own
+  // shape - not exercised by any test in this file (none of them
+  // construct an est::loop under this stub), but a stub answering these
+  // incorrectly would be a silent trap for whoever adds one later.
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+    return current_loop_context;
+  }
+  void set_current_loop_context(void* context) noexcept override { current_loop_context = context; }
+
   static constexpr std::chrono::steady_clock::time_point epoch{};
   mutable std::optional<std::chrono::steady_clock::time_point> last_sleep_until;
   mutable std::optional<std::string> last_vprintdbg_message;
+  void* current_loop_context = nullptr;
 };
 
 } // namespace

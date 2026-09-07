@@ -29,6 +29,18 @@ public:
   // A no-op: nothing in these tests triggers a debug diagnostic.
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
 
+  // No-ops: these tests exercise est::timer_queue directly, never an
+  // est::loop, so neither the long-running-callback path nor the
+  // current-loop slot is ever touched - platform::interface holds no
+  // state of its own to back a shared default for either (per review),
+  // so every concrete backend, this fake included, must still answer
+  // them itself.
+  void reset_loop_stall_detection() noexcept override {}
+  void
+  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override { return nullptr; }
+  void set_current_loop_context(void* /*context*/) noexcept override {}
+
   // No `{}` needed: std::chrono::time_point's default constructor is a
   // real, user-provided constructor (time_point() : __d_(duration::zero())
   // {} in libc++'s <chrono>) that always zero-initializes, not a defaulted

@@ -3272,6 +3272,62 @@ nesting precondition isn't a full RAII stack; documented on `loop`'s own
 top comment (`loop.cppm`) rather than guarded against, since nothing in
 this codebase does this today.
 
+**Revised a third time (repo owner's own PR review comments): `platform::
+interface` should be a pure interface, full stop** - every method pure
+virtual, no data members of its own. The previous revision had put
+`current_loop_context_` directly on `interface`, with non-virtual
+accessors - "hold a pointer, hand it back" not being backend-specific
+behavior was true, but it meant `interface` still had one member and one
+pair of methods a derived class *couldn't* override, on top of
+`reset_loop_stall_detection()`/`detect_loop_stall()` (the long-running-
+callback detector, predating issue #30) which already had that exact
+shape - a default body backed by a member (`stall_start_`) declared
+directly on `interface`. Per review, both pairs move onto `hosted_stdcpp`
+entirely - state and logic alike - leaving `interface` with nothing but
+pure virtual declarations:
+
+```cpp
+// est::platform::interface - no data members anywhere on this class
+[[nodiscard]] virtual auto get_current_loop_context() const noexcept -> void* = 0;
+virtual void set_current_loop_context(void* context) noexcept = 0;
+virtual void reset_loop_stall_detection() noexcept = 0;
+virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
+
+// est::platform::hosted_stdcpp - owns the state, implements all four
+[[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  return current_loop_context_;
+}
+void set_current_loop_context(void* context) noexcept override { current_loop_context_ = context; }
+void reset_loop_stall_detection() noexcept override { stall_start_ = now(); }
+void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+  const auto elapsed = now() - stall_start_;
+  if (elapsed > threshold) { printdbg(...); }
+}
+private:
+  std::chrono::steady_clock::time_point stall_start_;
+  void* current_loop_context_ = nullptr;
+```
+
+Every test fake in `est/tests/` deriving from `interface` (`fake_platform`
+and `jumping_platform` in `loop_tests.cpp`, `stub_platform` in
+`platform_tests.cpp`, `fake_platform` in `timer_tests.cpp`) needed new
+overrides of all four, since none could compile as an abstract class
+otherwise. `jumping_platform` - whose entire purpose is exercising the
+long-running-callback path - lost its own "relies on inheriting
+`interface`'s default implementation" doc comment and gained a real
+`reset_loop_stall_detection()`/`detect_loop_stall()` pair duplicating
+`hosted_stdcpp`'s own logic against its own `stall_start` member; the
+other three fakes (which never trigger that path) got no-op bodies
+instead. `fake_platform`/`jumping_platform` in `loop_tests.cpp`, the two
+that actually construct an `est::loop` under them, needed a real, working
+`get_current_loop_context()`/`set_current_loop_context()` pair backed by
+their own member too - a no-op there would have silently broken
+`loop::current()` for every test using them; `stub_platform` and
+`timer_tests.cpp`'s `fake_platform` never construct a loop, so a
+not-exercised-but-still-correct member (`stub_platform`) or a bare
+`nullptr`/no-op pair (`timer_tests.cpp`, which drives `est::timer_queue`
+directly and never `est::loop` at all) were both fine there.
+
 A single slot with a checked precondition against nesting (constructing
 a second loop while one is already current is an `est::check()`
 failure), not a push/pop RAII stack like `platform::override_instance()`'s
@@ -3292,30 +3348,46 @@ the original loop-taking one:
 ```cpp
 template <class First, class... Rest>
   requires(!std::same_as<std::remove_cvref_t<First>, loop>)
-explicit promise_type(First& /*unused*/, Rest&... /*unused*/)
-    : detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(
-          loop::current().allocator(), loop::current())) {}
+explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(loop::current()) {}
 
-promise_type()
-    : detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(
-          loop::current().allocator(), loop::current())) {}
+promise_type() : promise_type(loop::current()) {}
 ```
 
-The `requires` clause is load-bearing: without it, this constructor and
-the original `promise_type(loop&, Args&...)` would be genuinely ambiguous
-for a call that *does* pass a loop first - a bare parameter pack happily
-absorbs a leading `loop&` into its own pack, so both candidates deduce to
-the identical actual parameter list for such a call, a tie conversion
-ranking alone can't break (confirmed by reasoning through the standard's
-partial-ordering rules before writing this, not just by testing - the
-constrained-SFINAE approach was chosen specifically to not have to *rely*
-on partial ordering, since it's a genuinely easy corner of overload
-resolution to get subtly wrong). A coroutine with no parameters at all
-needs its own non-template overload, since the constrained one still
-requires at least one `First`. `operator new` gained the identical three-
-way split, matched against the same argument list by the same "promise
-constructor arguments" rule, so whichever constructor is chosen and
-whichever `operator new` is chosen always agree on which loop to use.
+(Shown here in the delegating form a later review pass produced - see
+below.) The `requires` clause is load-bearing: without it, this
+constructor and the original `promise_type(loop&, Args&...)` would be
+genuinely ambiguous for a call that *does* pass a loop first - a bare
+parameter pack happily absorbs a leading `loop&` into its own pack, so
+both candidates deduce to the identical actual parameter list for such a
+call, a tie conversion ranking alone can't break (confirmed by reasoning
+through the standard's partial-ordering rules before writing this, not
+just by testing - the constrained-SFINAE approach was chosen specifically
+to not have to *rely* on partial ordering, since it's a genuinely easy
+corner of overload resolution to get subtly wrong). A coroutine with no
+parameters at all needs its own non-template overload, since the
+constrained one still requires at least one `First`. `operator new`
+gained the identical three-way split, matched against the same argument
+list by the same "promise constructor arguments" rule, so whichever
+constructor is chosen and whichever `operator new` is chosen always agree
+on which loop to use.
+
+**Revised (repo owner's own PR review): all three constructors should
+delegate to a single one that actually builds `state_`.** The original
+version above independently repeated the same
+`detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(...))`
+initializer three times. Since the first (loop-taking) constructor is
+already a template accepting an empty `Args...` pack, it already covers
+"just a `loop&`, nothing else" - so the other two now delegate straight to
+it: `promise_type(First&, Rest&...) : promise_type(loop::current()) {}`
+and `promise_type() : promise_type(loop::current()) {}`. Overload
+resolution among the class's own constructors still correctly picks the
+`(loop&, Args&...)` template for that single-argument delegating call (the
+`requires`-constrained one is excluded by its own clause, since the
+argument's type genuinely is `loop`), so this is a pure deduplication, not
+a behavior change. `operator new`'s three-way split wasn't touched -
+review flagged only the constructors, and each `operator new` overload
+was already a single-line call straight to
+`detail::coroutine_frame_alloc()`, with nothing left to deduplicate.
 
 `est::future<T>::get_promise()`, the issue's other original suggestion
 (let a bare `future<T>` be constructed and a matching `promise<T>`

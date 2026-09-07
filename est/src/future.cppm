@@ -838,18 +838,20 @@ public:
     // happily absorbs a leading loop& into Rest itself) - an ambiguity
     // conversion ranking alone can't break, since the two candidates
     // would be indistinguishable by it.
+    //
+    // Delegates to the constructor above (Args deduced empty) rather than
+    // repeating its body - per review, all three constructors should
+    // share the one place that actually builds state_. loop::current()'s
+    // own precondition (a loop must actually be current) is checked
+    // exactly once either way.
     template <class First, class... Rest>
       requires(!std::same_as<std::remove_cvref_t<First>, loop>)
-    explicit promise_type(First& /*unused*/, Rest&... /*unused*/)
-        : detail::future_promise_result<T>(
-              shared_ptr<future_state<T>>::make(loop::current().allocator(), loop::current())) {}
+    explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(loop::current()) {}
 
     // Issue #30: a coroutine taking no parameters at all - the
     // constructor above needs at least one (First is not optional), so
-    // this needs its own, non-template overload.
-    promise_type()
-        : detail::future_promise_result<T>(
-              shared_ptr<future_state<T>>::make(loop::current().allocator(), loop::current())) {}
+    // this needs its own, non-template overload. Delegates the same way.
+    promise_type() : promise_type(loop::current()) {}
 
     promise_type(const promise_type&) = delete;
     auto operator=(const promise_type&) -> promise_type& = delete;

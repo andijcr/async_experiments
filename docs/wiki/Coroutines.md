@@ -73,16 +73,24 @@ parameter at all, or no parameters whatsoever:
 ```cpp
 template <class First, class... Rest>
   requires(!std::same_as<std::remove_cvref_t<First>, loop>)
-explicit promise_type(First& /*unused*/, Rest&... /*unused*/)
-    : detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(
-          loop::current().allocator(), loop::current())) {}
+explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(loop::current()) {}
 
-promise_type()
-    : detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(
-          loop::current().allocator(), loop::current())) {}
+promise_type() : promise_type(loop::current()) {}
 ```
 
-(plus the matching `operator new` pair, same shapes). The `requires`
+Both delegate to the `loop&`-taking constructor above rather than
+repeating its initializer - per review, all three constructors should
+share the one place that actually builds `state_`. That constructor is
+already a template accepting an empty `Args...` pack, so
+`promise_type(loop::current())` (a single `loop&` argument) already
+matches it directly; the `requires`-constrained constructor is correctly
+excluded from that call by its own clause, since the argument's type
+genuinely is `loop`.
+
+(plus the matching `operator new` pair, same shapes - not delegated the
+same way, since each was already a single-line call straight to
+`detail::coroutine_frame_alloc()`, with nothing left to deduplicate). The
+`requires`
 clause on the first is load-bearing, not decoration: without it, this
 constructor and the `loop&`-taking one above would be genuinely
 ambiguous for a call that *does* pass a loop first - a bare parameter

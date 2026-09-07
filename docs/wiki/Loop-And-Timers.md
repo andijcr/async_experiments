@@ -76,22 +76,43 @@ onto `platform::interface` itself as a plain (still not `thread_local`)
 data member, with `get_current_loop_context()`/`set_current_loop_context()`
 as ordinary (non-virtual) methods on it - per repo owner review, this
 belongs on the platform instance rather than as parallel global state next
-to it. The two are equivalent in every case this codebase actually
+to it.
+
+**A third revision, also per repo owner review, went further still:
+`platform::interface` should be a pure interface, full stop** - every
+method pure virtual, no data members of its own at all. The two methods
+that used to have a shared default body backed by a member declared
+directly on `interface` - `get_current_loop_context()`/
+`set_current_loop_context()` from the second revision, and
+`reset_loop_stall_detection()`/`detect_loop_stall()` (the long-running-
+callback detector, already on `interface` before issue #30) - are now
+pure virtual too, with their state and logic moved onto `hosted_stdcpp`
+alongside its other overrides. Every test fake in `est/tests/` that
+derives from `interface` picked up matching overrides of its own: most
+are no-ops (nothing in those tests exercises loop-stall detection, or
+even constructs an `est::loop` at all, in `est/tests/timer_tests.cpp`'s
+case), but `est/tests/loop_tests.cpp`'s `fake_platform`/`jumping_platform`
+need working ones, since `est::loop` is genuinely constructed under both.
+
+The two designs behave identically in every case this codebase actually
 exercises (every `override_instance()` guard's scope brackets the full
 lifetime of any loop constructed under it - see `loop`'s own top comment
-for the one corner case this doesn't cover: swapping the platform instance
-out from under a still-live loop, rather than around one).
+for the one corner case neither version defends against: swapping the
+platform instance out from under a still-live loop, rather than around
+one).
 
-The actual storage is a plain `void*`, not `loop*`: `:platform` sits below
-`:loop` in the dependency DAG (this file's own top comment on why `:loop`
-imports `:platform`, never the reverse), so it can never name `est::loop`
-directly. `est::loop` performs the cast on both sides - safe by
-construction, not by RTTI, since the only two call sites that ever touch
-this slot are `loop`'s own constructor (stores `this`) and destructor
-(stores `nullptr`). The methods themselves are non-virtual, unlike
-`now()`/`sleep_until()`/`assert_failure()`: "hold a pointer and hand it
-back" isn't backend-specific behavior a future backend would ever need to
-answer differently.
+The actual storage is still a plain `void*`, not `loop*`: `:platform` sits
+below `:loop` in the dependency DAG (this file's own top comment on why
+`:loop` imports `:platform`, never the reverse), so it can never name
+`est::loop` directly. `est::loop` performs the cast on both sides - safe
+by construction, not by RTTI, since the only two call sites that ever
+touch this slot are `loop`'s own constructor (stores `this`) and
+destructor (stores `nullptr`). `get_current_loop_context()`/
+`set_current_loop_context()` are now virtual, unlike the second revision -
+not because "hold a pointer and hand it back" became backend-specific
+(it still isn't, for `hosted_stdcpp`), but because `interface` no longer
+special-cases *any* method as non-overridable state-holding, now that it
+holds no state for any of them.
 
 A single slot with a checked precondition against nesting, not a
 push/pop stack like `platform::override_instance()`'s: constructing a
@@ -166,15 +187,18 @@ void run_one(detail::ready_node& node) {
   `est::loop` calling `std::chrono`/`std::this_thread` directly: "how do
   we know a callback ran long" is a policy a backend should get to answer
   for itself. `est::loop` only calls the two bracketing hooks and owns the
-  threshold value; `platform::interface`'s default implementation of both
-  (inherited by `hosted_stdcpp` and every test fake unchanged) just
-  records `now()` on reset and compares against it on detect, printing via
-  `platform::printdbg()` if exceeded — the same synchronous, single-
-  threaded behavior as before. A future backend could override both to run
-  a watchdog on a background thread instead, catching (and reporting) a
-  stall in parallel while the callback is still running, rather than only
-  finding out once it returns — without `run_one()` itself changing at
-  all.
+  threshold value; both are pure virtual on `platform::interface` itself
+  (per repo owner review - see the `loop::current()` section above for the
+  fuller story on why `interface` carries no default bodies or state of
+  its own at all), so each concrete backend answers them itself.
+  `hosted_stdcpp`'s own override just records `now()` on reset and
+  compares against it on detect, printing via `platform::printdbg()` if
+  exceeded — the same synchronous, single-threaded behavior an earlier
+  version of this design had as `interface`'s shared default. A future
+  backend could implement both to run a watchdog on a background thread
+  instead, catching (and reporting) a stall in parallel while the callback
+  is still running, rather than only finding out once it returns —
+  without `run_one()` itself changing at all.
 
 ## Timers: `schedule_timer()`, and the `future<void>` bridge
 
