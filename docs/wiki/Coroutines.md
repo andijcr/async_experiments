@@ -33,17 +33,14 @@ of `sleep_for()`/`then()` chains. A caller genuinely cannot tell, from the
 type alone or from calling-stack behavior, whether a `future<T>` came from a
 coroutine or from ordinary continuation-passing code. That's the point.
 
-## The calling convention: `est::loop&` first
+## The calling convention: `est::loop&` first, or `est::current_loop()` (issue #30)
 
-Every `est::future<T>`-returning coroutine function must take `est::loop&`
-as its first parameter. This isn't a style preference — it's what
-`future<T>::promise_type`'s constructor and `operator new` pattern-match
-against, via C++20's "promise constructor arguments" rule: the compiler
-tries to construct `promise_type` from the same argument list the coroutine
-was actually called with, before ever falling back to a default constructor.
-`promise_type` here has no default constructor, so a coroutine that doesn't
-supply `est::loop&` first fails to compile with "no matching constructor for
-promise_type" rather than silently doing the wrong thing.
+An `est::future<T>`-returning coroutine function can take `est::loop&` as
+its first parameter - what `future<T>::promise_type`'s constructor and
+`operator new` originally, and still, pattern-match against, via C++20's
+"promise constructor arguments" rule: the compiler tries to construct
+`promise_type` from the same argument list the coroutine was actually
+called with, before ever falling back to a default constructor.
 
 ```cpp
 class promise_type : public detail::future_promise_result<T> {
@@ -51,8 +48,7 @@ public:
   template <class... Args>
   explicit promise_type(loop& loop_ref, Args&... /*unused*/)
       : detail::future_promise_result<T>(
-            shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)),
-        loop_(loop_ref) {}
+            shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)) {}
   ...
   template <class... Args>
   static auto operator new(std::size_t size, loop& loop_ref, Args&... /*unused*/) -> void* {
@@ -66,7 +62,54 @@ public:
 
 The trailing `Args&...` pack exists purely so this constructor/`operator
 new` pair matches *whatever else* the actual coroutine function declares
-(`read_and_double`'s `int input` above, say) — the pack is never read.
+(`read_and_double`'s `int input` above, say) — the pack is never read;
+`loop_ref` itself isn't stored either, only used here to build `state_`.
+
+**Issue #30** added two more ways to write a coroutine, for a caller
+content relying on whichever loop is current (`est::current_loop()`,
+[The Loop and Timers](Loop-And-Timers.md) - a free function, not a method
+on `est::loop` itself, deliberately kept out of `loop.cppm` entirely)
+instead of threading one through by hand - no `est::loop&` parameter at
+all, or no parameters whatsoever:
+
+```cpp
+template <class First, class... Rest>
+  requires(!std::same_as<std::remove_cvref_t<First>, loop>)
+explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(current_loop()) {}
+
+promise_type() : promise_type(current_loop()) {}
+```
+
+Both delegate to the `loop&`-taking constructor above rather than
+repeating its initializer - per review, all three constructors should
+share the one place that actually builds `state_`. That constructor is
+already a template accepting an empty `Args...` pack, so
+`promise_type(current_loop())` (a single `loop&` argument) already
+matches it directly; the `requires`-constrained constructor is correctly
+excluded from that call by its own clause, since the argument's type
+genuinely is `loop`.
+
+(plus the matching `operator new` pair, same shapes - not delegated the
+same way, since each was already a single-line call straight to
+`detail::coroutine_frame_alloc()`, with nothing left to deduplicate). The
+`requires`
+clause on the first is load-bearing, not decoration: without it, this
+constructor and the `loop&`-taking one above would be genuinely
+ambiguous for a call that *does* pass a loop first - a bare parameter
+pack happily absorbs a leading `loop&` into `Rest` itself, so both
+candidates would deduce to the identical actual parameter list
+`(loop&, Rest&...)` for such a call, a tie conversion ranking alone
+can't break. Excluding a leading `loop&` specifically (`std::same_as`,
+matching the exact-type match the constructor above already relies on,
+not a broader "convertible to") keeps the two mutually exclusive by
+SFINAE instead of relying on any partial-ordering tie-break. A coroutine
+taking no parameters at all needs its own non-template overload, since
+the constrained one above still requires at least one `First`.
+
+There's no default constructor with no `requires` clause at all - a
+future<T>-returning coroutine always resolves to exactly one of the
+three shapes above, based purely on its own parameter list, never
+silently misbehaving.
 
 `promise_type` doesn't hold its own `est::promise<T>` at all: it builds a
 `shared_ptr<future_state<T>>` directly (the same call

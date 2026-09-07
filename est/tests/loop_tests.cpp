@@ -56,19 +56,42 @@ public:
   // A no-op: nothing in these tests triggers a debug diagnostic.
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
 
+  // No-ops: nothing in these tests exercises the long-running-callback
+  // warning path (est/tests/loop_tests.cpp's jumping_platform, below, is
+  // what does) - platform::interface has no data members of its own to
+  // inherit a shared implementation from (per review), so every concrete
+  // backend, this fake included, must answer these itself.
+  void reset_loop_stall_detection() noexcept override {}
+  void
+  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+
+  // A real, working slot, not a no-op: est::make_current_loop()/
+  // est::current_loop() (est:util.current_loop) are actually exercised
+  // against this fake in several tests below, going through
+  // get_current_loop_context()/set_current_loop_context()
+  // (est::platform::interface's own doc comment) - a no-op here would
+  // silently break current_loop() for every one of them.
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
+    return current_loop_context;
+  }
+  void set_current_loop_context(est::loop* context) noexcept override {
+    current_loop_context = context;
+  }
+
   mutable std::chrono::steady_clock::time_point current;
+  est::loop* current_loop_context = nullptr;
 };
 
 // A platform whose now() advances by `step` on every single call - used
 // to make a continuation's runtime appear to exceed the long-running-
 // callback threshold without an actual real delay, so that code path gets
-// exercised (docs/PLAN.md, M3's "long-running-callback detection"). Relies
-// on inheriting interface::reset_loop_stall_detection()/
-// detect_loop_stall()'s default implementation unchanged (docs/PLAN.md's
-// "loop-stall detection moved to platform::interface" refactor) - it still
-// calls now() exactly twice bracketing node.run(), the same shape
-// loop::run_one() used to do directly before that logic moved onto
-// platform::interface itself.
+// exercised (docs/PLAN.md, M3's "long-running-callback detection"). Its
+// own reset_loop_stall_detection()/detect_loop_stall() below duplicate
+// hosted_stdcpp's own implementation (platform.cppm) rather than
+// inheriting a shared default - platform::interface holds no state of its
+// own to back one (per review) - but the shape is unchanged: still calls
+// now() exactly twice bracketing node.run(), the same measurement
+// loop::run_one() itself triggers via these two calls.
 class jumping_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
@@ -87,15 +110,37 @@ public:
   }
 
   // A no-op, not a std::cerr write: this fake's whole purpose is
-  // triggering detect_loop_stall()'s default body's diagnostic (see this
-  // class's own doc comment above), which does call this - but the test
-  // using it doesn't assert on the printed content (see its own doc
-  // comment), so silently discarding it here just keeps test output
-  // clean rather than actually writing anything.
+  // triggering detect_loop_stall()'s diagnostic below (see this class's
+  // own doc comment above) - but the test using it doesn't assert on the
+  // printed content (see its own doc comment), so silently discarding it
+  // here just keeps test output clean rather than actually writing
+  // anything.
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
+
+  void reset_loop_stall_detection() noexcept override { stall_start = now(); }
+
+  void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+    const auto elapsed = now() - stall_start;
+    if (elapsed > threshold) {
+      est::platform::printdbg(
+          "stall of {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    }
+  }
+
+  // A real, working slot: est::loop is constructed under this fake too
+  // (see get_current_loop_context()'s own doc comment on fake_platform,
+  // above, for why a no-op here isn't an option).
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
+    return current_loop_context;
+  }
+  void set_current_loop_context(est::loop* context) noexcept override {
+    current_loop_context = context;
+  }
 
   mutable std::chrono::steady_clock::time_point current;
   std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);
+  mutable std::chrono::steady_clock::time_point stall_start;
+  est::loop* current_loop_context = nullptr;
 };
 
 } // namespace
@@ -374,4 +419,69 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
+}
+
+// Issue #30: est::make_current_loop()/current_loop()
+// (est:util.current_loop) and the no-loop sugar built on current_loop().
+// est::check()'s own failure path (make_current_loop()-ing a second loop
+// while one is already current, or calling current_loop() with none
+// registered and no fallback available) isn't unit-testable in this
+// codebase - it terminates the process, same as every other checked
+// precondition (est/tests/check_tests.cpp's own doc comment) - so only
+// the happy path is covered here.
+
+TEST_CASE("current_loop() returns whichever loop called make_current_loop()", "[loop]") {
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  REQUIRE(&est::current_loop() == &loop);
+}
+
+TEST_CASE("make_promise_future<T>() with no loop argument uses est::current_loop()", "[loop]") {
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_value(42);
+  REQUIRE(future.ready());
+  REQUIRE(future.get() == 42);
+}
+
+TEST_CASE("sleep_for()/sleep_until()/yield_execution() with no loop argument use "
+          "est::current_loop()",
+          "[loop]") {
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto platform_guard = est::platform::override_instance(fake);
+
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  auto slept_for = est::sleep_for(10s);
+  auto slept_until = est::sleep_until(fake.current + 5s);
+  auto yielded = est::yield_execution();
+  REQUIRE_FALSE(slept_for.ready());
+  REQUIRE_FALSE(slept_until.ready());
+  REQUIRE_FALSE(yielded.ready());
+
+  loop.run_until_idle();
+  REQUIRE(slept_for.ready());
+  REQUIRE(slept_until.ready());
+  REQUIRE(yielded.ready());
+}
+
+TEST_CASE("current_loop() with nothing explicitly registered falls back to hosted_stdcpp's "
+          "own default loop",
+          "[loop]") {
+  // No est::make_current_loop() call anywhere in this test, and no
+  // override_instance() either - the one test in this file that runs
+  // against the real, default platform::instance() (hosted_stdcpp),
+  // specifically to exercise its own get_current_loop_context() fallback
+  // (module estext) rather than a fake's or an explicitly registered
+  // loop. yield_execution(), not sleep_for()/sleep_until(): this runs
+  // against the real backend, so a timer-based wait would be a genuine
+  // (if short) wall-clock sleep - yield_execution() resolves through the
+  // ready-queue alone, no real deadline involved.
+  auto yielded = est::yield_execution();
+  REQUIRE_FALSE(yielded.ready());
+  est::current_loop().run_until_idle();
+  REQUIRE(yielded.ready());
 }

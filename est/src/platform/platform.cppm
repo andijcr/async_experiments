@@ -3,11 +3,30 @@ export module est:platform;
 import std;
 import :util.scope_exit;
 
-// The hosted-stdcpp platform backend, and the runtime-polymorphic seam it
-// plugs into. `interface` is what est::check()/est::timer_queue actually
+// The runtime-polymorphic seam est::check()/est::timer_queue actually
 // need from "the platform" - a monotonic clock, and an answer to "what
-// happens when a check fails." `hosted_stdcpp` is the only implementation
-// that exists so far.
+// happens when a check fails." `interface` is deliberately the *only*
+// thing this module knows about a platform: a pure abstract base with no
+// concrete backend of its own. An earlier version defined `hosted_stdcpp`
+// right here too; per review, it now lives in its own module,
+// `:platform.hosted_stdcpp` - not for this class's own sake, but because
+// that backend's "current loop" fallback (issue #30, see its own doc
+// comment on get_current_loop_context() below) needs to *construct* an
+// actual est::loop, not just name the type - this module can forward-
+// declare est::loop just fine (below), since an exported forward
+// declaration in one partition of a module attaches to the real
+// definition in another partition of the *same* module without needing
+// an import edge between them (confirmed against this exact toolchain: a
+// plain, non-exported forward declaration does *not* work this way -
+// clang diagnoses it as redeclaring an entity with module-private
+// linkage). What `:platform` still can't do is construct one, call any
+// of its methods, or otherwise need it as a complete type - `:loop`
+// itself is what `:platform` never imports, keeping the dependency DAG a
+// strict one-way street. A concrete backend, being a *different*
+// partition, is free to `import :loop` for that; this one still isn't.
+// (This is the same split issue #6 once proposed and this codebase
+// closed as "no concrete payoff with only one backend" - docs/PLAN.md -
+// there's a real one now.)
 //
 // This is virtual dispatch through a single global object, not a
 // compile-time template parameter (docs/PLAN.md records why: a prior,
@@ -15,17 +34,30 @@ import :util.scope_exit;
 // was rejected; this design actually drops est::timer_queue's Platform
 // template parameter, at the cost of one indirect call per now()/
 // assert_failure() instead of a direct one). A future bare-metal backend
-// is a second `final` class implementing `interface`, installed as the
-// global instance at startup, not a framework redesign.
+// is a second `final` class implementing `interface`, in its own module
+// alongside `hosted_stdcpp`, installed as the global instance at startup
+// (or compiled in at link time instead of hosted_stdcpp entirely -
+// "ideally at link time, but for simplicity it's a vtable" for now) - not
+// a framework redesign either way.
+
+// Forward declaration only, deliberately `export`ed - see this file's own
+// top comment for why this (and not a plain, non-exported declaration)
+// is what makes get_current_loop_context()/set_current_loop_context()
+// below able to name `est::loop*` directly, with no `:loop` import and no
+// `void*`+cast in sight.
+export namespace est {
+class loop;
+}
+
 export namespace est::platform {
 
 class interface;
 
-// Declared here (defined later, once hosted_stdcpp/detail::
-// current_instance exist for its body to reference) purely so printdbg()
-// below - and, transitively, interface::detect_loop_stall()'s default
-// body - can call it. See instance()'s own canonical doc comment further
-// down for what it actually does.
+// Declared here (defined later, once detail::current_instance exists for
+// its body to reference) purely so printdbg() below - and, transitively,
+// hosted_stdcpp::detect_loop_stall() (:platform.hosted_stdcpp) - can call
+// it. See instance()'s own canonical doc comment further down for what it
+// actually does.
 [[nodiscard]] auto instance() noexcept -> interface&;
 
 // A best-effort, nothrow debug diagnostic. Does the compile-time-checked
@@ -48,6 +80,20 @@ class interface;
 // isn't.
 template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept;
 
+// A pure interface, deliberately: every method below is pure virtual and
+// this class holds no data members of its own - per review, "the
+// implementation" (state included) belongs entirely to whichever concrete
+// backend needs it (hosted_stdcpp, :platform.hosted_stdcpp), not to this
+// abstraction. Two methods here (reset_loop_stall_detection()/
+// detect_loop_stall(), get_current_loop_context()/
+// set_current_loop_context()) used to have default bodies backed by
+// members declared right here - moved onto hosted_stdcpp instead,
+// alongside its other overrides, so this class stays what its name says:
+// an interface, not a partial implementation with some state
+// pre-supplied. A future bare-metal backend implements every one of these
+// itself, the same as it already had to for now()/sleep_until()/
+// assert_failure()/vprintdbg(); it just no longer gets two of them "for
+// free."
 class interface {
 public:
   interface() = default;
@@ -81,12 +127,7 @@ public:
   // mirroring std::vprint_unicode()'s split from std::print(): printdbg()
   // does the compile-time-checked formatting and type-erases the
   // arguments via std::make_format_args(), this decides what happens to
-  // the result. Pure virtual, not defaulted the way
-  // reset_loop_stall_detection()/detect_loop_stall() below are: unlike
-  // "measure wall-clock time" (genuinely backend-agnostic), "where does a
-  // debug line go" has no universal answer - a bare-metal backend may
-  // have no console at all, or want to write somewhere other than a
-  // stream. An implementation must swallow its own failures (an I/O
+  // the result. An implementation must swallow its own failures (an I/O
   // error, e.g.) internally - printdbg() itself already promises nothrow,
   // best-effort behavior, and can't do that on this method's behalf
   // without seeing inside it.
@@ -100,22 +141,15 @@ public:
   // platform, for the same reason now()/sleep_until() are platform
   // hooks rather than est::loop calling std::chrono/std::this_thread
   // directly: "how do we know a callback ran long" is a policy a backend
-  // should get to answer for itself. The default implementation just
-  // records now() into a member for detect_loop_stall() to compare
-  // against - the only strategy that makes sense for a single-threaded,
-  // synchronous-checkpoint backend like hosted_stdcpp. A future backend
-  // could override both this and detect_loop_stall() to run a watchdog on
-  // a background thread instead, checking for (and reporting) a stall in
-  // parallel while the callback is still running, rather than only
-  // finding out once it returns.
-  //
-  // Virtual with a default body, not pure: unlike now()/sleep_until()/
-  // assert_failure() (which every backend must answer for itself),
-  // reset_loop_stall_detection()/detect_loop_stall() have one sensible
-  // default nearly every backend can just inherit - hosted_stdcpp does,
-  // and so does every test fake in est/tests/ that only overrides now()/
-  // sleep_until()/assert_failure() (unaffected by this addition).
-  virtual void reset_loop_stall_detection() noexcept { stall_start_ = now(); }
+  // should get to answer for itself. hosted_stdcpp's own override
+  // (:platform.hosted_stdcpp) just records now() into a member for its
+  // detect_loop_stall() to compare against - the only strategy that makes
+  // sense for a single-threaded, synchronous-checkpoint backend. A future
+  // backend could override both this method and detect_loop_stall() to
+  // run a watchdog on a background thread instead, checking for (and
+  // reporting) a stall in parallel while the callback is still running,
+  // rather than only finding out once it returns.
+  virtual void reset_loop_stall_detection() noexcept = 0;
 
   // Checked by est::loop::run_one() right after a node/timer callback
   // returns: has it been longer than `threshold` since the matching
@@ -128,17 +162,33 @@ public:
   // reset_loop_stall_detection(), so est::loop's own
   // long_running_threshold (docs/PLAN.md, M3) stays the single source of
   // truth for the value, unchanged by which backend is installed.
-  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept {
-    const auto elapsed = now() - stall_start_;
-    if (elapsed > threshold) {
-      printdbg("est::loop: a continuation took {}ms (> {}ms threshold) to run",
-               std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
-               std::chrono::duration_cast<std::chrono::milliseconds>(threshold).count());
-    }
-  }
+  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
 
-private:
-  std::chrono::steady_clock::time_point stall_start_;
+  // est::loop's own "current loop" slot (issue #30) - held wherever the
+  // installed interface implementation keeps it (hosted_stdcpp's own
+  // member, :platform.hosted_stdcpp), rather than as a free-standing
+  // global living alongside current_instance further down: :platform
+  // already tracks "the current one" for interface itself via
+  // current_instance/instance(), so this reuses that same idea instead of
+  // inventing a parallel piece of global state. See est::loop's own top
+  // comment for why this exists at all, and why it's deliberately not
+  // thread_local (docs/PLAN.md's bare-metal embedded port stretch goal -
+  // freestanding, no OS - may have no well-defined thread_local support).
+  //
+  // A genuinely typed est::loop*, not an opaque void* - see the forward
+  // declaration above (and this file's own top comment) for how this
+  // module gets to name est::loop without importing :loop: naming the
+  // type is fine, constructing or otherwise completing one is what would
+  // actually invert the dependency DAG, and no method here needs to.
+  // Whichever concrete backend implements this is the one place that
+  // actually completes the type (:platform.hosted_stdcpp's own `import
+  // :loop;`) - the only call sites that ever write into this slot are
+  // est::loop::make_current()'s own guard (storing `this`, then `nullptr`
+  // when the guard is destroyed) and, for hosted_stdcpp specifically, its
+  // own lazily-constructed fallback loop.
+  [[nodiscard]] virtual auto get_current_loop_context() const noexcept -> est::loop* = 0;
+
+  virtual void set_current_loop_context(est::loop* context) noexcept = 0;
 };
 
 // The actual body, deferred until here (see the forward declaration's own
@@ -162,114 +212,37 @@ template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args
   }
 }
 
-class hosted_stdcpp final : public interface {
-public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
-    return std::chrono::steady_clock::now();
-  }
-
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
-    std::this_thread::sleep_until(deadline);
-  }
-
-  // std::vprint_unicode(), not std::println(): this is the type-erased
-  // half of the split printdbg()/interface::vprintdbg() (platform.cppm's
-  // own doc comments) exists for - fmt/args already arrive pre-erased via
-  // std::format_args, exactly what std::vprint_unicode() itself takes, so
-  // there's no formatting left for this override to do beyond handing
-  // both straight through to std::cerr.
-  void vprintdbg(std::string_view fmt, std::format_args args) const noexcept override {
-    // Same reasoning as assert_failure()'s own try/catch below:
-    // std::vprint_unicode() can throw (a format error, or an I/O
-    // failure), swallowed here rather than escaping this noexcept
-    // method - printdbg() promises best-effort, nothrow behavior to its
-    // own caller, and this is the one place actually positioned to
-    // fulfill that promise for this backend.
-    try {
-      std::vprint_unicode(std::cerr, fmt, args);
-      // NOLINTNEXTLINE(bugprone-empty-catch)
-    } catch (...) {
-    }
-  }
-
-  // One std::println call, not several - a reviewer comment on an
-  // earlier, multi-call version pointed out there's no reason to split
-  // this into 2-3 separate writes when a single format string says the
-  // same thing; always including `message` (even when empty, giving
-  // "assertion failed:  (in func)" with a blank between the colons) is a
-  // deliberate simplification, not an oversight - the empty case is rare
-  // enough (every current est::check() call site either always or never
-  // passes one) that a special-cased branch to avoid a stray blank isn't
-  // worth the extra code on a path that only exists to report a bug.
-  // Directly to std::cerr, not building an intermediate std::string
-  // first: the whole point of std::print's format_string overload is
-  // writing straight into the destination.
-  //
-  // std::cerr (an ostream), not stderr (a FILE*): unlike stderr, std::cerr
-  // is a proper namespace-std entity, so it needs nothing beyond
-  // `import std;` to reach - no #include, unlike the FILE*-based stderr
-  // this replaced (see docs/PLAN.md). Confirmed with a standalone
-  // `import std;`-only program that actually triggers this path (not
-  // just compiles it) that std::cerr writes correctly with no <iostream>
-  // #include anywhere in the TU - the standard library's own static
-  // initialization for the standard streams isn't skipped just because
-  // the include was replaced by an import.
-  [[noreturn]] void assert_failure(std::string_view message,
-                                   std::source_location location) const noexcept override {
-    // std::println can throw (std::format_error, or an I/O failure) -
-    // caught and discarded rather than left to escape this noexcept
-    // function: aborting either way is the whole point of
-    // assert_failure, so a best-effort diagnostic isn't worth preferring
-    // one termination path over another. Same pattern
-    // examples/hello_world/main.cpp already needs around its own
-    // std::println call, for the same reason.
-    try {
-      std::println(std::cerr,
-                   "{}:{}: assertion failed: {} (in {})",
-                   location.file_name(),
-                   location.line(),
-                   message,
-                   location.function_name());
-      // Deliberately empty: std::abort() unconditionally follows below
-      // regardless of whether the diagnostic above printed successfully,
-      // so there's nothing to handle or re-throw here.
-      // NOLINTNEXTLINE(bugprone-empty-catch)
-    } catch (...) {
-    }
-    std::abort();
-  }
-};
-
 } // namespace est::platform
 
 // Not part of est::platform's exported surface (unlike future.cppm's own
 // est::detail, this one is nested under est::platform specifically since
 // it's platform-local state, not a framework-wide implementation detail)
 // - a plain, non-exported `namespace est::platform::detail` here, so
-// `default_instance`/`current_instance` stay reachable only from within
-// this module, not assignable by any `import est;` consumer bypassing
-// instance()/override_instance() below.
+// `current_instance` stays reachable only from within this module, not
+// assignable by any `import est;` consumer bypassing instance()/
+// override_instance() below.
 namespace est::platform::detail {
-// False positive below: bugprone-throwing-static-initialization flags
-// hosted_stdcpp's implicit default constructor as "possibly throwing"
-// purely because interface (its base) now has a non-static data member
-// (stall_start_, added for loop-stall detection) - it doesn't actually
-// analyze whether that member's own default construction can throw
-// (std::chrono::steady_clock::time_point's is trivial/noexcept), it just
-// treats "no longer a literally empty class" as enough to warn. Confirmed
-// by testing: any non-static member on interface at all triggers the
-// identical warning, regardless of its type.
-// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
-inline hosted_stdcpp default_instance{};
-inline interface* current_instance = &default_instance;
+// No default backend constructed here, unlike an earlier version: the
+// only backend that exists, hosted_stdcpp, now lives in its own module
+// (:platform.hosted_stdcpp, this file's own top comment explains why),
+// which :platform can't import without inverting the dependency DAG the
+// other way. Starts null; est.cppm's own module initializer is what
+// actually installs hosted_stdcpp as the real default, once, before any
+// user code can run (its own comment explains how) - instance() below is
+// only ever safe to call after that has happened, which `import est;`
+// itself guarantees.
+inline interface* current_instance = nullptr;
 } // namespace est::platform::detail
 
 export namespace est::platform {
 
 // The globally accessible platform object est::check()/est::timer_queue
-// actually call through - defaults to hosted_stdcpp. Tests retarget it for
-// a scope via override_instance(), below; a future bare-metal backend
-// would install its own implementation here at startup instead.
+// actually call through - defaults to hosted_stdcpp, installed by
+// est.cppm's own module initializer (:platform.hosted_stdcpp) rather than
+// by this module itself (detail::current_instance's own doc comment
+// explains why). Tests retarget it for a scope via override_instance(),
+// below; a future bare-metal backend would install its own implementation
+// here at startup instead.
 [[nodiscard]] inline auto instance() noexcept -> interface& {
   return *detail::current_instance;
 }

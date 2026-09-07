@@ -4,6 +4,7 @@ import std;
 import :future;
 import :loop;
 import :platform;
+import :util.current_loop;
 import :util.shared_ptr;
 
 export namespace est {
@@ -59,6 +60,14 @@ template <class T> auto make_promise_future(loop& loop_ref) -> std::pair<promise
   auto state = shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref);
   auto state_for_future = state; // copy bumps the ref count from 1 to 2
   return {promise<T>(std::move(state)), future<T>(std::move(state_for_future))};
+}
+
+// Issue #30: sugar over the overload above using est::current_loop()
+// (est:util.current_loop) instead of a caller-supplied loop& - for a
+// caller that doesn't want to thread a loop& through by hand and is
+// content relying on whichever loop is current.
+template <class T> auto make_promise_future() -> std::pair<promise<T>, future<T>> {
+  return make_promise_future<T>(current_loop());
 }
 
 } // namespace est
@@ -157,11 +166,23 @@ export namespace est {
   return std::move(fut);
 }
 
+// Issue #30: sugar over the overload above using est::current_loop()
+// instead of a caller-supplied loop&.
+[[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
+  return sleep_until(current_loop(), deadline);
+}
+
 // Returns a future<void> that becomes ready once `delay` elapses from
 // now (est::platform::instance().now(), the same clock est::timer_queue
 // itself is built on, docs/PLAN.md M1) - sugar over sleep_until() above.
 [[nodiscard]] inline auto sleep_for(loop& loop_ref, loop::clock::duration delay) -> future<void> {
   return sleep_until(loop_ref, platform::instance().now() + delay);
+}
+
+// Issue #30: sugar over the overload above using est::current_loop()
+// instead of a caller-supplied loop&.
+[[nodiscard]] inline auto sleep_for(loop::clock::duration delay) -> future<void> {
+  return sleep_for(current_loop(), delay);
 }
 
 // Issue #45: gives `loop_ref` the opportunity to run whatever else is
@@ -187,6 +208,12 @@ export namespace est {
   auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
+}
+
+// Issue #30: sugar over the overload above using est::current_loop()
+// instead of a caller-supplied loop&.
+[[nodiscard]] inline auto yield_execution() -> future<void> {
+  return yield_execution(current_loop());
 }
 
 } // namespace est

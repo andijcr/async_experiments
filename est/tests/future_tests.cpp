@@ -799,3 +799,61 @@ TEST_CASE("dropping an awaited future_state destroys the still-suspended corouti
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
+
+// Issue #30: a coroutine's own promise_type no longer requires est::loop&
+// as its first parameter - it falls back to est::current_loop()
+// (est:util.current_loop) instead, matched via the same "promise
+// constructor arguments" rule that the loop-taking convention already
+// relies on (see promise_type's own doc comment). Both new overload
+// shapes (some-parameters-but-not-loop, and no-parameters-at-all) get
+// their own test - the interesting risk here isn't behavior, it's
+// overload resolution: promise_type has three constructor/operator new
+// pairs now, and the wrong one silently winning would either fail to
+// compile (caught immediately) or, worse, compile and quietly ignore the
+// intended loop.
+
+TEST_CASE("a coroutine with no loop& parameter uses est::current_loop()", "[future][coroutine]") {
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  auto coro = [](int value) -> est::future<int> { co_return value + 1; };
+
+  auto fut = coro(41);
+  REQUIRE(fut.ready());
+  REQUIRE(fut.get() == 42);
+}
+
+TEST_CASE("a coroutine with no parameters at all uses est::current_loop()", "[future][coroutine]") {
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  auto coro = []() -> est::future<int> { co_return 42; };
+
+  auto fut = coro();
+  REQUIRE(fut.ready());
+  REQUIRE(fut.get() == 42);
+}
+
+TEST_CASE("a loop-less coroutine genuinely suspends and resumes via est::current_loop()",
+          "[future][coroutine]") {
+  // Not just "runs synchronously to completion" (both tests above never
+  // hit a real suspension point) - this one actually suspends on a
+  // not-yet-ready future and needs loop.run_until_idle() to resume it,
+  // proving the frame was allocated against the *same* loop
+  // current_loop() names, not some other one.
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto coro = [](est::future<int>& fut) -> est::future<int> {
+    const int value = co_await fut;
+    co_return value * 2;
+  };
+
+  auto result = coro(future);
+  REQUIRE_FALSE(result.ready());
+
+  promise.set_value(21);
+  loop.run_until_idle();
+  REQUIRE(result.ready());
+  REQUIRE(result.get() == 42);
+}

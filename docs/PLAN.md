@@ -681,6 +681,16 @@ flagged the tests' own `.find(x) != npos` idiom in favor of C++23's
   functions with no concrete payoff today - only one platform backend
   exists. Revisit once/if a second backend (the bare-metal stretch goal)
   is actually being built.
+  **Reopened and implemented in the issue #30 PR** (see that section's
+  "Revised a fifth time" below) once a real payoff appeared: not a second
+  *backend*, but `hosted_stdcpp` needing to name `est::loop` for its own
+  "current loop" fallback - something `:platform` itself can never do
+  without inverting the module dependency DAG. `hosted_stdcpp` moved into
+  its own module, `est/src/platform/hosted_stdcpp.cppm`
+  (`:platform.hosted_stdcpp`), free to depend on both `:platform` and
+  `:loop` precisely because it's no longer `:platform` itself. (Moved
+  again in that same PR's "Revised a seventh time" - out of `est`'s own
+  module entirely, into a wholly separate one, `estext`.)
 - **#11** (`shared_ptr` adopt-a-pointer constructor + a `shared_base`
   mixin for `shared_from_this()` parity) - nothing in the codebase needs
   self-referencing `shared_ptr`s yet; building the mixin now means
@@ -3198,6 +3208,593 @@ above on its first sanitize run and passes clean after the reorder; the
 tests, being otherwise a pure refactor of already-tested behavior);
 `clang-format`/`clang-tidy` clean; full suite passes under the `sanitize`
 preset (ASan+UBSan) too; both example binaries still run correctly.
+
+### Issue #30: `loop::current()` - user-visible types no longer require an explicit `loop&` (done)
+
+The issue's own original suggestion was `platform::get_loop()`, a method
+on `est::platform` mirroring `platform::instance()`. A first pass at this
+rejected that in favor of a `thread_local loop*` scoped to `loop`'s own
+constructor/destructor, reasoning that `platform::interface` is safe as a
+global specifically because it's stateless policy (`docs/wiki/
+Loop-And-Timers.md`'s own "why an explicit `loop&`, not a global
+singleton" section) and a mutable `loop*` living there would reintroduce
+exactly the state that section rules out.
+
+Revised (repo owner's own review): that reasoning solved a problem this
+codebase doesn't have while creating one it does. This codebase already
+has a plain, *non*-`thread_local` global doing exactly this "which one is
+current" job - `platform::detail::current_instance` (`instance()`/
+`override_instance()`, `platform.cppm`) - so a second global following
+the identical pattern costs nothing new. `thread_local`, on the other
+hand, is something this codebase has never otherwise needed, and the
+repo owner is specifically targeting a future bare-metal backend
+(`docs/PLAN.md`'s own stretch goal, freestanding/no-OS) where
+`thread_local` may have no well-defined support at all - reaching for it
+here would have introduced a genuinely new, more fragile requirement to
+solve a problem a plain global already avoids just fine.
+
+First implemented as `est::platform::detail::current_loop_context`, a
+plain `void*` global living in `:platform` alongside `current_instance`,
+with plain accessor functions mirroring `instance()`/`override_instance()`
+- not `loop*` (this partition sits below `:loop` in the dependency DAG, so
+it can never name `est::loop` directly; `est::loop` performs the cast on
+both sides, safe by construction since the only two call sites that ever
+touch it are `loop`'s own constructor and destructor).
+
+**Revised again (repo owner's own review): `get_current_loop_context()`
+should be a method of the platform instance**, not a second free-standing
+global living next to `current_instance`. Moved onto `platform::interface`
+itself as a plain data member, with `get_current_loop_context()`/
+`set_current_loop_context()` as ordinary (non-virtual) methods on it -
+still not virtual, for the same reason as before: nothing about "hold a
+pointer, hand it back" is backend-specific behavior the way `now()`/
+`sleep_until()` genuinely are, so there's nothing here for a derived class
+to override:
+
+```cpp
+// est::platform::interface
+[[nodiscard]] auto get_current_loop_context() const noexcept -> void* {
+  return current_loop_context_;
+}
+void set_current_loop_context(void* context) noexcept { current_loop_context_ = context; }
+private:
+  void* current_loop_context_ = nullptr;
+
+// est:loop
+[[nodiscard]] static auto current() -> loop& {
+  auto* const context = platform::instance().get_current_loop_context();
+  check(context != nullptr, "est::loop::current(): no loop is current (issue #30) ...");
+  return *static_cast<loop*>(context);
+}
+```
+
+The two designs behave identically for every case this codebase actually
+exercises: `platform::instance()` only ever points at one `interface` at a
+time, and every `override_instance()` guard in this codebase brackets the
+full lifetime of any loop constructed under it (`loop_tests.cpp`,
+`timer_tests.cpp`) - the loop's constructor and destructor always run
+against the same installed instance. The one corner case the per-instance
+version doesn't defend against - swapping the platform instance out from
+under a still-live loop, rather than around one, which would let that
+loop's destructor clear a *different* instance's (and possibly a different
+loop's) slot - isn't checked for here, same as `loop::current()`'s own
+nesting precondition isn't a full RAII stack; documented on `loop`'s own
+top comment (`loop.cppm`) rather than guarded against, since nothing in
+this codebase does this today.
+
+**Revised a third time (repo owner's own PR review comments): `platform::
+interface` should be a pure interface, full stop** - every method pure
+virtual, no data members of its own. The previous revision had put
+`current_loop_context_` directly on `interface`, with non-virtual
+accessors - "hold a pointer, hand it back" not being backend-specific
+behavior was true, but it meant `interface` still had one member and one
+pair of methods a derived class *couldn't* override, on top of
+`reset_loop_stall_detection()`/`detect_loop_stall()` (the long-running-
+callback detector, predating issue #30) which already had that exact
+shape - a default body backed by a member (`stall_start_`) declared
+directly on `interface`. Per review, both pairs move onto `hosted_stdcpp`
+entirely - state and logic alike - leaving `interface` with nothing but
+pure virtual declarations:
+
+```cpp
+// est::platform::interface - no data members anywhere on this class
+[[nodiscard]] virtual auto get_current_loop_context() const noexcept -> void* = 0;
+virtual void set_current_loop_context(void* context) noexcept = 0;
+virtual void reset_loop_stall_detection() noexcept = 0;
+virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
+
+// est::platform::hosted_stdcpp - owns the state, implements all four
+[[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  return current_loop_context_;
+}
+void set_current_loop_context(void* context) noexcept override { current_loop_context_ = context; }
+void reset_loop_stall_detection() noexcept override { stall_start_ = now(); }
+void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+  const auto elapsed = now() - stall_start_;
+  if (elapsed > threshold) { printdbg(...); }
+}
+private:
+  std::chrono::steady_clock::time_point stall_start_;
+  void* current_loop_context_ = nullptr;
+```
+
+Every test fake in `est/tests/` deriving from `interface` (`fake_platform`
+and `jumping_platform` in `loop_tests.cpp`, `stub_platform` in
+`platform_tests.cpp`, `fake_platform` in `timer_tests.cpp`) needed new
+overrides of all four, since none could compile as an abstract class
+otherwise. `jumping_platform` - whose entire purpose is exercising the
+long-running-callback path - lost its own "relies on inheriting
+`interface`'s default implementation" doc comment and gained a real
+`reset_loop_stall_detection()`/`detect_loop_stall()` pair duplicating
+`hosted_stdcpp`'s own logic against its own `stall_start` member; the
+other three fakes (which never trigger that path) got no-op bodies
+instead. `fake_platform`/`jumping_platform` in `loop_tests.cpp`, the two
+that actually construct an `est::loop` under them, needed a real, working
+`get_current_loop_context()`/`set_current_loop_context()` pair backed by
+their own member too - a no-op there would have silently broken
+`loop::current()` for every test using them; `stub_platform` and
+`timer_tests.cpp`'s `fake_platform` never construct a loop, so a
+not-exercised-but-still-correct member (`stub_platform`) or a bare
+`nullptr`/no-op pair (`timer_tests.cpp`, which drives `est::timer_queue`
+directly and never `est::loop` at all) were both fine there.
+
+A single slot with a checked precondition against nesting (constructing
+a second loop while one is already current is an `est::check()`
+failure), not a push/pop RAII stack like `platform::override_instance()`'s
+- simpler to reason about, and nothing in this codebase has a legitimate
+reason to nest loops today.
+
+**Revised a fourth time (repo owner's own PR review): "creating a loop
+and setting it as current should be the caller's responsibility," not
+something `loop`'s own constructor decides unconditionally.** The
+auto-registration above - stores `this` in the constructor, clears it in
+the destructor - got reverted outright: `est::loop`'s constructor and
+destructor are back to knowing nothing about "current" at all. In its
+place, a new method, `make_current()`, does the registration explicitly
+and returns an `est::scope_exit`-based guard, modeled directly on
+`platform::override_instance()`'s own RAII shape:
+
+```cpp
+[[nodiscard]] auto make_current() noexcept {
+  check(!detail::loop_is_current,
+        "est::loop::make_current(): another loop is already current (issue #30) - only one "
+        "loop can be current at a time");
+  detail::loop_is_current = true;
+  platform::instance().set_current_loop_context(this);
+  return scope_exit([]() noexcept {
+    detail::loop_is_current = false;
+    platform::instance().set_current_loop_context(nullptr);
+  });
+}
+```
+
+The nesting-precondition check moved with it, but *not* onto
+`get_current_loop_context() == nullptr` the way the constructor's own
+check used to read it - that question changes meaning under the fifth
+revision below (it becomes "is nothing explicitly registered," not
+"nothing is registered at all," once a fallback exists). A dedicated flag,
+`detail::loop_is_current` (a plain, non-`thread_local` `bool` local to
+`:loop`, same bare-metal reasoning as this section's every other global),
+tracks "has some loop called `make_current()`" independently of whatever
+`:platform`'s own storage returns.
+
+**Revised a fifth time, in the same round of review, to actually deliver
+the ergonomic goal issue #30 was chasing: a caller that never wants to
+think about `est::loop` at all.** Without this, `loop::current()` would
+simply fail its own precondition until *something* called
+`make_current()` - workable, but no more convenient than before for the
+simplest case (a script, an example) that has no loop to register in the
+first place. Per review: **`hosted_stdcpp` should create a loop and
+return it from `get_current_loop_context()`** - lazily, on first use,
+whenever nothing has been explicitly registered:
+
+```cpp
+// est::platform::hosted_stdcpp (now in its own module - see below)
+[[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  if (explicit_loop_ != nullptr) {
+    return explicit_loop_;
+  }
+  if (!default_loop_.has_value()) {
+    default_loop_.emplace();
+  }
+  return &*default_loop_;
+}
+void set_current_loop_context(void* context) noexcept override { explicit_loop_ = context; }
+private:
+  void* explicit_loop_ = nullptr;
+  mutable std::optional<loop> default_loop_;
+```
+
+`explicit_loop_` (whatever a caller most recently registered via
+`make_current()`) takes priority whenever set; `default_loop_` is
+`hosted_stdcpp`'s own fallback, constructed once and kept for as long as
+that `hosted_stdcpp` instance lives - not torn down and rebuilt every time
+an explicit registration comes and goes. A caller using the fallback
+drives it exactly like any other loop: `est::loop::current().run_until_idle();`,
+without ever writing `est::loop loop;` themselves.
+
+This is what actually forced the module split proposed in review:
+`hosted_stdcpp` now has to name `est::loop` to construct its own
+fallback, and `:platform` sits below `:loop` in the module dependency DAG
+specifically so it never has to - naming `est::loop` there would invert
+it. `hosted_stdcpp` moved out of `platform.cppm` entirely, into its own
+module, `est/src/platform/hosted_stdcpp.cppm` (`:platform.hosted_stdcpp`)
+- a *different* partition is free to import `:loop` without inverting
+anything, since only `:platform` itself (the abstraction every backend
+implements) is barred from it. `:platform` itself shrank down to exactly
+what its own class comment now says: `interface` (pure virtual, no
+concrete backend), `instance()`/`override_instance()`, `printdbg()` - and
+`detail::current_instance` now starts `nullptr`, since `:platform` can no
+longer construct a `hosted_stdcpp` to seed it with. `est/src/est.cppm`
+(the umbrella every `import est;` consumer actually triggers) is where
+the real one gets installed instead - a process-lifetime
+`hosted_stdcpp`, installed as the permanent default via the exact same
+`override_instance()` every test already uses to install a *temporary*
+one, just never letting the returned guard go out of scope:
+
+```cpp
+// est.cppm
+namespace est::detail {
+inline platform::hosted_stdcpp default_platform_instance{};
+inline auto default_platform_guard = platform::override_instance(default_platform_instance);
+} // namespace est::detail
+```
+
+Notably, this is the same split **issue #6** once proposed ("split
+`platform.cppm` into a declare-only interface + a link-time
+implementation") and this codebase closed as not planned, reasoning
+"no concrete payoff with only one backend exists" - true at the time, but
+issue #30's own fallback-loop requirement is exactly the concrete payoff
+that was missing then. Revisiting a past "closed as not planned" decision
+once its stated reasoning stops holding is the same stance this codebase
+already took on issue #11 (reopened once a real `shared_from_this()` call
+site appeared) - not a reversal of the earlier judgment, just new
+information the earlier judgment explicitly said would change it
+("revisit once/if a second backend... is actually being built" - the
+`:platform.hosted_stdcpp`/`:platform` split isn't a second *backend*, but
+it's the same underlying module-boundary tradeoff issue #6 was actually
+asking about).
+
+A genuinely new test exercises this fallback specifically:
+`est/tests/loop_tests.cpp`'s "`loop::current()` with nothing explicitly
+registered falls back to hosted_stdcpp's own default loop" - the one test
+in that file with no `make_current()` call and no `override_instance()`
+either, running against the real, default `platform::instance()` on
+purpose. `yield_execution()`, not `sleep_for()`/`sleep_until()`: this
+exercises the real backend, so a timer-based wait would be a genuine (if
+short) wall-clock sleep. Every other issue #30 test that used to rely on
+constructor auto-registration now calls `loop.make_current()` explicitly
+right after constructing its loop - `loop_tests.cpp`, `future_tests.cpp`'s
+three coroutine tests, and `mutex_tests.cpp`'s no-argument-constructor
+test.
+
+**Revised a sixth time, two smaller follow-ups from the same round of
+review.**
+
+First: **why not forward-declare `loop` in `:platform`, instead of an
+opaque `void*`?** Tried, and it works: `get_current_loop_context()`/
+`set_current_loop_context()` now return/take a genuinely typed
+`est::loop*`.
+
+```cpp
+// est::platform (platform.cppm) - no `import :loop;` anywhere in this file
+export namespace est { class loop; }
+```
+
+The forward declaration has to be `export`ed. Confirmed directly against
+this toolchain (clang, the pinned devenv): a plain, non-exported `class
+loop;` gets diagnosed as redeclaring an entity with module-private
+linkage the moment `:loop`'s own `export class loop { ... };` tries to
+attach to it -
+
+```
+error: cannot export redeclaration 'loop' here since the previous declaration has module linkage
+```
+
+- because `:platform` and `:loop` are different partitions of the *same*
+module, and a non-exported declaration in one partition has linkage
+private to that partition alone. The `export`ed version compiles cleanly:
+an exported declaration in one partition genuinely attaches to the real
+definition given in another partition of the same module, without either
+partition needing to `import` the other. `:platform` still can't
+construct, dereference, or otherwise complete `est::loop` - naming the
+type is all this needed, and is as far as `:platform` itself ever goes;
+completing it is still exclusively `hosted_stdcpp`'s job (`import
+:loop;`, in its own, separate partition). `loop::current()`'s own
+`static_cast<loop*>(...)` and its accompanying NOLINT are both gone -
+`get_current_loop_context()` already returns the right type.
+
+Second: **`import est;` installing `hosted_stdcpp` as a process-lifetime
+side effect (shown in the `est.cppm` snippet above) is the library making
+a decision - which backend, if any - that isn't the library's to make
+silently.** Reverted: `est.cppm` no longer installs anything, and goes
+back to being a plain umbrella of `export import`s. Each consumer now
+does its own installation, at the top of its own entry point:
+
+```cpp
+// examples/hello_world/main.cpp, examples/sleep_sort/main.cpp
+auto main() -> int {
+  est::platform::hosted_stdcpp platform_instance;
+  const auto platform_guard = est::platform::override_instance(platform_instance);
+  // ...
+}
+```
+
+`est/tests/`'s own Catch2 binary needed the equivalent for its one shared
+process: previously linked against `Catch2::Catch2WithMain` (Catch2's own
+pre-built `main()`), it now links `Catch2::Catch2` instead and supplies a
+small `est/tests/test_main.cpp` of its own - construct `hosted_stdcpp`,
+`override_instance()` it, then `Catch::Session().run(argc, argv)` - so
+the installation happens exactly once, before any `TEST_CASE` runs,
+rather than being every individual test file's own concern. Every test
+that needs a *different* backend still uses `override_instance()` to
+retarget it for its own scope, unchanged - this only supplies the one
+installed underneath that, so `platform::instance()` is never null to
+begin with.
+
+No new tests came out of this revision (all pre-existing behavior, same
+106 tests as before) - the entire point was that plumbing which backend
+gets installed, and where, shouldn't change any test's own outcome.
+
+**Revised a seventh time: `hosted_stdcpp` shouldn't be one of `est`'s own
+partitions at all - not even re-exported through `est.cppm`.** The sixth
+revision's own module split (`:platform.hosted_stdcpp`) genuinely solved
+the `:platform`-can't-import-`:loop` problem, but it still left
+`hosted_stdcpp` inside `est`'s own module boundary: `est.cppm` had to
+`export import :platform.hosted_stdcpp;` for `examples/*/main.cpp` and
+`est/tests/test_main.cpp` to name `est::platform::hosted_stdcpp` at all
+(a partition is only visible outside its module if the primary module
+interface unit re-exports it), which meant `hosted_stdcpp` was always
+compiled as part of `est` and logically part of its exported surface,
+whether or not a given consumer's program ever touched it.
+
+Per review: move it to `estext`, a wholly separate module with its own
+CMake target (`estext/CMakeLists.txt`, `add_library(estext STATIC)`,
+linked `PUBLIC` against `est::est`), not a partition of `est` at all:
+
+```cpp
+// estext/src/hosted_stdcpp.cppm
+export module estext;
+import est;
+import std;
+
+export namespace estext {
+class hosted_stdcpp final : public est::platform::interface {
+  // ... identical to the :platform.hosted_stdcpp version, just
+  // est::loop/est::platform::printdbg/est::platform::interface qualified
+  // explicitly now, since this is namespace estext, not namespace
+  // est::platform anymore.
+};
+}
+```
+
+`import est;` alone now gives a consumer the complete framework with
+*zero* trace of any concrete backend; a consumer that wants a working one
+opts in with a second, separate import - `import est; import estext;` -
+exactly mirroring how a future bare-metal backend would be its own
+similarly separate module, never touching `estext`. Note what `estext`
+does *not* need that `:platform` itself does: since it's not a partition
+bound by `est`'s own internal module DAG, `import est;` alone already
+hands it the complete, already-defined `est::loop` - no forward
+declaration trick required (that trick stays exactly where it was, inside
+`:platform` itself, purely for `platform::interface`'s own pure virtual
+method signature).
+
+This did surface one real CMake ordering wrinkle, not a design problem so
+much as a consequence of `est/tests/` being a *nested*
+`add_subdirectory()` call inside `est/CMakeLists.txt` itself:
+
+```
+root CMakeLists.txt
+  add_subdirectory(est)       # defines est::est; also processes
+                               # est/tests/ internally (its own
+                               # add_subdirectory(tests) call) - but
+                               # estext::estext doesn't exist yet at
+                               # that point
+  add_subdirectory(estext)    # needs est::est, so can't come first either
+```
+
+`est/tests/CMakeLists.txt` needs `estext::estext` (`test_main.cpp`'s own
+`import estext;`), but by the time it's processed, `add_subdirectory(estext)`
+hasn't run yet - and `estext` itself can't move earlier, since it needs
+`est::est` to already exist. Resolved without restructuring `est/CMakeLists
+.txt`'s existing, self-contained `EST_BUILD_TESTS` handling: the one extra
+link edge is added from the root `CMakeLists.txt` instead, once both
+targets exist (`CMP0079`, default `NEW` under this project's
+`cmake_minimum_required(VERSION 3.28)`, lets a target defined in one
+directory be given more link dependencies from a different directory's
+scope):
+
+```cmake
+# root CMakeLists.txt
+add_subdirectory(est)
+add_subdirectory(estext)
+
+if(EST_BUILD_TESTS)
+  target_link_libraries(est_tests PRIVATE estext::estext)
+endif()
+```
+
+`examples/hello_world/CMakeLists.txt`/`examples/sleep_sort/CMakeLists.txt`
+don't hit this - `add_subdirectory(examples/...)` already runs after both
+`est` and `estext` in the root file, so they link `estext::estext`
+directly, same as `est::est`.
+
+Verified in the pinned Docker devenv: reconfigured from a clean build
+directory (to catch any ordering issue the wrinkle above could have
+introduced, not just an incremental rebuild) - 106/106 tests still pass,
+`clang-format`/`clang-tidy` clean across every touched and new file
+(`estext/src/hosted_stdcpp.cppm`, `est/src/est.cppm`, both examples'
+`main.cpp`, `est/tests/test_main.cpp`), full suite passes under the
+`sanitize` preset (also reconfigured from clean) too, both example
+binaries still run correctly.
+
+**Revised an eighth time, the last: `loop.cppm` shouldn't be touched by
+this issue at all.** Per review: "the code to set it as the current
+belongs maybe to a free function somewhere else, maybe in the util."
+Every revision from the fourth onward had put this mechanism directly on
+`est::loop` itself - `make_current()` (an instance method) and `current()`
+(a static method) - meaning the class's own diff carried this entire
+issue, even though "a primitive ready-queue-and-timers type" and "an
+opt-in convenience for not threading a `loop&` by hand" are unrelated
+concerns. Moved both into a new partition, `est/src/util/current_loop.cppm`
+(`:util.current_loop`), as free functions instead of methods:
+
+```cpp
+// est:util.current_loop
+[[nodiscard]] auto make_current_loop(loop& loop_ref) noexcept {
+  check(!detail::loop_is_current, "est::make_current_loop(): ...");
+  detail::loop_is_current = true;
+  platform::instance().set_current_loop_context(&loop_ref);
+  return scope_exit([]() noexcept {
+    detail::loop_is_current = false;
+    platform::instance().set_current_loop_context(nullptr);
+  });
+}
+
+[[nodiscard]] auto current_loop() -> loop& {
+  auto* const context = platform::instance().get_current_loop_context();
+  check(context != nullptr, "est::current_loop(): ...");
+  return *context;
+}
+```
+
+`detail::loop_is_current` (the nesting flag) moved into this same new
+file, still non-exported and scoped to just this one partition.
+`est/src/loop.cppm` itself is now byte-for-byte identical to `main` -
+confirmed directly (`git diff origin/main -- est/src/loop.cppm` produces
+no output) rather than just eyeballed. This partition needed no forward-
+declaration trick the way `:platform` did (previous revision): it's an
+ordinary partition of `est`, free to `import :loop` and `:platform`
+directly, sitting above both in the dependency DAG - only `:platform`
+itself (and anything that must stay *below* `:loop`) is barred from
+importing it.
+
+Every call site using the old member-method names updated to the free
+functions: `promise.cppm` (`make_promise_future()`'s no-arg overload,
+`sleep_until()`/`sleep_for()`/`yield_execution()`'s no-arg overloads),
+`future.cppm` (`promise_type`'s two delegating constructors and two
+`operator new` overloads), `sync/mutex.cppm` (`mutex()`'s no-arg
+constructor), and every test that used to call `loop.make_current()`/
+`est::loop::current()` directly (`loop_tests.cpp`, `future_tests.cpp`,
+`mutex_tests.cpp`). Each of these files already needed `import
+:util.current_loop;` added (or, for `mutex.cppm`, added even though it
+already transitively depended on `:promise` - a private `import` in one
+partition doesn't propagate visibility to that partition's own
+importers, so `current_loop()` needed its own direct import there too).
+
+No test behavior changed - this was a pure rename plus a relocation, not
+a design change. Verified in the pinned Docker devenv: reconfigured `ci`
+from scratch (nothing had reason to affect configure-time behavior, but
+checked anyway) - 106/106 tests still pass, `clang-format`/`clang-tidy`
+clean across every touched file (one `clang-format -i` needed afterward,
+for a `TEST_CASE` title string that grew past the column limit when
+renamed), full suite passes under `sanitize` too, both examples still run
+correctly.
+
+Every loop-taking free function gained a matching overload built on
+`current_loop()`: `make_promise_future<T>()`, `sleep_for()`/
+`sleep_until()`, `yield_execution()` (all `est:promise`). `est::mutex`
+gained a matching no-argument constructor.
+
+**A coroutine returning `est::future<T>` can drop the `est::loop&`
+parameter too** - the issue's own "at least for user-visible types"
+framing extended to cover this, not just the free-function helpers.
+`promise_type` gained two more constructor/`operator new` pairs beyond
+the original loop-taking one:
+
+```cpp
+template <class First, class... Rest>
+  requires(!std::same_as<std::remove_cvref_t<First>, loop>)
+explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(loop::current()) {}
+
+promise_type() : promise_type(loop::current()) {}
+```
+
+(Shown here in the delegating form a later review pass produced - see
+below.) The `requires` clause is load-bearing: without it, this
+constructor and the original `promise_type(loop&, Args&...)` would be
+genuinely ambiguous for a call that *does* pass a loop first - a bare
+parameter pack happily absorbs a leading `loop&` into its own pack, so
+both candidates deduce to the identical actual parameter list for such a
+call, a tie conversion ranking alone can't break (confirmed by reasoning
+through the standard's partial-ordering rules before writing this, not
+just by testing - the constrained-SFINAE approach was chosen specifically
+to not have to *rely* on partial ordering, since it's a genuinely easy
+corner of overload resolution to get subtly wrong). A coroutine with no
+parameters at all needs its own non-template overload, since the
+constrained one still requires at least one `First`. `operator new`
+gained the identical three-way split, matched against the same argument
+list by the same "promise constructor arguments" rule, so whichever
+constructor is chosen and whichever `operator new` is chosen always agree
+on which loop to use.
+
+**Revised (repo owner's own PR review): all three constructors should
+delegate to a single one that actually builds `state_`.** The original
+version above independently repeated the same
+`detail::future_promise_result<T>(shared_ptr<future_state<T>>::make(...))`
+initializer three times. Since the first (loop-taking) constructor is
+already a template accepting an empty `Args...` pack, it already covers
+"just a `loop&`, nothing else" - so the other two now delegate straight to
+it: `promise_type(First&, Rest&...) : promise_type(loop::current()) {}`
+and `promise_type() : promise_type(loop::current()) {}`. Overload
+resolution among the class's own constructors still correctly picks the
+`(loop&, Args&...)` template for that single-argument delegating call (the
+`requires`-constrained one is excluded by its own clause, since the
+argument's type genuinely is `loop`), so this is a pure deduplication, not
+a behavior change. `operator new`'s three-way split wasn't touched -
+review flagged only the constructors, and each `operator new` overload
+was already a single-line call straight to
+`detail::coroutine_frame_alloc()`, with nothing left to deduplicate.
+
+`est::future<T>::get_promise()`, the issue's other original suggestion
+(let a bare `future<T>` be constructed and a matching `promise<T>`
+extracted from it later), wasn't implemented - it doesn't add anything
+`make_promise_future<T>()`'s own no-argument overload doesn't already
+cover for the same underlying goal ("create a promise/future pair
+without an explicit loop"), and would be a second, redundant way to
+reach it.
+
+Tests added: `loop::current()`'s happy path (returns the loop actually
+constructed); each new no-`loop&` overload
+(`make_promise_future<T>()`, `sleep_for()`/`sleep_until()`/
+`yield_execution()`, `mutex()`); three coroutine shapes (some parameters
+but no `loop&`, no parameters at all, and one that genuinely suspends and
+resumes through `loop::current()` rather than just running synchronously
+to completion, to prove the frame was actually allocated against the
+right loop). `est::check()`'s own failure path (no loop current, or a
+second loop constructed while one already is) isn't unit-tested, same
+stance as every other checked precondition in this codebase
+(`est/tests/check_tests.cpp`'s own doc comment).
+
+One more test came out of the fourth/fifth revisions above: `hosted_stdcpp`'s
+own lazy-fallback loop (`loop_tests.cpp`'s "`loop::current()` with nothing
+explicitly registered falls back to hosted_stdcpp's own default loop" -
+this section's own fuller description of it) - bringing the total to 8
+new tests, not 7.
+
+Docs updated: `docs/wiki/Coroutines.md`'s calling-convention section
+(also fixed a small pre-existing staleness there - the shown
+`promise_type` code snippet still had a `loop_` member removed in an
+earlier PR #37 follow-up), `docs/wiki/Loop-And-Timers.md`'s own new
+`current_loop()` section (rewritten again across the fourth through
+eighth revisions), `docs/wiki/Home.md`'s quick overview, `docs/wiki/
+Architecture.md`'s module-DAG diagram (added `:util.current_loop`, its
+own short section, and its new `estext` section - replacing the sixth
+revision's `:platform.hosted_stdcpp` partition/edge with the seventh's
+wholly separate `estext` module, plus the `est::loop*`-not-`void*` and
+no-auto-install notes carried over from the sixth).
+
+**Verified in the pinned Docker devenv, after the eighth revision
+above:** reconfigured from a clean build directory for both the `ci` and
+`sanitize` presets (not just an incremental rebuild) - 106/106 tests pass
+(8 new, unchanged since the fifth revision); `clang-format`/`clang-tidy`
+clean across every touched and new file (`est/src/util/current_loop.cppm`,
+`estext/src/hosted_stdcpp.cppm`, `est/src/est.cppm`, `est/src/promise.cppm`,
+`est/src/future.cppm`, `est/src/sync/mutex.cppm`, both examples'
+`main.cpp`, `est/tests/test_main.cpp`); `est/src/loop.cppm` confirmed
+byte-identical to `main`; full suite passes under the `sanitize` preset
+(ASan+UBSan) too; both example binaries still run correctly.
 
 ---
 

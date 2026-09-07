@@ -16,6 +16,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 add_executable(est_tests
+  test_main.cpp
   platform_tests.cpp
   check_tests.cpp
   intrusive_list_tests.cpp
@@ -26,7 +27,21 @@ add_executable(est_tests
   scope_exit_tests.cpp
   shared_ptr_tests.cpp
 )
-target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2WithMain)
+# Catch2::Catch2, not Catch2::Catch2WithMain: test_main.cpp supplies its
+# own main() (installing a platform::interface before any TEST_CASE runs,
+# per review - see that file's own doc comment), so this binary can't
+# also link Catch2's own pre-built one.
+#
+# estext::estext isn't linked here - test_main.cpp's own `import estext;`
+# needs it, but this directory is processed (via the root CMakeLists.txt's
+# add_subdirectory(est), which reaches here through EST_BUILD_TESTS below)
+# before add_subdirectory(estext) ever runs, so that target doesn't exist
+# yet at this point. The root CMakeLists.txt adds that link edge itself,
+# once both est_tests and estext::estext exist (CMP0079 - a target this
+# directory doesn't own can still be given more link dependencies from
+# another directory's scope, as long as the target itself already exists
+# by then).
+target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2)
 est_set_warnings(est_tests)
 est_enable_coverage(est_tests)
 est_enable_sanitizers(est_tests)

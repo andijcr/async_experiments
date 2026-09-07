@@ -68,6 +68,19 @@ if(EST_BUILD_TESTS)
 endif()
 
 add_subdirectory(est)
+add_subdirectory(estext)
+
+# estext depends on est::est (its own CMakeLists.txt), so it has to be
+# added after add_subdirectory(est) above - but est_tests is defined
+# *inside* that same add_subdirectory(est) call (est/CMakeLists.txt's own
+# add_subdirectory(tests)), before estext::estext exists yet. This link
+# edge - test_main.cpp's own `import estext;` - has to be added here
+# instead, once both targets exist (CMP0079, default NEW as of this
+# project's cmake_minimum_required), rather than in est/tests/
+# CMakeLists.txt itself (see that file's own comment on why).
+if(EST_BUILD_TESTS)
+  target_link_libraries(est_tests PRIVATE estext::estext)
+endif()
 
 if(EST_BUILD_EXAMPLES)
   add_subdirectory(examples/hello_world)

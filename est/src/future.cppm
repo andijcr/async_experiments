@@ -3,6 +3,7 @@ export module est:future;
 import std;
 import :check;
 import :loop;
+import :util.current_loop;
 import :util.intrusive_list;
 import :util.shared_ptr;
 
@@ -796,17 +797,21 @@ public:
   // changes; this class only exists for the compiler's coroutine
   // machinery to find via the standard promise_type protocol.
   //
-  // Requires the coroutine function's first parameter to be exactly
-  // est::loop& - both this constructor and operator new below are
-  // templated to match it (plus however many further parameters the
-  // actual coroutine function takes) via the standard's "promise
-  // constructor arguments"/allocator-argument matching, which tries
-  // building promise_type from the coroutine call's own argument list
-  // before ever falling back to a default constructor. There is
-  // deliberately no default constructor here: a future<T>-returning
-  // coroutine that doesn't take est::loop& first fails to compile with
-  // "no matching constructor for promise_type" instead of silently
-  // misbehaving.
+  // A coroutine function may (still the original M4 convention) take
+  // est::loop& as its first parameter - both this constructor and
+  // operator new below are templated to match it (plus however many
+  // further parameters the actual coroutine function takes) via the
+  // standard's "promise constructor arguments"/allocator-argument
+  // matching, which tries building promise_type from the coroutine
+  // call's own argument list before ever falling back to a default
+  // constructor. Or (issue #30) it may take no loop& at all - a second
+  // constructor/operator new pair below falls back to
+  // est::current_loop() (est:util.current_loop) instead, for a caller
+  // content relying on whichever loop is current rather than threading
+  // one through by hand. Or it may take no parameters
+  // whatsoever - a third, non-template pair covers that case, since a
+  // bare parameter pack can't match zero arguments against "at least one
+  // parameter."
   class promise_type : public detail::future_promise_result<T> {
   public:
     // Args&... /*unused*/: only loop_ref is ever read - the pack exists
@@ -822,6 +827,33 @@ public:
     explicit promise_type(loop& loop_ref, Args&... /*unused*/)
         : detail::future_promise_result<T>(
               shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)) {}
+
+    // Issue #30: a coroutine whose own first parameter isn't est::loop&
+    // falls back to est::current_loop() instead. Constrained to exclude
+    // a leading loop& specifically (std::same_as, not a broader
+    // "convertible to" - matching the exact-type match the constructor
+    // above already relies on) so this never competes with it for a call
+    // that *does* pass one: without the constraint, both constructors
+    // would deduce to the identical actual parameter list for such a
+    // call ((loop&, Rest&...) either way, since a bare parameter pack
+    // happily absorbs a leading loop& into Rest itself) - an ambiguity
+    // conversion ranking alone can't break, since the two candidates
+    // would be indistinguishable by it.
+    //
+    // Delegates to the constructor above (Args deduced empty) rather than
+    // repeating its body - per review, all three constructors should
+    // share the one place that actually builds state_. current_loop()'s
+    // own precondition (a loop must actually be current) is checked
+    // exactly once either way.
+    template <class First, class... Rest>
+      requires(!std::same_as<std::remove_cvref_t<First>, loop>)
+    explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(current_loop()) {}
+
+    // Issue #30: a coroutine taking no parameters at all - the
+    // constructor above needs at least one (First is not optional), so
+    // this needs its own, non-template overload. Delegates the same way.
+    promise_type() : promise_type(current_loop()) {}
+
     promise_type(const promise_type&) = delete;
     auto operator=(const promise_type&) -> promise_type& = delete;
     promise_type(promise_type&&) = delete;
@@ -864,10 +896,25 @@ public:
 
     // pmr-aware coroutine frame allocation - see
     // detail::coroutine_frame_alloc()/coroutine_frame_dealloc()'s own
-    // doc comment.
+    // doc comment. Three overloads mirroring the three constructors
+    // above, matched against the exact same argument list by the same
+    // "promise constructor arguments" rule - the compiler picks whichever
+    // operator new and whichever constructor line up with the coroutine
+    // call's own arguments together, so these always agree on which loop
+    // to use.
     template <class... Args>
     static auto operator new(std::size_t size, loop& loop_ref, Args&... /*unused*/) -> void* {
       return detail::coroutine_frame_alloc(size, loop_ref.allocator());
+    }
+
+    template <class First, class... Rest>
+      requires(!std::same_as<std::remove_cvref_t<First>, loop>)
+    static auto operator new(std::size_t size, First& /*unused*/, Rest&... /*unused*/) -> void* {
+      return detail::coroutine_frame_alloc(size, current_loop().allocator());
+    }
+
+    static auto operator new(std::size_t size) -> void* {
+      return detail::coroutine_frame_alloc(size, current_loop().allocator());
     }
 
     static void operator delete(void* ptr, std::size_t size) noexcept {

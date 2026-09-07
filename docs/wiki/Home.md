@@ -59,18 +59,38 @@ est::promise<T> — a thin, shared_ptr-backed producer/consumer pair; .then()
 Every future/promise pair is built via `est::make_promise_future<T>(loop&)` —
 an explicit `est::loop&` is threaded through everything (not a global
 singleton), so a caller owns exactly when and where continuations actually
-run.
+run. A caller that doesn't want to thread one through by hand can instead
+rely on `est::current_loop()` (issue #30, [Loop and Timers](Loop-And-Timers.md))
+— every loop-taking function in this codebase has a matching no-`loop&`
+overload built on it. A loop only becomes "current" by an explicit
+`est::make_current_loop(loop)` call (a free function, not a method on
+`est::loop` itself - deliberately kept out of `loop.cppm` entirely),
+scoped to that loop's own lifetime, not a global — except that the real
+(`estext::hosted_stdcpp`) backend also falls back to a loop of its own,
+lazily, when nothing has been explicitly registered, so `current_loop()`
+still works for a caller with no loop to register in the first place.
+
+`import est;` doesn't install a `platform::interface` on its own, either —
+in fact it doesn't even know a concrete backend exists. `estext` is a
+second, wholly separate module holding `hosted_stdcpp`, the one that does
+([Architecture](Architecture.md) has the full story on why it's not part
+of `est` at all); a program's own `main()` does `import estext;`,
+constructs one, and `platform::override_instance()`s it
+(`examples/hello_world/main.cpp`, `examples/sleep_sort/main.cpp`), same as
+`est/tests/`'s own test binary does once, in `est/tests/test_main.cpp`.
 
 ## Where to look in the source
 
 | Concept | File |
 |---|---|
-| Platform seam (clock, `sleep_until`, `assert_failure`, loop-stall detection, `printdbg`) | `est/src/platform/platform.cppm` |
+| Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`) | `est/src/platform/platform.cppm` |
+| `hosted_stdcpp` (the one concrete `platform::interface` - a separate module, `estext`, not part of `est`) | `estext/src/hosted_stdcpp.cppm` |
 | `est::check()` | `est/src/check.cppm` |
 | `est::shared_ptr<T>`, `enable_shared_from_this<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
 | `est::mutex`, `mutex::lock_awaiter`, `mutex::lock_resume_node` | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
+| `est::current_loop()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::future_state<T>`, `est::future<T>`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `sleep_for()`/`sleep_until()` | `est/src/promise.cppm` |

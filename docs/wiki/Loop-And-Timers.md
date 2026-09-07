@@ -32,6 +32,199 @@ very next touch of the loop. This is documented explicitly on both
 it's an easy first-use mistake with no compiler or runtime defense against
 it.
 
+## `est::current_loop()`: opt-in, not automatic, and not `thread_local` (issue #30)
+
+A caller can still avoid threading a `loop&` through by hand, without
+reopening the global-singleton problem the section above rules out -
+`est::make_current_loop(loop&)` registers that loop as the one
+`make_promise_future()`, `sleep_for()`/`sleep_until()`/`yield_execution()`,
+and a loop-less coroutine's own `promise_type` (all consuming
+`est::current_loop()`) fall back to, until the returned guard is
+destroyed:
+
+```cpp
+// est:util.current_loop - free functions, not methods on est::loop itself
+[[nodiscard]] auto make_current_loop(loop& loop_ref) noexcept {
+  check(!detail::loop_is_current, "est::make_current_loop(): another loop is already current...");
+  detail::loop_is_current = true;
+  platform::instance().set_current_loop_context(&loop_ref);
+  return scope_exit([]() noexcept {
+    detail::loop_is_current = false;
+    platform::instance().set_current_loop_context(nullptr);
+  });
+}
+
+[[nodiscard]] auto current_loop() -> loop& {
+  auto* const context = platform::instance().get_current_loop_context();
+  check(context != nullptr, "est::current_loop(): no loop is current (issue #30) ...");
+  return *context;
+}
+```
+
+This took eight revisions to land on. The issue's own original suggestion
+was a method on `est::platform` - `platform::get_loop()`.
+
+1. The first version rejected any platform involvement at all, in favor of
+   a `thread_local loop*` scoped to `loop`'s own constructor/destructor,
+   reasoning that `platform::interface` is safe to make a global
+   specifically *because* it's stateless policy (the "why an explicit
+   `loop&`" section above), and a mutable `loop*` living there would
+   reintroduce exactly the state that section rules out. That reasoning
+   wasn't wrong, but it solved a problem this codebase doesn't actually
+   have while creating a new one: this codebase already has a plain,
+   *non*-`thread_local` mechanism doing exactly this kind of "which one is
+   current" job - `platform`'s own `current_instance`/`instance()` - and
+   doing the same thing for `loop::current()` costs nothing that
+   global-swap pattern doesn't already pay for `platform::instance()`
+   itself. `thread_local`, on the other hand, is something this codebase
+   has never otherwise needed, and the repo owner's own bare-metal
+   stretch goal (`docs/PLAN.md` - freestanding, no OS) is exactly the kind
+   of target where `thread_local` may have no well-defined support at all.
+2. Moved the slot from a second free-standing global living alongside
+   `current_instance` in `:platform`, onto `platform::interface` itself as
+   a plain (still not `thread_local`) data member, with
+   `get_current_loop_context()`/`set_current_loop_context()` as ordinary
+   (non-virtual) methods on it - per repo owner review, this belongs on
+   the platform instance rather than as parallel global state next to it.
+3. Went further still: `platform::interface` should be a pure interface,
+   full stop - every method pure virtual, no data members of its own at
+   all. The two methods that used to have a shared default body backed by
+   a member declared directly on `interface` - the pair above, and
+   `reset_loop_stall_detection()`/`detect_loop_stall()` (the long-running-
+   callback detector, already on `interface` before issue #30) - moved
+   their state and logic onto `hosted_stdcpp`. Every test fake in
+   `est/tests/` deriving from `interface` needed matching overrides of its
+   own from this point on - most are no-ops, but `loop_tests.cpp`'s
+   `fake_platform`/`jumping_platform` need working ones, since `est::loop`
+   is genuinely constructed under both.
+4. **The constructor/destructor auto-registration itself got reverted -
+   per repo owner review, "creating a loop and setting it as current
+   should be the caller's responsibility," not something every loop
+   constructor decides unconditionally.** `make_current()` above is the
+   result: an explicit, RAII-scoped opt-in a caller reaches for only when
+   it actually wants a specific loop to be the implicit one, modeled
+   directly on `platform::override_instance()`'s own shape. Most loops in
+   this codebase's own tests were never meant to be "the" current loop at
+   all - forcing every one of them through the same nesting-checked slot
+   was the wrong default. The nesting precondition itself moved with it,
+   tracked by a dedicated `detail::loop_is_current` flag in `:loop` rather
+   than by asking `get_current_loop_context()` for a null/non-null answer
+   (see point 5 below for why that specific question changed meaning).
+5. **This same review also asked for the ergonomic case issue #30 was
+   actually chasing: a caller that never wants to think about `est::loop`
+   at all.** Rather than `loop::current()` simply failing its own
+   precondition until *something* calls `make_current()`,
+   `hosted_stdcpp`'s own `get_current_loop_context()` now falls back to a
+   loop of its own, lazily constructed on first use, whenever nothing has
+   been explicitly registered - genuinely usable, not just non-null: a
+   caller drives it the same way any other loop
+   (`est::loop::current().run_until_idle();`), without ever writing
+   `est::loop loop;` themselves. Making this possible needed one more
+   change: `hosted_stdcpp` moved into its own module,
+   `:platform.hosted_stdcpp`, since it now has to name `est::loop` to
+   construct that fallback, and `:platform` sits below `:loop` in the
+   dependency DAG specifically so it never has to (this file's own top
+   comment; [Architecture](Architecture.md) has the fuller module-DAG
+   picture). (This revisits - with a real payoff this time - a module
+   split, issue #6, this codebase once closed as "no concrete payoff with
+   only one backend.")
+6. Two smaller follow-ups from the same round of review. First: **why not
+   forward-declare `loop` in `:platform`, instead of an opaque `void*`?**
+   Tried and confirmed against this toolchain -
+   `get_current_loop_context()`/`set_current_loop_context()` now return/
+   take a genuinely typed `est::loop*`. The trick is that the forward
+   declaration has to be `export`ed (`export namespace est { class loop;
+   }`, `platform.cppm`'s own top comment) - a *non*-exported one gets
+   diagnosed by clang as redeclaring an entity with module-private
+   linkage, since `:platform` and `:loop` are different partitions of the
+   same module. `:platform` still never `import`s `:loop`, and still
+   can't construct or otherwise complete the type - naming it is all this
+   needed. Second: **`import est;` installing `hosted_stdcpp` as a
+   process-lifetime side effect (what point 5 above originally did in
+   `est.cppm`) is the library's own decision to make silently - it
+   shouldn't.** Reverted: `est.cppm` no longer installs anything.
+   `examples/hello_world/main.cpp` and `examples/sleep_sort/main.cpp` now
+   each construct a `hosted_stdcpp` and `override_instance()` it at the
+   top of their own `main()`; `est/tests/`'s own Catch2 binary does the
+   same once, in a small custom `main()` (`est/tests/test_main.cpp`,
+   linked against `Catch2::Catch2` rather than `Catch2::Catch2WithMain`)
+   instead of every individual test file.
+7. **One more follow-up, on where exactly `hosted_stdcpp` should live.**
+   Point 5 above made it one of `est`'s own partitions
+   (`:platform.hosted_stdcpp`, re-exported through `est.cppm`) - reachable
+   via plain `import est;`, same as everything else. Per further review,
+   that still leaves a concrete backend inside `est`'s own module
+   boundary, always compiled in and logically part of its exported
+   surface. Moved to `estext`, a wholly separate module
+   (`estext/src/hosted_stdcpp.cppm`, its own CMake target) that
+   `import est;`s the finished framework rather than being one of its
+   partitions - so `import est;` alone now gives zero trace of
+   `hosted_stdcpp`, and a consumer that wants it opts in with a second,
+   explicit `import estext;`. See [Architecture](Architecture.md)'s own
+   `estext` section for the fuller module-boundary picture. Nothing about
+   `loop::current()`/`make_current()` themselves changed - only where the
+   one concrete `get_current_loop_context()` implementation that offers a
+   fallback loop happens to live.
+8. **Last: `loop.cppm` itself shouldn't be touched by this issue at all -
+   the registration mechanism belongs in a free function somewhere else,
+   maybe alongside the other utilities.** Everything from point 4 onward
+   had lived as two methods on `est::loop` itself - `make_current()`
+   (instance method) and `current()` (static method) - meaning `est::loop`
+   carried this issue's entire diff, even though the two concerns (a
+   primitive ready-queue-and-timers type; an opt-in convenience for not
+   threading a `loop&` by hand) have nothing to do with each other. Moved
+   out into their own partition, `est/src/util/current_loop.cppm`
+   (`:util.current_loop`) - free functions `est::make_current_loop(loop&)`
+   and `est::current_loop()`, not methods on `loop`. `loop.cppm` itself is
+   now byte-for-byte identical to what it was before this PR: no new
+   methods, no new members, no new imports. The new partition sits above
+   both `:loop` (needs the type) and `:platform` (needs `instance()`) in
+   the dependency DAG, same shape as `estext` one level up - nothing about
+   *this* move needed a forward declaration or a separate module, though,
+   since a partition of `est` itself is free to import `:loop` directly
+   (only `:platform` itself, and anything that must stay *below* `:loop`,
+   can't). `detail::loop_is_current` (the nesting flag) moved into this
+   new file too, still non-exported and still scoped to just this one
+   partition.
+
+The actual storage is a genuinely typed `est::loop*`, not an opaque
+`void*` (point 6 above) - `:platform` names the type via an exported
+forward declaration without needing to complete it; only the concrete
+backend that implements `get_current_loop_context()` needs the complete
+type, to actually construct one. No cast needed on either side anymore.
+The only call sites that ever write into this slot are
+`make_current_loop()`'s own guard and, for `estext::hosted_stdcpp`
+specifically, its own lazily-constructed fallback loop.
+`get_current_loop_context()`/`set_current_loop_context()` are virtual
+(point 3 above) - not because "hold a pointer and hand it back" is
+backend-specific (it still isn't), but because `interface` no longer
+special-cases *any* method as non-overridable state-holding, now that it
+holds no state for any of them; a bare-metal backend might reasonably
+want to answer this differently too (a fixed static slot, say, with no
+global initialization order to worry about).
+
+A single slot with a checked precondition against nesting, not a
+push/pop stack like `platform::override_instance()`'s: two loops both
+current at once (one calling `make_current_loop()` while another's guard
+is still alive) is treated as a programming error (an `est::check()`
+failure - see `est/tests/check_tests.cpp`'s own doc comment on why that
+failure path isn't unit-tested here), not "the inner one temporarily
+shadows the outer."
+
+Every free function that takes an explicit `loop&` today gained a
+matching overload that pulls `est::current_loop()` instead -
+`make_promise_future<T>()`, `sleep_for()`/`sleep_until()`,
+`yield_execution()` (all `est:promise`) - and `est::mutex` gained a
+matching no-argument constructor. A coroutine returning `est::future<T>`
+can drop the `est::loop&` parameter the same way - see
+[Coroutines](Coroutines.md)'s own calling-convention section for how
+`promise_type` resolves that without ambiguity against the original,
+loop-taking convention. None of these needed to change shape across any
+of the eight revisions above (only the names `loop::current()` →
+`est::current_loop()` at the very end, point 8) - they only ever consume
+the "current loop" query, never `make_current_loop()`/`make_current()`
+itself, so only the registration side ever moved.
+
 ## The ready-queue
 
 `loop::enqueue_ready(detail::ready_node&)` pushes onto `ready_`, an
@@ -88,15 +281,18 @@ void run_one(detail::ready_node& node) {
   `est::loop` calling `std::chrono`/`std::this_thread` directly: "how do
   we know a callback ran long" is a policy a backend should get to answer
   for itself. `est::loop` only calls the two bracketing hooks and owns the
-  threshold value; `platform::interface`'s default implementation of both
-  (inherited by `hosted_stdcpp` and every test fake unchanged) just
-  records `now()` on reset and compares against it on detect, printing via
-  `platform::printdbg()` if exceeded — the same synchronous, single-
-  threaded behavior as before. A future backend could override both to run
-  a watchdog on a background thread instead, catching (and reporting) a
-  stall in parallel while the callback is still running, rather than only
-  finding out once it returns — without `run_one()` itself changing at
-  all.
+  threshold value; both are pure virtual on `platform::interface` itself
+  (per repo owner review - see the `loop::current()` section above for the
+  fuller story on why `interface` carries no default bodies or state of
+  its own at all), so each concrete backend answers them itself.
+  `hosted_stdcpp`'s own override just records `now()` on reset and
+  compares against it on detect, printing via `platform::printdbg()` if
+  exceeded — the same synchronous, single-threaded behavior an earlier
+  version of this design had as `interface`'s shared default. A future
+  backend could implement both to run a watchdog on a background thread
+  instead, catching (and reporting) a stall in parallel while the callback
+  is still running, rather than only finding out once it returns —
+  without `run_one()` itself changing at all.
 
 ## Timers: `schedule_timer()`, and the `future<void>` bridge
 
