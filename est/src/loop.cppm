@@ -108,16 +108,17 @@ export namespace est {
 // sleep_for()/sleep_until()/yield_execution(), and a loop-less
 // coroutine's own promise_type (est:future) all fall back to when called
 // without an explicit loop&. The actual storage is
-// est::platform::detail::current_loop_context, a plain (deliberately
-// *not* thread_local) global living in :platform - see that variable's
-// own doc comment for why: a target this codebase explicitly wants to
-// support later (docs/PLAN.md's bare-metal stretch goal) may have no
-// well-defined thread_local support at all, and :platform already has
-// the identical "plain global, swapped explicitly" pattern for
-// current_instance, so this reuses it rather than inventing a
-// thread-local-based mechanism of its own. This constructor stores
-// `this` into it; the destructor clears it back to nullptr; current()
-// below reads it back and casts.
+// platform::interface::get_current_loop_context()/
+// set_current_loop_context() - a plain (deliberately *not* thread_local)
+// data member of whichever platform::interface is currently installed -
+// see that member's own doc comment (platform.cppm) for why: a target
+// this codebase explicitly wants to support later (docs/PLAN.md's
+// bare-metal stretch goal) may have no well-defined thread_local support
+// at all, and :platform already has the identical "plain state, swapped
+// explicitly" pattern for current_instance/instance(), so this reuses it
+// rather than inventing a thread-local-based mechanism of its own. This
+// constructor stores `this` into it; the destructor clears it back to
+// nullptr; current() below reads it back and casts.
 //
 // Deliberately a single slot with a checked precondition against
 // nesting, not a push/pop RAII stack like est::platform::
@@ -128,6 +129,19 @@ export namespace est {
 // today has a legitimate reason to nest loops this way. Revisit if that
 // turns out to matter in practice, same stance this codebase already
 // takes elsewhere on not building for a hypothetical need (docs/PLAN.md).
+//
+// A consequence of the slot living on platform::interface rather than as
+// an independent global: this constructor and destructor always go
+// through whichever platform::interface happens to be current *at that
+// moment* (platform::instance()), not necessarily the same one for both
+// calls. Every existing est::platform::override_instance() use in this
+// codebase already nests correctly around this - the guard's scope always
+// brackets the full lifetime of any loop constructed under it (loop_tests
+// .cpp, timer_tests.cpp) - so this has never come up in practice, but
+// swapping the platform instance out from under a still-live loop (rather
+// than around one) isn't checked for here, and would let this loop's
+// destructor clear a different loop's slot on whatever instance happens
+// to be current by then.
 class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
@@ -135,10 +149,10 @@ public:
 
   explicit loop(allocator_type allocator = {})
       : allocator_(allocator), timers_(allocator), pending_timers_(allocator) {
-    check(platform::get_current_loop_context() == nullptr,
+    check(platform::instance().get_current_loop_context() == nullptr,
           "est::loop: another loop is already current (issue #30) - constructing a second "
           "loop while one is still current isn't supported, even briefly");
-    platform::set_current_loop_context(this);
+    platform::instance().set_current_loop_context(this);
   }
   loop(const loop&) = delete;
   auto operator=(const loop&) -> loop& = delete;
@@ -151,13 +165,13 @@ public:
   // called without an explicit loop&. Precondition (checked): a loop
   // must actually be current - construct one first, or keep passing a
   // loop& explicitly if none is meant to be implicit here. The
-  // static_cast back from platform::get_current_loop_context()'s opaque
-  // void* is safe by construction, not by RTTI - see
-  // est::platform::detail::current_loop_context's own doc comment for
-  // why the only thing that context can ever be, once non-null, is a
-  // genuinely live loop*.
+  // static_cast back from get_current_loop_context()'s opaque void* is
+  // safe by construction, not by RTTI - see
+  // platform::interface::get_current_loop_context()'s own doc comment
+  // (platform.cppm) for why the only thing that context can ever be, once
+  // non-null, is a genuinely live loop*.
   [[nodiscard]] static auto current() -> loop& {
-    auto* const context = platform::get_current_loop_context();
+    auto* const context = platform::instance().get_current_loop_context();
     check(context != nullptr,
           "est::loop::current(): no loop is current (issue #30) - construct one first, or "
           "pass a loop& explicitly instead of relying on the implicit one");
@@ -197,7 +211,7 @@ public:
     // silently handing back a reference to this half-destroyed object.
     // Always this exact loop - the constructor's own check rules out
     // ever having a different loop current while this one is alive.
-    platform::set_current_loop_context(nullptr);
+    platform::instance().set_current_loop_context(nullptr);
     for (const auto& entry : pending_timers_) {
       entry.node->destroy(allocator_, false);
     }

@@ -3223,32 +3223,54 @@ repo owner is specifically targeting a future bare-metal backend
 here would have introduced a genuinely new, more fragile requirement to
 solve a problem a plain global already avoids just fine.
 
-Implemented as `est::platform::detail::current_loop_context`, a plain
-`void*` global in `:platform` (not `loop*` - this partition sits below
-`:loop` in the dependency DAG, so it can never name `est::loop` directly;
-`est::loop` performs the cast on both sides, safe by construction since
-the only two call sites that ever touch it are `loop`'s own constructor
-and destructor), with plain accessor functions mirroring `instance()`/
-`override_instance()`'s own shape rather than virtual methods on
-`interface` - nothing about "hold a pointer, hand it back" is
-backend-specific behavior the way `now()`/`sleep_until()` genuinely are:
+First implemented as `est::platform::detail::current_loop_context`, a
+plain `void*` global living in `:platform` alongside `current_instance`,
+with plain accessor functions mirroring `instance()`/`override_instance()`
+- not `loop*` (this partition sits below `:loop` in the dependency DAG, so
+it can never name `est::loop` directly; `est::loop` performs the cast on
+both sides, safe by construction since the only two call sites that ever
+touch it are `loop`'s own constructor and destructor).
+
+**Revised again (repo owner's own review): `get_current_loop_context()`
+should be a method of the platform instance**, not a second free-standing
+global living next to `current_instance`. Moved onto `platform::interface`
+itself as a plain data member, with `get_current_loop_context()`/
+`set_current_loop_context()` as ordinary (non-virtual) methods on it -
+still not virtual, for the same reason as before: nothing about "hold a
+pointer, hand it back" is backend-specific behavior the way `now()`/
+`sleep_until()` genuinely are, so there's nothing here for a derived class
+to override:
 
 ```cpp
-// est:platform
-[[nodiscard]] inline auto get_current_loop_context() noexcept -> void* {
-  return detail::current_loop_context;
+// est::platform::interface
+[[nodiscard]] auto get_current_loop_context() const noexcept -> void* {
+  return current_loop_context_;
 }
-inline void set_current_loop_context(void* context) noexcept {
-  detail::current_loop_context = context;
-}
+void set_current_loop_context(void* context) noexcept { current_loop_context_ = context; }
+private:
+  void* current_loop_context_ = nullptr;
 
 // est:loop
 [[nodiscard]] static auto current() -> loop& {
-  auto* const context = platform::get_current_loop_context();
+  auto* const context = platform::instance().get_current_loop_context();
   check(context != nullptr, "est::loop::current(): no loop is current (issue #30) ...");
   return *static_cast<loop*>(context);
 }
 ```
+
+The two designs behave identically for every case this codebase actually
+exercises: `platform::instance()` only ever points at one `interface` at a
+time, and every `override_instance()` guard in this codebase brackets the
+full lifetime of any loop constructed under it (`loop_tests.cpp`,
+`timer_tests.cpp`) - the loop's constructor and destructor always run
+against the same installed instance. The one corner case the per-instance
+version doesn't defend against - swapping the platform instance out from
+under a still-live loop, rather than around one, which would let that
+loop's destructor clear a *different* instance's (and possibly a different
+loop's) slot - isn't checked for here, same as `loop::current()`'s own
+nesting precondition isn't a full RAII stack; documented on `loop`'s own
+top comment (`loop.cppm`) rather than guarded against, since nothing in
+this codebase does this today.
 
 A single slot with a checked precondition against nesting (constructing
 a second loop while one is already current is an `est::check()`

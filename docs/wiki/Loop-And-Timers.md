@@ -37,47 +37,61 @@ it.
 A caller can still avoid threading a `loop&` through by hand, without
 reopening the global-singleton problem the section above rules out.
 `est::loop`'s own constructor stores `this` into
-`est::platform::detail::current_loop_context`, a plain global living in
-`:platform` (`platform.cppm`); its destructor clears it back to
-`nullptr`. `loop::current()` reads it back and casts:
+`platform::instance().set_current_loop_context(this)`; its destructor
+clears it back to `nullptr`. `loop::current()` reads it back and casts:
 
 ```cpp
 [[nodiscard]] static auto current() -> loop& {
-  auto* const context = platform::get_current_loop_context();
+  auto* const context = platform::instance().get_current_loop_context();
   check(context != nullptr, "est::loop::current(): no loop is current (issue #30) ...");
   return *static_cast<loop*>(context);
 }
 ```
 
-The issue's own original suggestion was `platform::get_loop()` - a method
-on `est::platform`, mirroring how `platform::instance()` already works.
-An earlier version of this feature rejected that in favor of a
-`thread_local loop*` scoped to `loop`'s own constructor/destructor,
-reasoning that `platform::interface` is safe to make a global
-specifically *because* it's stateless policy (the "why an explicit
-`loop&`" section above), and a mutable `loop*` living there would
-reintroduce exactly the state that section rules out. That reasoning
-wasn't wrong, but it solved a problem this codebase doesn't actually
-have while creating a new one: this codebase already has a plain,
-*non*-`thread_local` global doing exactly this kind of "which one is
-current" job - `platform`'s own `detail::current_instance` - and doing
-the same thing for `loop::current()` costs nothing that global-swap
-pattern doesn't already pay for `platform::instance()` itself.
-`thread_local`, on the other hand, is something this codebase has never
-otherwise needed, and the repo owner's own bare-metal stretch goal
+The issue's own original suggestion was a method on `est::platform` -
+`platform::get_loop()`. This is exactly that, in its final form, but it
+took two revisions to get there. The first version rejected any platform
+involvement at all, in favor of a `thread_local loop*` scoped to `loop`'s
+own constructor/destructor, reasoning that `platform::interface` is safe
+to make a global specifically *because* it's stateless policy (the "why
+an explicit `loop&`" section above), and a mutable `loop*` living there
+would reintroduce exactly the state that section rules out. That
+reasoning wasn't wrong, but it solved a problem this codebase doesn't
+actually have while creating a new one: this codebase already has a
+plain, *non*-`thread_local` mechanism doing exactly this kind of "which
+one is current" job - `platform`'s own `current_instance`/`instance()` -
+and doing the same thing for `loop::current()` costs nothing that
+global-swap pattern doesn't already pay for `platform::instance()`
+itself. `thread_local`, on the other hand, is something this codebase has
+never otherwise needed, and the repo owner's own bare-metal stretch goal
 (`docs/PLAN.md` - freestanding, no OS) is exactly the kind of target
 where `thread_local` may have no well-defined support at all - reaching
 for it here would have been introducing a genuinely new, more fragile
 requirement to solve a problem (global cross-test state) a plain global
 already avoids just fine, the same way `current_instance` does.
 
-The actual storage is a plain `void*` in `:platform`, not `loop*`:
-`:platform` sits below `:loop` in the dependency DAG (this file's own
-top comment on why `:loop` imports `:platform`, never the reverse), so
-it can never name `est::loop` directly. `est::loop` performs the cast on
-both sides - safe by construction, not by RTTI, since the only two call
-sites that ever touch this slot are `loop`'s own constructor (stores
-`this`) and destructor (stores `nullptr`).
+The second revision moved the slot one more step, from a second
+free-standing global living alongside `current_instance` in `:platform`,
+onto `platform::interface` itself as a plain (still not `thread_local`)
+data member, with `get_current_loop_context()`/`set_current_loop_context()`
+as ordinary (non-virtual) methods on it - per repo owner review, this
+belongs on the platform instance rather than as parallel global state next
+to it. The two are equivalent in every case this codebase actually
+exercises (every `override_instance()` guard's scope brackets the full
+lifetime of any loop constructed under it - see `loop`'s own top comment
+for the one corner case this doesn't cover: swapping the platform instance
+out from under a still-live loop, rather than around one).
+
+The actual storage is a plain `void*`, not `loop*`: `:platform` sits below
+`:loop` in the dependency DAG (this file's own top comment on why `:loop`
+imports `:platform`, never the reverse), so it can never name `est::loop`
+directly. `est::loop` performs the cast on both sides - safe by
+construction, not by RTTI, since the only two call sites that ever touch
+this slot are `loop`'s own constructor (stores `this`) and destructor
+(stores `nullptr`). The methods themselves are non-virtual, unlike
+`now()`/`sleep_until()`/`assert_failure()`: "hold a pointer and hand it
+back" isn't backend-specific behavior a future backend would ever need to
+answer differently.
 
 A single slot with a checked precondition against nesting, not a
 push/pop stack like `platform::override_instance()`'s: constructing a
