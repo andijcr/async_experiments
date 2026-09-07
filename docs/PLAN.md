@@ -3202,29 +3202,59 @@ preset (ASan+UBSan) too; both example binaries still run correctly.
 ### Issue #30: `loop::current()` - user-visible types no longer require an explicit `loop&` (done)
 
 The issue's own original suggestion was `platform::get_loop()`, a method
-on `est::platform` mirroring `platform::instance()`. Implemented
-differently, deliberately: `platform::interface` is safe as a global,
-swappable pointer specifically because it's stateless policy (see
-`docs/wiki/Loop-And-Timers.md`'s own "why an explicit `loop&`, not a
-global singleton" section) - bolting a mutable `loop*` onto it would
-reintroduce exactly the shared, cross-test-contaminating state that
-section already rules out for `loop` itself. Implemented instead as a
-`thread_local loop*` scoped to `loop`'s own constructor (sets itself
-current) and destructor (clears back to `nullptr`), exposed as
-`loop::current()`:
+on `est::platform` mirroring `platform::instance()`. A first pass at this
+rejected that in favor of a `thread_local loop*` scoped to `loop`'s own
+constructor/destructor, reasoning that `platform::interface` is safe as a
+global specifically because it's stateless policy (`docs/wiki/
+Loop-And-Timers.md`'s own "why an explicit `loop&`, not a global
+singleton" section) and a mutable `loop*` living there would reintroduce
+exactly the state that section rules out.
+
+Revised (repo owner's own review): that reasoning solved a problem this
+codebase doesn't have while creating one it does. This codebase already
+has a plain, *non*-`thread_local` global doing exactly this "which one is
+current" job - `platform::detail::current_instance` (`instance()`/
+`override_instance()`, `platform.cppm`) - so a second global following
+the identical pattern costs nothing new. `thread_local`, on the other
+hand, is something this codebase has never otherwise needed, and the
+repo owner is specifically targeting a future bare-metal backend
+(`docs/PLAN.md`'s own stretch goal, freestanding/no-OS) where
+`thread_local` may have no well-defined support at all - reaching for it
+here would have introduced a genuinely new, more fragile requirement to
+solve a problem a plain global already avoids just fine.
+
+Implemented as `est::platform::detail::current_loop_context`, a plain
+`void*` global in `:platform` (not `loop*` - this partition sits below
+`:loop` in the dependency DAG, so it can never name `est::loop` directly;
+`est::loop` performs the cast on both sides, safe by construction since
+the only two call sites that ever touch it are `loop`'s own constructor
+and destructor), with plain accessor functions mirroring `instance()`/
+`override_instance()`'s own shape rather than virtual methods on
+`interface` - nothing about "hold a pointer, hand it back" is
+backend-specific behavior the way `now()`/`sleep_until()` genuinely are:
 
 ```cpp
+// est:platform
+[[nodiscard]] inline auto get_current_loop_context() noexcept -> void* {
+  return detail::current_loop_context;
+}
+inline void set_current_loop_context(void* context) noexcept {
+  detail::current_loop_context = context;
+}
+
+// est:loop
 [[nodiscard]] static auto current() -> loop& {
-  check(current_loop != nullptr, "est::loop::current(): no loop is current on this thread ...");
-  return *current_loop;
+  auto* const context = platform::get_current_loop_context();
+  check(context != nullptr, "est::loop::current(): no loop is current (issue #30) ...");
+  return *static_cast<loop*>(context);
 }
 ```
 
 A single slot with a checked precondition against nesting (constructing
-a second loop while one is already current on the same thread is an
-`est::check()` failure), not a push/pop RAII stack like `platform::
-override_instance()`'s - simpler to reason about, and nothing in this
-codebase has a legitimate reason to nest loops on one thread today.
+a second loop while one is already current is an `est::check()`
+failure), not a push/pop RAII stack like `platform::override_instance()`'s
+- simpler to reason about, and nothing in this codebase has a legitimate
+reason to nest loops today.
 
 Every loop-taking free function gained a matching overload built on
 `loop::current()`: `make_promise_future<T>()`, `sleep_for()`/
@@ -3274,7 +3304,7 @@ without an explicit loop"), and would be a second, redundant way to
 reach it.
 
 Tests added: `loop::current()`'s happy path (returns the loop actually
-constructed on this thread); each new no-`loop&` overload
+constructed); each new no-`loop&` overload
 (`make_promise_future<T>()`, `sleep_for()`/`sleep_until()`/
 `yield_execution()`, `mutex()`); three coroutine shapes (some parameters
 but no `loop&`, no parameters at all, and one that genuinely suspends and

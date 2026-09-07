@@ -32,47 +32,69 @@ very next touch of the loop. This is documented explicitly on both
 it's an easy first-use mistake with no compiler or runtime defense against
 it.
 
-## `loop::current()`: implicit, not global (issue #30)
+## `loop::current()`: implicit, not global, and not `thread_local` (issue #30)
 
 A caller can still avoid threading a `loop&` through by hand, without
-reopening the global-singleton problem the section above rules out:
-`est::loop`'s own constructor sets a `thread_local loop*` (`current_loop`,
-a private static member) to itself, and its destructor clears it back to
-`nullptr`. `loop::current()` reads it back:
+reopening the global-singleton problem the section above rules out.
+`est::loop`'s own constructor stores `this` into
+`est::platform::detail::current_loop_context`, a plain global living in
+`:platform` (`platform.cppm`); its destructor clears it back to
+`nullptr`. `loop::current()` reads it back and casts:
 
 ```cpp
 [[nodiscard]] static auto current() -> loop& {
-  check(current_loop != nullptr, "est::loop::current(): no loop is current on this thread ...");
-  return *current_loop;
+  auto* const context = platform::get_current_loop_context();
+  check(context != nullptr, "est::loop::current(): no loop is current (issue #30) ...");
+  return *static_cast<loop*>(context);
 }
 ```
 
 The issue's own original suggestion was `platform::get_loop()` - a method
 on `est::platform`, mirroring how `platform::instance()` already works.
-Deliberately not done that way: `platform::interface` is safe to make a
-global, swappable pointer specifically *because* it's stateless policy (the
-"why an explicit `loop&`" section above) - bolting a mutable `loop*` onto
-it would reintroduce exactly the shared, cross-test-contaminating state
-that section rules out for `loop` itself. Scoping the pointer to `loop`'s
-own constructor/destructor instead keeps the guarantee intact: it's still
-one loop's lifetime, made implicitly reachable rather than always passed
-by hand.
+An earlier version of this feature rejected that in favor of a
+`thread_local loop*` scoped to `loop`'s own constructor/destructor,
+reasoning that `platform::interface` is safe to make a global
+specifically *because* it's stateless policy (the "why an explicit
+`loop&`" section above), and a mutable `loop*` living there would
+reintroduce exactly the state that section rules out. That reasoning
+wasn't wrong, but it solved a problem this codebase doesn't actually
+have while creating a new one: this codebase already has a plain,
+*non*-`thread_local` global doing exactly this kind of "which one is
+current" job - `platform`'s own `detail::current_instance` - and doing
+the same thing for `loop::current()` costs nothing that global-swap
+pattern doesn't already pay for `platform::instance()` itself.
+`thread_local`, on the other hand, is something this codebase has never
+otherwise needed, and the repo owner's own bare-metal stretch goal
+(`docs/PLAN.md` - freestanding, no OS) is exactly the kind of target
+where `thread_local` may have no well-defined support at all - reaching
+for it here would have been introducing a genuinely new, more fragile
+requirement to solve a problem (global cross-test state) a plain global
+already avoids just fine, the same way `current_instance` does.
+
+The actual storage is a plain `void*` in `:platform`, not `loop*`:
+`:platform` sits below `:loop` in the dependency DAG (this file's own
+top comment on why `:loop` imports `:platform`, never the reverse), so
+it can never name `est::loop` directly. `est::loop` performs the cast on
+both sides - safe by construction, not by RTTI, since the only two call
+sites that ever touch this slot are `loop`'s own constructor (stores
+`this`) and destructor (stores `nullptr`).
 
 A single slot with a checked precondition against nesting, not a
 push/pop stack like `platform::override_instance()`'s: constructing a
-second loop while one is already current on the same thread is treated
-as a programming error (an `est::check()` failure - see
-`est/tests/check_tests.cpp`'s own doc comment on why that failure path
-isn't unit-tested here), not "the inner one temporarily shadows the
-outer." Every
-free function that takes an explicit `loop&` today gained a matching
-overload that pulls `loop::current()` instead - `make_promise_future<T>()`,
-`sleep_for()`/`sleep_until()`, `yield_execution()` (all `est:promise`) -
-and `est::mutex` gained a matching no-argument constructor. A coroutine
-returning `est::future<T>` can drop the `est::loop&` parameter the same
-way - see [Coroutines](Coroutines.md)'s own calling-convention section
-for how `promise_type` resolves that without ambiguity against the
-original, loop-taking convention.
+second loop while one is already current is treated as a programming
+error (an `est::check()` failure - see `est/tests/check_tests.cpp`'s own
+doc comment on why that failure path isn't unit-tested here), not "the
+inner one temporarily shadows the outer."
+
+Every free function that takes an explicit `loop&` today gained a
+matching overload that pulls `loop::current()` instead -
+`make_promise_future<T>()`, `sleep_for()`/`sleep_until()`,
+`yield_execution()` (all `est:promise`) - and `est::mutex` gained a
+matching no-argument constructor. A coroutine returning `est::future<T>`
+can drop the `est::loop&` parameter the same way - see
+[Coroutines](Coroutines.md)'s own calling-convention section for how
+`promise_type` resolves that without ambiguity against the original,
+loop-taking convention.
 
 ## The ready-queue
 

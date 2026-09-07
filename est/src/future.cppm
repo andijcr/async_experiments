@@ -806,8 +806,8 @@ public:
   // constructor. Or (issue #30) it may take no loop& at all - a second
   // constructor/operator new pair below falls back to
   // est::loop::current() (est:loop) instead, for a caller content
-  // relying on whichever loop is current on this thread rather than
-  // threading one through by hand. Or it may take no parameters
+  // relying on whichever loop is current rather than threading one
+  // through by hand. Or it may take no parameters
   // whatsoever - a third, non-template pair covers that case, since a
   // bare parameter pack can't match zero arguments against "at least one
   // parameter."

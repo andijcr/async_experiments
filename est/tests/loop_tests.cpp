@@ -383,7 +383,7 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
 // other checked precondition (est/tests/check_tests.cpp's own doc
 // comment) - so only the happy path is covered here.
 
-TEST_CASE("loop::current() returns the loop constructed on this thread", "[loop]") {
+TEST_CASE("loop::current() returns the currently live loop", "[loop]") {
   est::loop loop;
   REQUIRE(&est::loop::current() == &loop);
 }

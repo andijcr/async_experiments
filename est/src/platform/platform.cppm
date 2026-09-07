@@ -262,6 +262,27 @@ namespace est::platform::detail {
 // NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 inline hosted_stdcpp default_instance{};
 inline interface* current_instance = &default_instance;
+
+// est::loop's own "current loop" slot (issue #30) - a plain, ordinary
+// global, deliberately *not* thread_local, mirroring current_instance
+// just above rather than reaching for language-level thread-local
+// storage: a target this codebase explicitly wants to support later
+// (docs/PLAN.md's "bare-metal embedded port" stretch goal - freestanding,
+// no OS) may have no well-defined thread_local support at all, the same
+// reason est::mutex's own M1 design never assumed threads to begin with.
+// A plain global costs nothing this codebase doesn't already pay for
+// current_instance itself, and works identically hosted or freestanding.
+//
+// Opaque void*, not est::loop* - this partition sits below :loop in the
+// dependency DAG (this file's own top comment) precisely so :loop can
+// depend on :platform and never the other way around; naming est::loop
+// here would invert that. est::loop performs the cast on both sides (see
+// get_current_loop_context()/set_current_loop_context() below), safe by
+// construction rather than by RTTI: the only two call sites that ever
+// touch this are est::loop's own constructor (stores `this`) and
+// destructor (stores `nullptr`), so whatever's read back is always
+// either null or a genuinely live est::loop*.
+inline void* current_loop_context = nullptr;
 } // namespace est::platform::detail
 
 export namespace est::platform {
@@ -289,6 +310,22 @@ export namespace est::platform {
 [[nodiscard]] inline auto override_instance(interface& replacement) noexcept {
   interface* const previous = std::exchange(detail::current_instance, &replacement);
   return scope_exit([previous]() noexcept { detail::current_instance = previous; });
+}
+
+// est::loop's own "current loop" accessors (issue #30) - see
+// detail::current_loop_context's own doc comment above for why this
+// lives here, as a plain global, rather than as a thread_local member on
+// est::loop itself. Plain free functions rather than methods on
+// `interface`, mirroring instance()/override_instance() above: nothing
+// about "hold a pointer and hand it back" is backend-specific behavior
+// the way now()/sleep_until()/assert_failure() genuinely are, so there's
+// nothing for a backend to actually override here.
+[[nodiscard]] inline auto get_current_loop_context() noexcept -> void* {
+  return detail::current_loop_context;
+}
+
+inline void set_current_loop_context(void* context) noexcept {
+  detail::current_loop_context = context;
 }
 
 } // namespace est::platform

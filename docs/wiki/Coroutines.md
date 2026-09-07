@@ -66,9 +66,9 @@ new` pair matches *whatever else* the actual coroutine function declares
 `loop_ref` itself isn't stored either, only used here to build `state_`.
 
 **Issue #30** added two more ways to write a coroutine, for a caller
-content relying on whichever loop is current on this thread
-(`est::loop::current()`, below) instead of threading one through by
-hand - no `est::loop&` parameter at all, or no parameters whatsoever:
+content relying on whichever loop is current (`est::loop::current()`,
+below) instead of threading one through by hand - no `est::loop&`
+parameter at all, or no parameters whatsoever:
 
 ```cpp
 template <class First, class... Rest>

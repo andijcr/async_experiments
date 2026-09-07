@@ -64,7 +64,7 @@ template <class T> auto make_promise_future(loop& loop_ref) -> std::pair<promise
 // Issue #30: sugar over the overload above using est::loop::current()
 // (est:loop) instead of a caller-supplied loop& - for a caller that
 // doesn't want to thread a loop& through by hand and is content relying
-// on whichever loop is current on this thread.
+// on whichever loop is current.
 template <class T> auto make_promise_future() -> std::pair<promise<T>, future<T>> {
   return make_promise_future<T>(loop::current());
 }
