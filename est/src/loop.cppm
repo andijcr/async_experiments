@@ -193,18 +193,16 @@ public:
   // back to a loop of its own when nothing has been explicitly
   // registered, rather than returning nullptr - but a test fake
   // (est/tests/) generally doesn't provide that fallback, so this stays a
-  // real, reachable precondition under one. The static_cast back from
-  // get_current_loop_context()'s opaque void* is safe by construction,
-  // not by RTTI - see platform::interface::get_current_loop_context()'s
-  // own doc comment (platform.cppm) for why the only thing that context
-  // can ever be, once non-null, is a genuinely live loop*.
+  // real, reachable precondition under one. No cast needed here, unlike
+  // an earlier version - get_current_loop_context() returns a genuinely
+  // typed est::loop* (platform.cppm's own doc comment on how), not an
+  // opaque void*.
   [[nodiscard]] static auto current() -> loop& {
     auto* const context = platform::instance().get_current_loop_context();
     check(context != nullptr,
           "est::loop::current(): no loop is current (issue #30) - call make_current() on one "
           "first, or pass a loop& explicitly instead of relying on the implicit one");
-    // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
-    return *static_cast<loop*>(context);
+    return *context;
   }
 
   // Destroys (without running) anything still queued - mirrors

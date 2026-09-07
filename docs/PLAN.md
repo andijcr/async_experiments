@@ -3466,6 +3466,74 @@ right after constructing its loop - `loop_tests.cpp`, `future_tests.cpp`'s
 three coroutine tests, and `mutex_tests.cpp`'s no-argument-constructor
 test.
 
+**Revised a sixth time, two smaller follow-ups from the same round of
+review.**
+
+First: **why not forward-declare `loop` in `:platform`, instead of an
+opaque `void*`?** Tried, and it works: `get_current_loop_context()`/
+`set_current_loop_context()` now return/take a genuinely typed
+`est::loop*`.
+
+```cpp
+// est::platform (platform.cppm) - no `import :loop;` anywhere in this file
+export namespace est { class loop; }
+```
+
+The forward declaration has to be `export`ed. Confirmed directly against
+this toolchain (clang, the pinned devenv): a plain, non-exported `class
+loop;` gets diagnosed as redeclaring an entity with module-private
+linkage the moment `:loop`'s own `export class loop { ... };` tries to
+attach to it -
+
+```
+error: cannot export redeclaration 'loop' here since the previous declaration has module linkage
+```
+
+- because `:platform` and `:loop` are different partitions of the *same*
+module, and a non-exported declaration in one partition has linkage
+private to that partition alone. The `export`ed version compiles cleanly:
+an exported declaration in one partition genuinely attaches to the real
+definition given in another partition of the same module, without either
+partition needing to `import` the other. `:platform` still can't
+construct, dereference, or otherwise complete `est::loop` - naming the
+type is all this needed, and is as far as `:platform` itself ever goes;
+completing it is still exclusively `hosted_stdcpp`'s job (`import
+:loop;`, in its own, separate partition). `loop::current()`'s own
+`static_cast<loop*>(...)` and its accompanying NOLINT are both gone -
+`get_current_loop_context()` already returns the right type.
+
+Second: **`import est;` installing `hosted_stdcpp` as a process-lifetime
+side effect (shown in the `est.cppm` snippet above) is the library making
+a decision - which backend, if any - that isn't the library's to make
+silently.** Reverted: `est.cppm` no longer installs anything, and goes
+back to being a plain umbrella of `export import`s. Each consumer now
+does its own installation, at the top of its own entry point:
+
+```cpp
+// examples/hello_world/main.cpp, examples/sleep_sort/main.cpp
+auto main() -> int {
+  est::platform::hosted_stdcpp platform_instance;
+  const auto platform_guard = est::platform::override_instance(platform_instance);
+  // ...
+}
+```
+
+`est/tests/`'s own Catch2 binary needed the equivalent for its one shared
+process: previously linked against `Catch2::Catch2WithMain` (Catch2's own
+pre-built `main()`), it now links `Catch2::Catch2` instead and supplies a
+small `est/tests/test_main.cpp` of its own - construct `hosted_stdcpp`,
+`override_instance()` it, then `Catch::Session().run(argc, argv)` - so
+the installation happens exactly once, before any `TEST_CASE` runs,
+rather than being every individual test file's own concern. Every test
+that needs a *different* backend still uses `override_instance()` to
+retarget it for its own scope, unchanged - this only supplies the one
+installed underneath that, so `platform::instance()` is never null to
+begin with.
+
+No new tests came out of this revision (all pre-existing behavior, same
+106 tests as before) - the entire point was that plumbing which backend
+gets installed, and where, shouldn't change any test's own outcome.
+
 Every loop-taking free function gained a matching overload built on
 `loop::current()`: `make_promise_future<T>()`, `sleep_for()`/
 `sleep_until()`, `yield_execution()` (all `est:promise`). `est::mutex`
@@ -3551,21 +3619,25 @@ Docs updated: `docs/wiki/Coroutines.md`'s calling-convention section
 (also fixed a small pre-existing staleness there - the shown
 `promise_type` code snippet still had a `loop_` member removed in an
 earlier PR #37 follow-up), `docs/wiki/Loop-And-Timers.md`'s own new
-`loop::current()` section (rewritten again for the fourth/fifth
+`loop::current()` section (rewritten again for the fourth/fifth/sixth
 revisions), `docs/wiki/Home.md`'s quick overview, `docs/wiki/
 Architecture.md`'s module-DAG diagram (added `:platform.hosted_stdcpp`
 and the edge explaining why it's the one partition depending on both
-`:platform` and `:loop` at once).
+`:platform` and `:loop` at once, plus the sixth revision's own
+`est::loop*`-not-`void*` and no-auto-install notes).
 
-**Verified in the pinned Docker devenv:** 106/106 tests pass (8 new);
-`clang-format`/`clang-tidy` clean (the module split needed its own
-`bugprone-throwing-static-initialization` NOLINT at the new
-`hosted_stdcpp` construction site in `est.cppm`, matching the one that
-used to sit where `platform.cppm`'s own `default_instance` was); full
-suite passes under the `sanitize` preset (ASan+UBSan) too - a meaningful
-check here given how much of this change is new overload-resolution
-surface and a genuinely new module-initialization-order dependency, not
-just new runtime behavior; both example binaries still run correctly.
+**Verified in the pinned Docker devenv, after the sixth revision above:**
+106/106 tests pass (8 new, unchanged by this revision - see its own
+closing note on why); `clang-format`/`clang-tidy` clean across every
+touched file, `examples/hello_world/main.cpp`/`examples/sleep_sort/
+main.cpp`/`est/tests/test_main.cpp` included (the
+`bugprone-throwing-static-initialization` NOLINT the previous revision
+needed at `est.cppm`'s own `hosted_stdcpp` construction site is gone
+along with that construction site - `hosted_stdcpp platform_instance` is
+now a local, automatic-storage-duration variable in each entry point's
+own `main()`, which this check doesn't flag at all); full suite passes
+under the `sanitize` preset (ASan+UBSan) too; both example binaries still
+run correctly, now doing their own platform installation first.
 
 ---
 

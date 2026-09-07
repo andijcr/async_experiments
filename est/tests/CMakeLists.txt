@@ -16,6 +16,7 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 add_executable(est_tests
+  test_main.cpp
   platform_tests.cpp
   check_tests.cpp
   intrusive_list_tests.cpp
@@ -26,7 +27,11 @@ add_executable(est_tests
   scope_exit_tests.cpp
   shared_ptr_tests.cpp
 )
-target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2WithMain)
+# Catch2::Catch2, not Catch2::Catch2WithMain: test_main.cpp supplies its
+# own main() (installing a platform::interface before any TEST_CASE runs,
+# per review - see that file's own doc comment), so this binary can't
+# also link Catch2's own pre-built one.
+target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2)
 est_set_warnings(est_tests)
 est_enable_coverage(est_tests)
 est_enable_sanitizers(est_tests)

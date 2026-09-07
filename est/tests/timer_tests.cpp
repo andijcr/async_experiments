@@ -38,8 +38,10 @@ public:
   void reset_loop_stall_detection() noexcept override {}
   void
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override { return nullptr; }
-  void set_current_loop_context(void* /*context*/) noexcept override {}
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
+    return nullptr;
+  }
+  void set_current_loop_context(est::loop* /*context*/) noexcept override {}
 
   // No `{}` needed: std::chrono::time_point's default constructor is a
   // real, user-provided constructor (time_point() : __d_(duration::zero())

@@ -69,6 +69,12 @@ a loop of its own, lazily, when nothing has been explicitly registered, so
 `loop::current()` still works for a caller with no loop to register in the
 first place.
 
+`import est;` doesn't install a `platform::interface` on its own, either —
+a program's own `main()` constructs `hosted_stdcpp` and
+`platform::override_instance()`s it first (`examples/hello_world/main.cpp`,
+`examples/sleep_sort/main.cpp`), same as `est/tests/`'s own test binary
+does once, in `est/tests/test_main.cpp`.
+
 ## Where to look in the source
 
 | Concept | File |

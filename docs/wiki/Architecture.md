@@ -70,9 +70,27 @@ Timers](Loop-And-Timers.md)), which `:platform` itself can never do without
 inverting the DAG the other way. Being a genuinely separate partition is
 what makes that legal: nothing stops a concrete backend from depending on
 `:loop`, only `:platform`, the abstraction every backend implements,
-doing so. `est/src/est.cppm` is what actually installs `hosted_stdcpp` as
-the process's permanent default (its own comment explains how) — a role
-`:platform` used to fill internally before this split.
+doing so. Also notable: `get_current_loop_context()`/
+`set_current_loop_context()` return a genuinely typed `est::loop*`, not an
+opaque `void*` - `:platform` forward-declares `est::loop` (`export
+namespace est { class loop; }`, `platform.cppm`'s own top comment on why
+an *exported* forward declaration in one partition attaches to the real
+definition in another partition of the same module, confirmed against
+this toolchain), naming the type without needing to complete it.
+`:platform` still never `import`s `:loop` - only `hosted_stdcpp` does, to
+actually construct its own fallback.
+
+`import est;` does *not* install a default `platform::interface` as a
+side effect - per review, that decision belongs to the program's own
+entry point, not to the library. `examples/hello_world/main.cpp` and
+`examples/sleep_sort/main.cpp` each construct a `hosted_stdcpp` and
+`platform::override_instance()` it at the top of their own `main()`;
+`est/tests/`'s own Catch2 binary does the same once, in a small custom
+`main()` (`est/tests/test_main.cpp`, linked against `Catch2::Catch2`
+rather than `Catch2::Catch2WithMain`), instead of every individual test
+file. Before this, `est.cppm` installed `hosted_stdcpp` itself as a
+process-lifetime side effect of `import est;` - reverted for the same
+reason.
 
 ## Design philosophy
 

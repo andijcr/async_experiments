@@ -71,13 +71,15 @@ public:
   // set_current_loop_context() (est::platform::interface's own doc
   // comment) - a no-op here would silently break loop::current() for
   // every one of them.
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
     return current_loop_context;
   }
-  void set_current_loop_context(void* context) noexcept override { current_loop_context = context; }
+  void set_current_loop_context(est::loop* context) noexcept override {
+    current_loop_context = context;
+  }
 
   mutable std::chrono::steady_clock::time_point current;
-  void* current_loop_context = nullptr;
+  est::loop* current_loop_context = nullptr;
 };
 
 // A platform whose now() advances by `step` on every single call - used
@@ -128,15 +130,17 @@ public:
   // A real, working slot: est::loop is constructed under this fake too
   // (see get_current_loop_context()'s own doc comment on fake_platform,
   // above, for why a no-op here isn't an option).
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
     return current_loop_context;
   }
-  void set_current_loop_context(void* context) noexcept override { current_loop_context = context; }
+  void set_current_loop_context(est::loop* context) noexcept override {
+    current_loop_context = context;
+  }
 
   mutable std::chrono::steady_clock::time_point current;
   std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);
   mutable std::chrono::steady_clock::time_point stall_start;
-  void* current_loop_context = nullptr;
+  est::loop* current_loop_context = nullptr;
 };
 
 } // namespace

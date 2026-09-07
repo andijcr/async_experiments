@@ -105,16 +105,20 @@ public:
   }
 
   // interface::get_current_loop_context()'s own doc comment explains what
-  // this slot is for and why it's an opaque void*. `explicit_loop_` is
-  // whatever a caller most recently registered via loop::make_current()
-  // (est:loop) - taking priority whenever set, since a caller that
-  // bothered to register a specific loop clearly wants that one used, not
-  // a fallback. When nothing has been explicitly registered,
-  // default_loop_ is lazily constructed on first use and returned instead
-  // - this is *the* payoff of splitting this class out of :platform (see
-  // this file's own top comment): a caller that never wants to think
-  // about est::loop at all - the original ergonomic goal of issue #30 -
-  // gets a genuinely working one for free, driven the same way any other
+  // this slot is for and why it's typed `est::loop*` here (a forward
+  // declaration in `:platform` itself, exported so this partition's own
+  // definition attaches to the same entity - platform.cppm's own doc
+  // comment on why that's legal despite `:platform` never importing
+  // `:loop`). `explicit_loop_` is whatever a caller most recently
+  // registered via loop::make_current() (est:loop) - taking priority
+  // whenever set, since a caller that bothered to register a specific
+  // loop clearly wants that one used, not a fallback. When nothing has
+  // been explicitly registered, default_loop_ is lazily constructed on
+  // first use and returned instead - this is *the* payoff of splitting
+  // this class out of :platform (see this file's own top comment): a
+  // caller that never wants to think about est::loop at all - the
+  // original ergonomic goal of issue #30 - gets a genuinely working one
+  // for free, driven the same way any other
   // (`est::loop::current().run_until_idle();`), rather than
   // loop::current() simply failing its own "no loop is current"
   // precondition until someone constructs one.
@@ -125,7 +129,7 @@ public:
   // long-lived default_instance, :platform's own doc comment) - it isn't
   // torn down and rebuilt every time an explicit registration comes and
   // goes, the way a naive single shared slot would force.
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
     if (explicit_loop_ != nullptr) {
       return explicit_loop_;
     }
@@ -135,11 +139,11 @@ public:
     return &*default_loop_;
   }
 
-  void set_current_loop_context(void* context) noexcept override { explicit_loop_ = context; }
+  void set_current_loop_context(est::loop* context) noexcept override { explicit_loop_ = context; }
 
 private:
   std::chrono::steady_clock::time_point stall_start_;
-  void* explicit_loop_ = nullptr;
+  est::loop* explicit_loop_ = nullptr;
   // mutable: get_current_loop_context() is const (interface's own
   // signature - every other backend answers "what's current" without
   // needing to mutate anything either), but lazily constructing the

@@ -52,15 +52,17 @@ public:
   // shape - not exercised by any test in this file (none of them
   // construct an est::loop under this stub), but a stub answering these
   // incorrectly would be a silent trap for whoever adds one later.
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> void* override {
+  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
     return current_loop_context;
   }
-  void set_current_loop_context(void* context) noexcept override { current_loop_context = context; }
+  void set_current_loop_context(est::loop* context) noexcept override {
+    current_loop_context = context;
+  }
 
   static constexpr std::chrono::steady_clock::time_point epoch{};
   mutable std::optional<std::chrono::steady_clock::time_point> last_sleep_until;
   mutable std::optional<std::string> last_vprintdbg_message;
-  void* current_loop_context = nullptr;
+  est::loop* current_loop_context = nullptr;
 };
 
 } // namespace

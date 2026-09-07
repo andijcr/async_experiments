@@ -123,21 +123,39 @@ was a method on `est::platform` - `platform::get_loop()`.
    construct that fallback, and `:platform` sits below `:loop` in the
    dependency DAG specifically so it never has to (this file's own top
    comment; [Architecture](Architecture.md) has the fuller module-DAG
-   picture). `est/src/est.cppm` is what actually installs `hosted_stdcpp`
-   as the process's permanent default now, via the same
-   `override_instance()` every test already uses to install a *temporary*
-   one - just never letting the returned guard go out of scope. (This
-   revisits - with a real payoff this time - a module split, issue #6,
-   this codebase once closed as "no concrete payoff with only one
-   backend.")
+   picture). (This revisits - with a real payoff this time - a module
+   split, issue #6, this codebase once closed as "no concrete payoff with
+   only one backend.")
+6. Two smaller follow-ups from the same round of review. First: **why not
+   forward-declare `loop` in `:platform`, instead of an opaque `void*`?**
+   Tried and confirmed against this toolchain -
+   `get_current_loop_context()`/`set_current_loop_context()` now return/
+   take a genuinely typed `est::loop*`. The trick is that the forward
+   declaration has to be `export`ed (`export namespace est { class loop;
+   }`, `platform.cppm`'s own top comment) - a *non*-exported one gets
+   diagnosed by clang as redeclaring an entity with module-private
+   linkage, since `:platform` and `:loop` are different partitions of the
+   same module. `:platform` still never `import`s `:loop`, and still
+   can't construct or otherwise complete the type - naming it is all this
+   needed. Second: **`import est;` installing `hosted_stdcpp` as a
+   process-lifetime side effect (what point 5 above originally did in
+   `est.cppm`) is the library's own decision to make silently - it
+   shouldn't.** Reverted: `est.cppm` no longer installs anything.
+   `examples/hello_world/main.cpp` and `examples/sleep_sort/main.cpp` now
+   each construct a `hosted_stdcpp` and `override_instance()` it at the
+   top of their own `main()`; `est/tests/`'s own Catch2 binary does the
+   same once, in a small custom `main()` (`est/tests/test_main.cpp`,
+   linked against `Catch2::Catch2` rather than `Catch2::Catch2WithMain`)
+   instead of every individual test file.
 
-The actual storage is still a plain `void*`, not `loop*`: `:platform`
-itself still can't name `est::loop` directly, even though the concrete
-backend that implements `get_current_loop_context()` now can (point 5
-above). Whichever backend implements it performs the cast - safe by
-construction, not by RTTI, since the only call sites that ever write into
-it are `make_current()`'s own guard and, for `hosted_stdcpp` specifically,
-its own lazily-constructed fallback loop. `get_current_loop_context()`/
+The actual storage is a genuinely typed `est::loop*`, not an opaque
+`void*` (point 6 above) - `:platform` names the type via an exported
+forward declaration without needing to complete it; only the concrete
+backend that implements `get_current_loop_context()` needs the complete
+type, to actually construct one. No cast needed on either side anymore.
+The only call sites that ever write into this slot are `make_current()`'s
+own guard and, for `hosted_stdcpp` specifically, its own
+lazily-constructed fallback loop. `get_current_loop_context()`/
 `set_current_loop_context()` are virtual (point 3 above) - not because
 "hold a pointer and hand it back" is backend-specific (it still isn't),
 but because `interface` no longer special-cases *any* method as

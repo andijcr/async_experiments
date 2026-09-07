@@ -11,13 +11,22 @@ import :util.scope_exit;
 // right here too; per review, it now lives in its own module,
 // `:platform.hosted_stdcpp` - not for this class's own sake, but because
 // that backend's "current loop" fallback (issue #30, see its own doc
-// comment on get_current_loop_context() below) needs to construct an
-// actual est::loop, and this module sits below `:loop` in the dependency
-// DAG specifically so it never has to name est::loop at all. A concrete
-// backend, being a *different* module, is free to import `:loop`; this
-// one still can't. (This is the same split issue #6 once proposed and
-// this codebase closed as "no concrete payoff with only one backend" -
-// docs/PLAN.md - there's a real one now.)
+// comment on get_current_loop_context() below) needs to *construct* an
+// actual est::loop, not just name the type - this module can forward-
+// declare est::loop just fine (below), since an exported forward
+// declaration in one partition of a module attaches to the real
+// definition in another partition of the *same* module without needing
+// an import edge between them (confirmed against this exact toolchain: a
+// plain, non-exported forward declaration does *not* work this way -
+// clang diagnoses it as redeclaring an entity with module-private
+// linkage). What `:platform` still can't do is construct one, call any
+// of its methods, or otherwise need it as a complete type - `:loop`
+// itself is what `:platform` never imports, keeping the dependency DAG a
+// strict one-way street. A concrete backend, being a *different*
+// partition, is free to `import :loop` for that; this one still isn't.
+// (This is the same split issue #6 once proposed and this codebase
+// closed as "no concrete payoff with only one backend" - docs/PLAN.md -
+// there's a real one now.)
 //
 // This is virtual dispatch through a single global object, not a
 // compile-time template parameter (docs/PLAN.md records why: a prior,
@@ -30,6 +39,16 @@ import :util.scope_exit;
 // (or compiled in at link time instead of hosted_stdcpp entirely -
 // "ideally at link time, but for simplicity it's a vtable" for now) - not
 // a framework redesign either way.
+
+// Forward declaration only, deliberately `export`ed - see this file's own
+// top comment for why this (and not a plain, non-exported declaration)
+// is what makes get_current_loop_context()/set_current_loop_context()
+// below able to name `est::loop*` directly, with no `:loop` import and no
+// `void*`+cast in sight.
+export namespace est {
+class loop;
+}
+
 export namespace est::platform {
 
 class interface;
@@ -156,20 +175,20 @@ public:
   // thread_local (docs/PLAN.md's bare-metal embedded port stretch goal -
   // freestanding, no OS - may have no well-defined thread_local support).
   //
-  // Opaque void*, not est::loop* - this partition sits below :loop in the
-  // module dependency DAG (this file's own top comment) precisely so
-  // :loop can depend on :platform and never the other way around; naming
-  // est::loop here would invert that. Whichever concrete backend
-  // implements this performs the cast on both sides - safe by
-  // construction rather than by RTTI, since the only call sites that ever
-  // write into it are est::loop::make_current()'s own guard (storing
-  // `this`, then `nullptr` when the guard is destroyed) and, for
-  // hosted_stdcpp specifically, its own lazily-constructed fallback loop
-  // (:platform.hosted_stdcpp) - so whatever's read back is always either
-  // null or a genuinely live est::loop*.
-  [[nodiscard]] virtual auto get_current_loop_context() const noexcept -> void* = 0;
+  // A genuinely typed est::loop*, not an opaque void* - see the forward
+  // declaration above (and this file's own top comment) for how this
+  // module gets to name est::loop without importing :loop: naming the
+  // type is fine, constructing or otherwise completing one is what would
+  // actually invert the dependency DAG, and no method here needs to.
+  // Whichever concrete backend implements this is the one place that
+  // actually completes the type (:platform.hosted_stdcpp's own `import
+  // :loop;`) - the only call sites that ever write into this slot are
+  // est::loop::make_current()'s own guard (storing `this`, then `nullptr`
+  // when the guard is destroyed) and, for hosted_stdcpp specifically, its
+  // own lazily-constructed fallback loop.
+  [[nodiscard]] virtual auto get_current_loop_context() const noexcept -> est::loop* = 0;
 
-  virtual void set_current_loop_context(void* context) noexcept = 0;
+  virtual void set_current_loop_context(est::loop* context) noexcept = 0;
 };
 
 // The actual body, deferred until here (see the forward declaration's own
