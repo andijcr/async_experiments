@@ -246,6 +246,36 @@ public:
   }
 
 private:
+  // One shared promise/future pair per cell, not one per waiter (PR #53
+  // review): future_state<T>'s own waiters_ list already supports any
+  // number of independent registrations against a single future - every
+  // .then()/co_await on the same future<T> lvalue just appends another
+  // continuation, all fired together once it completes (future.cppm,
+  // future_state<T>::set_continuation()/complete()). Safe specifically
+  // because this is future<void> - nothing to consume, so N waiters each
+  // calling get() (via co_await) off the same future_state is fine; it
+  // would not be for a value-carrying future<T>, whose move-only, single-
+  // consumer contract this deliberately doesn't disturb.
+  //
+  // Heap-allocated behind a shared_ptr, not stored by value in the map:
+  // a co_await'ing coroutine's own future_awaiter holds a *reference* to
+  // this future<void> object itself (not just its future_state) that has
+  // to stay valid until that specific coroutine actually resumes - which
+  // happens later, on a subsequent loop drain, not by the time
+  // notify_presence() (below) returns. An earlier version stored
+  // waiter_slot by value in the map and moved it out in notify_presence()
+  // to fire it, which let the *map entry* - and so the future<void> every
+  // still-suspended waiter's awaiter pointed at - be erased before those
+  // waiters ever resumed: a real, reproducible (SEGFAULT under the unit
+  // tests) use-after-free. Each wait_for_presence() call now keeps its
+  // own shared_ptr copy alive in its own coroutine frame across the
+  // suspension, so the slot outlives notify_presence() erasing the map's
+  // own reference to it, for as long as the last waiter needs it to.
+  struct waiter_slot {
+    est::promise<void> prom;
+    est::future<void> fut;
+  };
+
   // A waiter for `id` is only ever registered (see resolve_blocking()
   // above) while cells_ does not yet contain `id` - so the first SET that
   // makes it present is always the transition being waited for, and
@@ -255,9 +285,15 @@ private:
     if (cells_.contains(id)) {
       co_return;
     }
-    auto [prom, fut] = est::make_promise_future<void>();
-    presence_waiters_.try_emplace(id).first->second.push_back(std::move(prom));
-    co_await std::move(fut);
+    auto it = presence_waiters_.find(id);
+    if (it == presence_waiters_.end()) {
+      auto [prom, fut] = est::make_promise_future<void>();
+      it = presence_waiters_
+               .emplace(id, std::make_shared<waiter_slot>(std::move(prom), std::move(fut)))
+               .first;
+    }
+    const auto slot = it->second;
+    co_await slot->fut;
   }
 
   void notify_presence(char id) {
@@ -265,11 +301,9 @@ private:
     if (it == presence_waiters_.end()) {
       return;
     }
-    auto waiters = std::move(it->second);
+    const auto slot = std::move(it->second);
     presence_waiters_.erase(it);
-    for (auto& waiter : waiters) {
-      waiter.set_value();
-    }
+    slot->prom.set_value();
   }
 
   [[nodiscard]] auto resolve_impl(char id, std::unordered_map<char, double>& memo) const -> double {
@@ -324,7 +358,7 @@ private:
   }
 
   std::unordered_map<char, std::variant<double, std::vector<char>>> cells_;
-  std::unordered_map<char, std::vector<est::promise<void>>> presence_waiters_;
+  std::unordered_map<char, std::shared_ptr<waiter_slot>> presence_waiters_;
 };
 
 // Bridges one parsed_line into the sheet, returning the full response

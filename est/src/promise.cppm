@@ -44,7 +44,10 @@ public:
     state_->set_value(std::move(value));
   }
 
-  void set_exception(const std::exception_ptr& exception) { state_->set_exception(exception); }
+  // By value + move, not const& - see future_state<T>::set_exception()'s
+  // own doc comment (est:future); same reasoning, this just forwards.
+  // NOLINTNEXTLINE(performance-unnecessary-value-param)
+  void set_exception(std::exception_ptr exception) { state_->set_exception(std::move(exception)); }
 
 private:
   shared_ptr<future_state<T>> state_;

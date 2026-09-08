@@ -337,9 +337,23 @@ public:
     complete();
   }
 
-  void set_exception(const std::exception_ptr& exception) {
+  // By value, not const&, despite what performance-unnecessary-value-param
+  // suggests (PR #53 review): every real call site here passes a prvalue
+  // (std::current_exception(), get_exception()'s own by-value return) -
+  // taken by value, that binds via guaranteed copy elision (no copy or
+  // move at the call site at all) and is then moved into result_ below;
+  // taken by const&, every call site would instead pay a copy into
+  // result_, unconditionally, with no way to ever move. An lvalue caller
+  // costs the same either way (one copy, before or after the parameter).
+  // The check's blanket "always const&" heuristic doesn't model the
+  // by-value-sink-and-move idiom being at least as cheap and often
+  // cheaper - std::exception_ptr's copy is a refcount bump (like
+  // shared_ptr's), its move is not required to be but is free to be
+  // cheaper, and nothing here should foreclose that.
+  // NOLINTNEXTLINE(performance-unnecessary-value-param)
+  void set_exception(std::exception_ptr exception) {
     check_not_completed();
-    result_.template emplace<std::exception_ptr>(exception);
+    result_.template emplace<std::exception_ptr>(std::move(exception));
     complete();
   }
 
