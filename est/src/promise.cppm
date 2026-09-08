@@ -44,7 +44,7 @@ public:
     state_->set_value(std::move(value));
   }
 
-  void set_exception(std::exception_ptr exception) { state_->set_exception(std::move(exception)); }
+  void set_exception(const std::exception_ptr& exception) { state_->set_exception(exception); }
 
 private:
   shared_ptr<future_state<T>> state_;

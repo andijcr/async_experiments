@@ -138,6 +138,23 @@ private:
 // like any other shared_ptr copy.
 template <class T> class enable_shared_from_this {
 public:
+  // Copy/move stay deleted (rather than just never declared): T is
+  // always accessed through shared_ptr<T>, never copied/moved as a
+  // value, and a deleted declaration is public by convention (modernize-
+  // use-equals-delete) so misuse fails with a clear "deleted function"
+  // diagnostic instead of "private member" - unlike the default
+  // constructor below, deleting these reveals nothing about the CRTP
+  // access restriction that constructor exists to enforce.
+  enable_shared_from_this(const enable_shared_from_this&) = delete;
+  auto operator=(const enable_shared_from_this&) -> enable_shared_from_this& = delete;
+  enable_shared_from_this(enable_shared_from_this&&) = delete;
+  auto operator=(enable_shared_from_this&&) -> enable_shared_from_this& = delete;
+  // See the matching NOLINT in util/intrusive_list.cppm - same
+  // clang-tidy limitation, reproduced here for
+  // enable_shared_from_this<future_state<T>> instead.
+  // NOLINTNEXTLINE(performance-trivially-destructible)
+  ~enable_shared_from_this() = default;
+
   // Precondition: this object was actually constructed via
   // shared_ptr<T>::make() (which is what sets control_block_ - see
   // set_owning_control_block() below). Debug-checked, unlike the rest of

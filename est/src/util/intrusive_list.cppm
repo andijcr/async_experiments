@@ -62,6 +62,21 @@ template <class T>
   requires std::derived_from<T, intrusive_list_node>
 class intrusive_list {
 public:
+  intrusive_list() = default;
+  intrusive_list(const intrusive_list&) = delete;
+  auto operator=(const intrusive_list&) -> intrusive_list& = delete;
+  intrusive_list(intrusive_list&&) = delete;
+  auto operator=(intrusive_list&&) -> intrusive_list& = delete;
+  // Already exactly what performance-trivially-destructible asks for
+  // (=default, first and only declaration) - still flagged for some T
+  // (e.g. future<std::string>'s own continuation_node<std::string>),
+  // reproduced in isolation. A module-instantiation-specific clang-tidy
+  // limitation, same category as this project's own
+  // readability-redundant-declaration exclusion (.clang-tidy's own top
+  // comment).
+  // NOLINTNEXTLINE(performance-trivially-destructible)
+  ~intrusive_list() = default;
+
   void enqueue(T& node) noexcept {
     node.next = nullptr;
     tail_->next = &node;
