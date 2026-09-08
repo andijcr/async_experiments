@@ -337,7 +337,7 @@ public:
     complete();
   }
 
-  void set_exception(std::exception_ptr exception) {
+  void set_exception(std::exception_ptr&& exception) {
     check_not_completed();
     result_.template emplace<std::exception_ptr>(std::move(exception));
     complete();
