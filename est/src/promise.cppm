@@ -44,9 +44,6 @@ public:
     state_->set_value(std::move(value));
   }
 
-  // By value + move, not const& - see future_state<T>::set_exception()'s
-  // own doc comment (est:future); same reasoning, this just forwards.
-  // NOLINTNEXTLINE(performance-unnecessary-value-param)
   void set_exception(std::exception_ptr exception) { state_->set_exception(std::move(exception)); }
 
 private:
