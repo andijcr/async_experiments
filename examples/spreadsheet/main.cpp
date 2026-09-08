@@ -8,6 +8,7 @@ import std;
 // setup below are macros/plain declarations `import std;` doesn't carry
 // (same reasoning as examples/hello_world, examples/sleep_sort), so this
 // stays a classic #include.
+#include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
 #include <unistd.h>
@@ -69,6 +70,18 @@ auto main() -> int {
   // hello_world/main.cpp, examples/sleep_sort/main.cpp do the same).
   estext::hosted_stdcpp platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
+
+  // stdout is fully buffered by default whenever it isn't a tty - the
+  // normal case for this program, piped to whatever sent the commands -
+  // so without this, every response std::println() below writes sits in
+  // libc's buffer, invisible to the caller, until enough of them
+  // accumulate to fill it or the process exits. That defeats the whole
+  // "answers can come interleaved" point of the protocol: a caller
+  // expecting a prompt response to command N would see nothing until
+  // command N+50 or EXIT. Line-buffering forces a flush after every '\n'
+  // std::println() writes, matching a tty's own default behavior instead
+  // of a pipe's.
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
   // getline_async() polls stdin with a raw, non-blocking ::read() rather
   // than ever blocking the one thread est::loop runs on - this is the
