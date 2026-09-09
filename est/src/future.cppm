@@ -825,6 +825,27 @@ public:
     }
   }
 
+  // Returns another future<T> aliasing the same future_state as *this -
+  // both see the same eventual result, and either may safely call the
+  // lvalue (copying) get() or register any number of then() callbacks,
+  // any number of times. What it does *not* make safe: the consuming
+  // (rvalue) get() path - which co_await always uses (this class's own
+  // operator co_await(), below) - called from more than one clone of a
+  // value-carrying future<T>. The second such call reads the first's
+  // moved-from leftovers, silently: future_state<T>::get()'s lvalue
+  // branch copies the stored value out (harmless, repeatable - what
+  // then()'s own unwrapped dispatch already relies on to let multiple
+  // continuations each read it), but the rvalue branch moves it out, and
+  // a move doesn't reset the underlying storage - it just leaves
+  // whatever moved-from state T ends up in sitting there permanently.
+  // Safe unconditionally only when T is void (nothing to consume) or
+  // every clone sticks to the non-consuming paths (get() on an lvalue,
+  // then()). Just a copy of state_ - cheap regardless of whether T
+  // happens to opt into est::ref_counted's intrusive counting or the
+  // default control_block-based one (est:util.shared_ptr): either way
+  // it's a plain refcount bump, no extra allocation.
+  [[nodiscard]] auto clone() const -> future { return future(state_); }
+
   // Forwards to future_state<T>::then() (see its own doc comment) - the
   // node allocation and registration live there now, not here.
   template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn)); }
