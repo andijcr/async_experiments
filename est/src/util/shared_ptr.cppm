@@ -31,6 +31,14 @@ template <class T> class shared_ptr;
 // compiling and silently doing the wrong thing): there's no T to get
 // wrong here, since Self is always whatever the caller actually invoked
 // shared_from_this() on.
+//
+// T must be `final`: the destructor below is deliberately non-virtual
+// (nothing ever destroys through a ref_counted*, only ever through the
+// T* shared_ptr<T>'s own intrusive specialization allocated - see that
+// class's own doc comment), so a further-derived class would be
+// destroyed through T's destructor instead of its own the moment its ref
+// count reached zero. shared_ptr<T>'s intrusive specialization
+// static_asserts this for every T that inherits ref_counted.
 class ref_counted {
 public:
   ref_counted(const ref_counted&) = delete;
@@ -184,10 +192,23 @@ private:
 // same way the primary template's control_block always takes it as its
 // own first argument. This is the one visible difference a ref_counted T
 // has to cooperate with; see est::future_state<T> (est:future) for a real
-// example.
+// example - and must itself be marked `final` (the static_assert below),
+// for the same reason ref_counted's own destructor is deliberately
+// non-virtual: reset() below always deletes through a T* it constructed
+// itself, never through a ref_counted*, so it needs T's own destructor to
+// be the one that actually runs. A further-derived class would instead be
+// destroyed through T's (non-virtual) destructor once its ref count hit
+// zero - silently skipping the derived class's own destructor, exactly
+// the "delete through a base pointer with no virtual destructor" bug this
+// design otherwise avoids entirely by never deleting through a base
+// pointer at all.
 template <class T>
   requires std::derived_from<T, ref_counted>
 class shared_ptr<T> {
+  static_assert(std::is_final_v<T>,
+                "a T inheriting est::ref_counted must be marked final - see "
+                "this specialization's own doc comment just above");
+
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
 

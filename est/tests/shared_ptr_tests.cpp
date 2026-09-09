@@ -42,7 +42,7 @@ private:
 // takes the allocator first and forwards it to ref_counted, exactly the
 // contract shared_ptr<T>'s intrusive specialization requires (see
 // ref_counted's own doc comment, util/shared_ptr.cppm).
-class self_aware : public est::ref_counted {
+class self_aware final : public est::ref_counted {
 public:
   self_aware(std::pmr::polymorphic_allocator<std::byte> allocator, int value_in)
       : ref_counted(allocator), value(value_in) {}

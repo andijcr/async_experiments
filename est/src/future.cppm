@@ -277,7 +277,13 @@ namespace est {
 // control_block wrapping it), storing the ref count and allocator right
 // here instead - see ref_counted's own doc comment for why that also
 // makes shared_from_this() (used just below) essentially free, with no
-// back-pointer to wire up at construction time.
+// back-pointer to wire up at construction time. `final` for the same
+// reason shared_ptr<T>'s intrusive specialization static_asserts it of
+// every T that inherits ref_counted: ref_counted's own destructor is
+// deliberately non-virtual (it's only ever destroyed through T*, never
+// through ref_counted* - see its own doc comment), so a further-derived
+// class here would be destroyed through the wrong type's destructor the
+// moment its own ref count reached zero.
 //
 // Holds a reference to the est::loop it was created against (M3,
 // docs/PLAN.md) rather than its own allocator - the allocator it uses is
@@ -298,7 +304,7 @@ namespace est {
 // set_continuation(), even this class's own destructor). Callers must
 // arrange loop lifetime themselves; est::loop's own doc comment
 // (est:loop) describes the same dependency from the loop's side.
-template <class T> class future_state : public ref_counted {
+template <class T> class future_state final : public ref_counted {
 public:
   using continuation_node = detail::continuation_node<T>;
 
