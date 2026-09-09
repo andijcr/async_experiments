@@ -21,6 +21,7 @@ export import :util.shared_ptr;
 export import :platform;
 export import :check;
 export import :sync.mutex;
+export import :sync.event;
 export import :timer;
 export import :loop;
 export import :util.current_loop;

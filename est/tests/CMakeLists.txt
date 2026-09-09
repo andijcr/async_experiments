@@ -21,6 +21,7 @@ add_executable(est_tests
   check_tests.cpp
   intrusive_list_tests.cpp
   mutex_tests.cpp
+  event_tests.cpp
   timer_tests.cpp
   loop_tests.cpp
   future_tests.cpp

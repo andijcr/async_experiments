@@ -810,3 +810,28 @@ confirmed use-after-free for a different one:
 > `mutex&`. Precondition instead of a fix: the loop must outlive every
 > mutex constructed against it, and a caller must not let the loop keep
 > running past a mutex's destruction while a waiter is still queued on it.
+
+### `est::counting_event<Mode>` reuses this pattern unchanged
+
+`est/src/sync/event.cppm`'s `counting_event<Mode>` (an awaitable counting
+semaphore, `Mode` selecting whether a successful `wait()` consumes one unit
+of the count or leaves it alone - the classic Win32 auto-reset/manual-reset
+distinction, generalized past a plain boolean) is built from exactly the
+pieces above: a `loop&`, an `intrusive_list<detail::ready_node> waiters_`,
+and a nested `resume_node final : public detail::ready_node` whose
+`destroy()` completes an abandoned `promise<void>` with an exception for
+the identical reason `lock_resume_node`'s own doc comment gives - a
+coroutine suspended in `co_await event.wait()` holds the `future_state<void>`
+alive across the suspension, reachable only through that promise. `set()`
+defers through `loop.enqueue_ready()` rather than completing waiters
+inline, matching `unlock()`'s own reasoning above.
+
+`binary_event<Mode>` (count clamped to `{0, 1}`, the classic Win32 event
+object) and `one_shot_event<Mode>` (`set()` at most once, ever) are then
+just plain C++ name hiding on top of `counting_event<Mode>` - a
+no-argument `set()` that hides the base class's `set(int n)` from
+unqualified lookup, not a virtual override - since nothing in this
+hierarchy ever needs runtime dispatch: every caller always knows the
+concrete type it holds. `one_shot_event::reset()` is `= delete`d the same
+way, turning "don't call this" from a documented-but-unchecked
+precondition into a compile error.

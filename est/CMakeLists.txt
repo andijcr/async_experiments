@@ -13,6 +13,7 @@ target_sources(est
       src/platform/platform.cppm
       src/check.cppm
       src/sync/mutex.cppm
+      src/sync/event.cppm
       src/timer.cppm
       src/loop.cppm
       src/util/current_loop.cppm

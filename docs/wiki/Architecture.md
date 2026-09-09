@@ -15,6 +15,7 @@ graph BT
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, ref_counted"]
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
   mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::acquire, mutex::lock_guard"]
+  event[":sync.event<br/>counting_event&lt;Mode&gt;, binary_event&lt;Mode&gt;, one_shot_event&lt;Mode&gt;"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
   current_loop[":util.current_loop<br/>make_current_loop(loop&amp;), current_loop()"]
@@ -27,6 +28,12 @@ graph BT
   mutex --> future
   mutex --> promise
   mutex --> current_loop
+  event --> check
+  event --> intrusive_list
+  event --> loop
+  event --> future
+  event --> promise
+  event --> current_loop
   timer --> platform
   loop --> check
   loop --> platform
@@ -62,6 +69,17 @@ about `:sync.mutex` in return. `:sync.mutex` also depends on `:future`/
 instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
 rather than a coroutine of its own, the same "producer without co_await"
 pattern `sleep_until()` (`:promise`) already uses.
+
+`:sync.event` (`counting_event<Mode>`, `binary_event<Mode>`,
+`one_shot_event<Mode>` - an awaitable counting semaphore and the
+auto-reset/manual-reset event types built on top of it) depends on exactly
+the same set of partitions `:sync.mutex` does, for the same reasons - it
+reuses `:sync.mutex`'s own `loop&`/`intrusive_list<detail::ready_node>`/
+resume-node pattern outright rather than introducing a new one (see
+["`est::counting_event<Mode>` reuses this pattern
+unchanged"](Coroutines.md#estcounting_eventmode-reuses-this-pattern-unchanged)).
+It additionally depends on `:check` directly, for `set(n)`'s `n > 0`
+precondition and `one_shot_event::set()`'s at-most-once enforcement.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
