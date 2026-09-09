@@ -12,7 +12,7 @@ graph BT
   platform[":platform<br/>interface (pure virtual), instance, override_instance, printdbg"]
   check[":check<br/>est::check()"]
   scope_exit[":util.scope_exit"]
-  shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, enable_shared_from_this&lt;T&gt;"]
+  shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, ref_counted"]
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
   mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::acquire, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
@@ -22,7 +22,6 @@ graph BT
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
 
   check --> platform
-  shared_ptr --> check
   mutex --> intrusive_list
   mutex --> loop
   mutex --> future
@@ -231,7 +230,11 @@ the value-or-exception storage plus the continuation queue. It is
 through the thin, `shared_ptr`-backed `est::promise<T>` (producer) and
 `est::future<T>` (consumer) handles that wrap it, including inside a
 "wrapped" `then()` callback (which gets a real `future<T>`, built on demand
-via `enable_shared_from_this`, never the `future_state<T>` itself). This
+via `shared_from_this()` — `future_state<T>` inherits `est::ref_counted`
+(`est:util.shared_ptr`) for exactly this — never the `future_state<T>`
+itself). `future<T>::clone()` is the other way to get a second handle: an
+explicit caller-requested alias of the same `future_state<T>`, rather
+than one `then()` builds internally for its own use. This
 mirrors `std::promise`/`std::future`'s own split, but goes one step further
 by making the shared state module-private — there's no way for calling code
 to name `future_state<T>` even by accident.

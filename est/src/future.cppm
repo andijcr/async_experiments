@@ -32,6 +32,18 @@ namespace est::detail {
 // node. Not nested inside future_state<T> - it's an implementation
 // detail of :future, not part of future_state's public surface, so it
 // lives here instead.
+//
+// Written *before* future_state<T> (below) in this file, but owner_'s
+// shared_ptr<future_state<T>> only actually needs future_state<T>
+// complete once this template is first instantiated for a real T - which
+// never happens until concrete_continuation/future_resume_node<T>
+// (both further down this file, after future_state<T>'s own definition)
+// actually use it. See future_state<T>::waiters_'s own doc comment for
+// the specific reason that laziness matters here: an earlier version of
+// this file had future_state<T>'s own waiters_ list keyed on
+// continuation_node<T> directly, which forced exactly the opposite,
+// eager instantiation - and with it, a genuine circular completeness
+// requirement between the two classes.
 template <class T> class continuation_node : public detail::ready_node {
 public:
   void run() final { invoke(*owner_); }
@@ -257,8 +269,21 @@ namespace est {
 // Holds value-or-exception storage and a continuation slot built on
 // est::intrusive_list. Lifetime is managed externally by an
 // est::shared_ptr<future_state<T>> (see make_promise_future() in
-// est:promise) - never constructed directly by a caller, and holds no
-// ref count of its own.
+// est:promise) - never constructed directly by a caller.
+//
+// Inherits est::ref_counted (est:util.shared_ptr) rather than the more
+// general est::enable_shared_from_this<T>: shared_ptr<future_state<T>>'s
+// intrusive specialization allocates this object directly (no separate
+// control_block wrapping it), storing the ref count and allocator right
+// here instead - see ref_counted's own doc comment for why that also
+// makes shared_from_this() (used just below) essentially free, with no
+// back-pointer to wire up at construction time. `final` for the same
+// reason shared_ptr<T>'s intrusive specialization static_asserts it of
+// every T that inherits ref_counted: ref_counted's own destructor is
+// deliberately non-virtual (it's only ever destroyed through T*, never
+// through ref_counted* - see its own doc comment), so a further-derived
+// class here would be destroyed through the wrong type's destructor the
+// moment its own ref count reached zero.
 //
 // Holds a reference to the est::loop it was created against (M3,
 // docs/PLAN.md) rather than its own allocator - the allocator it uses is
@@ -279,7 +304,7 @@ namespace est {
 // set_continuation(), even this class's own destructor). Callers must
 // arrange loop lifetime themselves; est::loop's own doc comment
 // (est:loop) describes the same dependency from the loop's side.
-template <class T> class future_state : public enable_shared_from_this<future_state<T>> {
+template <class T> class future_state final : public ref_counted {
 public:
   using continuation_node = detail::continuation_node<T>;
 
@@ -288,7 +313,16 @@ public:
   // stand-in tag type is used instead - see detail::void_value.
   using stored_t = std::conditional_t<std::is_void_v<T>, detail::void_value, T>;
 
-  explicit future_state(loop& loop_ref) noexcept : loop_(loop_ref) {}
+  // `allocator`: forwarded straight to ref_counted's own constructor, not
+  // used for anything else here - this class already gets its own
+  // allocator on demand via loop_.allocator() (see allocator() below).
+  // shared_ptr<future_state>::make()'s intrusive specialization (this
+  // class inherits est::ref_counted, est:util.shared_ptr) always passes
+  // it as this constructor's first argument automatically; a caller of
+  // make_promise_future() never spells it out.
+  explicit future_state(std::pmr::polymorphic_allocator<std::byte> allocator,
+                        loop& loop_ref) noexcept
+      : ref_counted(allocator), loop_(loop_ref) {}
 
   future_state(const future_state&) = delete;
   auto operator=(const future_state&) -> future_state& = delete;
@@ -303,7 +337,7 @@ public:
   // still-pending nodes are simply unreachable once this future_state
   // itself is gone - a permanent leak, not just a skipped notification.
   ~future_state() {
-    waiters_.drain([this](continuation_node& node) { node.destroy(loop_.allocator(), false); });
+    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator(), false); });
   }
 
   void set_value()
@@ -432,20 +466,23 @@ public:
   // entirely under NDEBUG, at which point a caller violating the
   // precondition is undefined behavior by design (see
   // check_not_completed()'s own comment on this class's general
-  // validate-at-boundaries philosophy). But std::get<T>() below also
-  // throws std::bad_variant_access unconditionally, regardless of
-  // NDEBUG, as an accidental (not intentionally designed) second line of
-  // defense for T != void; every std::get<stored_t> call, including the
-  // T = void one, keeps that same accidental behavior rather than
-  // letting T = void alone skip it by returning before ever touching
-  // result_'s active alternative.
+  // validate-at-boundaries philosophy). std::get<T>() below also throws
+  // std::bad_variant_access unconditionally, regardless of NDEBUG, as an
+  // accidental (not intentionally designed) second line of defense for
+  // T != void - but the T = void branch has nothing left to call
+  // std::get on for the same purpose: once ready() holds and the
+  // exception alternative has already been ruled out above, result_ can
+  // only be holding stored_t (the variant has exactly three
+  // alternatives - monostate, stored_t, exception_ptr), so a
+  // std::get<stored_t> purely to reconfirm that would be a genuine
+  // no-op, not even an accidental check of anything std::get<T> above
+  // doesn't already cover for T != void by actually returning a value.
   template <class Self> [[nodiscard]] decltype(auto) get(this Self&& self) {
     check(self.ready());
     if (auto* exception = std::get_if<std::exception_ptr>(&self.result_)) {
       std::rethrow_exception(*exception);
     }
     if constexpr (std::is_void_v<T>) {
-      (void)std::get<stored_t>(self.result_);
       return;
     } else {
       return std::get<T>(std::forward<Self>(self).result_);
@@ -664,14 +701,43 @@ private:
   // every other reference to it (promise, future) is dropped in the
   // meantime.
   void complete() {
-    waiters_.drain([this](continuation_node& node) {
-      node.bind_owner(this->shared_from_this());
-      loop_.enqueue_ready(node);
+    waiters_.drain([this](detail::ready_node& node) {
+      // Safe by construction: every node ever enqueued here arrived
+      // through set_continuation(continuation_node&) below, never
+      // anything else, so it's always actually a continuation_node -
+      // exactly the same "safe by construction, not by RTTI" contract
+      // est::intrusive_list<T>::dequeue() itself already documents, one
+      // level further out since waiters_ is keyed on ready_node rather
+      // than continuation_node specifically (see waiters_'s own doc
+      // comment on why).
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
+      auto& typed_node = static_cast<continuation_node&>(node);
+      typed_node.bind_owner(this->shared_from_this());
+      loop_.enqueue_ready(typed_node);
     });
   }
 
   loop& loop_;
-  intrusive_list<continuation_node> waiters_;
+  // detail::ready_node, not continuation_node (the more specific type
+  // set_continuation() below actually enqueues) - deliberately: this
+  // future_state<T> is what continuation_node<T>::owner_ itself holds a
+  // shared_ptr back to, so instantiating continuation_node<T> to store it
+  // here would force shared_ptr<future_state<T>>'s intrusive
+  // specialization to resolve std::derived_from<future_state<T>,
+  // ref_counted> - requiring future_state<T> complete - while
+  // future_state<T> is still busy being defined (this very member).
+  // ready_node (est:loop) is already complete by this point regardless of
+  // T, so keying waiters_ on it instead sidesteps that cycle entirely;
+  // complete()/the destructor above recover the real continuation_node
+  // type themselves where they actually need it (bind_owner()/destroy()).
+  // continuation_node<T> itself is untouched by this - it still declares
+  // a plain shared_ptr<future_state<T>> owner_ member, same as ever;
+  // nothing here forces it to be instantiated before future_state<T>
+  // completes any more, so that member now resolves fine wherever
+  // continuation_node<T> actually first gets used (concrete_continuation
+  // below, future_resume_node<T> further down this file) - always after
+  // this class's own definition has finished.
+  intrusive_list<detail::ready_node> waiters_;
   std::variant<std::monostate, stored_t, std::exception_ptr> result_;
 };
 
@@ -766,6 +832,45 @@ public:
     } else {
       return std::move(*self.state_).get();
     }
+  }
+
+  // Returns another future<T> aliasing the same future_state as *this -
+  // both see the same eventual result, and either may safely call
+  // get() or register any number of then() callbacks, any number of
+  // times. Just a copy of state_ - cheap regardless of whether T
+  // happens to opt into est::ref_counted's intrusive counting or the
+  // default control_block-based one (est:util.shared_ptr): either way
+  // it's a plain refcount bump, no extra allocation.
+  //
+  // Constrained to T = void or a scalar T (integral, floating-point,
+  // enumeration, pointer, pointer-to-member, or std::nullptr_t) rather
+  // than offered for every T, because of what a clone does *not* make
+  // safe in general: future<T>::get()'s consuming (rvalue) path - the
+  // one co_await always takes (this class's own operator co_await(),
+  // below) - called from more than one clone of the same future_state.
+  // The second such call would read the first's moved-from leftovers,
+  // silently: future_state<T>::get()'s lvalue branch copies the stored
+  // value out (harmless, repeatable - what then()'s own unwrapped
+  // dispatch already relies on to let multiple continuations each read
+  // it), but the rvalue branch moves it out, and a move doesn't reset
+  // the underlying storage - it just leaves whatever moved-from state T
+  // ends up in sitting there permanently. That hazard needs T to have a
+  // meaningfully different "moved-from" state to begin with. For T =
+  // void there's nothing to consume in the first place; for a scalar T,
+  // move construction/assignment is defined to do exactly what copying
+  // it would - it reads the value, and the "moved-from" object is left
+  // completely unchanged (unlike, say, std::string or std::vector) - so
+  // every clone consuming the same scalar via co_await/rvalue get() is
+  // just redundantly reading the same, still-intact value, not a bug.
+  // Every other T keeps this as a caller-enforced precondition instead
+  // (at most one clone may ever be co_await-ed or rvalue-get()-ed) -
+  // that's real and not caught by this constraint, but the constraint
+  // at least removes the two cases where the whole hazard was moot to
+  // begin with.
+  [[nodiscard]] auto clone() const -> future
+    requires(std::is_void_v<T> || std::is_scalar_v<T>)
+  {
+    return future(state_);
   }
 
   // Forwards to future_state<T>::then() (see its own doc comment) - the

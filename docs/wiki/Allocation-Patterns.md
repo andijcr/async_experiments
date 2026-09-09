@@ -12,13 +12,20 @@ complex `.then()` chain actually cost."
 
 ## The two allocation primitives
 
-1. **`est::shared_ptr<T>::make(allocator, args...)`** — *one* allocation for
-   a `control_block` that combines the ref count, the allocator, and `T`
-   itself. This is what every `future_state<T>` is built through
-   (`make_promise_future()`, and every `then()` call's downstream state).
-   Unlike `std::shared_ptr<T>` built via `new T` then wrapped, there's never
-   a second, separate control-block allocation to worry about — `make()` is
-   already the `make_shared`-equivalent path, always.
+1. **`est::shared_ptr<T>::make(allocator, args...)`** — *one* allocation
+   either way, though what that allocation actually holds depends on `T`:
+   for most `T`, a `control_block` combining the ref count, the
+   allocator, and `T` itself; for a `T` that inherits `est::ref_counted`
+   instead (`future_state<T>` is the one `T` in this codebase that does —
+   see [Architecture](Architecture.md)), `shared_ptr<T>` allocates `T`
+   *directly*, with no separate wrapping struct at all — `T` carries its
+   own ref count and allocator right on itself, via `ref_counted`. Either
+   way this is what every `future_state<T>` is built through
+   (`make_promise_future()`, and every `then()` call's downstream state),
+   and either way there's never a second, separate control-block
+   allocation to worry about, unlike `std::shared_ptr<T>` built via `new
+   T` then wrapped — `make()` is already the `make_shared`-equivalent
+   path, always.
 2. **`allocator.new_object<Concrete>(args...)`** — a *direct*, un-shared
    allocation for a continuation or timer node (`concrete_continuation<Fn,
    U>`, `est:promise`'s `sleep_resume_node`/`yield_resume_node`). These
@@ -34,9 +41,9 @@ complex `.then()` chain actually cost."
 
 | Operation | Allocations | What they are |
 |---|---|---|
-| `make_promise_future<T>(loop)` | **1** | `future_state<T>`'s control block |
-| `future<T>::then(fn)` (plain, non-flattening) | **2** | the downstream `future_state<U>`'s control block, plus the `concrete_continuation<Fn, U>` node |
-| `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`'s control block, plus the `sleep_resume_node` node |
+| `make_promise_future<T>(loop)` | **1** | `future_state<T>` itself (no separate control block - see above) |
+| `future<T>::then(fn)` (plain, non-flattening) | **2** | the downstream `future_state<U>`, plus the `concrete_continuation<Fn, U>` node |
+| `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`, plus the `sleep_resume_node` node |
 | `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 1 more when it runs** | the usual 2 for the visible registration, plus 1 more, *invisible to the caller*, for `detail::flatten_forwarder<V>`'s forwarding node — see below |
 
 A plain chain of `N` `.then()` calls off one `make_promise_future` therefore
