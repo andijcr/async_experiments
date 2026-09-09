@@ -86,11 +86,11 @@ constructs one, and `platform::override_instance()`s it
 | Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`) | `est/src/platform/platform.cppm` |
 | `hosted_stdcpp` (the one concrete `platform::interface` - a separate module, `estext`, not part of `est`) | `estext/src/hosted_stdcpp.cppm` |
 | `est::check()` | `est/src/check.cppm` |
-| `est::shared_ptr<T>`, `enable_shared_from_this<T>` | `est/src/util/shared_ptr.cppm` |
+| `est::shared_ptr<T>`, `est::ref_counted` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
 | `est::mutex`, `mutex::lock_awaiter`, `mutex::lock_resume_node` | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
-| `est::future_state<T>`, `est::future<T>`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
+| `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `sleep_for()`/`sleep_until()` | `est/src/promise.cppm` |

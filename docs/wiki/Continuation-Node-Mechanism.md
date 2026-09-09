@@ -159,6 +159,24 @@ Two possible starting states, one converging path:
   takes the same `bind_owner()` + `enqueue_ready()` step immediately,
   skipping `waiters_` entirely.
 
+`waiters_`'s own declared element type is actually `detail::ready_node`
+(`est:loop`), not `continuation_node<T>` as the diagram above simplifies
+it to - deliberately: `future_state<T>` now inherits `est::ref_counted`
+(`est:util.shared_ptr`), so `shared_ptr<future_state<T>>` allocates it
+directly rather than through a separate control block, and that in turn
+means naming `shared_ptr<future_state<T>>` anywhere requires
+`future_state<T>` to already be a complete type. Keying `waiters_` on
+`continuation_node<T>` specifically would force exactly that - complete
+- while `future_state<T>` is still being defined (its own `waiters_`
+member declaration is what would be doing the forcing), a genuine
+circular dependency between the two class templates. `ready_node` is
+already complete at that point regardless of `T`, so `complete()` (and
+the destructor above) recover the real `continuation_node<T>&` with a
+`static_cast` where they actually need it - safe by construction, since
+`set_continuation()` is the only thing that ever enqueues anything here,
+always a real `continuation_node&`. See `continuation_node<T>`'s own doc
+comment (`future.cppm`) for the full account.
+
 Either way, once a node reaches the loop's ready-queue it's in exactly the
 same state: owned by the queue (an intrusive link, no `shared_ptr`) *and*
 holding its own `shared_ptr<future_state<T>>` back to its parent. The loop's
