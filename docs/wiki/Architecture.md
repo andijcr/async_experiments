@@ -72,14 +72,15 @@ pattern `sleep_until()` (`:promise`) already uses.
 
 `:sync.event` (`counting_event<Mode>`, `binary_event<Mode>`,
 `one_shot_event<Mode>` - an awaitable counting semaphore and the
-auto-reset/manual-reset event types built on top of it) depends on exactly
-the same set of partitions `:sync.mutex` does, for the same reasons - it
-reuses `:sync.mutex`'s own `loop&`/`intrusive_list<detail::ready_node>`/
-resume-node pattern outright rather than introducing a new one (see
+auto-reset/manual-reset event types built on top of it) depends on the same
+partitions `:sync.mutex` does, for the same reasons - it reuses
+`:sync.mutex`'s own `loop&`/`intrusive_list<detail::ready_node>`/resume-node
+pattern outright rather than introducing a new one (see
 ["`est::counting_event<Mode>` reuses this pattern
 unchanged"](Coroutines.md#estcounting_eventmode-reuses-this-pattern-unchanged)).
-It additionally depends on `:check` directly, for `set(n)`'s `n > 0`
-precondition and `one_shot_event::set()`'s at-most-once enforcement.
+It additionally depends on `:check` directly, unlike `:sync.mutex`, for
+`set(n)`'s `n > 0` precondition and `one_shot_event::set()`'s at-most-once
+enforcement.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
