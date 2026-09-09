@@ -818,13 +818,20 @@ semaphore, `Mode` selecting whether a successful `wait()` consumes one unit
 of the count or leaves it alone - the classic Win32 auto-reset/manual-reset
 distinction, generalized past a plain boolean) is built from exactly the
 pieces above: a `loop&`, an `intrusive_list<detail::ready_node> waiters_`,
-and a nested `resume_node final : public detail::ready_node` whose
-`destroy()` completes an abandoned `promise<void>` with an exception for
-the identical reason `lock_resume_node`'s own doc comment gives - a
+and `detail::event_resume_node final : public ready_node` whose `destroy()`
+completes an abandoned `promise<void>` with an exception for the identical
+reason `lock_resume_node`'s own doc comment gives - a
 coroutine suspended in `co_await event.wait()` holds the `future_state<void>`
 alive across the suspension, reachable only through that promise. `set()`
 defers through `loop.enqueue_ready()` rather than completing waiters
 inline, matching `unlock()`'s own reasoning above.
+
+`event_resume_node` lives in `est::detail`, not nested inside
+`counting_event<Mode>` the way `lock_resume_node` nests inside the
+non-template `mutex` - its `run()`/`destroy()` never touch `Mode` or
+anything else about the `counting_event` that enqueued them, so nesting it
+would only generate an identical type once per `Mode` instantiation for no
+reason (caught in review).
 
 `binary_event<Mode>` (count clamped to `{0, 1}`, the classic Win32 event
 object) and `one_shot_event<Mode>` (`set()` at most once, ever) are then

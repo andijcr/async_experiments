@@ -20,15 +20,69 @@ export namespace est {
 // multi-unit count rather than a plain boolean.
 enum class EventResetMode : std::uint8_t { automatic, manual };
 
+} // namespace est
+
+namespace est::detail {
+
+// The waiter node behind counting_event<Mode>::wait()'s slow path (not yet
+// signaled): queued in counting_event<Mode>::waiters_, completing an
+// est::promise<void> once set() hands it a unit. No coroutine_handle in
+// sight here, mirroring mutex::lock_resume_node exactly - wait() itself is
+// no coroutine-only primitive, so this node only ever has to know how to
+// complete a promise.
+//
+// Deliberately *not* nested inside counting_event<Mode> (unlike
+// mutex::lock_resume_node inside the non-template mutex): run()/destroy()
+// only ever touch promise_, never Mode or anything else about the
+// counting_event that enqueued them - review caught the first version of
+// this file defining an identical resume_node type once per Mode
+// instantiation for no reason. Hoisted out here instead, matching
+// est::detail::ready_node/timer_node's own "type-erased, internal-only"
+// placement (est:loop) - counting_event<Mode>::wait() (below) is the only
+// caller either way, on both Mode values.
+//
+// destroy() completing the promise with an exception (rather than simply
+// deallocating the node) matters for the identical reason
+// mutex::lock_resume_node's own doc comment gives in full: a coroutine
+// suspended on the future<void> wait() returned holds that future_state
+// alive via its own frame, reachable only once this future_state itself
+// completes - silently dropping the promise instead would strand that
+// frame forever, with neither side able to free the other first.
+// Completing it here (whether from set()'s own successful hand-off, `ran`
+// true, or from ~counting_event()'s/loop::~loop()'s abandonment drain,
+// `ran` false) always drains the future_state's own pending continuation
+// onto the loop's ready queue, so the frame is never stranded either way.
+class event_resume_node final : public ready_node {
+public:
+  explicit event_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
+
+  void run() final { promise_.set_value(); }
+
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
+    if (!ran) {
+      promise_.set_exception(std::make_exception_ptr(
+          std::runtime_error("counting_event destroyed while wait() was pending")));
+    }
+    allocator.delete_object(this);
+  }
+
+private:
+  promise<void> promise_;
+};
+
+} // namespace est::detail
+
+export namespace est {
+
 // A cooperative-scheduling counting event: an awaitable generalization of
 // a counting semaphore, built the same way est::mutex is (est:sync.mutex,
 // see its own top comment for the underlying rationale) - a plain int
-// count, an est::intrusive_list<detail::ready_node> waiters_ queue, and a
-// small resume_node completing an est::promise<void> once a waiter is
-// satisfied. wait() returns a plain future<void>, exactly like
-// mutex::lock() - already-satisfied wait() resumes immediately, through
-// future_awaiter<T>'s own already-ready fast path (est:future), with no
-// extra allocation or suspension.
+// count, an est::intrusive_list<detail::ready_node> waiters_ queue, and
+// detail::event_resume_node (above) completing an est::promise<void> once
+// a waiter is satisfied. wait() returns a plain future<void>, exactly
+// like mutex::lock() - already-satisfied wait() resumes immediately,
+// through future_awaiter<T>'s own already-ready fast path (est:future),
+// with no extra allocation or suspension.
 //
 // est::binary_event<Mode> and est::one_shot_event<Mode> (both below) are
 // derived from this - not separate implementations - each one layering
@@ -57,10 +111,10 @@ public:
   // Destroys (without satisfying) any waiter still queued on wait() -
   // mirrors mutex::~mutex() and future_state<T>::~future_state() (both
   // drain their own pending lists the same way, for the same reason).
-  // Each waiter node's own destroy() (below) completes its promise with
-  // an exception first, rather than just deallocating itself silently -
-  // see resume_node's own doc comment for why that matters beyond just
-  // freeing the node itself.
+  // Each waiter node's own destroy() (detail::event_resume_node, above)
+  // completes its promise with an exception first, rather than just
+  // deallocating itself silently - see its own doc comment for why that
+  // matters beyond just freeing the node itself.
   ~counting_event() {
     waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator(), false); });
   }
@@ -68,8 +122,6 @@ public:
   [[nodiscard]] auto count() const noexcept -> int { return count_; }
 
   [[nodiscard]] auto has_waiters() const noexcept -> bool { return !waiters_.empty(); }
-
-  class resume_node;
 
   // Increments the count by n (default 1) and wakes waiters:
   //  - automatic: hands the increment directly to up to n currently
@@ -84,8 +136,8 @@ public:
   //    wait() also takes the fast path, until reset().
   // Deferred through est::loop::enqueue_ready() rather than completed
   // directly here, for the identical reason mutex::unlock() defers
-  // (see its own doc comment): resume_node::run() only ever calls
-  // promise_.set_value(), never runs arbitrary downstream coroutine
+  // (see its own doc comment): detail::event_resume_node::run() only ever
+  // calls promise_.set_value(), never runs arbitrary downstream coroutine
   // code inline on this call stack, so nothing about set() itself needs
   // to bound recursion - deferring anyway keeps this consistent with
   // every other completion path in this codebase (M3, docs/PLAN.md:
@@ -121,66 +173,25 @@ public:
   // Suspends the calling coroutine until the count is greater than zero,
   // resuming immediately (no suspension, no allocation - see
   // future_awaiter<T>::await_ready(), est:future) if it already is.
-  // Defined out-of-line, below resume_node - needs it to be a complete
-  // type first.
-  [[nodiscard]] auto wait() -> future<void>;
+  [[nodiscard]] auto wait() -> future<void> {
+    auto [prom, fut] = make_promise_future<void>(loop_);
+    if (count_ > 0) {
+      if constexpr (Mode == EventResetMode::automatic) {
+        --count_;
+      }
+      prom.set_value();
+      return std::move(fut);
+    }
+    auto* node = loop_.allocator().template new_object<detail::event_resume_node>(std::move(prom));
+    waiters_.enqueue(*node);
+    return std::move(fut);
+  }
 
 private:
   int count_ = 0;
   loop& loop_;
   intrusive_list<detail::ready_node> waiters_;
 };
-
-// The waiter node behind wait()'s slow path (not yet signaled): queued in
-// counting_event::waiters_, completing an est::promise<void> once set()
-// hands it a unit. No coroutine_handle in sight here, mirroring
-// mutex::lock_resume_node exactly - wait() itself is no coroutine-only
-// primitive, so this node only ever has to know how to complete a
-// promise.
-//
-// destroy() completing the promise with an exception (rather than simply
-// deallocating the node) matters for the identical reason
-// mutex::lock_resume_node's own doc comment gives in full: a coroutine
-// suspended on the future<void> wait() returned holds that future_state
-// alive via its own frame, reachable only once this future_state itself
-// completes - silently dropping the promise instead would strand that
-// frame forever, with neither side able to free the other first.
-// Completing it here (whether from set()'s own successful hand-off, `ran`
-// true, or from ~counting_event()'s/loop::~loop()'s abandonment drain,
-// `ran` false) always drains the future_state's own pending continuation
-// onto the loop's ready queue, so the frame is never stranded either way.
-template <EventResetMode Mode>
-class counting_event<Mode>::resume_node final : public detail::ready_node {
-public:
-  explicit resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
-
-  void run() final { promise_.set_value(); }
-
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
-    if (!ran) {
-      promise_.set_exception(std::make_exception_ptr(
-          std::runtime_error("counting_event destroyed while wait() was pending")));
-    }
-    allocator.delete_object(this);
-  }
-
-private:
-  promise<void> promise_;
-};
-
-template <EventResetMode Mode> auto counting_event<Mode>::wait() -> future<void> {
-  auto [prom, fut] = make_promise_future<void>(loop_);
-  if (count_ > 0) {
-    if constexpr (Mode == EventResetMode::automatic) {
-      --count_;
-    }
-    prom.set_value();
-    return std::move(fut);
-  }
-  auto* node = loop_.allocator().template new_object<resume_node>(std::move(prom));
-  waiters_.enqueue(*node);
-  return std::move(fut);
-}
 
 // A counting_event<Mode> whose count never exceeds one - the classic
 // Win32 event object (CreateEvent/SetEvent/ResetEvent), generalized only
