@@ -34,9 +34,19 @@ namespace est::detail {
 // lives here instead.
 template <class T> class continuation_node : public detail::ready_node {
 public:
-  void run() final { invoke(*owner_); }
+  void run() final { invoke(owner_); }
 
-  virtual void invoke(future_state<T>& state) = 0;
+  // const shared_ptr<future_state<T>>&, not future_state<T>& - the one
+  // place that actually needs an owning shared_ptr (concrete_continuation's
+  // wrapped-mode branch, building a future<T> view to hand a callback) can
+  // copy it out of the reference itself; everything else (future_resume_node,
+  // flatten_forwarder, concrete_continuation's own unwrapped branch) never
+  // pays for a refcount bump it doesn't need. Passing owner_ itself (a
+  // reference to run()'s own member, no copy at the call site either)
+  // is what replaced future_state<T>::shared_from_this() here - see
+  // docs/wiki/Coroutines.md, "Why future<T> can't be copyable" and issue
+  // #26.
+  virtual void invoke(const shared_ptr<future_state<T>>& state) = 0;
 
   // Called exactly once, by future_state<T>::complete()/
   // set_continuation() right before this node is handed to
@@ -73,19 +83,19 @@ public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
       : downstream_(std::move(downstream)) {}
 
-  void invoke(future_state<T>& state) override {
-    if (state.failed()) {
-      downstream_->set_exception(state.get_exception());
+  void invoke(const shared_ptr<future_state<T>>& state) override {
+    if (state->failed()) {
+      downstream_->set_exception(state->get_exception(), downstream_);
       return;
     }
     try {
       if constexpr (std::is_void_v<T>) {
-        downstream_->set_value();
+        downstream_->set_value(downstream_);
       } else {
-        downstream_->set_value(std::move(state).get());
+        downstream_->set_value(std::move(*state).get(), downstream_);
       }
     } catch (...) {
-      downstream_->set_exception(std::current_exception());
+      downstream_->set_exception(std::current_exception(), downstream_);
     }
   }
 
@@ -253,12 +263,24 @@ namespace est {
 // this type directly, only through the est::promise<T>/est::future<T>
 // handles that wrap it - including a then() callback registered with
 // the "wrapped" calling convention, which receives a real est::future<T>
-// (built via shared_from_this(), below) rather than a future_state<T>&.
+// built from a continuation_node<T>'s own owner_ reference (below),
+// rather than a future_state<T>&.
 // Holds value-or-exception storage and a continuation slot built on
 // est::intrusive_list. Lifetime is managed externally by an
 // est::shared_ptr<future_state<T>> (see make_promise_future() in
 // est:promise) - never constructed directly by a caller, and holds no
 // ref count of its own.
+//
+// Does not inherit est::enable_shared_from_this<future_state<T>> (issue
+// #26; it did until then, back when set_continuation()/complete() and
+// concrete_continuation's wrapped-mode view each computed their own
+// shared_ptr<future_state<T>> via shared_from_this()). Every one of
+// those call sites is reached from external code that already holds a
+// shared_ptr<future_state<T>> pointing at the exact same object - a
+// caller's own promise<T>/future<T>::state_, or a continuation_node's
+// own owner_ - so set_value()/set_exception()/set_continuation()/then()
+// now take that shared_ptr explicitly (conventionally named `self`)
+// instead of manufacturing a fresh one internally.
 //
 // Holds a reference to the est::loop it was created against (M3,
 // docs/PLAN.md) rather than its own allocator - the allocator it uses is
@@ -279,7 +301,7 @@ namespace est {
 // set_continuation(), even this class's own destructor). Callers must
 // arrange loop lifetime themselves; est::loop's own doc comment
 // (est:loop) describes the same dependency from the loop's side.
-template <class T> class future_state : public enable_shared_from_this<future_state<T>> {
+template <class T> class future_state {
 public:
   using continuation_node = detail::continuation_node<T>;
 
@@ -306,12 +328,18 @@ public:
     waiters_.drain([this](continuation_node& node) { node.destroy(loop_.allocator(), false); });
   }
 
-  void set_value()
+  // `self` is a shared_ptr aliasing *this, supplied by a caller that
+  // already holds one (promise<T>::state_, or a coroutine promise_type's
+  // own state_) - see this class's own doc comment on why it's an
+  // explicit parameter now rather than computed internally via
+  // shared_from_this(). Forwarded straight into complete(), unused
+  // otherwise.
+  void set_value(const shared_ptr<future_state>& self)
     requires std::is_void_v<T>
   {
     check_not_completed();
     result_.template emplace<stored_t>();
-    complete();
+    complete(self);
   }
 
   // stored_t, not T, in these two signatures - a requires-clause only
@@ -321,26 +349,26 @@ public:
   // actually void, so it sidesteps the problem entirely; it's also
   // simply T whenever T isn't void, so this changes nothing observable
   // for every T this class was already used with.
-  void set_value(const stored_t& value)
+  void set_value(const stored_t& value, const shared_ptr<future_state>& self)
     requires(!std::is_void_v<T>)
   {
     check_not_completed();
     result_.template emplace<stored_t>(value);
-    complete();
+    complete(self);
   }
 
-  void set_value(stored_t&& value)
+  void set_value(stored_t&& value, const shared_ptr<future_state>& self)
     requires(!std::is_void_v<T>)
   {
     check_not_completed();
     result_.template emplace<stored_t>(std::move(value));
-    complete();
+    complete(self);
   }
 
-  void set_exception(std::exception_ptr&& exception) {
+  void set_exception(std::exception_ptr&& exception, const shared_ptr<future_state>& self) {
     check_not_completed();
     result_.template emplace<std::exception_ptr>(std::move(exception));
-    complete();
+    complete(self);
   }
 
   // Registers a continuation node (already allocated via allocator()) to
@@ -348,10 +376,14 @@ public:
   // ready-queue instead of queueing it locally - either way, this
   // future_state never invokes a continuation itself; est::loop always
   // does, on its own drain pass, never inline on this call stack (M3,
-  // docs/PLAN.md).
-  void set_continuation(continuation_node& node) {
+  // docs/PLAN.md). `self`: see this class's own doc comment - bound to
+  // the node (a real, owning reference this future_state itself can no
+  // longer manufacture) only on this ready-now path; the not-yet-ready
+  // path below doesn't need it at all yet, since bind_owner() only
+  // happens later, from complete().
+  void set_continuation(continuation_node& node, const shared_ptr<future_state>& self) {
     if (ready()) {
-      node.bind_owner(this->shared_from_this());
+      node.bind_owner(self);
       loop_.enqueue_ready(node);
       return;
     }
@@ -468,10 +500,10 @@ public:
   //     itself throws.)
   //   - fn(future<T>&): "wrapped" - always called, whether this
   //     future_state succeeded or failed, with a fresh future<T> view of
-  //     *this (built via shared_from_this() - future_state is a detail,
-  //     not what a callback should see, see this class's own doc
-  //     comment); fn inspects ready()/failed()/get() to decide what to
-  //     do. No implicit unwrap.
+  //     *this (built from the continuation node's own owner_ reference -
+  //     future_state is a detail, not what a callback should see, see
+  //     this class's own doc comment); fn inspects ready()/failed()/get()
+  //     to decide what to do. No implicit unwrap.
   // Checked in that order - unwrapped first - so a generic callback (e.g.
   // an `auto&`/`auto&&` lambda, incidentally invocable both ways) is
   // interpreted as unwrapped by default. Wrapped is only chosen when
@@ -493,7 +525,10 @@ public:
   // invoking it to its own ready-queue drain pass instead (M3,
   // docs/PLAN.md) - the returned future<U> reuses this future_state's
   // own loop, so a chain of then() calls all resolve on that one loop.
-  template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
+  // `self`: see this class's own doc comment - forwarded straight into
+  // set_continuation(), unused otherwise.
+  template <detail::then_callback_for<T> Fn>
+  auto then(Fn&& fn, const shared_ptr<future_state>& self) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
     auto downstream =
@@ -502,7 +537,7 @@ public:
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
     auto* node = loop_.allocator().template new_object<node_type>(std::forward<Fn>(fn),
                                                                   std::move(downstream_for_node));
-    set_continuation(*node);
+    set_continuation(*node, self);
     return future<downstream_value_type>(std::move(downstream));
   }
 
@@ -546,21 +581,21 @@ private:
     concrete_continuation(Fn fn, shared_ptr<future_state<U>> downstream)
         : fn_(std::move(fn)), downstream_(std::move(downstream)) {}
 
-    void invoke(future_state& state) override {
+    void invoke(const shared_ptr<future_state>& state) override {
       try {
         if constexpr (detail::invocable_unwrapped<Fn, T>()) {
-          if (state.failed()) {
+          if (state->failed()) {
             // Unwrapped mode's auto-propagate-on-failure, fn_ not called:
             // failed() already tells us there's an exception waiting, so
             // fetching it via get_exception() is a plain pointer copy -
             // cheaper than the alternative of calling get() purely to
             // have it rethrow into the catch below, even though this
             // isn't the happy path either way.
-            downstream_->set_exception(state.get_exception());
+            downstream_->set_exception(state->get_exception(), downstream_);
           } else if constexpr (std::is_void_v<T>) {
             invoke_and_fulfill();
           } else {
-            invoke_and_fulfill(state.get());
+            invoke_and_fulfill(state->get());
           }
         } else {
           // Wrapped mode: unwrapped isn't viable for Fn (checked first,
@@ -569,12 +604,17 @@ private:
           // with future<T>& instead. A fresh future<T> per invocation,
           // not a stored one - this continuation only runs once, so
           // there's nothing to reuse it for, and future_state<T> itself
-          // never keeps a future<T> alive on its own account.
-          future<T> view(state.shared_from_this());
+          // never keeps a future<T> alive on its own account. Copies
+          // `state` (this override's own const& parameter, ultimately
+          // aliasing the node's own owner_) into future<T>'s by-value
+          // constructor - the one refcount bump this whole call pays,
+          // only on this branch (issue #26: no shared_from_this() left
+          // anywhere in this file).
+          future<T> view(state);
           invoke_and_fulfill(view);
         }
       } catch (...) {
-        downstream_->set_exception(std::current_exception());
+        downstream_->set_exception(std::current_exception(), downstream_);
       }
     }
 
@@ -605,7 +645,7 @@ private:
     template <class... Args> void invoke_and_fulfill(Args&&... args) {
       if constexpr (std::is_void_v<std::invoke_result_t<Fn&, Args...>>) {
         fn_(std::forward<Args>(args)...);
-        downstream_->set_value();
+        downstream_->set_value(downstream_);
       } else {
         fulfill(fn_(std::forward<Args>(args)...));
       }
@@ -628,9 +668,9 @@ private:
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
         auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
             downstream_);
-        result.state_->set_continuation(*node);
+        result.state_->set_continuation(*node, result.state_);
       } else {
-        downstream_->set_value(std::forward<R>(result));
+        downstream_->set_value(std::forward<R>(result), downstream_);
       }
     }
 
@@ -657,15 +697,15 @@ private:
   // est::intrusive_list's documented FIFO order). Called by each setter
   // after it has already stored the result into result_ - this function
   // only drains, it doesn't know or care what was stored. Each node
-  // binds a fresh shared_ptr back to this future_state right before
-  // being handed off (see continuation_node<T>::bind_owner()'s own doc
-  // comment on why not earlier), so this future_state is guaranteed to
-  // survive until est::loop actually runs (and destroys) it, even if
-  // every other reference to it (promise, future) is dropped in the
-  // meantime.
-  void complete() {
-    waiters_.drain([this](continuation_node& node) {
-      node.bind_owner(this->shared_from_this());
+  // binds its own copy of `self` (see this class's own doc comment)
+  // right before being handed off (see continuation_node<T>::
+  // bind_owner()'s own doc comment on why not earlier), so this
+  // future_state is guaranteed to survive until est::loop actually runs
+  // (and destroys) it, even if every other reference to it (promise,
+  // future) is dropped in the meantime.
+  void complete(const shared_ptr<future_state>& self) {
+    waiters_.drain([&self, this](continuation_node& node) {
+      node.bind_owner(self);
       loop_.enqueue_ready(node);
     });
   }
@@ -689,8 +729,8 @@ namespace est::detail {
 // two near-identical T/void specializations.
 template <class T> class future_promise_result {
 public:
-  void return_value(const T& value) { state_->set_value(value); }
-  void return_value(T&& value) { state_->set_value(std::move(value)); }
+  void return_value(const T& value) { state_->set_value(value, state_); }
+  void return_value(T&& value) { state_->set_value(std::move(value), state_); }
 
 protected:
   explicit future_promise_result(shared_ptr<future_state<T>> state) : state_(std::move(state)) {}
@@ -707,7 +747,7 @@ protected:
 
 template <> class future_promise_result<void> {
 public:
-  void return_void() { state_->set_value(); }
+  void return_void() { state_->set_value(state_); }
 
 protected:
   explicit future_promise_result(shared_ptr<future_state<void>> state) : state_(std::move(state)) {}
@@ -768,9 +808,22 @@ public:
     }
   }
 
+  // Returns another future<T> aliasing the same future_state as *this -
+  // both see the same eventual result, and either may safely call the
+  // lvalue (copying) get() or register any number of then() callbacks,
+  // any number of times. What it does *not* make safe: the consuming
+  // (rvalue) get() path - which co_await always uses (this class's own
+  // operator co_await(), below) - called from more than one clone of a
+  // value-carrying future<T>. The second such call reads the first's
+  // moved-from leftovers, silently; see docs/wiki/Coroutines.md, "Why
+  // future<T> can't be copyable," for the full reasoning. Safe
+  // unconditionally only when T is void (nothing to consume) or every
+  // clone sticks to the non-consuming paths. Issue #26.
+  [[nodiscard]] auto clone() const -> future { return future(state_); }
+
   // Forwards to future_state<T>::then() (see its own doc comment) - the
   // node allocation and registration live there now, not here.
-  template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn)); }
+  template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn), state_); }
 
   // Suspends the calling coroutine until *this becomes ready, resuming
   // with its value (or rethrowing its exception) - the primitive that
@@ -892,7 +945,9 @@ public:
     // to touch afterward.
     auto final_suspend() noexcept -> std::suspend_never { return {}; }
 
-    void unhandled_exception() { this->state_->set_exception(std::current_exception()); }
+    void unhandled_exception() {
+      this->state_->set_exception(std::current_exception(), this->state_);
+    }
 
     // pmr-aware coroutine frame allocation - see
     // detail::coroutine_frame_alloc()/coroutine_frame_dealloc()'s own
@@ -971,10 +1026,10 @@ template <class T> class future_resume_node final : public continuation_node<T> 
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
 
-  // future_state<T>& /*unused*/: continuation_node<T>::invoke() must take
-  // one - this node doesn't need it for anything beyond satisfying that
-  // signature.
-  void invoke(future_state<T>& /*unused*/) override { handle_.resume(); }
+  // const shared_ptr<future_state<T>>& /*unused*/: continuation_node<T>::
+  // invoke() must take one - this node doesn't need it for anything
+  // beyond satisfying that signature.
+  void invoke(const shared_ptr<future_state<T>>& /*unused*/) override { handle_.resume(); }
 
   // If invoke() never ran (the future_state this node was registered on
   // was dropped without ever completing - docs/PLAN.md, M2's
@@ -1039,7 +1094,7 @@ public:
 
   void await_suspend(std::coroutine_handle<> handle) {
     auto* node = future_.state_->allocator().template new_object<future_resume_node<T>>(handle);
-    future_.state_->set_continuation(*node);
+    future_.state_->set_continuation(*node, future_.state_);
   }
 
   // Moves the value out rather than copying it: co_await is inherently a

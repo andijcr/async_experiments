@@ -200,7 +200,8 @@ ready-queue's element type) and `est::detail::timer_node` (`fire()` +
 `destroy(allocator, ran)`, the pending-timer list's element type) — and
 knows nothing about futures, promises, or continuations at all.
 `:future`'s `continuation_node<T>` then *inherits* `ready_node` (adding the
-one T-dependent thing it needs, `invoke(future_state<T>&)`), and
+one T-dependent thing it needs, `invoke(const shared_ptr<future_state<T>>&)`),
+and
 `:promise`'s `sleep_for()`/`sleep_until()` build a `sleep_resume_node`
 directly on top of `timer_node` (no generic callback-wrapping layer - it
 holds the `promise<void>` itself) to bridge a fired timer into a
@@ -231,7 +232,10 @@ the value-or-exception storage plus the continuation queue. It is
 through the thin, `shared_ptr`-backed `est::promise<T>` (producer) and
 `est::future<T>` (consumer) handles that wrap it, including inside a
 "wrapped" `then()` callback (which gets a real `future<T>`, built on demand
-via `enable_shared_from_this`, never the `future_state<T>` itself). This
+from a `shared_ptr<future_state<T>>` a caller already holds, never the
+`future_state<T>` itself directly) and `future<T>::clone()` (issue #26,
+[Coroutines](Coroutines.md)), which hands out another such handle to an
+arbitrary caller. This
 mirrors `std::promise`/`std::future`'s own split, but goes one step further
 by making the shared state module-private — there's no way for calling code
 to name `future_state<T>` even by accident.

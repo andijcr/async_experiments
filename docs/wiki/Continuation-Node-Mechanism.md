@@ -72,11 +72,18 @@ excerpts below for the real, fully-qualified signatures.)
   `ready_node` actually *is* — that's the whole point (see
   [Architecture](Architecture.md#why-loop-doesnt-depend-on-future)).
 - **`continuation_node<T>`** (`est:future`) is the first T-dependent layer.
-  It adds `invoke(future_state<T>&)` (still pure virtual — a concrete `Fn`
-  hasn't entered the picture yet) and implements `run()` *once*, for every
-  `T`, by forwarding to `invoke(*owner_)`. It also owns `bind_owner()` and
-  the `owner_` member — the mechanism that keeps a queued node's
-  `future_state<T>` alive; see "The `bind_owner()` subtlety" below.
+  It adds `invoke(const shared_ptr<future_state<T>>&)` (still pure virtual —
+  a concrete `Fn` hasn't entered the picture yet) and implements `run()`
+  *once*, for every `T`, by forwarding to `invoke(owner_)`. It also owns
+  `bind_owner()` and the `owner_` member — the mechanism that keeps a
+  queued node's `future_state<T>` alive; see "The `bind_owner()` subtlety"
+  below. Taking `const shared_ptr<future_state<T>>&` rather than
+  `future_state<T>&` (issue #26) means the one caller that actually needs
+  an owning `shared_ptr` — `concrete_continuation`'s wrapped-mode
+  `future<T>` view, below — can copy it straight out of the reference;
+  every other override (`future_resume_node`, `flatten_forwarder`,
+  `concrete_continuation`'s own unwrapped branch) never pays for a
+  refcount bump it doesn't need.
 - **`concrete_continuation<Fn, U>`** is a private nested class template
   *inside* `future_state<T>` — one instantiation per distinct
   `(T, Fn, U)` triple a real `.then()` call site produces. It's the layer
@@ -92,7 +99,8 @@ of once per T" reasoning `ready_node` itself exists for.
 ## What `then()` actually builds
 
 ```cpp
-template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
+template <detail::then_callback_for<T> Fn>
+auto then(Fn&& fn, const shared_ptr<future_state>& self) {
   using decayed_fn = std::decay_t<Fn>;
   using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
   auto downstream =
@@ -101,10 +109,17 @@ template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
   using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
   auto* node = loop_.allocator().template new_object<node_type>(std::forward<Fn>(fn),
                                                                  std::move(downstream_for_node));
-  set_continuation(*node);
+  set_continuation(*node, self);
   return future<downstream_value_type>(std::move(downstream));
 }
 ```
+
+`self` is a `shared_ptr<future_state<T>>` aliasing `this`, supplied by
+`future<T>::then()` (which already holds one in its own `state_` member)
+rather than manufactured here via `shared_from_this()` — see "Why
+`future<T>` can't be copyable"'s closing section
+([Coroutines](Coroutines.md)) for why `future_state<T>` no longer inherits
+`est::enable_shared_from_this` at all (issue #26).
 
 Four things happen, in order:
 1. A **new `future_state<U>`** is created (`U` = `downstream_value_type`,
@@ -114,8 +129,9 @@ Four things happen, in order:
 2. A **`concrete_continuation<Fn, U>` node** is allocated directly (not
    through `shared_ptr` — see [Allocation Patterns](Allocation-Patterns.md)
    for why), holding `fn` and a `shared_ptr` copy of the new downstream.
-3. **`set_continuation(*node)`** registers the node with `this` (the
-   *parent* `future_state<T>`, the one `then()` was called on).
+3. **`set_continuation(*node, self)`** registers the node with `this` (the
+   *parent* `future_state<T>`, the one `then()` was called on), forwarding
+   `self` along in case the ready-now fast path needs it.
 4. The caller gets back a `future<U>` wrapping the new downstream — *not*
    the node. The node is now owned entirely by whichever queue it's sitting
    in (see "Node lifecycle").
@@ -129,41 +145,47 @@ sequenceDiagram
   participant node as continuation_node&lt;T&gt;
   participant est_loop as est::loop
 
-  caller->>parent: then(fn)
+  caller->>parent: then(fn, self)
   parent->>node: allocate (holds fn, downstream)
-  parent->>parent: set_continuation(node)
+  parent->>parent: set_continuation(node, self)
   alt not ready yet
     parent->>parent: waiters_.enqueue(node)
     Note over parent,node: node is owned by raw pointer only -<br/>owner_ is still null
-    caller->>parent: (later) set_value()/set_exception()
-    parent->>parent: complete(): waiters_.dequeue()
+    caller->>parent: (later) set_value(self)/set_exception(..., self)
+    parent->>parent: complete(self): waiters_.dequeue()
   end
-  parent->>node: bind_owner(shared_from_this())
+  parent->>node: bind_owner(self)
   parent->>est_loop: enqueue_ready(node)
   Note over node: node now holds a real shared_ptr<br/>keeping `parent` alive
   est_loop->>est_loop: drain_ready(): ready_.dequeue()
-  est_loop->>node: run() -> invoke(*owner_)
+  est_loop->>node: run() -> invoke(owner_)
   node->>node: runs fn_, reports into downstream_
   est_loop->>node: destroy(allocator, true) [always, via scope_exit guard]
 ```
+
+`self` — the same `shared_ptr<future_state<T>>` `then()` received (see
+above) — flows all the way through `set_continuation()`/`complete()`
+without `future_state<T>` ever manufacturing its own copy internally
+(issue #26): it has nothing left to build one *from*, since it no longer
+inherits `est::enable_shared_from_this`.
 
 Two possible starting states, one converging path:
 
 - **Parent not ready yet.** `set_continuation()` enqueues the node into the
   parent `future_state<T>`'s own `waiters_` list. At this point the node is
   owned *by pointer* by the parent — not by `shared_ptr`. Later, when
-  `set_value()`/`set_exception()` runs, `complete()` drains `waiters_` and,
-  for each node, calls `bind_owner()` before handing it to
+  `set_value()`/`set_exception()` runs, `complete(self)` drains `waiters_`
+  and, for each node, calls `bind_owner(self)` before handing it to
   `loop.enqueue_ready()`.
 - **Parent already ready.** `set_continuation()`'s `if (ready())` branch
-  takes the same `bind_owner()` + `enqueue_ready()` step immediately,
+  takes the same `bind_owner(self)` + `enqueue_ready()` step immediately,
   skipping `waiters_` entirely.
 
 Either way, once a node reaches the loop's ready-queue it's in exactly the
 same state: owned by the queue (an intrusive link, no `shared_ptr`) *and*
 holding its own `shared_ptr<future_state<T>>` back to its parent. The loop's
 `drain_ready()` eventually dequeues it, `run_one()` calls `node.run()`
-(dispatching through `continuation_node<T>::run()` to `invoke(*owner_)`),
+(dispatching through `continuation_node<T>::run()` to `invoke(owner_)`),
 and — always, via a `scope_exit`-based guard, whether or not `run()`
 somehow threw — `node.destroy(allocator, true)` deallocates it.
 
@@ -202,22 +224,22 @@ implements — dispatches on how `Fn` can be called, checked in this order
 (precedence changed by issue #39 — see below):
 
 ```cpp
-void invoke(future_state& state) override {
+void invoke(const shared_ptr<future_state>& state) override {
   try {
     if constexpr (detail::invocable_unwrapped<Fn, T>()) {
-      if (state.failed()) {                        // "unwrapped", auto-propagate
-        downstream_->set_exception(state.get_exception());
+      if (state->failed()) {                        // "unwrapped", auto-propagate
+        downstream_->set_exception(state->get_exception(), downstream_);
       } else if constexpr (std::is_void_v<T>) {
         invoke_and_fulfill();                        // "unwrapped", T = void
       } else {
-        invoke_and_fulfill(state.get());              // "unwrapped", T != void
+        invoke_and_fulfill(state->get());             // "unwrapped", T != void
       }
     } else {
-      future<T> view(state.shared_from_this());   // "wrapped"
+      future<T> view(state);                       // "wrapped"
       invoke_and_fulfill(view);
     }
   } catch (...) {
-    downstream_->set_exception(std::current_exception());
+    downstream_->set_exception(std::current_exception(), downstream_);
   }
 }
 ```
@@ -229,10 +251,14 @@ void invoke(future_state& state) override {
   throw/catch round-trip, since `failed()` already established there's an
   exception waiting.
 - **Wrapped** (`Fn` invocable with `future<T>&`): always called, success or
-  failure, with a *fresh* `future<T>` view built via `shared_from_this()` —
-  never a stored one, since a continuation only ever runs once. `Fn`
-  inspects `ready()`/`failed()`/`get()` itself to decide what to do. No
-  implicit unwrap, no auto-propagation.
+  failure, with a *fresh* `future<T>` view built by copying `state` (this
+  override's own `const shared_ptr<future_state>&` parameter, ultimately
+  aliasing the node's own `owner_`) into `future<T>`'s by-value constructor
+  — never a stored view, since a continuation only ever runs once, and the
+  one refcount bump this whole call pays, only on this branch (issue #26:
+  no `shared_from_this()` left anywhere in `est:future`). `Fn` inspects
+  `ready()`/`failed()`/`get()` itself to decide what to do. No implicit
+  unwrap, no auto-propagation.
 
 Checked in that order — unwrapped first — so a generic callback (e.g. an
 `auto&` lambda, incidentally invocable both ways, since a template
@@ -287,9 +313,9 @@ template <class R> void fulfill(R&& result) {
   if constexpr (detail::is_future_v<std::decay_t<R>>) {
     auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
         downstream_);
-    result.state_->set_continuation(*node);
+    result.state_->set_continuation(*node, result.state_);
   } else {
-    downstream_->set_value(std::forward<R>(result));
+    downstream_->set_value(std::forward<R>(result), downstream_);
   }
 }
 ```
@@ -339,19 +365,19 @@ public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
       : downstream_(std::move(downstream)) {}
 
-  void invoke(future_state<T>& state) override {
-    if (state.failed()) {
-      downstream_->set_exception(state.get_exception());
+  void invoke(const shared_ptr<future_state<T>>& state) override {
+    if (state->failed()) {
+      downstream_->set_exception(state->get_exception(), downstream_);
       return;
     }
     try {
       if constexpr (std::is_void_v<T>) {
-        downstream_->set_value();
+        downstream_->set_value(downstream_);
       } else {
-        downstream_->set_value(std::move(state).get());
+        downstream_->set_value(std::move(*state).get(), downstream_);
       }
     } catch (...) {
-      downstream_->set_exception(std::current_exception());
+      downstream_->set_exception(std::current_exception(), downstream_);
     }
   }
 
@@ -370,13 +396,14 @@ abstraction built to support one caller (`fulfill()`'s flatten branch), and
 that caller's forwarding logic is fixed — it never varies by closure, only
 by `T`. Templating the node on an arbitrary `Fn` was over-generalizing a
 primitive with exactly one real shape. `flatten_forwarder<T>` bakes that one
-shape in directly: no `Fn` member, no lambda, no `future<T>` view built via
-`shared_from_this()` (it operates on the `future_state<T>&` `invoke()`
-already receives, which already exposes `failed()`/`get_exception()`/`get()`
-publicly — the view was only ever needed for `on_ready()`'s generic,
+shape in directly: no `Fn` member, no lambda, no `future<T>` view at all
+(it operates on the `const shared_ptr<future_state<T>>&` `invoke()` already
+receives, dereferencing it directly for `failed()`/`get_exception()`/`get()`
+— the view was only ever needed for `on_ready()`'s generic,
 arbitrary-callback shape). It's also no longer public anywhere:
 `future<T>::on_ready()` is gone, and `future_state<T>::on_ready()` is gone,
-replaced by the direct `result.state_->set_continuation(*node)` call above.
+replaced by the direct `result.state_->set_continuation(*node, result.state_)`
+call above.
 
 The main compile-time benefit: every flattening `.then()` at the same inner
 value type `T` now reuses the *same* `flatten_forwarder<T>` instantiation,

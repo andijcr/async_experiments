@@ -29,22 +29,24 @@ public:
   void set_value()
     requires std::is_void_v<T>
   {
-    state_->set_value();
+    state_->set_value(state_);
   }
 
   void set_value(const stored_t& value)
     requires(!std::is_void_v<T>)
   {
-    state_->set_value(value);
+    state_->set_value(value, state_);
   }
 
   void set_value(stored_t&& value)
     requires(!std::is_void_v<T>)
   {
-    state_->set_value(std::move(value));
+    state_->set_value(std::move(value), state_);
   }
 
-  void set_exception(std::exception_ptr exception) { state_->set_exception(std::move(exception)); }
+  void set_exception(std::exception_ptr exception) {
+    state_->set_exception(std::move(exception), state_);
+  }
 
 private:
   shared_ptr<future_state<T>> state_;

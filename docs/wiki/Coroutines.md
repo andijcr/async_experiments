@@ -347,14 +347,14 @@ is what the diagram's `alt` now shows.
 `future_awaiter<T>` needs its resumption node to satisfy
 `future_state<T>::set_continuation()`'s signature —
 `detail::continuation_node<T>&` — so it gets its own tiny heap-allocated
-trampoline, `future_resume_node<T>`, that ignores the `future_state<T>&`
-it's handed and just resumes:
+trampoline, `future_resume_node<T>`, that ignores the
+`const shared_ptr<future_state<T>>&` it's handed and just resumes:
 
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
-  void invoke(future_state<T>&) override {
+  void invoke(const shared_ptr<future_state<T>>&) override {
     handle_.resume();
   }
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
@@ -376,6 +376,133 @@ rethrows — which, thrown from inside `await_resume()`, the language treats
 as equivalent to the exception being thrown from the `co_await` expression
 itself, so it surfaces in the awaiting coroutine exactly like any other
 exception crossing a `co_await`.
+
+### Why `future<T>` can't be copyable
+
+`future<T>` is a thin wrapper around a `shared_ptr<future_state<T>>`, and
+`shared_ptr` itself is freely copyable — so it's a fair question why
+`future<T>` isn't too; a copy would just be another handle to the same
+`future_state`, which sounds like exactly what `co_await`ing the same
+result from two places would want. The reason lives in what `get()` does
+with the value once it's there, not in the shared_ptr underneath it.
+
+`future<T>::get()` is deducing-this, and the two branches don't do the
+same thing:
+
+```cpp
+template <class Self> [[nodiscard]] auto get(this Self&& self) -> T {
+  if constexpr (std::is_lvalue_reference_v<Self>) {
+    return self.state_->get();            // future_state::get() lvalue path -> T&, copied into the by-value return
+  } else {
+    return std::move(*self.state_).get(); // future_state::get() rvalue path -> T&&, moved into the by-value return
+  }
+}
+```
+
+The lvalue path (`future.get()`) *copies* the stored value out of
+`future_state<T>::result_` — harmless and repeatable, which is exactly why
+`.then()`'s unwrapped dispatch (`state.get()` on an lvalue
+`future_state<T>&`, [Continuation Node
+Mechanism](Continuation-Node-Mechanism.md#the-two-calling-conventions))
+can register any number of independent continuations against one
+`future_state` and let every one of them read the result safely, however
+many there are. The rvalue path (`std::move(future).get()`) *moves* it
+out instead, and a move doesn't reset `result_` — it just leaves whatever
+moved-from state `T` ends up in sitting there permanently, since nothing
+else ever touches that variant again. `await_resume()` above always takes
+this path.
+
+So: if `future<T>` were copyable, nothing would stop two copies each
+`co_await`ing their own handle to the same `future_state`. The first one
+to run gets the real value; the second gets `T`'s moved-from state —
+silently, no exception, no diagnostic, just wrong data if `T` isn't
+trivially copyable enough for "moved-from" to coincidentally look like
+"unchanged" (an `int` wouldn't even show it; a `std::string` or a
+`std::vector` would). That's a materially worse failure mode than a
+compile error, so `future<T>`'s copy constructor stays deleted and its
+move constructor is `= default`, matching `std::future<T>`'s own
+single-consumer contract rather than `std::shared_future<T>`'s multi-
+consumer one (which sidesteps this exact problem by having `get()` return
+a `const T&`/copy, never a move, in exchange for requiring `T` be
+copyable at all).
+
+Two details worth being explicit about, since they rule out the more
+clever-looking fixes:
+
+- **A decision made once, when the future_state becomes ready, isn't
+  enough.** `future_state<T>::set_continuation()` explicitly supports a
+  waiter registering *after* the future is already resolved — it's the
+  fast path every already-satisfied `co_await`/`then()` takes:
+  ```cpp
+  void set_continuation(continuation_node& node, const shared_ptr<future_state>& self) {
+    if (ready()) {
+      node.bind_owner(self);
+      loop_.enqueue_ready(node);
+      return;
+    }
+    waiters_.enqueue(node);
+  }
+  ```
+  So "how many waiters exist when `set_value()`/`complete()` runs" isn't
+  "how many will ever exist" — a value moved out (or discarded) right
+  then based on that count would break any consumer that shows up later.
+  `result_` has to stay in `future_state` for as long as the
+  `future_state` itself lives, which is exactly what the always-copying
+  `.then()` path relies on.
+- **A refcount check at each `get()` call doesn't line up with when
+  consumption actually happens either.** `future_resume_node<T>` (above)
+  binds its own `shared_ptr<future_state<T>>` reference before being
+  queued, and [`est::loop::run_one()`](Loop-And-Timers.md) doesn't destroy
+  that node until *after* `run()` returns - which is also after
+  `await_resume()` (called from inside `run()`'s own `handle_.resume()`)
+  has already run. A "move only if I'm the sole reference" check made
+  from inside `await_resume()` would almost never see a count of one,
+  even for the genuinely-only-one-waiter case:
+  the resume node driving that exact resumption is still holding its own
+  reference at that point.
+
+The general shape of "move if you're the last owner, copy otherwise" is a
+real, useful pattern elsewhere (`Rc::try_unwrap` in Rust; copy-on-write
+strings) — it just doesn't have a sound place to hook into *this*
+specific design without changing what triggers a consumption in the first
+place. `.then()`, already always on the non-consuming path regardless of
+count, is the existing answer for "more than one independent reaction to
+one result"; `future<T>::clone()`
+([issue #26](https://github.com/andijcr/async_experiments/issues/26))
+makes that available to an arbitrary caller, not just `then()`'s own
+internals:
+
+```cpp
+[[nodiscard]] auto clone() const -> future { return future(state_); }
+```
+
+A clone is another `future<T>` aliasing the same `future_state` — both
+see the same eventual result, and either may safely call the lvalue
+(copying) `get()` or register any number of `then()` callbacks, any
+number of times. It does *not* make the rvalue (consuming) `get()` path
+safe across clones of a value-carrying `future<T>`: `co_await` always
+takes that path (`await_resume()`, above), so a second clone's `co_await`
+still reads the first's moved-from leftovers, for exactly the reasons
+this section just walked through — `clone()` hands out another handle to
+the same `future_state`, it doesn't change what consuming that state's
+value means. It's unconditionally safe when `T` is `void` (nothing to
+consume, so every clone's `co_await` is just a "when is this ready"
+signal) or when every clone sticks to the non-consuming paths (`get()` on
+an lvalue, `then()`). This is exactly the shape `est::event` (issue #55)
+needs: one `future<void>`, cloned once per waiter, each independently
+`co_await`-able.
+
+Implementing `clone()` also removed the one place this codebase used to
+call `shared_from_this()` from inside `future_state<T>` itself
+(`set_continuation()`'s ready-now fast path, and the wrapped-mode `then()`
+view shown in the [Continuation Node
+Mechanism](Continuation-Node-Mechanism.md) page) — every one of those call
+sites is reached from code that already holds a `shared_ptr<future_state<T>>`
+pointing at the same object (a `promise<T>`/`future<T>`'s own `state_`, or a
+`continuation_node`'s own `owner_`), so `future_state<T>` no longer inherits
+`est::enable_shared_from_this` at all; `set_value()`/`set_exception()`/
+`set_continuation()`/`then()` each take that `shared_ptr` as an explicit
+`self` parameter instead.
 
 ### Composability, concretely
 
@@ -423,7 +550,7 @@ code review, before merging, not after). The fix: each resumption node's
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
-  void invoke(future_state<T>&) override {
+  void invoke(const shared_ptr<future_state<T>>&) override {
     handle_.resume();
   }
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {

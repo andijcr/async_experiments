@@ -126,16 +126,20 @@ private:
 // Opt-in CRTP base giving a shared_ptr<T>-managed T the ability to hand
 // out new shared ownership of itself (shared_from_this()) from inside
 // its own member functions - the same problem
-// std::enable_shared_from_this solves for std::shared_ptr, needed here
-// because est::future_state<T> (est:future) invokes a then() callback
-// that wants a real est::future<T> - itself just a shared_ptr<T> plus a
-// thin interface - without future_state<T> otherwise having any way to
-// produce one. shared_ptr<T>::make() wires the back-pointer in
-// automatically for any T that inherits from this (see the `if
-// constexpr (requires ...)` there); never call set_owning_control_block
-// directly otherwise. Weak, not owning: stores a raw pointer, never
-// bumps the ref count itself - only shared_from_this() does, exactly
-// like any other shared_ptr copy.
+// std::enable_shared_from_this solves for std::shared_ptr. Originally
+// added for est::future_state<T> (est:future), which used to invoke a
+// then() callback wanting a real est::future<T> from inside its own
+// member functions; that call site was reworked (issue #26) to take an
+// explicit shared_ptr<future_state<T>> parameter from a caller who
+// already holds one instead, so nothing in this codebase currently
+// inherits from this - kept as a general-purpose, independently tested
+// (shared_ptr_tests.cpp) utility for a future T that needs the same
+// capability, not dead code. shared_ptr<T>::make() wires the
+// back-pointer in automatically for any T that inherits from this (see
+// the `if constexpr (requires ...)` there); never call
+// set_owning_control_block directly otherwise. Weak, not owning: stores
+// a raw pointer, never bumps the ref count itself - only
+// shared_from_this() does, exactly like any other shared_ptr copy.
 template <class T> class enable_shared_from_this {
 public:
   // Copy/move stay deleted (rather than just never declared): T is

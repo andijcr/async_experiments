@@ -55,12 +55,12 @@ node directly on the inner future's own `future_state<U>`, reached through
 ```cpp
 auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
     downstream_);
-result.state_->set_continuation(*node);
+result.state_->set_continuation(*node, result.state_);
 ```
 
 `flatten_forwarder<T>` (issue #25) is templated on the inner value type
-alone — no `Fn`, no closure, no `future<T>` view built via
-`shared_from_this()`, no wrapped/unwrapped dispatch — and every flattening
+alone — no `Fn`, no closure, no `future<T>` view at all, no
+wrapped/unwrapped dispatch — and every flattening
 `.then()` at the same inner type reuses the same instantiation. Two earlier,
 now-removed designs paid more for the same one call site: first a plain
 `.then()` call, which worked (the discarded `future<void>` it returned was
@@ -111,8 +111,10 @@ owner (`bind_owner()` — see
 
 ### What `promise.set_value(10)` + `run_until_idle()` do to that graph
 
-1. `FS0.set_value(10)` → `complete()` drains `FS0.waiters_`, calls
-   `Node_a.bind_owner(FS0.shared_from_this())`, hands `Node_a` to
+1. `FS0.set_value(10, self)` → `complete(self)` drains `FS0.waiters_`, calls
+   `Node_a.bind_owner(self)` (`self` being the same `shared_ptr<FS0>`
+   `promise`/`future` already held, threaded through rather than
+   manufactured internally — issue #26), hands `Node_a` to
    `loop.enqueue_ready()`. `FS0` now has two owners again: the original
    `promise`/`future` handles (if still alive) *and* `Node_a` itself.
 2. `loop.run_until_idle()` dequeues `Node_a`, runs it: `fn_(10)` → `20`,
