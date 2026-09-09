@@ -460,20 +460,23 @@ public:
   // entirely under NDEBUG, at which point a caller violating the
   // precondition is undefined behavior by design (see
   // check_not_completed()'s own comment on this class's general
-  // validate-at-boundaries philosophy). But std::get<T>() below also
-  // throws std::bad_variant_access unconditionally, regardless of
-  // NDEBUG, as an accidental (not intentionally designed) second line of
-  // defense for T != void; every std::get<stored_t> call, including the
-  // T = void one, keeps that same accidental behavior rather than
-  // letting T = void alone skip it by returning before ever touching
-  // result_'s active alternative.
+  // validate-at-boundaries philosophy). std::get<T>() below also throws
+  // std::bad_variant_access unconditionally, regardless of NDEBUG, as an
+  // accidental (not intentionally designed) second line of defense for
+  // T != void - but the T = void branch has nothing left to call
+  // std::get on for the same purpose: once ready() holds and the
+  // exception alternative has already been ruled out above, result_ can
+  // only be holding stored_t (the variant has exactly three
+  // alternatives - monostate, stored_t, exception_ptr), so a
+  // std::get<stored_t> purely to reconfirm that would be a genuine
+  // no-op, not even an accidental check of anything std::get<T> above
+  // doesn't already cover for T != void by actually returning a value.
   template <class Self> [[nodiscard]] decltype(auto) get(this Self&& self) {
     check(self.ready());
     if (auto* exception = std::get_if<std::exception_ptr>(&self.result_)) {
       std::rethrow_exception(*exception);
     }
     if constexpr (std::is_void_v<T>) {
-      (void)std::get<stored_t>(self.result_);
       return;
     } else {
       return std::get<T>(std::forward<Self>(self).result_);
@@ -826,25 +829,43 @@ public:
   }
 
   // Returns another future<T> aliasing the same future_state as *this -
-  // both see the same eventual result, and either may safely call the
-  // lvalue (copying) get() or register any number of then() callbacks,
-  // any number of times. What it does *not* make safe: the consuming
-  // (rvalue) get() path - which co_await always uses (this class's own
-  // operator co_await(), below) - called from more than one clone of a
-  // value-carrying future<T>. The second such call reads the first's
-  // moved-from leftovers, silently: future_state<T>::get()'s lvalue
-  // branch copies the stored value out (harmless, repeatable - what
-  // then()'s own unwrapped dispatch already relies on to let multiple
-  // continuations each read it), but the rvalue branch moves it out, and
-  // a move doesn't reset the underlying storage - it just leaves
-  // whatever moved-from state T ends up in sitting there permanently.
-  // Safe unconditionally only when T is void (nothing to consume) or
-  // every clone sticks to the non-consuming paths (get() on an lvalue,
-  // then()). Just a copy of state_ - cheap regardless of whether T
+  // both see the same eventual result, and either may safely call
+  // get() or register any number of then() callbacks, any number of
+  // times. Just a copy of state_ - cheap regardless of whether T
   // happens to opt into est::ref_counted's intrusive counting or the
   // default control_block-based one (est:util.shared_ptr): either way
   // it's a plain refcount bump, no extra allocation.
-  [[nodiscard]] auto clone() const -> future { return future(state_); }
+  //
+  // Constrained to T = void or a scalar T (integral, floating-point,
+  // enumeration, pointer, pointer-to-member, or std::nullptr_t) rather
+  // than offered for every T, because of what a clone does *not* make
+  // safe in general: future<T>::get()'s consuming (rvalue) path - the
+  // one co_await always takes (this class's own operator co_await(),
+  // below) - called from more than one clone of the same future_state.
+  // The second such call would read the first's moved-from leftovers,
+  // silently: future_state<T>::get()'s lvalue branch copies the stored
+  // value out (harmless, repeatable - what then()'s own unwrapped
+  // dispatch already relies on to let multiple continuations each read
+  // it), but the rvalue branch moves it out, and a move doesn't reset
+  // the underlying storage - it just leaves whatever moved-from state T
+  // ends up in sitting there permanently. That hazard needs T to have a
+  // meaningfully different "moved-from" state to begin with. For T =
+  // void there's nothing to consume in the first place; for a scalar T,
+  // move construction/assignment is defined to do exactly what copying
+  // it would - it reads the value, and the "moved-from" object is left
+  // completely unchanged (unlike, say, std::string or std::vector) - so
+  // every clone consuming the same scalar via co_await/rvalue get() is
+  // just redundantly reading the same, still-intact value, not a bug.
+  // Every other T keeps this as a caller-enforced precondition instead
+  // (at most one clone may ever be co_await-ed or rvalue-get()-ed) -
+  // that's real and not caught by this constraint, but the constraint
+  // at least removes the two cases where the whole hazard was moot to
+  // begin with.
+  [[nodiscard]] auto clone() const -> future
+    requires(std::is_void_v<T> || std::is_scalar_v<T>)
+  {
+    return future(state_);
+  }
 
   // Forwards to future_state<T>::then() (see its own doc comment) - the
   // node allocation and registration live there now, not here.

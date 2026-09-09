@@ -929,3 +929,32 @@ TEST_CASE("future<void>: two clones can each be co_awaited independently",
   REQUIRE(result_a.ready());
   REQUIRE(result_b.ready());
 }
+
+TEST_CASE("future<int>: two clones can each be co_awaited independently, both see the real value",
+          "[future][clone]") {
+  // clone() is constrained to T = void or scalar T specifically so this
+  // is safe: co_await always takes future<T>::get()'s consuming (rvalue)
+  // path, but "consuming" a scalar is defined to do exactly what copying
+  // it would - the moved-from int is left completely unchanged - so
+  // whichever clone resumes second still reads the real value, not
+  // moved-from leftovers the way it would for a non-scalar T.
+  est::loop loop;
+  auto [promise, future] = est::make_promise_future<int>(loop);
+  auto clone_a = future.clone();
+  auto clone_b = future.clone();
+
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto waiter = [](est::future<int>& fut) -> est::future<int> { co_return co_await fut; };
+
+  auto result_a = waiter(clone_a);
+  auto result_b = waiter(clone_b);
+  REQUIRE_FALSE(result_a.ready());
+  REQUIRE_FALSE(result_b.ready());
+
+  promise.set_value(7);
+  loop.run_until_idle();
+  REQUIRE(result_a.ready());
+  REQUIRE(result_b.ready());
+  REQUIRE(result_a.get() == 7);
+  REQUIRE(result_b.get() == 7);
+}
