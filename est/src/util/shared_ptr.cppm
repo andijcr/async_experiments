@@ -205,6 +205,11 @@ public:
     }
   }
 
+  // Copy-and-swap: self-assignment-safe without an explicit check, same
+  // reasoning (and the same static-analysis limitation) as the primary
+  // template's own operator= above - see its own comment. Exercised
+  // directly by shared_ptr_tests.cpp's "self-copy-assignment and
+  // self-move-assignment are safe for a ref_counted T too".
   // NOLINTNEXTLINE(bugprone-unhandled-self-assignment)
   auto operator=(const shared_ptr& other) noexcept -> shared_ptr& {
     shared_ptr(other).swap(*this);

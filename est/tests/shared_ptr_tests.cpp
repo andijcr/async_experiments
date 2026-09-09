@@ -164,6 +164,30 @@ TEST_CASE("self-copy-assignment and self-move-assignment are safe", "[shared_ptr
   REQUIRE(resource.deallocations == 0);
 }
 
+TEST_CASE("self-copy-assignment and self-move-assignment are safe for a ref_counted T too",
+          "[shared_ptr]") {
+  // Same exercise as the test above, but for shared_ptr<T>'s intrusive
+  // (ref_counted-based) specialization - copy-and-swap is self-assignment-
+  // safe there for the identical reason it is on the primary template
+  // (see that specialization's own NOLINTNEXTLINE(bugprone-unhandled-
+  // self-assignment) comment): the temporary built from `other` bumps
+  // ref_count_ before the swap, so a self-assignment's extra increment
+  // and the temporary's own decrement on destruction cancel out exactly.
+  counting_resource resource;
+  auto ptr = est::shared_ptr<self_aware>::make(&resource, 5);
+
+  auto& self_ref = ptr;
+  ptr = self_ref;
+  REQUIRE(ptr);
+  REQUIRE(ptr->value == 5);
+
+  ptr = std::move(self_ref);
+  REQUIRE(ptr);
+  REQUIRE(ptr->value == 5);
+  REQUIRE(resource.allocations == 1);
+  REQUIRE(resource.deallocations == 0);
+}
+
 TEST_CASE("a default-constructed shared_ptr is empty", "[shared_ptr]") {
   est::shared_ptr<int> ptr;
   REQUIRE_FALSE(ptr);
