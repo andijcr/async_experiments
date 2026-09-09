@@ -190,9 +190,8 @@ TEST_CASE("destroying a counting_event with a coroutine still queued on wait() l
     est::counting_event<EventResetMode::automatic> ev(loop);
 
     // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
-    auto coro =
-        [](est::loop&,
-           est::counting_event<EventResetMode::automatic>& event_ref) -> est::future<void> {
+    auto coro = [](est::loop&,
+                   est::counting_event<EventResetMode::automatic>& event_ref) -> est::future<void> {
       co_await event_ref.wait();
       co_return; // never reached - never set()
     };
