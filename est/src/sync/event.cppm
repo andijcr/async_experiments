@@ -99,12 +99,18 @@ export namespace est {
 // max_count bounds how high the count is ever allowed to climb: set(n)
 // (below) saturates at it rather than growing without limit, the same
 // way std::counting_semaphore<LeastMaxValue> bounds release() - except
-// saturating instead of std::counting_semaphore's own undefined-behavior-
-// on-overflow contract, matching this codebase's general preference for a
-// defined, checked outcome over UB wherever the standard library itself
-// permits UB. Defaults to an effectively-unbounded value (a plain
-// semaphore/counting event with no meaningful ceiling); est::binary_event
-// (below) is nothing more than a counting_event<Mode> constructed with
+// saturating, a deliberate choice for this primitive specifically, rather
+// than std::counting_semaphore's own undefined-behavior-on-overflow
+// contract: est::binary_event (below) needs set() to be a safe no-op once
+// already signaled, callable from more than one place without every
+// caller first checking whether someone else already signaled it - a
+// precondition violation here would defeat that outright, whereas
+// est::mutex/est::shared_ptr's own preconditions elsewhere in this
+// codebase are all check()-enforced, not saturated, since violating
+// those really does indicate a caller bug worth catching. Defaults to an
+// effectively-unbounded value (a plain semaphore/counting event with no
+// meaningful ceiling); est::binary_event (below) is nothing more than a
+// counting_event<Mode> constructed with
 // max_count = 1 - not a separate implementation.
 template <EventResetMode Mode> class counting_event {
 public:
