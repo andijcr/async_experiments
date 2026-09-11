@@ -31,6 +31,45 @@ import std;
   return std::move(fut);
 }
 
+// Added for the current-loop-only-experiment branch: probe_make_promise_future()
+// above only shows current_loop() reached *once* per call. est::mutex/
+// est::counting_event/a coroutine's own promise_type now each resolve it
+// independently, per method, instead of caching it once at construction -
+// these two probes show what that repeated resolution actually compiles to.
+
+// Uncontended fast path only - a fresh, never-locked mutex.
+[[gnu::noinline]] auto probe_mutex_lock() -> est::future<void> {
+  est::mutex m;
+  return m.lock();
+}
+
+// No queued waiter - the branch that never touches current_loop() at all,
+// for contrast with lock() above (which always does, even uncontended).
+[[gnu::noinline]] void probe_mutex_unlock_uncontended() {
+  est::mutex m;
+  m.unlock();
+}
+
+// A real coroutine (not make_promise_future() called directly). Never
+// actually suspends (no co_await), so clang's coroutine-frame elision
+// (HALO) proves the heap allocation can be skipped entirely - this probe
+// exercises promise_type's constructor (current_loop() once, to build
+// state_) but *not* its operator new/delete: with elision, there's no
+// heap frame to allocate or free in the first place.
+[[gnu::noinline]] auto probe_coroutine() -> est::future<int> {
+  co_return 42;
+}
+
+// Genuinely suspends on a not-yet-ready future, which HALO can't see
+// through (the frame's lifetime crosses the co_await, so eliding the heap
+// allocation isn't provably safe) - this is the probe that actually
+// exercises coroutine_frame_alloc()/coroutine_frame_dealloc(), each
+// resolving current_loop() independently rather than sharing one lookup.
+[[gnu::noinline]] auto probe_coroutine_suspending(est::future<int>& fut) -> est::future<int> {
+  const int value = co_await fut;
+  co_return value + 1;
+}
+
 auto main() -> int {
   estext::hosted_stdcpp platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
@@ -40,6 +79,15 @@ auto main() -> int {
     std::println("{}", probe_loop_allocator());
     std::println("{}", static_cast<void*>(probe_platform_instance()));
     std::println("{}", probe_make_promise_future().get());
+    probe_mutex_lock().get();
+    probe_mutex_unlock_uncontended();
+    std::println("{}", probe_coroutine().get());
+
+    auto [prom, fut] = est::make_promise_future<int>();
+    auto suspended = probe_coroutine_suspending(fut); // suspends - fut isn't ready yet
+    prom.set_value(41);
+    est::current_loop().run_until_idle(); // resumes it, frame freed
+    std::println("{}", suspended.get());
   } catch (...) {
     return EXIT_FAILURE;
   }
