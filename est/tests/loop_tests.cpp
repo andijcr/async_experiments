@@ -35,9 +35,8 @@ private:
 // A fake platform with a controllable clock whose sleep_until() advances
 // that same fake clock instead of actually blocking - the seam
 // est::loop's own timer-driven tests need to run instantly rather than
-// for real wall-clock seconds (docs/PLAN.md, M3), extending the
-// now()-only fake_platform pattern est/tests/timer_tests.cpp already
-// established.
+// for real wall-clock seconds, extending the now()-only fake_platform
+// pattern est/tests/timer_tests.cpp already established.
 class fake_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
@@ -59,8 +58,8 @@ public:
   // No-ops: nothing in these tests exercises the long-running-callback
   // warning path (est/tests/loop_tests.cpp's jumping_platform, below, is
   // what does) - platform::interface has no data members of its own to
-  // inherit a shared implementation from (per review), so every concrete
-  // backend, this fake included, must answer these itself.
+  // inherit a shared implementation from, so every concrete backend,
+  // this fake included, must answer these itself.
   void reset_loop_stall_detection() noexcept override {}
   void
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
@@ -85,11 +84,10 @@ public:
 // A platform whose now() advances by `step` on every single call - used
 // to make a continuation's runtime appear to exceed the long-running-
 // callback threshold without an actual real delay, so that code path gets
-// exercised (docs/PLAN.md, M3's "long-running-callback detection"). Its
-// own reset_loop_stall_detection()/detect_loop_stall() below duplicate
-// hosted_stdcpp's own implementation (platform.cppm) rather than
-// inheriting a shared default - platform::interface holds no state of its
-// own to back one (per review) - but the shape is unchanged: still calls
+// exercised. Its own reset_loop_stall_detection()/detect_loop_stall()
+// below duplicate hosted_stdcpp's own implementation (platform.cppm)
+// rather than inheriting a shared default - platform::interface holds no
+// state of its own to back one - but the shape is unchanged: still calls
 // now() exactly twice bracketing node.run(), the same measurement
 // loop::run_one() itself triggers via these two calls.
 class jumping_platform final : public est::platform::interface {
@@ -313,8 +311,8 @@ TEST_CASE(
     "a continuation that appears to exceed the long-running threshold still completes normally",
     "[loop]") {
   // Exercises loop::run_one()'s long-running-callback warning path
-  // (docs/PLAN.md, M3) without asserting on the printed diagnostic's
-  // content - not separately unit-tested, same stance this codebase
+  // without asserting on the printed diagnostic's content - not
+  // separately unit-tested, same stance this codebase
   // already takes on platform::hosted_stdcpp::assert_failure()'s own
   // best-effort diagnostic (est/tests/check_tests.cpp).
   jumping_platform fake;

@@ -7,8 +7,8 @@ import estext;
 // Every other file in this binary just `import est;`/`import std;` and
 // use Catch2's TEST_CASE macro - none of them install a
 // platform::interface themselves, since that isn't an individual test
-// file's job (per review: `import est;` doesn't install one either, and
-// est itself doesn't even know estext/hosted_stdcpp exist - exactly like
+// file's job (`import est;` doesn't install one either, and est itself
+// doesn't even know estext/hosted_stdcpp exist - exactly like
 // examples/hello_world/main.cpp and examples/sleep_sort/main.cpp each do
 // their own installation, from estext, in their own main()). This file is
 // the test binary's equivalent of that main() - linked against plain

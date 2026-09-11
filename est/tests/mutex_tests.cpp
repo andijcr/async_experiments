@@ -34,10 +34,9 @@ private:
 
 } // namespace
 
-// est::mutex::lock() returns a plain est::future<void> (M4, docs/PLAN.md;
-// PR #37 review follow-up) - unlike an earlier, awaitable-only version of
-// this API, it can be used from perfectly ordinary, non-coroutine code
-// too (polled via ready()/get(), or chained with then()), not just via
+// est::mutex::lock() returns a plain est::future<void>, so it can be
+// used from perfectly ordinary, non-coroutine code too (polled via
+// ready()/get(), or chained with then()), not just via
 // co_await. Most tests below still drive their scenario through a small
 // coroutine anyway (an ordinary lambda returning est::future<void> -
 // est::future<T>'s own doc comment on operator co_await()/promise_type
@@ -359,11 +358,9 @@ TEST_CASE("destroying a mutex with a coroutine co_await-ing acquire() still pend
 }
 
 TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks nothing", "[mutex]") {
-  // Regression test (found in review): est::mutex's destructor used to be
-  // `= default`, which simply discarded waiters_ without draining it -
-  // a coroutine still queued in mutex::waiters_ when the mutex is
-  // destroyed was never resumed *or* destroyed, permanently leaking both
-  // its lock_resume_node and its entire coroutine frame.
+  // Guards ~mutex()'s waiters_ drain: a coroutine still queued in
+  // mutex::waiters_ when the mutex is destroyed must be destroyed
+  // (never resumed), or it and its lock_resume_node would leak.
   counting_resource resource;
   {
     est::loop loop{&resource};
