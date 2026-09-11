@@ -7,11 +7,8 @@ export namespace est {
 
 // A min-heap of pending one-shot deadlines, ordered by
 // platform::instance().now(). Templated on the allocator used for the
-// underlying storage, part of the framework's allocator-first design
-// (docs/PLAN.md, "Allocator support") rather than bolted on later.
-// Periodic timers and actually firing continuations are est::loop's job
-// (M3); this is just the scheduling structure a future loop will own and
-// drive.
+// underlying storage. Just the scheduling structure - est::loop owns one
+// and is what actually fires deadlines as continuations.
 template <class Allocator = std::allocator<std::byte>> class timer_queue {
 public:
   using clock = std::chrono::steady_clock;
