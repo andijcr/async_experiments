@@ -34,9 +34,8 @@ namespace est::detail {
 // Deliberately *not* nested inside counting_event<Mode> (unlike
 // mutex::lock_resume_node inside the non-template mutex): run()/destroy()
 // only ever touch promise_, never Mode or anything else about the
-// counting_event that enqueued them - review caught the first version of
-// this file defining an identical resume_node type once per Mode
-// instantiation for no reason. Hoisted out here instead, matching
+// counting_event that enqueued them, so hoisting it out here avoids an
+// identical resume_node type per Mode instantiation. Matches
 // est::detail::ready_node/timer_node's own "type-erased, internal-only"
 // placement (est:loop) - counting_event<Mode>::wait() (below) is the only
 // caller either way, on both Mode values.
@@ -89,7 +88,7 @@ export namespace est {
 // exactly one more constraint on top of set()/wait()/reset(), reusing
 // this class's own waiters_ mechanism unchanged all the way down.
 //
-// Holds a `loop&` (M3's convention, same as future_state<T>/mutex - see
+// Holds a `loop&` (same convention as future_state<T>/mutex - see
 // their own doc comments) rather than its own allocator: wait() builds a
 // future_state<void> against it, and set()/~counting_event() need its
 // allocator to enqueue/destroy waiter nodes. Same lifetime precondition
@@ -119,7 +118,7 @@ public:
     check(max_count > 0, "counting_event: max_count must be positive");
   }
 
-  // Issue #30: sugar over the constructor above using est::current_loop()
+  // Sugar over the constructor above using est::current_loop()
   // (est:util.current_loop) instead of a caller-supplied loop&.
   explicit counting_event(int max_count = std::numeric_limits<int>::max()) noexcept
       : counting_event(current_loop(), max_count) {}
@@ -182,8 +181,8 @@ public:
   // calls promise_.set_value(), never runs arbitrary downstream coroutine
   // code inline on this call stack, so nothing about set() itself needs
   // to bound recursion - deferring anyway keeps this consistent with
-  // every other completion path in this codebase (M3, docs/PLAN.md:
-  // never invoke a continuation inline).
+  // every other completion path in this codebase: never invoke a
+  // continuation inline.
   auto set(int n = 1) -> int {
     check(n > 0, "counting_event::set(n) requires n > 0");
     const int actual_n = std::min(n, max_count_ - count_);
@@ -259,16 +258,16 @@ template <EventResetMode Mode> class binary_event : public counting_event<Mode> 
 public:
   explicit binary_event(loop& loop_ref) noexcept : counting_event<Mode>(loop_ref, 1) {}
 
-  // Issue #30: sugar over the constructor above using est::current_loop()
+  // Sugar over the constructor above using est::current_loop()
   // (est:util.current_loop) instead of a caller-supplied loop&.
   binary_event() noexcept : counting_event<Mode>(1) {}
 
   [[nodiscard]] auto signaled() const noexcept -> bool { return this->count() > 0; }
 };
 
-// A binary_event<Mode> that may be set() at most once, ever - the
-// motivating shape for est::event (issue #55): a single signal, handed
-// out to every interested waiter (Mode = manual, the common case - one
+// A binary_event<Mode> that may be set() at most once, ever - a single
+// signal, handed out to every interested waiter (Mode = manual, the
+// common case - one
 // broadcast, seen by any number of independent wait() callers, present
 // or future) or to exactly the first one to observe it (Mode =
 // automatic - a single-consumer handoff, every later wait() blocks
@@ -283,12 +282,12 @@ public:
 //
 // set() past the first call is a no-op, not a checked precondition
 // violation - matching counting_event<Mode>::set()'s own saturating
-// idempotency once max_count is reached, one layer down (review: forcing
-// every caller to guard set() with its own "have I already signaled
-// this?" check, on pain of aborting the whole process, would defeat the
-// point of a primitive meant to let independent callers - e.g. two
-// unrelated cancellation sources racing to fire the same one-shot signal
-// - all safely call set() without coordinating first).
+// idempotency once max_count is reached, one layer down: forcing every
+// caller to guard set() with its own "have I already signaled this?"
+// check, on pain of aborting the whole process, would defeat the point
+// of a primitive meant to let independent callers - e.g. two unrelated
+// cancellation sources racing to fire the same one-shot signal - all
+// safely call set() without coordinating first.
 //
 // reset() is deleted outright (again: hides the base's declaration from
 // unqualified lookup, same technique set() above already uses, not an
