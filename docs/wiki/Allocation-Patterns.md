@@ -65,19 +65,15 @@ auto* node = result.state_->allocator().template new_object<detail::flatten_forw
 result.state_->set_continuation(*node);
 ```
 
-`flatten_forwarder<T>` (issue #25) is templated on the inner value type
+`flatten_forwarder<T>` is templated on the inner value type
 alone — no `Fn`, no closure, no `future<T>` view built via
 `shared_from_this()`, no wrapped/unwrapped dispatch — and every flattening
-`.then()` at the same inner type reuses the same instantiation. Two earlier,
-now-removed designs paid more for the same one call site: first a plain
-`.then()` call, which worked (the discarded `future<void>` it returned was
-never wrong, just wasted) but paid for a second, throwaway
-`future_state<void>` plus a full `concrete_continuation` node every single
-time; then a lower-level `on_ready()`/`raw_continuation<Fn>` pair that
-dropped the throwaway `future_state<void>` but still minted a fresh node
-(and closure) type per `(T, Fn, U)` call site, and had to be public on both
-`future_state<T>` and `future<T>` for `fulfill()` to reach — even though
-`fulfill()` was its only legitimate caller.
+`.then()` at the same inner type reuses the same instantiation. Registering
+through a plain `.then()` call instead would work (the discarded
+`future<void>` it returns is never wrong, just wasted) but would pay for a
+second, throwaway `future_state<void>` plus a full `concrete_continuation`
+node on every single flattening call — exactly what `flatten_forwarder<T>`
+avoids by registering directly on the inner future's `future_state`.
 
 ## Worked example: a three-link chain
 

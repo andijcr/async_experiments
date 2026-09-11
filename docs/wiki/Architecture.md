@@ -60,11 +60,11 @@ The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
 above them** — even though a loop's whole job is running futures'
 continuations. See "Why `:loop` doesn't depend on `:future`" below; it's the
 key to understanding how the continuation mechanism is split across files.
-`:sync.mutex` depends on `:loop` too (M4, [Coroutines](Coroutines.md)) — an
+`:sync.mutex` depends on `:loop` too ([Coroutines](Coroutines.md)) — an
 awaitable `lock()` needs somewhere to defer a waiter's resumption to, and
 `est::loop::enqueue_ready()` is that somewhere; `:loop` still knows nothing
 about `:sync.mutex` in return. `:sync.mutex` also depends on `:future`/
-`:promise` (PR #37 review follow-up) for `acquire() -> future<lock_guard>`
+`:promise` for `acquire() -> future<lock_guard>`
 — an alternative to `lock()`/`unlock()` returning a move-only RAII handle
 instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
 rather than a coroutine of its own, the same "producer without co_await"
@@ -84,12 +84,11 @@ enforcement.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
-behind issue #30's "current loop" convenience (registering a loop as the
+behind the "current loop" convenience (registering a loop as the
 one `make_promise_future()`/`sleep_for()`/a loop-less coroutine's
 `promise_type` fall back to, [The Loop and Timers](Loop-And-Timers.md)).
 Deliberately free functions in their own partition, not methods on
-`est::loop` itself: per review, `loop.cppm` shouldn't carry this
-mechanism's own diff at all, since the two concerns - a primitive
+`est::loop` itself: the two concerns - a primitive
 ready-queue-and-timers type, and an opt-in convenience for not threading a
 `loop&` by hand - have nothing to do with each other. Nothing unusual
 about where this partition sits, unlike `estext` below: it's an ordinary
@@ -113,7 +112,7 @@ graph BT
   estext --> est
 ```
 
-This is an explicit design goal (issue #30's review), not an accident of
+This is an explicit design goal, not an accident of
 where the file happened to land: `import est;` alone gives a consumer the
 complete framework with *zero* trace of any concrete backend - no
 partition silently re-exporting `hosted_stdcpp`, nothing `std::chrono`/
@@ -136,21 +135,20 @@ access needed (unlike `:platform` itself, which forward-declares
 `est::loop` - `export namespace est { class loop; }`, `platform.cppm`'s
 own top comment on why an *exported* forward declaration in one partition
 attaches to the real definition in another partition of the *same*
-module, confirmed against this toolchain - purely so
+module - purely so
 `get_current_loop_context()`/`set_current_loop_context()` can return/take
 a genuinely typed `est::loop*` instead of an opaque `void*`, without
 `:platform` ever importing `:loop`).
 
-An earlier version of this design made `hosted_stdcpp` one of `est`'s own
-partitions (`:platform.hosted_stdcpp`, re-exported through `est.cppm`) -
-reverted per review in favor of the fully separate module above, since
-"only `:platform` can't import `:loop`, but a different partition of the
-same module can" still leaves `hosted_stdcpp` inside `est`'s own module
-boundary, always compiled and logically exported as part of it. A
-genuinely separate module makes the boundary real rather than incidental.
+Making `hosted_stdcpp` one of `est`'s own partitions instead - even
+though "only `:platform` can't import `:loop`, but a different partition
+of the same module can" - would still leave `hosted_stdcpp` inside
+`est`'s own module boundary, always compiled and logically exported as
+part of it. A genuinely separate module makes the boundary real rather
+than incidental.
 
 `import est;` also does *not* install a default `platform::interface` as
-a side effect - per the same review, that decision belongs to the
+a side effect - that decision belongs to the
 program's own entry point, not to the library. `examples/hello_world/
 main.cpp` and `examples/sleep_sort/main.cpp` each `import estext;`,
 construct a `hosted_stdcpp`, and `platform::override_instance()` it at
@@ -164,12 +162,11 @@ every individual test file.
 - **Single-threaded, no atomics, no OS-level concurrency protection — yet.**
   `est::shared_ptr`'s ref count is a plain `int`, and `est::loop` is driven
   from exactly one call stack. This isn't an oversight to fix later; it's a
-  deliberate scope boundary recorded early in `docs/PLAN.md` ("Revised:
-  critical sections removed") — real interrupt-context protection gets added
+  deliberate scope boundary — real interrupt-context protection gets added
   when a backend that actually needs it exists (bare-metal interrupts, or a
   future multi-loop), not speculatively. `est::mutex::lock()` *is* real
   protection against a different, still-single-threaded hazard though
-  (M4, [Coroutines](Coroutines.md)): two coroutines interleaving at a
+  ([Coroutines](Coroutines.md)): two coroutines interleaving at a
   `co_await` while both hold a reference to the same structure.
 - **Allocator-first.** Every owned object — `shared_ptr<T>`'s control block,
   a continuation node, `timer_queue`'s storage, `loop`'s own containers — is
@@ -187,8 +184,8 @@ every individual test file.
   concrete classes; this is the only place virtual dispatch is used for
   polymorphism rather than for type erasure.
 - **`est::check()`, not `assert()`.** A plain function (named to avoid
-  colliding with the `<cassert>` macro even fully-qualified — a real mistake
-  made once and documented), compiled away entirely under `NDEBUG`. Every
+  colliding with the `<cassert>` macro even fully-qualified), compiled away
+  entirely under `NDEBUG`. Every
   precondition it guards is explicitly documented as "debug-checked,
   undefined behavior on release-build violation" — the codebase's consistent
   stance rather than something reinvented per call site.
@@ -229,11 +226,9 @@ This is also *why* `est::loop`'s ready-queue, `est::future_state<T>`'s
 "not yet ready" queue, and `est::mutex`'s own waiter list all share one
 root node type and one list container - `est::intrusive_list_node` and
 `est::intrusive_list<T>` (`est:util.intrusive_list`), a genuinely generic
-utility, not something borrowed from `est::mutex` (`mutex_waiter` used to
-live there, back when `est::mutex` was its only user - it's since moved
-here and been generalized, see that file's own doc comment). `ready_node :
-public intrusive_list_node` directly, and (M4) `est::mutex`'s own waiter
-queue is now typed `intrusive_list<detail::ready_node>` too - the same
+utility rather than something specific to any one of its users. `ready_node :
+public intrusive_list_node` directly, and `est::mutex`'s own waiter
+queue is typed `intrusive_list<detail::ready_node>` too - the same
 type `est::loop`'s ready-queue and `est::future_state<T>`'s continuation
 queue already use, not just a sibling built on the same base - so the same
 enqueue/dequeue mechanics serve all three, with none of them depending on
