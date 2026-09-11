@@ -11,48 +11,36 @@ inline constexpr bool checks_enabled = false;
 inline constexpr bool checks_enabled = true;
 #endif
 
-// A function replacement for the <cassert> macro - avoids future.cppm's
-// own prior need for the assert() macro (see below for why a function
-// literally named `assert` doesn't work).
-// std::source_location::current(), defaulted here and evaluated at
-// each call site, replaces __FILE__/__LINE__.
+// A function replacement for the <cassert> macro.
+// std::source_location::current(), defaulted here and evaluated at each
+// call site, replaces __FILE__/__LINE__.
 //
 // Named check(), not assert(): a function named `assert` collides with
 // <cassert>'s own macro even when called fully-qualified as
 // `est::assert(...)` - the preprocessor expands `assert` by raw token
 // match before the compiler ever sees the `est::` qualifier, so any
-// translation unit that transitively includes <cassert> (every test
-// file using Catch2 does) fails to compile. Confirmed the hard way: the
-// first version of this function was literally named assert() and
-// broke every test file for exactly this reason.
+// translation unit that transitively includes <cassert> fails to
+// compile.
 //
-// Two differences from the <cassert> macro worth knowing about, not
-// just an invisible drop-in:
+// Two differences from the <cassert> macro:
 // - No automatic condition-stringification: a function can't see the
 //   caller's source text the way a macro can via #condition. Pass an
-//   explicit message instead of relying on the old `assert(cond &&
-//   "message")` idiom.
+//   explicit message instead of the old `assert(cond && "message")`
+//   idiom.
 // - `condition` is an ordinary function argument, so it's always
 //   evaluated, even when checks_enabled is false - unlike the macro,
-//   which expands to nothing under NDEBUG and never evaluates its
-//   argument at all. Only matters for a condition with real cost or
-//   side effects; every current call site is a cheap query.
+//   which never evaluates its argument under NDEBUG. Only matters for a
+//   condition with real cost or side effects.
 //
 // Debug-only, same as the macro it replaces: the `if constexpr` below
-// compiles the check away entirely (not just skips it at runtime) in a
-// build defining NDEBUG. Terminates via platform::instance().
-// assert_failure() on failure and never returns in that case.
+// compiles the check away entirely in a build defining NDEBUG.
+// Terminates via platform::instance().assert_failure() on failure and
+// never returns in that case.
 //
-// `inline` matters here, concretely, not just as an ODR nicety: verified
-// in a -DCMAKE_BUILD_TYPE=Release build (-O3 -DNDEBUG) via objdump/nm
-// that without it, call sites in future.cppm still emit a real `call` to
-// check() - now an empty function body, but still a call plus whatever
-// work its argument expression does - because Clang's cross-TU-via-BMI
-// inlining didn't kick in on its own at this optimization level. Adding
-// `inline` here removed every call site and the symbol itself from the
-// binary entirely, confirming the earlier "compiles away entirely" claim
-// actually holds at the call site too, not just inside this function's
-// own body.
+// `inline` is required, not just an ODR nicety: without it, call sites
+// in other translation units still emit a real call into an empty
+// function body under -O3 -DNDEBUG, since cross-TU-via-BMI inlining
+// doesn't kick in on its own at that point.
 inline void check(bool condition,
                   std::string_view message = {},
                   std::source_location location = std::source_location::current()) {

@@ -12,19 +12,18 @@ import :util.scope_exit;
 // type-erased "thing to run" for its ready-queue, and est::future's own
 // continuation nodes are exactly that - but future_state<T> also needs to
 // depend on est::loop to defer onto it, so :loop cannot import :future
-// without a circular module dependency (docs/PLAN.md, M3). Resolved by
-// keeping :loop the lower-level partition: :future's continuation_node<T>
-// inherits ready_node directly instead of :loop naming future_state<T>,
-// and est::sleep_for()/sleep_until() (the future<void>-returning sugar
-// built on schedule_timer() below) live in :promise instead of here.
-// Deliberately not exported, same reasoning as :future's own (now former)
-// waiter_node: not part of this partition's public surface, only visible
-// to another partition that imports :loop.
+// without a circular module dependency. Resolved by keeping :loop the
+// lower-level partition: :future's continuation_node<T> inherits
+// ready_node directly instead of :loop naming future_state<T>, and
+// est::sleep_for()/sleep_until() (the future<void>-returning sugar built
+// on schedule_timer() below) live in :promise instead of here.
+// Deliberately not exported: not part of this partition's public
+// surface, only visible to another partition that imports :loop.
 namespace est::detail {
 
 // One entry in est::loop's ready-queue: something already known to be
-// ready to run, whatever produced it - a fulfilled future_state<T>'s
-// continuation today, a resumed coroutine handle eventually (M4).
+// ready to run - a fulfilled future_state<T>'s continuation, or a
+// resumed coroutine handle (future_resume_node<T>, est:future).
 class ready_node : public intrusive_list_node {
 public:
   ready_node() = default;
@@ -36,10 +35,9 @@ public:
 
   virtual void run() = 0;
 
-  // Deallocates *this through the actual allocated (derived) type - same
-  // reasoning as :future's own former waiter_node::destroy(): deducing
-  // through this base's size/alignment instead would be undefined
-  // behaviour per memory_resource::deallocate's contract.
+  // Deallocates *this through the actual allocated (derived) type:
+  // deducing through this base's size/alignment instead would be
+  // undefined behaviour per memory_resource::deallocate's contract.
   //
   // `ran`: whether run() was actually called on this exact node before
   // this destroy() call - the caller always knows this statically (every
@@ -83,12 +81,12 @@ public:
 
 export namespace est {
 
-// The single-threaded run loop M3 adds (docs/PLAN.md): owns a ready-queue
-// of already-fulfilled continuations and the M1 timer_queue, and is the
-// thing that actually resumes continuations once a promise is fulfilled
-// or a timer fires - est::future_state<T>::complete() (est:future) defers
-// to it via enqueue_ready() instead of invoking a continuation inline on
-// the fulfilling call stack the way M2 did.
+// The single-threaded run loop: owns a ready-queue of already-fulfilled
+// continuations and a timer_queue, and is the thing that actually
+// resumes continuations once a promise is fulfilled or a timer fires -
+// est::future_state<T>::complete() (est:future) defers to it via
+// enqueue_ready() instead of invoking a continuation inline on the
+// fulfilling call stack.
 //
 // An explicit object a caller constructs and threads through
 // make_promise_future<T>(loop&) (est:promise), not a global singleton
@@ -120,26 +118,20 @@ public:
   // abandons whatever it hadn't gotten to yet, rather than leaking it.
   //
   // pending_timers_ drained *before* ready_, not the more obvious other
-  // way around - a real ordering bug, not a style choice (found via the
-  // `sanitize` preset catching a leak issue #50's fix newly exercised).
-  // A timer node's destroy(allocator_, false) can complete its promise
-  // with an exception (detail::sleep_resume_node, est:promise) - and
-  // that completion, like any other, drains the future_state's own
-  // waiters onto *this* loop's ready_ via enqueue_ready(). Draining
-  // ready_ first, then pending_timers_ (the original order), means
-  // anything cascaded into ready_ during the pending_timers_ loop below
-  // is appended *after* ready_.drain()'s own while-loop has already
-  // finished for good - nothing ever comes back to collect it, a
-  // permanent leak of whatever that cascade was keeping alive (a
-  // coroutine's own frame, concretely). Draining pending_timers_ first
-  // means any such cascade lands in ready_ before ready_.drain() ever
-  // runs - and drain() re-checks after every single node it destroys
+  // way around: a timer node's destroy(allocator_, false) can complete
+  // its promise with an exception (detail::sleep_resume_node,
+  // est:promise), and that completion, like any other, drains the
+  // future_state's own waiters onto *this* loop's ready_ via
+  // enqueue_ready(). Draining pending_timers_ first means anything it
+  // cascades into ready_ lands there before ready_.drain() runs - and
+  // drain() re-checks after every node it destroys
   // (`intrusive_list<T>::drain()`'s own while-loop), so it picks up
-  // anything appended during its own pass, however many rounds deep.
-  // Nothing in this codebase's own node types ever cascades the other
-  // direction (ready_ back into pending_timers_), so a single pass in
-  // this order is sufficient - not just "first, then second" but
-  // "whichever can feed the other must drain after it."
+  // anything appended during its own pass. The reverse order would leave
+  // a cascade appended after ready_.drain() has already finished,
+  // leaking whatever it was keeping alive (a coroutine's own frame,
+  // concretely). Nothing in this codebase's node types ever cascades the
+  // other direction (ready_ back into pending_timers_), so a single pass
+  // in this order is sufficient.
   ~loop() {
     for (const auto& entry : pending_timers_) {
       entry.node->destroy(allocator_, false);
@@ -186,10 +178,9 @@ public:
 
   // The real service loop: drains ready continuations, sleeps until the
   // next timer deadline, repeats. Currently behaves identically to
-  // run_until_idle() - the difference PLAN.md anticipates (blocking
-  // indefinitely, kept alive by a live I/O reactor with more external
-  // wakeup sources than timers) only becomes real once I/O support lands,
-  // explicitly out of scope for this milestone; until then nothing could
+  // run_until_idle() - the difference (blocking indefinitely, kept alive
+  // by a live I/O reactor with more external wakeup sources than timers)
+  // only becomes real once I/O support exists; until then nothing could
   // ever wake a fully idle loop back up anyway, so returning is the only
   // sane behavior for both. stop() lets a caller request an even earlier
   // exit, before the loop would otherwise go idle on its own.
@@ -214,10 +205,9 @@ private:
   // loop.stop() and then loop.run_until_idle() again before returning) -
   // the outer call's `if (stop_requested_) return;` would then never
   // trip, silently losing the stop() request instead of failing loudly.
-  // No coroutine machinery exists yet (M4) to make nested pumping a real,
-  // supported use case - same debug-checked-precondition stance this
-  // codebase already takes elsewhere (est:check) rather than building
-  // real reentrant-stop() bookkeeping nothing currently needs.
+  // Nested pumping isn't a supported use case; this is a debug-checked
+  // precondition (est:check) rather than real reentrant-stop()
+  // bookkeeping.
   void run_impl() {
     check(!running_, "est::loop::run()/run_until_idle() called reentrantly");
     running_ = true;
@@ -247,33 +237,27 @@ private:
   }
 
   // Returns a guard that destroys `node` via this loop's allocator when
-  // it goes out of scope, however that happens - the "always destroy
-  // after running/firing" pattern both run_one() and fire_ready_timers()
-  // need, factored out so a future change to it only has one place to
-  // make. Always passes ran=true: both of this guard's only two callers
-  // construct it immediately before unconditionally calling run()/fire()
-  // on the same node, so by the time this guard's destructor runs,
-  // run()/fire() always already has. Returned by value as a genuine
-  // prvalue (never bound to a named variable and then moved) so this
-  // compiles despite scope_exit's deleted move constructor - the same
-  // guaranteed-copy-elision pattern est::platform::override_instance()
-  // already relies on. Defined ahead of run_one()/fire_ready_timers()
-  // below, not just declared: a deduced (auto) return type has to be
-  // resolved from the function's own body before any caller earlier in
-  // the class can use it.
+  // it goes out of scope - the "always destroy after running/firing"
+  // pattern both run_one() and fire_ready_timers() need. Always passes
+  // ran=true: both callers construct it immediately before
+  // unconditionally calling run()/fire() on the same node. Returned by
+  // value as a genuine prvalue (never bound to a named variable and then
+  // moved) so this compiles despite scope_exit's deleted move
+  // constructor - the same guaranteed-copy-elision pattern
+  // est::platform::override_instance() relies on. Defined ahead of
+  // run_one()/fire_ready_timers() below: a deduced (auto) return type
+  // must be resolved from the function's own body before any earlier
+  // caller in the class can use it.
   template <class Node> [[nodiscard]] auto destroy_guard(Node& node) noexcept {
     return scope_exit([&node, this]() noexcept { node.destroy(allocator_, true); });
   }
 
-  // Runs one ready continuation, checking it against long_running_threshold
-  // (docs/PLAN.md, M3's "long-running-callback detection"). Single-
-  // threaded means one slow continuation blocks everything else this
-  // loop owns, with nothing to preempt it, so a runaway handler should at
-  // least show up as a clear diagnostic instead of "the whole program
-  // mysteriously stalled." The threshold value is a starting point, not
-  // tuned against any real workload - easy to revisit if it turns out to
-  // matter in practice (same stance this codebase already takes on other
-  // debug-only/best-effort details, docs/PLAN.md).
+  // Runs one ready continuation, checking it against
+  // long_running_threshold. Single-threaded means one slow continuation
+  // blocks everything else this loop owns, with nothing to preempt it,
+  // so a runaway handler should at least show up as a clear diagnostic
+  // instead of "the whole program mysteriously stalled." The threshold
+  // value is a starting point, not tuned against any real workload.
   //
   // The actual timing/measuring/printing is platform::interface's job,
   // not this loop's (reset_loop_stall_detection()/detect_loop_stall(),

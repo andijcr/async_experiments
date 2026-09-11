@@ -52,17 +52,16 @@ private:
 
 // Constructs a fresh future_state<T> against `loop_ref` (using its
 // allocator - see future_state<T>'s own doc comment on why it holds a
-// loop& instead of an allocator directly, docs/PLAN.md, M3) and returns
-// the promise/future pair that share it. This is the only way a
-// future_state gets created - promise<T>/future<T> only otherwise exist
-// as the result of a move.
+// loop& instead of an allocator directly) and returns the promise/future
+// pair that share it. This is the only way a future_state gets created -
+// promise<T>/future<T> only otherwise exist as the result of a move.
 template <class T> auto make_promise_future(loop& loop_ref) -> std::pair<promise<T>, future<T>> {
   auto state = shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref);
   auto state_for_future = state; // copy bumps the ref count from 1 to 2
   return {promise<T>(std::move(state)), future<T>(std::move(state_for_future))};
 }
 
-// Issue #30: sugar over the overload above using est::current_loop()
+// Sugar over the overload above using est::current_loop()
 // (est:util.current_loop) instead of a caller-supplied loop& - for a
 // caller that doesn't want to thread a loop& through by hand and is
 // content relying on whichever loop is current.
@@ -75,23 +74,20 @@ template <class T> auto make_promise_future() -> std::pair<promise<T>, future<T>
 namespace est::detail {
 
 // The node behind sleep_for()/sleep_until() (below): holds a
-// promise<void> directly rather than a generic Fn - an earlier version
-// (concrete_timer_node<Fn>, wrapping a closure that itself captured the
-// promise) couldn't complete that promise on abandonment (destroy()
-// called without fire() ever having run), because a type-erased Fn
-// gives destroy() no way to know it's holding a promise at all, let
-// alone call set_exception() on it. That was a real, latent bug (issue
-// #50): a coroutine doing `co_await sleep_for(loop, 10s);`, abandoned
-// when its loop is destroyed before the timer ever fires, would leak
-// its own frame forever - the exact shape of hazard `ran`-guarded
-// exception-completion already fixed for mutex::lock_resume_node/
-// acquire_resume_node (PR #37 review) and detail::yield_resume_node
-// below, for the identical reason: the awaiting coroutine holds the
-// only other reference to this promise's future_state<void> (the
-// future<void> temporary co_await awaits is spilled into the
-// coroutine's own frame across the suspension), so silently dropping
-// the promise instead of completing it would strand that frame with
-// nothing left to free it.
+// promise<void> directly rather than a generic Fn, so destroy() can
+// complete that promise on abandonment (destroy() called without fire()
+// ever having run) - a type-erased Fn would give destroy() no way to
+// know it's holding a promise at all, let alone call set_exception() on
+// it. Without this, a coroutine doing `co_await sleep_for(loop, 10s);`,
+// abandoned when its loop is destroyed before the timer ever fires,
+// would leak its own frame forever - the same `ran`-guarded
+// exception-completion mutex::lock_resume_node/acquire_resume_node
+// (est:sync.mutex) and detail::yield_resume_node below also rely on, for
+// the identical reason: the awaiting coroutine holds the only other
+// reference to this promise's future_state<void> (the future<void>
+// temporary co_await awaits is spilled into the coroutine's own frame
+// across the suspension), so silently dropping the promise instead of
+// completing it would strand that frame with nothing left to free it.
 class sleep_resume_node final : public timer_node {
 public:
   explicit sleep_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
@@ -117,12 +113,10 @@ private:
 // search+erase on fire, and the platform::sleep_until() call run_impl()
 // makes before it ever checks pending_timers_ are all pure overhead for
 // something that only ever needs "run after whatever's already ready."
-// est::intrusive_list<T>'s FIFO order (not this class's original policy -
-// see its own doc comment) is what makes handing this straight to
-// ready_ safe: enqueue_ready() appends at the tail, so everything
-// already queued when yield_execution() was called runs first - the
-// same trick under the old LIFO policy would have cut this node in
-// line ahead of everything else instead.
+// est::intrusive_list<T>'s FIFO order (see its own doc comment) is what
+// makes handing this straight to ready_ safe: enqueue_ready() appends at
+// the tail, so everything already queued when yield_execution() was
+// called runs first.
 //
 // run()/destroy() completing the promise with an exception on
 // abandonment (rather than silently dropping it, the "broken promise,
@@ -166,43 +160,35 @@ export namespace est {
   return std::move(fut);
 }
 
-// Issue #30: sugar over the overload above using est::current_loop()
-// instead of a caller-supplied loop&.
+// Sugar over the overload above using est::current_loop() instead of a caller-supplied loop&.
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
   return sleep_until(current_loop(), deadline);
 }
 
 // Returns a future<void> that becomes ready once `delay` elapses from
 // now (est::platform::instance().now(), the same clock est::timer_queue
-// itself is built on, docs/PLAN.md M1) - sugar over sleep_until() above.
+// itself is built on) - sugar over sleep_until() above.
 [[nodiscard]] inline auto sleep_for(loop& loop_ref, loop::clock::duration delay) -> future<void> {
   return sleep_until(loop_ref, platform::instance().now() + delay);
 }
 
-// Issue #30: sugar over the overload above using est::current_loop()
-// instead of a caller-supplied loop&.
+// Sugar over the overload above using est::current_loop() instead of a caller-supplied loop&.
 [[nodiscard]] inline auto sleep_for(loop::clock::duration delay) -> future<void> {
   return sleep_for(current_loop(), delay);
 }
 
-// Issue #45: gives `loop_ref` the opportunity to run whatever else is
-// already ready before the calling coroutine resumes - `co_await
+// Gives `loop_ref` the opportunity to run whatever else is already
+// ready before the calling coroutine resumes - `co_await
 // yield_execution(loop);` inside a loop that would otherwise monopolize
 // the ready-queue with back-to-back synchronous resumes (every
 // `co_await` on an already-ready future skips suspension entirely,
 // est:future's own `future_awaiter<T>::await_ready()`) lets other
-// pending work interleave instead.
-//
-// Originally sugar over sleep_for(loop_ref, 0) - a zero-duration timer
-// lands in pending_timers_, only reached once drain_ready() has fully
-// emptied ready_ first, giving exactly the right ordering "for free."
-// Replaced with a direct detail::yield_resume_node once
-// est::intrusive_list<T> became FIFO (PR #49): re-entering ready_
-// directly is now just as correctly ordered, without paying for a
-// timer_queue heap insert/pop, pending_timers_'s own linear search+erase
-// on fire, or the platform::sleep_until() call run_impl() makes before
-// it ever checks pending_timers_ - none of which yield_execution() ever
-// needed, having no real deadline to track.
+// pending work interleave instead. Re-enters ready_ directly via
+// detail::yield_resume_node rather than going through sleep_for(loop_ref,
+// 0): it has no real deadline to track, so there's no reason to pay for
+// a timer_queue heap insert/pop, pending_timers_'s own linear
+// search+erase on fire, or the platform::sleep_until() call run_impl()
+// makes before it ever checks pending_timers_.
 [[nodiscard]] inline auto yield_execution(loop& loop_ref) -> future<void> {
   auto [prom, fut] = make_promise_future<void>(loop_ref);
   auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
@@ -210,8 +196,7 @@ export namespace est {
   return std::move(fut);
 }
 
-// Issue #30: sugar over the overload above using est::current_loop()
-// instead of a caller-supplied loop&.
+// Sugar over the overload above using est::current_loop() instead of a caller-supplied loop&.
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   return yield_execution(current_loop());
 }

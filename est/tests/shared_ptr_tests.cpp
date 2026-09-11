@@ -74,13 +74,13 @@ TEST_CASE("shared_from_this() bumps the ref count like an ordinary copy would", 
   REQUIRE(resource.deallocations == 1);
 }
 
-TEST_CASE("a shared_ptr<T> for a T that doesn't opt into ref_counted works exactly as before",
+TEST_CASE("a shared_ptr<T> for a T that doesn't opt into ref_counted uses the primary template",
           "[shared_ptr]") {
-  // Regression test: shared_ptr<T>'s primary (control_block-based)
-  // template must be exactly what a non-ref_counted T gets, unconditionally
-  // - est::shared_ptr<int> (used throughout the rest of this file) is
-  // exactly such a T, and never sees ref_counted's allocator-first
-  // construction contract.
+  // Guards partial-specialization selection: shared_ptr<T>'s primary
+  // (control_block-based) template must be exactly what a non-ref_counted
+  // T gets, unconditionally - est::shared_ptr<int> (used throughout the
+  // rest of this file) is exactly such a T, and never sees ref_counted's
+  // allocator-first construction contract.
   auto ptr = est::shared_ptr<int>::make(std::pmr::get_default_resource(), 7);
   REQUIRE(*ptr == 7);
 }

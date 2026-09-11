@@ -1,7 +1,6 @@
 ---
-# Starting rule set for `est`. Tuned to gate CI without fighting this
-# project's deliberate patterns (allocator-heavy code, intrusive
-# waiter-list pointers owned outside a smart pointer). See docs/PLAN.md.
+# Rule set for `est`. Tuned to allocator-heavy code and intrusive
+# waiter-list pointers owned outside a smart pointer.
 Checks: >
   -*,
   bugprone-*,
@@ -19,22 +18,15 @@ Checks: >
   -cppcoreguidelines-avoid-magic-numbers,
   -readability-redundant-declaration
 
-# cppcoreguidelines-avoid-do-while is dropped above rather than NOLINT'd
-# per call site: Catch2's REQUIRE/CHECK macros expand to a do-while, and
-# the diagnostic attributes to the (user-code) call site, not the header,
-# so header filtering alone can't suppress it.
+# cppcoreguidelines-avoid-do-while: off because Catch2's REQUIRE/CHECK
+# macros expand to a do-while at the call site, which header filtering
+# can't suppress.
 #
-# readability-redundant-declaration is dropped for a module-specific
-# false positive, reproduced in isolation: when partition B `import`s
-# partition A (which pulled in e.g. <chrono> via its own global module
-# fragment) and B *also* independently #includes overlapping standard
-# headers (e.g. <memory>/<vector>, which transitively reach <new> too),
-# this Clang generation's module-aware analysis sees operator new/delete
-# declared via two global-module-fragment paths and flags it as
-# "redundant" - which is normal, expected behavior for how C++ modules
-# work, not a real duplicate declaration. Any two interdependent
-# partitions that both use enough of the standard library to reach <new>
-# hit this, so it isn't a one-off NOLINT candidate.
+# readability-redundant-declaration: off because two interdependent
+# partitions that both reach <new> (directly or transitively) make
+# Clang's module-aware analysis see operator new/delete declared via two
+# global-module-fragment paths and flag it as redundant - a false
+# positive inherent to how modules work, not a real duplicate.
 
 WarningsAsErrors: '*'
 # Anchored so it only matches an actual est/ or examples/ path component

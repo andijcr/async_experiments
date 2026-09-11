@@ -3,9 +3,9 @@ export module spreadsheet;
 import est;
 import std;
 
-// The whole spreadsheet protocol (docs/PLAN.md's "spreadsheet server"
-// example) lives here as plain, synchronous-looking logic (sheet's own
-// methods, parse_line()) plus one thin coroutine (execute()) that bridges
+// The whole spreadsheet protocol lives here as plain, synchronous-looking
+// logic (sheet's own methods, parse_line()) plus one thin coroutine
+// (execute()) that bridges
 // it into est::future<std::string> for the async command/response flow
 // main.cpp drives. Deliberately its own module, separate from
 // spreadsheet_io (getline_async()): this half is pure enough to unit-test
@@ -246,9 +246,9 @@ public:
   }
 
 private:
-  // One shared promise/future pair per cell, not one per waiter (PR #53
-  // review): future_state<T>'s own waiters_ list already supports any
-  // number of independent registrations against a single future - every
+  // One shared promise/future pair per cell, not one per waiter:
+  // future_state<T>'s own waiters_ list already supports any number of
+  // independent registrations against a single future - every
   // .then()/co_await on the same future<T> lvalue just appends another
   // continuation, all fired together once it completes (future.cppm,
   // future_state<T>::set_continuation()/complete()). Safe specifically
@@ -262,15 +262,14 @@ private:
   // this future<void> object itself (not just its future_state) that has
   // to stay valid until that specific coroutine actually resumes - which
   // happens later, on a subsequent loop drain, not by the time
-  // notify_presence() (below) returns. An earlier version stored
-  // waiter_slot by value in the map and moved it out in notify_presence()
-  // to fire it, which let the *map entry* - and so the future<void> every
-  // still-suspended waiter's awaiter pointed at - be erased before those
-  // waiters ever resumed: a real, reproducible (SEGFAULT under the unit
-  // tests) use-after-free. Each wait_for_presence() call now keeps its
-  // own shared_ptr copy alive in its own coroutine frame across the
-  // suspension, so the slot outlives notify_presence() erasing the map's
-  // own reference to it, for as long as the last waiter needs it to.
+  // notify_presence() (below) returns. Storing waiter_slot by value in
+  // the map instead would let notify_presence() erase the *map entry* -
+  // and so the future<void> every still-suspended waiter's awaiter
+  // points at - before those waiters ever resume: a use-after-free. Each
+  // wait_for_presence() call keeps its own shared_ptr copy alive in its
+  // own coroutine frame across the suspension, so the slot outlives
+  // notify_presence() erasing the map's own reference to it, for as long
+  // as the last waiter needs it to.
   struct waiter_slot {
     est::promise<void> prom;
     est::future<void> fut;

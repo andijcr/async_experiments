@@ -40,8 +40,8 @@ private:
 } // namespace
 
 // Every test below declares its own est::loop and threads it into
-// make_promise_future<T>() (M3, docs/PLAN.md): a continuation registered
-// via then() is never invoked inline on the call stack that fulfills its
+// make_promise_future<T>(): a continuation registered via then() is
+// never invoked inline on the call stack that fulfills its
 // promise any more - est::loop defers it to its own ready-queue, so a
 // test that wants to observe a continuation's side effects must call
 // loop.run_until_idle() first. `loop` is always declared before its
@@ -49,9 +49,8 @@ private:
 // future_state built against it holds a bare loop&, so the loop must
 // outlive it. Where a loop needs a specific memory_resource (the
 // counting_resource-based leak tests), it's built as est::loop{&resource}
-// - the same implicit polymorphic_allocator<std::byte> conversion the
-// resource pointer already supported when passed directly to
-// make_promise_future() before M3.
+// - the same implicit polymorphic_allocator<std::byte> conversion
+// est::loop's constructor takes directly.
 
 TEST_CASE("set_value then get() returns the value", "[future]") {
   est::loop loop;
@@ -64,19 +63,16 @@ TEST_CASE("set_value then get() returns the value", "[future]") {
 
 TEST_CASE("an unwrapped then() receives a reference into the stored value, not a copy",
           "[future]") {
-  // Regression test: the underlying future_state::get()'s deduced return
-  // type must be decltype(auto), not plain auto - plain auto strips
-  // references from the return expression's type (the same rule as
-  // `auto x = expr;`), which would silently turn the documented
-  // "non-consuming const T&" into a fresh copy of T on every call
-  // instead of a reference to the one stored value. Caught by a PR
-  // review comment, not a test, the first time. Observed here via two
-  // separate unwrapped then() registrations (each gets its own const
-  // int& argument straight from future_state::get(), not exposed to
-  // this test file directly) rather than by naming future_state itself,
-  // which - now that then()'s wrapped mode hands out an est::future<T>
-  // instead (see below) - is no longer part of the public API surface
-  // this test file can reach.
+  // Guards future_state::get()'s deduced return type: it must be
+  // decltype(auto), not plain auto - plain auto strips references from
+  // the return expression's type (the same rule as `auto x = expr;`),
+  // which would silently turn the documented "non-consuming const T&"
+  // into a fresh copy of T on every call instead of a reference to the
+  // one stored value. Observed here via two separate unwrapped then()
+  // registrations (each gets its own const int& argument straight from
+  // future_state::get(), not exposed to this test file directly) rather
+  // than by naming future_state itself, which is not part of the public
+  // API surface this test file can reach.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
   promise.set_value(42);
@@ -163,9 +159,9 @@ TEST_CASE("multiple then() registrations are all invoked on completion", "[futur
 }
 
 TEST_CASE("every then() registration observes the same, correct value via get()", "[future]") {
-  // Regression test: get() used to move the value out of future_state on
-  // its first call, so a second continuation reading it would see a
-  // moved-from value instead of the real one.
+  // Guards future_state::get()'s lvalue branch: a second continuation
+  // reading the value must see the real one, not a moved-from leftover
+  // from the first.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
   auto first = future.then([](est::future<int>& state) { return state.get(); });
@@ -209,10 +205,9 @@ TEST_CASE("dropping the future doesn't prevent the promise from completing", "[f
 }
 
 TEST_CASE("a registered continuation is freed even if never invoked (broken promise)", "[future]") {
-  // Regression test: future_state's destructor didn't drain its
-  // continuation list, so a then() registered on a future whose promise
-  // is dropped without ever completing leaked the continuation node
-  // forever - it just sat, unreachable, in the waiter list.
+  // Guards future_state's destructor draining its continuation list: a
+  // then() registered on a future whose promise is dropped without ever
+  // completing must not leak the continuation node.
   counting_resource resource;
   {
     est::loop loop{&resource};
@@ -227,12 +222,10 @@ TEST_CASE("a registered continuation is freed even if never invoked (broken prom
 
 TEST_CASE("a throwing continuation's exception is isolated to its own downstream future",
           "[future]") {
-  // Regression test: complete()'s drain loop used to abort entirely when
-  // a continuation threw, abandoning any later-queued sibling
-  // continuation. then() now catches a callback's exception and routes
-  // it into that continuation's own downstream future via
-  // set_exception() instead of letting it escape - a throwing
-  // continuation no longer stops its siblings from running.
+  // Guards complete()'s drain loop: then() catches a callback's
+  // exception and routes it into that continuation's own downstream
+  // future via set_exception() instead of letting it escape, so a
+  // throwing continuation must not stop its siblings from running.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
 
@@ -332,13 +325,10 @@ TEST_CASE("a wrapped (future<T>&) then() callback can inspect failed() instead o
   REQUIRE(chained.get() == -1);
 }
 
-// Regression test for issue #39: a generic callback (here, an `auto&`
+// Guards then()'s dispatch order: a generic callback (here, an `auto&`
 // lambda) is incidentally invocable both ways - with `future<int>&` and
-// with `const int&` - since a template parameter binds to either. An
-// earlier version of then() checked the wrapped shape first, so a
-// generic lambda like this one silently got wrapped (no-unwrap)
-// behavior even though nothing about it opted into that explicitly. Now
-// unwrapped is checked first: `value` below is deduced as `int`, not
+// with `const int&` - since a template parameter binds to either.
+// Unwrapped is checked first, so `value` below is deduced as `int`, not
 // `est::future<int>`, and this callback is skipped (not invoked) on
 // failure rather than being invoked to inspect it.
 TEST_CASE("a generic callback defaults to unwrapped, not wrapped, when both are viable",
@@ -464,15 +454,11 @@ TEST_CASE("then() returning a future<U> flattens into future<U>, not future<futu
   REQUIRE(chained.get() == 40);
 }
 
-// Regression test for issue #25: fulfill()'s flatten branch used to
-// forward the inner future's value with a plain (copying) get() call,
-// which didn't just cost an extra copy - it made flattening a
-// move-only-valued future<T> outright fail to compile, since
-// forwarding a move-only value through the copying set_value(const T&)
-// overload requires copy-constructing T. std::unique_ptr<int> can't be
-// copied at all, so this test would not have compiled before the fix
-// (std::move(inner_future).get() now feeds the move-taking
-// set_value(T&&) overload instead).
+// Guards fulfill()'s flatten branch: it forwards the inner future's
+// value via std::move(inner_future).get(), feeding the move-taking
+// set_value(T&&) overload rather than the copying set_value(const T&)
+// one. std::unique_ptr<int> can't be copied at all, so this test would
+// fail to compile if that ever regressed.
 TEST_CASE("flattening a then() that returns a future<unique_ptr<T>> moves, not copies, the value",
           "[future]") {
   est::loop loop;
@@ -549,27 +535,26 @@ TEST_CASE("flattening a chained then() frees every node involved, no leak", "[fu
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
-  // Exact count, not just "balanced" (issue #25): outer future_state<int>,
-  // then()'s downstream future_state<int> + concrete_continuation node,
-  // inner future_state<int>, and fulfill()'s detail::flatten_forwarder<int>
-  // node - 5 total. Before flatten_forwarder<T> existed, fulfill()'s
-  // flatten path called then() on the inner future purely to register its
-  // forwarding callback, which allocated a throwaway future_state<void>
-  // plus a concrete_continuation<Fn, void> node - 2 more, for 7 total -
-  // even though nothing ever observed either one. A regression back to 7
-  // here would mean that overhead came back.
+  // Exact count, not just "balanced": outer future_state<int>, then()'s
+  // downstream future_state<int> + concrete_continuation node, inner
+  // future_state<int>, and fulfill()'s detail::flatten_forwarder<int>
+  // node - 5 total. A flatten path that called then() on the inner
+  // future instead of registering flatten_forwarder<T> directly would
+  // allocate a throwaway future_state<void> plus a
+  // concrete_continuation<Fn, void> node nothing ever observes - 7
+  // total, not 5.
   REQUIRE(resource.allocations == 5);
 }
 
-// M4 (docs/PLAN.md): est::future<T> itself is a coroutine's return type -
-// no separate task<T> wrapper - via future<T>::promise_type. Every
-// coroutine below is a plain lambda taking est::loop& as its first
-// parameter; est::future<T>'s own doc comment on promise_type explains
-// why that first parameter is required (it's what promise_type's own
+// est::future<T> itself is a coroutine's return type - no separate
+// task<T> wrapper - via future<T>::promise_type. Every coroutine below
+// is a plain lambda taking est::loop& as its first parameter;
+// est::future<T>'s own doc comment on promise_type explains why that
+// first parameter is required (it's what promise_type's own
 // constructor/operator new pattern-match against) and why a plain
-// function (a lambda's non-static call operator included - confirmed
-// empirically against the pinned toolchain) works as a coroutine here
-// with no extra ceremony. None of these capture anything - state a
+// function (a lambda's non-static call operator included) works as a
+// coroutine here with no extra ceremony. None of these capture
+// anything - state a
 // coroutine needs crosses in as an ordinary by-value/by-reference
 // parameter instead, since a capturing lambda's closure lives outside
 // the coroutine frame it starts and isn't guaranteed to outlive it
@@ -588,17 +573,17 @@ TEST_CASE("a coroutine returning est::future<int> can co_return a value", "[futu
   auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
 
   auto fut = coro(loop);
-  // No co_await inside - initial_suspend() never suspends (PR #37 review
-  // follow-up), so this runs synchronously to completion, like a plain
-  // function, with no loop involvement at all.
+  // No co_await inside - initial_suspend() never suspends, so this runs
+  // synchronously to completion, like a plain function, with no loop
+  // involvement at all.
   REQUIRE(fut.ready());
   REQUIRE(fut.get() == 42);
 }
 
 TEST_CASE("then() can be chained onto a future returned by a coroutine", "[future][coroutine]") {
-  // A coroutine-produced future is a plain est::future<T> like any other
-  // (M4, docs/PLAN.md) - a caller can't tell it apart from one built out
-  // of a then() chain, so registering an ordinary then() continuation on
+  // A coroutine-produced future is a plain est::future<T> like any
+  // other - a caller can't tell it apart from one built out of a then()
+  // chain, so registering an ordinary then() continuation on
   // it must work exactly the same way, homogeneity this test exercises
   // directly rather than only through co_await (already covered by "a
   // coroutine can co_await another coroutine's future, chaining values"
@@ -736,19 +721,15 @@ TEST_CASE("a coroutine's frame and resume nodes are all freed through the loop's
 
 TEST_CASE("co_await on an already-ready future resumes inline, no loop round-trip needed",
           "[future][coroutine]") {
-  // future_awaiter<T>::await_ready() returns future_.ready() directly
-  // (PR #37 review follow-up) - unlike then(), which always defers even
-  // for an already-ready registration (see "then() registered on an
-  // already-ready future still defers to the loop" above), co_await on
-  // an already-ready future skips suspension entirely: the rest of the
-  // awaiting coroutine's body runs immediately, right there on whatever
-  // call stack reached this co_await, the same "don't wait for something
+  // future_awaiter<T>::await_ready() returns future_.ready() directly -
+  // unlike then(), which always defers even for an already-ready
+  // registration (see "then() registered on an already-ready future
+  // still defers to the loop" above), co_await on an already-ready
+  // future skips suspension entirely: the rest of the awaiting
+  // coroutine's body runs immediately, right there on whatever call
+  // stack reached this co_await, the same "don't wait for something
   // that isn't being waited for" stance promise_type::initial_suspend()
-  // now takes at the other end of a coroutine's lifetime. An earlier
-  // version of this test (and of await_ready() itself) asserted the
-  // opposite, when deferring unconditionally was this codebase's
-  // deliberate policy; see future_awaiter<T>::await_ready()'s own doc
-  // comment for the full history of that reversal.
+  // takes at the other end of a coroutine's lifetime.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
   promise.set_value(5);
@@ -768,11 +749,9 @@ TEST_CASE("co_await on an already-ready future resumes inline, no loop round-tri
 
 TEST_CASE("dropping an awaited future_state destroys the still-suspended coroutine, no leak",
           "[future][coroutine]") {
-  // Regression test (found in review): future_resume_node<T>::destroy()
-  // had the identical gap - if the future_state a coroutine is suspended
-  // awaiting is dropped without ever completing (the abandoned-future
-  // scenario docs/PLAN.md's M2 section already describes for then()),
-  // the coroutine's frame used to leak instead of being destroyed.
+  // Guards future_resume_node<T>::destroy(): if the future_state a
+  // coroutine is suspended awaiting is dropped without ever completing,
+  // the coroutine's frame must still be destroyed, not leaked.
   //
   // The coroutine takes its future by reference, not by value, so this
   // test controls that future_state's lifetime independently of the
@@ -800,12 +779,12 @@ TEST_CASE("dropping an awaited future_state destroys the still-suspended corouti
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-// Issue #30: a coroutine's own promise_type no longer requires est::loop&
-// as its first parameter - it falls back to est::current_loop()
+// A coroutine's own promise_type doesn't require est::loop& as its
+// first parameter - it falls back to est::current_loop()
 // (est:util.current_loop) instead, matched via the same "promise
 // constructor arguments" rule that the loop-taking convention already
-// relies on (see promise_type's own doc comment). Both new overload
-// shapes (some-parameters-but-not-loop, and no-parameters-at-all) get
+// relies on (see promise_type's own doc comment). Both overload shapes
+// (some-parameters-but-not-loop, and no-parameters-at-all) get
 // their own test - the interesting risk here isn't behavior, it's
 // overload resolution: promise_type has three constructor/operator new
 // pairs now, and the wrong one silently winning would either fail to
@@ -899,8 +878,8 @@ TEST_CASE("both a future and its clone can register independent then() callbacks
 
 TEST_CASE("future<void>: two clones can each be co_awaited independently",
           "[future][clone][void]") {
-  // The motivating case for clone() (issue #26, issue #55): a single
-  // future<void> handing out N independent waiters, each safely
+  // The motivating case for clone(): a single future<void> handing out
+  // N independent waiters, each safely
   // co_await-able on its own clone - nothing to consume for T=void, so
   // there's no moved-from-leftovers hazard the way there would be for a
   // value-carrying future<T> (see future<T>::clone()'s own doc comment).

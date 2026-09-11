@@ -5,9 +5,7 @@ import std;
 export namespace est {
 
 // Runs `fn` when the guard goes out of scope, however it exits (normal
-// return or exception) - a generic version of the ad-hoc RAII guards
-// this codebase kept hand-rolling for exactly this purpose (e.g.
-// est::future's shared_state::run(), before this existed).
+// return or exception).
 //
 // Fn must be nothrow-invocable: ~scope_exit() calls it unconditionally,
 // including while another exception is already propagating (the guard

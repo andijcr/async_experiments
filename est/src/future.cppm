@@ -39,11 +39,9 @@ namespace est::detail {
 // never happens until concrete_continuation/future_resume_node<T>
 // (both further down this file, after future_state<T>'s own definition)
 // actually use it. See future_state<T>::waiters_'s own doc comment for
-// the specific reason that laziness matters here: an earlier version of
-// this file had future_state<T>'s own waiters_ list keyed on
-// continuation_node<T> directly, which forced exactly the opposite,
-// eager instantiation - and with it, a genuine circular completeness
-// requirement between the two classes.
+// why that laziness matters: keying waiters_ on continuation_node<T>
+// directly instead would force eager instantiation, and with it a
+// circular completeness requirement between the two classes.
 template <class T> class continuation_node : public detail::ready_node {
 public:
   void run() final { invoke(*owner_); }
@@ -76,10 +74,8 @@ private:
 // callback, no closure, and no wrapped/unwrapped dispatch to pick between:
 // the inner future's exact value type T is already known and fixed by the
 // call site, so there's nothing left to genericize over. Templated on T
-// alone (issue #25's own follow-up simplification, replacing an earlier
-// on_ready()/raw_continuation<Fn> pair that were templated on an arbitrary
-// callback type instead) - every flatten at the same T reuses this one
-// instantiation instead of minting a fresh one per (T, Fn, U) call site.
+// alone - every flatten at the same T reuses this one instantiation
+// instead of minting a fresh one per (T, Fn, U) call site.
 template <class T> class flatten_forwarder final : public continuation_node<T> {
 public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
@@ -195,8 +191,8 @@ struct void_value {};
 
 // Pattern-matches Fn's raw then() result against est::future<U> so
 // then() can flatten a continuation returning a future into a plain
-// future<U> instead of a future<future<U>> - futures are monadic, per
-// the redesign in docs/PLAN.md (issue #23). Forward-declared only
+// future<U> instead of a future<future<U>> - futures are monadic.
+// Forward-declared only
 // (est::future's own definition comes later in this file); a partial
 // specialization only needs to match the template name, not a complete
 // type.
@@ -239,11 +235,11 @@ template <class Fn, class T> consteval auto invocable_unwrapped() -> bool {
 // future (see its own doc comment), not part of the interface a
 // then() callback should see.
 //
-// invocable_unwrapped<Fn, T>() checked first, not just as a matter of
-// style matching then()'s own dispatch order (issue #39) but because it
-// has to be: constraint disjunction (||) short-circuits left-to-right, so
-// whichever operand comes first is the one actually evaluated for an Fn
-// that satisfies it. A generic callback (an `auto&` lambda, say) that's
+// invocable_unwrapped<Fn, T>() checked first, matching then()'s own
+// dispatch order, and not just as a matter of style: constraint
+// disjunction (||) short-circuits left-to-right, so whichever operand
+// comes first is the one actually evaluated for an Fn that satisfies
+// it. A generic callback (an `auto&` lambda, say) that's
 // only valid when called with a plain T - e.g. one that returns a copy of
 // its argument, which future<T>'s deleted copy constructor makes
 // ill-formed for a future<T>& argument - hard-errors (not a graceful
@@ -260,8 +256,9 @@ concept then_callback_for = invocable_unwrapped<Fn, T>() || std::invocable<Fn&, 
 namespace est {
 
 // The single owned object behind an est::promise<T>/est::future<T> pair
-// - a view over shared state, not the state itself (docs/PLAN.md). Not
-// exported (see the forward declaration above): a caller never sees
+// - promise<T>/future<T> are views over this shared state, not the state
+// itself. Not exported (see the forward declaration above): a caller
+// never sees
 // this type directly, only through the est::promise<T>/est::future<T>
 // handles that wrap it - including a then() callback registered with
 // the "wrapped" calling convention, which receives a real est::future<T>
@@ -285,9 +282,9 @@ namespace est {
 // class here would be destroyed through the wrong type's destructor the
 // moment its own ref count reached zero.
 //
-// Holds a reference to the est::loop it was created against (M3,
-// docs/PLAN.md) rather than its own allocator - the allocator it uses is
-// simply the loop's (loop_.allocator()), an explicit dependency threaded
+// Holds a reference to the est::loop it was created against rather than
+// its own allocator - the allocator it uses is simply the loop's
+// (loop_.allocator()), an explicit dependency threaded
 // through make_promise_future(loop&) (est:promise) rather than a global
 // singleton like est::platform::instance(): unlike platform, a loop
 // carries real mutable state (its ready-queue, pending timers) a shared
@@ -381,8 +378,7 @@ public:
   // run once ready. If already ready, hands it straight to est::loop's
   // ready-queue instead of queueing it locally - either way, this
   // future_state never invokes a continuation itself; est::loop always
-  // does, on its own drain pass, never inline on this call stack (M3,
-  // docs/PLAN.md).
+  // does, on its own drain pass, never inline on this call stack.
   void set_continuation(continuation_node& node) {
     if (ready()) {
       node.bind_owner(this->shared_from_this());
@@ -494,8 +490,7 @@ public:
   }
 
   // Registers fn to run once ready. Two calling conventions, chosen by
-  // how fn can be invoked (docs/PLAN.md, issue #23; precedence changed
-  // by issue #39):
+  // how fn can be invoked:
   //   - fn(const T&), or fn() when T is void: "unwrapped" - called only
   //     on success, with the value itself (or no argument at all for
   //     void). On failure fn is *not* called; the returned future fails
@@ -527,9 +522,9 @@ public:
   // downstream future and does not stop a sibling continuation queued
   // behind it from running. Never runs inline on whichever call stack
   // completes this future_state: est::loop always defers actually
-  // invoking it to its own ready-queue drain pass instead (M3,
-  // docs/PLAN.md) - the returned future<U> reuses this future_state's
-  // own loop, so a chain of then() calls all resolve on that one loop.
+  // invoking it to its own ready-queue drain pass instead - the returned
+  // future<U> reuses this future_state's own loop, so a chain of then()
+  // calls all resolve on that one loop.
   template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
@@ -624,9 +619,7 @@ private:
     // nodes or future_resume_node<T> below - whether a coroutine
     // co_await-ing a `.then()`-chained future can be stranded the same
     // way if the *upstream* future_state is dropped first is a real,
-    // separate question this class doesn't yet answer either way (not
-    // addressed here - see issue #50's discussion for the identical
-    // shape of hazard in sleep_for()/sleep_until()).
+    // separate question this class doesn't yet answer.
     void destroy(std::pmr::polymorphic_allocator<std::byte> allocator,
                  bool /*ran*/) noexcept override {
       allocator.delete_object(this);
@@ -651,10 +644,9 @@ private:
     // Reports a non-void fn_ result to downstream_: directly via
     // set_value() if it's a plain U, or - if it's itself a future<U> - by
     // registering a detail::flatten_forwarder<U> node directly on the
-    // inner future's own future_state<U> (issue #25's own follow-up
-    // simplification: no callback, no closure, and no intermediate
-    // future<U>/future_state<U> pair to allocate and immediately discard -
-    // result.state_ is reached directly via future<U>'s
+    // inner future's own future_state<U>: no callback, no closure, and
+    // no intermediate future<U>/future_state<U> pair to allocate and
+    // immediately discard - result.state_ is reached directly via future<U>'s
     // `template <class> friend class future_state;` declaration, since
     // this code is itself nested inside a future_state<T> instantiation
     // and nested-class members share their enclosing class's access
@@ -788,8 +780,8 @@ export namespace est {
 // Consumer handle: a thin, move-only view over a future_state<T>, backed
 // by an est::shared_ptr so destroying a future does not destroy the
 // future_state if something else - a still-live est::promise, or a
-// continuation node already handed off to est::loop's ready-queue (M3,
-// see continuation_node<T>::bind_owner()) - still references it.
+// continuation node already handed off to est::loop's ready-queue (see
+// continuation_node<T>::bind_owner()) - still references it.
 template <class T> class future {
 public:
   explicit future(shared_ptr<future_state<T>> state) noexcept : state_(std::move(state)) {}
@@ -902,14 +894,13 @@ public:
   // changes; this class only exists for the compiler's coroutine
   // machinery to find via the standard promise_type protocol.
   //
-  // A coroutine function may (still the original M4 convention) take
-  // est::loop& as its first parameter - both this constructor and
-  // operator new below are templated to match it (plus however many
-  // further parameters the actual coroutine function takes) via the
-  // standard's "promise constructor arguments"/allocator-argument
-  // matching, which tries building promise_type from the coroutine
-  // call's own argument list before ever falling back to a default
-  // constructor. Or (issue #30) it may take no loop& at all - a second
+  // A coroutine function may take est::loop& as its first parameter -
+  // both this constructor and operator new below are templated to match
+  // it (plus however many further parameters the actual coroutine
+  // function takes) via the standard's "promise constructor arguments"/
+  // allocator-argument matching, which tries building promise_type from
+  // the coroutine call's own argument list before ever falling back to a
+  // default constructor. Or it may take no loop& at all - a second
   // constructor/operator new pair below falls back to
   // est::current_loop() (est:util.current_loop) instead, for a caller
   // content relying on whichever loop is current rather than threading
@@ -924,39 +915,37 @@ public:
     // actual coroutine function declares, per the "promise constructor
     // arguments" rule this whole design relies on (see this class's own
     // doc comment above). loop_ref itself isn't stored - it's only ever
-    // needed here, to build state_ - now that initial_suspend() no longer
-    // needs a loop& of its own to build a coroutine_start_awaiter from
-    // (PR #37 review follow-up), nothing in this class touches it again
-    // after construction.
+    // needed here, to build state_; nothing in this class touches it
+    // again after construction.
     template <class... Args>
     explicit promise_type(loop& loop_ref, Args&... /*unused*/)
         : detail::future_promise_result<T>(
               shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)) {}
 
-    // Issue #30: a coroutine whose own first parameter isn't est::loop&
-    // falls back to est::current_loop() instead. Constrained to exclude
-    // a leading loop& specifically (std::same_as, not a broader
-    // "convertible to" - matching the exact-type match the constructor
-    // above already relies on) so this never competes with it for a call
-    // that *does* pass one: without the constraint, both constructors
-    // would deduce to the identical actual parameter list for such a
-    // call ((loop&, Rest&...) either way, since a bare parameter pack
-    // happily absorbs a leading loop& into Rest itself) - an ambiguity
-    // conversion ranking alone can't break, since the two candidates
-    // would be indistinguishable by it.
+    // A coroutine whose own first parameter isn't est::loop& falls back
+    // to est::current_loop() instead. Constrained to exclude a leading
+    // loop& specifically (std::same_as, not a broader "convertible to" -
+    // matching the exact-type match the constructor above already relies
+    // on) so this never competes with it for a call that *does* pass
+    // one: without the constraint, both constructors would deduce to the
+    // identical actual parameter list for such a call ((loop&, Rest&...)
+    // either way, since a bare parameter pack happily absorbs a leading
+    // loop& into Rest itself) - an ambiguity conversion ranking alone
+    // can't break, since the two candidates would be indistinguishable
+    // by it.
     //
-    // Delegates to the constructor above (Args deduced empty) rather than
-    // repeating its body - per review, all three constructors should
-    // share the one place that actually builds state_. current_loop()'s
-    // own precondition (a loop must actually be current) is checked
-    // exactly once either way.
+    // Delegates to the constructor above (Args deduced empty) rather
+    // than repeating its body, so all three constructors share the one
+    // place that actually builds state_. current_loop()'s own
+    // precondition (a loop must actually be current) is checked exactly
+    // once either way.
     template <class First, class... Rest>
       requires(!std::same_as<std::remove_cvref_t<First>, loop>)
     explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(current_loop()) {}
 
-    // Issue #30: a coroutine taking no parameters at all - the
-    // constructor above needs at least one (First is not optional), so
-    // this needs its own, non-template overload. Delegates the same way.
+    // A coroutine taking no parameters at all - the constructor above
+    // needs at least one (First is not optional), so this needs its own,
+    // non-template overload. Delegates the same way.
     promise_type() : promise_type(current_loop()) {}
 
     promise_type(const promise_type&) = delete;
@@ -972,12 +961,10 @@ public:
     // the caller's own stack, exactly like the work an ordinary function
     // does before handing back a future - see future_awaiter<T>::
     // await_ready()'s own doc comment (below) for the matching decision
-    // on the other end of a co_await, and PR #37's own review discussion
-    // for why this replaced an earlier, always-deferred design (a
-    // coroutine_start_awaiter that unconditionally suspended into
-    // est::loop's ready-queue before running anything, at the cost of one
-    // extra heap-allocated resume node and ready-queue round trip per
-    // coroutine call, even for one that never awaits anything at all).
+    // on the other end of a co_await. Suspending unconditionally instead
+    // would cost one extra heap-allocated resume node and ready-queue
+    // round trip per coroutine call, even for one that never awaits
+    // anything at all.
     auto initial_suspend() noexcept -> std::suspend_never { return {}; }
 
     // Never suspends at the end either: nothing outside this coroutine
@@ -986,14 +973,13 @@ public:
     // underneath), which by now already has its result via
     // return_value()/return_void()/unhandled_exception(). std::suspend_never
     // here lets the compiler destroy the coroutine frame immediately and
-    // automatically once the body finishes. Safe to do so unconditionally
-    // (unlike an earlier version of this design, which tried resuming
-    // through a ready_node embedded *in* the frame being destroyed - see
-    // future_resume_node<T>'s own doc comment for why that didn't work):
+    // automatically once the body finishes. Safe to do so unconditionally:
     // every node that ever resumes this coroutine (future_resume_node<T>
     // below, mutex::lock_resume_node/acquire_resume_node) is separately
     // heap-allocated, entirely independent of the frame this suspend
-    // point destroys, so there is nothing left in this frame for anything
+    // point destroys - see future_resume_node<T>'s own doc comment for
+    // why it has to be heap-allocated rather than embedded in the frame
+    // it resumes - so there is nothing left in this frame for anything
     // to touch afterward.
     auto final_suspend() noexcept -> std::suspend_never { return {}; }
 
@@ -1055,23 +1041,18 @@ namespace est::detail {
 // Separately heap-allocated via an allocator (like every other ready_node
 // this codebase queues - concrete_continuation<Fn, U>,
 // est:promise's sleep_resume_node/yield_resume_node), *not* embedded
-// inside the coroutine frame it
-// resumes, for a subtle but real reason a first version of this class got
-// wrong: an awaiter object embedded in a coroutine's own frame only lives
-// for the duration of *its own* co_await expression - once run() resumes
-// the coroutine past that point, the compiler is free to reuse that exact
-// frame storage for whatever the coroutine's later code constructs (its
-// next awaiter, a local variable, ...), since their lifetimes don't
-// overlap. est::loop::run_one() (est:loop) calls destroy() on this same
-// node *after* run() already returned - by then, for a frame-embedded
-// node, that storage may already have been overwritten, and calling a
-// virtual function through it is undefined behavior - confirmed the hard
-// way (libc++abi: "Pure virtual function called!", a dispatch through a
-// vtable pointer that had already been clobbered by the coroutine's own
-// later frame activity) before landing on this heap-allocated design
-// instead. A separately allocated node has its own real, independent
-// lifetime, so run()-then-destroy() is exactly as safe here as it already
-// is for every other ready_node in this codebase.
+// inside the coroutine frame it resumes: an awaiter object embedded in a
+// coroutine's own frame only lives for the duration of *its own*
+// co_await expression - once run() resumes the coroutine past that
+// point, the compiler is free to reuse that exact frame storage for
+// whatever the coroutine's later code constructs (its next awaiter, a
+// local variable, ...), since their lifetimes don't overlap. But
+// est::loop::run_one() (est:loop) calls destroy() on this same node
+// *after* run() already returned - for a frame-embedded node, that
+// storage could already be overwritten by then, making a virtual call
+// through it undefined behavior. A separately allocated node has its own
+// real, independent lifetime, so run()-then-destroy() is exactly as safe
+// here as it already is for every other ready_node in this codebase.
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
@@ -1082,9 +1063,9 @@ public:
   void invoke(future_state<T>& /*unused*/) override { handle_.resume(); }
 
   // If invoke() never ran (the future_state this node was registered on
-  // was dropped without ever completing - docs/PLAN.md, M2's
-  // abandoned-future design - so `ran` is false, per ready_node::
-  // destroy()'s own doc comment, est:loop), the awaiting coroutine is
+  // was dropped without ever completing, so `ran` is false, per
+  // ready_node::destroy()'s own doc comment, est:loop), the awaiting
+  // coroutine is
   // still fully intact and untouched, so this is the only chance to free
   // its frame; if invoke() did run, the coroutine either already
   // self-destroyed or suspended again on something else that now owns
@@ -1123,20 +1104,11 @@ public:
 
   // Skips suspension entirely when the awaited future is already
   // resolved - the same "don't wait for something that isn't being
-  // waited for" reasoning promise_type::initial_suspend() (above) now
-  // uses at the other end of a coroutine's lifetime (PR #37's own review
-  // discussion). An earlier version of this unconditionally returned
-  // `false`, deliberately matching future_state<T>::then()'s own "never
-  // run inline, even when already ready" invariant - found, at the time,
-  // to be the more defensible default (a caller of a coroutine-returning
-  // function couldn't otherwise assume a `co_await` never ran some of the
-  // awaited producer's own logic inline on an unexpected call stack).
-  // That tradeoff was revisited once initial_suspend() itself adopted the
-  // same "skip a suspend that isn't needed" stance: paying for a
+  // waited for" reasoning promise_type::initial_suspend() (above) uses
+  // at the other end of a coroutine's lifetime: paying for a
   // future_resume_node<T> allocation and a full ready-queue round trip
   // purely to resume something that was never actually going to wait for
-  // anything stopped being worth it, for the identical reason it stopped
-  // being worth it there. future_state<T>::set_continuation() (called
+  // anything isn't worth it. future_state<T>::set_continuation() (called
   // from await_suspend() below) still handles the "not yet ready" case
   // correctly either way - this only changes whether that call, and the
   // node it needs, happens at all.

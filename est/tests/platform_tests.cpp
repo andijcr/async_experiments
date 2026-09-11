@@ -42,8 +42,8 @@ public:
 
   // No-ops: none of these tests exercise est::loop's long-running-callback
   // detection - platform::interface holds no state of its own to back a
-  // shared default for these (per review), so every concrete backend,
-  // this stub included, must answer them itself.
+  // shared default for these, so every concrete backend, this stub
+  // included, must answer them itself.
   void reset_loop_stall_detection() noexcept override {}
   void
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
@@ -142,8 +142,7 @@ TEST_CASE("hosted_stdcpp's sleep_until() returns once the deadline has passed", 
   REQUIRE(est::platform::instance().now() >= deadline);
 }
 
-// hosted_stdcpp::assert_failure()'s formatting isn't separately unit-tested:
-// unlike an earlier version of this file, it's no longer split out into a
-// standalone, testable helper - it's inlined directly into the
-// [[noreturn]]/std::abort() body, the same not-practically-unit-testable
-// situation as est::check()'s failure path (est/tests/check_tests.cpp).
+// hosted_stdcpp::assert_failure()'s formatting isn't separately
+// unit-tested: it's inlined directly into the [[noreturn]]/std::abort()
+// body, the same not-practically-unit-testable situation as
+// est::check()'s failure path (est/tests/check_tests.cpp).

@@ -5,14 +5,9 @@
 # job, applied via the "default"/"ci" CMake presets, not this image's
 # environment.
 #
-# The LLVM_VERSION/CMAKE_VERSION pins below were originally written blind
-# (see docs/PLAN.md "Known open items" for that history) but have since
-# been confirmed twice: once by real CI (docs/PLAN.md, "First real
-# toolchain build") and again by a from-scratch `docker build` plus a full
-# configure/build/tidy/format/test pass in a network-enabled sandbox
-# (docs/PLAN.md, "Docker build verified end-to-end"). Clang resolves to
-# 22.1.8; libc++-22-dev/libc++abi-22-dev/libclang-rt-22-dev all exist and
-# install cleanly for this LLVM_VERSION/Debian combination.
+# LLVM_VERSION=22 resolves to Clang 22.1.8; libc++-22-dev/libc++abi-22-dev/
+# libclang-rt-22-dev all install cleanly for this version on
+# debian:bookworm-slim.
 
 FROM debian:bookworm-slim
 
@@ -26,9 +21,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # apt.llvm.org resolves to an AAAA (IPv6) record, and GitHub-hosted Actions
 # runners have no IPv6 route out of the Docker build - wget/apt then hang
 # on "Network is unreachable" instead of falling back to IPv4. Force IPv4
-# for both apt itself and the wget below. (Found by the first real CI run
-# on this Dockerfile - see docs/PLAN.md "Revised after the first real CI
-# run".)
+# for both apt itself and the wget below.
 RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
 
 # --- Base tooling needed to fetch the pinned Clang/CMake ---
@@ -60,11 +53,7 @@ RUN wget --inet4-only -O /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
 # it for `import std;`/<print> support without pairing it with libc++ -
 # `all` above does not reliably pull in either of these. compiler-rt's
 # profile runtime (libclang_rt.profile) is what -fprofile-instr-generate
-# links against for the coverage gate below. Package names follow
-# apt.llvm.org's usual libc++-<N>-dev/libc++abi-<N>-dev/libclang-rt-<N>-dev
-# convention - confirmed to exist and install cleanly for LLVM_VERSION=22
-# on debian:bookworm-slim (see docs/PLAN.md, "Docker build verified
-# end-to-end").
+# links against for the coverage gate.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         "libc++-${LLVM_VERSION}-dev" \
@@ -72,22 +61,18 @@ RUN apt-get update \
         "libclang-rt-${LLVM_VERSION}-dev" \
     && rm -rf /var/lib/apt/lists/*
 
-# Work around a real Debian packaging gap: `libc++-<N>-dev` installs
+# Work around a Debian packaging gap: `libc++-<N>-dev` installs
 # `libc++.modules.json` (the manifest CMake's `import std;` support
-# reads) at the standard multiarch path so plain `-stdlib=libc++` finds
-# it via `clang++ -print-file-name=libc++.modules.json` without needing
-# the versioned resource dir. But that JSON's `source-path` for the std
-# module is relative to its own directory and assumes a flat install
-# prefix - `<prefix>/lib/<triple>/libc++.modules.json` next to
+# reads) at the standard multiarch path, found via `clang++
+# -print-file-name=libc++.modules.json` without needing the versioned
+# resource dir. But that JSON's `source-path` for the std module is
+# relative to its own directory and assumes a flat install prefix -
+# `<prefix>/lib/<triple>/libc++.modules.json` next to
 # `<prefix>/share/libc++/v1/std.cppm` - which Debian's packaging doesn't
-# actually have: the std module's real sources only exist under the
-# versioned `/usr/lib/llvm-${LLVM_VERSION}/share/libc++/v1/`, not
-# mirrored to a plain `/usr/share/libc++/v1/`. Without this, `import
-# std;` fails to configure with "Cannot find source file:
-# /lib/share/libc++/v1/std.cppm" (confirmed - see docs/PLAN.md, "import
-# std; re-adopted, project-wide"). A directory symlink at the path the
-# JSON's relative resolution actually looks for fixes it without
-# touching the real, versioned installation.
+# have: the std module's real sources only exist under the versioned
+# `/usr/lib/llvm-${LLVM_VERSION}/share/libc++/v1/`. A directory symlink
+# at the path the JSON's relative resolution actually looks for fixes it
+# without touching the real, versioned installation.
 RUN mkdir -p /usr/lib/share/libc++ \
     && ln -s "/usr/lib/llvm-${LLVM_VERSION}/share/libc++/v1" /usr/lib/share/libc++/v1
 
@@ -99,12 +84,10 @@ RUN for tool in clang clang++ clang-format clang-tidy clang-scan-deps lld lldb l
             "/usr/bin/${tool}-${LLVM_VERSION}" 100; \
     done
 
-# diff-cover: intersects the llvm-cov lcov report below with a PR's diff
-# to gate on new-code coverage rather than the whole repo's. Pinned to
-# match what this session verified the coverage pipeline against locally.
-# Debian's system Python is "externally managed" (PEP 668); this is a
-# throwaway container image, not a shared system, so overriding that
-# guard is the right call here, not a workaround to avoid fixing properly.
+# diff-cover: intersects the llvm-cov lcov report with a PR's diff to
+# gate on new-code coverage rather than the whole repo's. Debian's system
+# Python is "externally managed" (PEP 668); this is a throwaway container
+# image, not a shared system, so overriding that guard is fine here.
 RUN pip install --no-cache-dir --break-system-packages diff-cover==10.5.1
 
 # --- Pinned CMake ---

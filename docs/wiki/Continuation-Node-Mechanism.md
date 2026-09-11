@@ -36,9 +36,9 @@ classDiagram
 ```
 
 - `intrusive_list_node` (real name `est::intrusive_list_node`) lives in
-  `est:util.intrusive_list` — a genuinely generic utility, not something
-  borrowed from `est::mutex`; `est::mutex`'s own `mutex_waiter` is just an
-  alias for it (see [Architecture](Architecture.md)).
+  `est:util.intrusive_list` — a genuinely generic utility shared by
+  `est::mutex`, `est::future_state<T>`, and `est::loop` alike (see
+  [Architecture](Architecture.md)).
 - `ready_node` (real name `est::detail::ready_node`) lives in `est:loop`.
 - `continuation_node_T` (real name `est::detail::continuation_node<T>`)
   lives in `est:future`.
@@ -52,8 +52,8 @@ excerpts below for the real, fully-qualified signatures.)
 
 - **`intrusive_list_node`** (`est:util.intrusive_list`) is nothing but an
   intrusive `next` pointer. It's the root of *three* independent intrusive
-  lists in this codebase: `est::mutex`'s own waiter list (via the
-  `mutex_waiter` alias), and (via `ready_node`) both `future_state<T>`'s
+  lists in this codebase: `est::mutex`'s own waiter list, and (via
+  `ready_node`) both `future_state<T>`'s
   "not yet ready" queue and `est::loop`'s "ready to run" queue. Reusing one
   link field across all of them is safe because a node is only ever a
   member of one such list at a time — see "Node lifecycle" below. The
@@ -187,10 +187,9 @@ somehow threw — `node.destroy(allocator, true)` deallocates it.
 
 ### The `bind_owner()` subtlety
 
-`continuation_node<T>` could have taken its `shared_ptr<future_state<T>>`
-owner at *construction* time instead of via a separate `bind_owner()` call
-later. An earlier draft of this design did exactly that — and it was a real
-bug, caught during review before it shipped:
+`continuation_node<T>` takes its `shared_ptr<future_state<T>>`
+owner via a separate `bind_owner()` call, not at construction time.
+Taking it at construction would create a reference cycle:
 
 A node still sitting in the parent's own `waiters_` (not yet ready) is
 already reachable *from* that same parent, by raw pointer. If it *also* held
@@ -202,7 +201,7 @@ count (the node it still owns keeps it artificially alive), so it — and the
 node — would leak forever instead of being cleaned up by
 `future_state<T>`'s own destructor the normal way.
 
-The fix is `bind_owner()`, called exactly once, right at the moment a node
+`bind_owner()` avoids that: called exactly once, right at the moment a node
 transitions from "pending, exclusively owned by the parent" to "queued on
 the loop, needs to survive independently of the parent's own ref count."
 Before that point, no cycle exists (the node has no strong reference to its
@@ -216,8 +215,7 @@ continuation still sitting in the loop's ready-queue, even if every other
 ## The two calling conventions
 
 `invoke()`'s real body — the part `concrete_continuation<Fn, U>` actually
-implements — dispatches on how `Fn` can be called, checked in this order
-(precedence changed by issue #39 — see below):
+implements — dispatches on how `Fn` can be called, checked in this order:
 
 ```cpp
 void invoke(future_state& state) override {
@@ -257,14 +255,10 @@ Checked in that order — unwrapped first — so a generic callback (e.g. an
 parameter binds to either) defaults to unwrapped. Wrapped is only chosen
 when unwrapped genuinely isn't viable: `Fn` explicitly typed to take
 `future<T>&` isn't invocable with a plain `const T&`, so it still falls
-through to wrapped exactly as before — the precedence change only affects
-callbacks generic enough to accept both shapes, flipping which one they
-get by default. (An earlier version of this code checked wrapped first,
-so a generic lambda like this silently got wrapped, no-unwrap behavior
-without opting into it — found and reported as issue #39.)
+through to wrapped.
 
 `then_callback_for<Fn, T>` (the concept constraining `then()`'s template
-parameter) needed the identical reordering, and for a sharper reason than
+parameter) checks in the identical order, and for a sharper reason than
 just matching `invoke()`'s own precedence:
 
 ```cpp
@@ -282,14 +276,13 @@ ill-formed for a `future<T>&` argument — doesn't fail `std::invocable<Fn&,
 future<T>&>` gracefully. "Use of a deleted function" isn't an
 overload-resolution failure the way "no viable candidate" is, so it isn't
 SFINAE-friendly; instantiating that check at all is a hard compile error,
-constraint or no constraint. With the wrapped shape checked first (as an
-earlier version of this concept had it), such an `Fn` failed to compile
-outright. Checking `invocable_unwrapped<Fn, T>()` first means an `Fn` for
-which it's satisfied never triggers the wrapped check at all — the same
-short-circuiting that makes the precedence change effective for dispatch
-is what makes it *necessary* here, not just consistent. An `Fn` matching
-neither shape still fails right at the `then()` call site with a
-"constraints not satisfied" diagnostic, not deep inside `invoke()`'s own
+constraint or no constraint. Checking `invocable_unwrapped<Fn, T>()`
+first means an `Fn` for which it's satisfied never triggers the wrapped
+check at all — the same short-circuiting that decides `invoke()`'s own
+dispatch order is what makes this ordering *necessary* here, not just
+consistent. An `Fn` matching neither shape still fails right at the
+`then()` call site with a "constraints not satisfied" diagnostic, not
+deep inside `invoke()`'s own
 instantiation.
 
 ## Flattening is not a special case
@@ -320,36 +313,18 @@ site, itself nested inside a `future_state<T>` instantiation, can register a
 continuation on an *inner* future's state without `future<U>` needing to
 expose a method for it at all.
 
-An earlier version of this called `.then()` here (issue #25). That's the
-more obvious way to register a callback, and it worked — but `then()`
-exists to hand the *caller* a `future<U>` to chain onward from, and this
-call site had nowhere to put one: the forwarding logic already reports
-straight into the real `downstream_`, and the `future<void>` `.then()`
-handed back was discarded the instant it was created. Paying for that
-anyway meant a throwaway `future_state<void>` plus a full
+This deliberately doesn't go through `.then()`: `then()` exists to hand
+the *caller* a `future<U>` to chain onward from, but this call site has
+nowhere to put one — the forwarding logic already reports straight into
+the real `downstream_`. Registering via `.then()` anyway would mean
+paying for a throwaway `future_state<void>` plus a full
 `concrete_continuation<Fn, void>` — with its own wrapped/unwrapped dispatch
 and `fulfill()`/`invoke_and_fulfill()` machinery none of it ever needed —
 for every single flattening `.then()` call, allocated and freed without
-anything ever observing either one.
-
-A first fix (still issue #25) replaced that `.then()` call with a lower-level
-`on_ready()`/`raw_continuation<Fn>` primitive: `then()`'s registration
-mechanism (`set_continuation()`) with the downstream-future half removed,
-but still templated on the callback's own closure type `Fn`, and still built
-by wrapping the forwarding logic in a lambda closed over a copy of
-`downstream_`. That was smaller than a full `concrete_continuation<Fn,
-void>`, but still one node instantiation — and one lambda closure type — per
-`(T, Fn, U)` call site, and `on_ready()` had to be a public method on both
-`future_state<T>` and `future<T>` for `fulfill()` to reach it at all, even
-though nothing outside this one internal call site ever had a legitimate
-reason to call it.
-
-### `detail::flatten_forwarder<T>`: degeneralized further
-
-A follow-up simplification (still issue #25) removed `on_ready()` and
-`raw_continuation<Fn>` entirely, in favor of `detail::flatten_forwarder<T>`
-— a free class template in `est::detail`, alongside `continuation_node<T>`,
-not nested inside `future_state<T>` at all:
+anything ever observing either one. `detail::flatten_forwarder<T>` avoids
+all of that: a free class template in `est::detail`, alongside
+`continuation_node<T>`, not nested inside `future_state<T>` at all,
+registered directly via `set_continuation()`:
 
 ```cpp
 template <class T> class flatten_forwarder final : public continuation_node<T> {
@@ -383,39 +358,24 @@ private:
 };
 ```
 
-The key observation behind this: `on_ready()` was only ever a private
-abstraction built to support one caller (`fulfill()`'s flatten branch), and
-that caller's forwarding logic is fixed — it never varies by closure, only
-by `T`. Templating the node on an arbitrary `Fn` was over-generalizing a
-primitive with exactly one real shape. `flatten_forwarder<T>` bakes that one
-shape in directly: no `Fn` member, no lambda, no `future<T>` view built via
+The forwarding logic this node needs is fixed — it never varies by
+closure, only by `T` — so `flatten_forwarder<T>` bakes that one shape in
+directly: no `Fn` member, no lambda, no `future<T>` view built via
 `shared_from_this()` (it operates on the `future_state<T>&` `invoke()`
 already receives, which already exposes `failed()`/`get_exception()`/`get()`
-publicly — the view was only ever needed for `on_ready()`'s generic,
-arbitrary-callback shape). It's also no longer public anywhere:
-`future<T>::on_ready()` is gone, and `future_state<T>::on_ready()` is gone,
-replaced by the direct `result.state_->set_continuation(*node)` call above.
-
-The main compile-time benefit: every flattening `.then()` at the same inner
-value type `T` now reuses the *same* `flatten_forwarder<T>` instantiation,
-instead of minting a fresh node type (and a fresh lambda closure type) per
-`(T, Fn, U)` call site the way `raw_continuation<Fn>` did — fewer template
+publicly). Every flattening `.then()` at the same inner value type `T`
+reuses the *same* `flatten_forwarder<T>` instantiation, instead of
+minting a fresh node type per `(T, Fn, U)` call site — fewer template
 instantiations overall for a codebase with many distinct flattening call
 sites sharing the same inner future type.
 
-The net effect for a flattening `.then()` call, versus the original
-`.then()`-based version: one fewer allocated `future_state`, one fewer
-allocated node (a smaller one, at that, with no wrapped/unwrapped branching
-or `fulfill()` recursion baked into its `invoke()`), and a move instead of a
-copy of the inner value — `std::move(state).get()`, not a copying `.get()` —
-since `state` is a fresh, single-owner future_state (`fn`'s own return
-value, not a stored one). That move isn't just faster: a
-`future<std::unique_ptr<T>>` returned from a `then()` callback couldn't be
-flattened at all under the original code, since `std::unique_ptr` has no
-copy constructor to select. `future_tests.cpp`'s own regression test for
-this fix exists specifically because it would not have compiled before it.
+`invoke()` moves the inner value out — `std::move(state).get()`, not a
+copying `.get()` — since `state` is a fresh, single-owner future_state
+(`fn`'s own return value, not a stored one). That move matters beyond
+speed: a `future<std::unique_ptr<T>>` returned from a `then()` callback
+couldn't be flattened through a copying path at all, since
+`std::unique_ptr` has no copy constructor to select.
 
 [Allocation Patterns](Allocation-Patterns.md#flattening-costs-one-extra-allocation)
 has the same story from that page's own angle (total allocation counts per
-`then()` shape); [issue #25](https://github.com/andijcr/async_experiments/issues/25)
-is where this was found and fixed.
+`then()` shape).

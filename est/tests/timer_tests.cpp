@@ -16,9 +16,9 @@ public:
 
   // A no-op: these tests exercise est::timer_queue directly and never
   // drive an est::loop, so sleep_until() is never actually called - every
-  // est::platform::interface implementation must still provide one
-  // (docs/PLAN.md, M3). See est/tests/loop_tests.cpp's own fake_platform
-  // for an implementation that actually advances a fake clock instead.
+  // est::platform::interface implementation must still provide one.
+  // See est/tests/loop_tests.cpp's own fake_platform for an
+  // implementation that actually advances a fake clock instead.
   void sleep_until(std::chrono::steady_clock::time_point /*deadline*/) const noexcept override {}
 
   [[noreturn]] void assert_failure(std::string_view /*message*/,
@@ -32,9 +32,8 @@ public:
   // No-ops: these tests exercise est::timer_queue directly, never an
   // est::loop, so neither the long-running-callback path nor the
   // current-loop slot is ever touched - platform::interface holds no
-  // state of its own to back a shared default for either (per review),
-  // so every concrete backend, this fake included, must still answer
-  // them itself.
+  // state of its own to back a shared default for either, so every
+  // concrete backend, this fake included, must still answer them itself.
   void reset_loop_stall_detection() noexcept override {}
   void
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
@@ -46,10 +45,7 @@ public:
   // No `{}` needed: std::chrono::time_point's default constructor is a
   // real, user-provided constructor (time_point() : __d_(duration::zero())
   // {} in libc++'s <chrono>) that always zero-initializes, not a defaulted
-  // one that would leave an automatic-storage member indeterminate -
-  // confirmed directly against the pinned toolchain's header after an
-  // earlier, incorrect assumption to the contrary briefly reintroduced
-  // the `{}` here (see docs/PLAN.md).
+  // one that would leave an automatic-storage member indeterminate.
   std::chrono::steady_clock::time_point current;
 };
 

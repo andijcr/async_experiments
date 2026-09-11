@@ -35,9 +35,10 @@ than duplicating it.
   timers into futures, and the long-running-callback / reentrancy guards.
 - **[Coroutines](Coroutines.md)** — why `est::future<T>` itself is the
   coroutine return type (no separate `task<T>`), the `promise_type`/
-  `operator co_await()` machinery behind it, a real use-after-reuse bug it
-  took to get right, and how `est::mutex::lock()` became awaitable on the
-  same pieces.
+  `operator co_await()` machinery behind it, why a resume node must be
+  separately heap-allocated rather than embedded in the coroutine frame
+  it resumes, and how `est::mutex::lock()` is awaitable on the same
+  pieces.
 
 ## The five-second architecture summary
 
@@ -64,7 +65,7 @@ Every future/promise pair is built via `est::make_promise_future<T>(loop&)` —
 an explicit `est::loop&` is threaded through everything (not a global
 singleton), so a caller owns exactly when and where continuations actually
 run. A caller that doesn't want to thread one through by hand can instead
-rely on `est::current_loop()` (issue #30, [Loop and Timers](Loop-And-Timers.md))
+rely on `est::current_loop()` ([Loop and Timers](Loop-And-Timers.md))
 — every loop-taking function in this codebase has a matching no-`loop&`
 overload built on it. A loop only becomes "current" by an explicit
 `est::make_current_loop(loop)` call (a free function, not a method on
@@ -92,7 +93,7 @@ constructs one, and `platform::override_instance()`s it
 | `est::check()` | `est/src/check.cppm` |
 | `est::shared_ptr<T>`, `est::ref_counted` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
-| `est::mutex`, `mutex::lock_awaiter`, `mutex::lock_resume_node` | `est/src/sync/mutex.cppm` |
+| `est::mutex`, `mutex::lock_resume_node`, `mutex::acquire_resume_node` | `est/src/sync/mutex.cppm` |
 | `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
