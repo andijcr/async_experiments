@@ -39,6 +39,10 @@ than duplicating it.
   separately heap-allocated rather than embedded in the coroutine frame
   it resumes, and how `est::mutex::lock()` is awaitable on the same
   pieces.
+- **[Global Lookup Codegen](Global-Lookup-Codegen.md)** — what
+  `est::current_loop()`/`.allocator()` actually compile to under LTO:
+  real disassembly, instruction counts, and pointer-chase counts, plus
+  why whole-program devirtualization doesn't currently help.
 
 ## The five-second architecture summary
 

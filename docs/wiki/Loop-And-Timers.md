@@ -154,7 +154,10 @@ A coroutine returning `est::future<T>`
 can drop the `est::loop&` parameter the same way - see
 [Coroutines](Coroutines.md)'s own calling-convention section for how
 `promise_type` resolves that without ambiguity against the original,
-loop-taking convention.
+loop-taking convention. See [Global Lookup Codegen](Global-Lookup-Codegen.md)
+for what going through `current_loop()` actually costs, in real,
+disassembled instructions - the explicit-`loop&` path this section
+describes skips all of it.
 
 ## The ready-queue
 
