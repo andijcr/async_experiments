@@ -52,7 +52,15 @@ public:
   // its promise with an exception first, rather than just deallocating
   // itself silently - see lock_resume_node's own doc comment for why
   // that matters beyond just freeing the node itself.
+  // waiters_.empty() checked *before* resolving current_loop() - a mutex
+  // with nothing queued can legitimately be destroyed long after whatever
+  // loop was current when it was created has stopped being current at
+  // all, and current_loop() would fail its own precondition in that case
+  // even though nothing here actually needs a loop.
   ~mutex() {
+    if (waiters_.empty()) {
+      return;
+    }
     auto& loop_ref = current_loop();
     waiters_.drain(
         [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });

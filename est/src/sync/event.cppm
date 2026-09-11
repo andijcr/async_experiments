@@ -136,7 +136,16 @@ public:
   // completes its promise with an exception first, rather than just
   // deallocating itself silently - see its own doc comment for why that
   // matters beyond just freeing the node itself.
+  // waiters_.empty() checked *before* resolving current_loop() - a
+  // counting_event with nothing queued can legitimately be destroyed
+  // long after whatever loop was current when it was created has stopped
+  // being current at all, and current_loop() would fail its own
+  // precondition in that case even though nothing here actually needs a
+  // loop.
   ~counting_event() {
+    if (waiters_.empty()) {
+      return;
+    }
     auto& loop_ref = current_loop();
     waiters_.drain(
         [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
@@ -186,6 +195,12 @@ public:
   // to bound recursion - deferring anyway keeps this consistent with
   // every other completion path in this codebase: never invoke a
   // continuation inline.
+  // current_loop() resolved only once it's known there's at least one
+  // queued waiter to hand off to, not unconditionally on every successful
+  // set() - a caller that sets an event with nothing queued (the common
+  // case for a manual-reset event set ahead of its first wait()) doesn't
+  // need a loop current at all, and current_loop() would fail its own
+  // precondition in that case otherwise.
   auto set(int n = 1) -> int {
     check(n > 0, "counting_event::set(n) requires n > 0");
     const int actual_n = std::min(n, max_count_ - count_);
@@ -193,19 +208,20 @@ public:
       return 0;
     }
     count_ += actual_n;
-    if constexpr (Mode == EventResetMode::automatic) {
+    if (!waiters_.empty()) {
       auto& loop_ref = current_loop();
-      for (int i = 0; i < actual_n; ++i) {
-        auto* waiter = waiters_.dequeue();
-        if (waiter == nullptr) {
-          break;
+      if constexpr (Mode == EventResetMode::automatic) {
+        for (int i = 0; i < actual_n; ++i) {
+          auto* waiter = waiters_.dequeue();
+          if (waiter == nullptr) {
+            break;
+          }
+          --count_;
+          loop_ref.enqueue_ready(*waiter);
         }
-        --count_;
-        loop_ref.enqueue_ready(*waiter);
+      } else {
+        waiters_.drain([&loop_ref](detail::ready_node& node) { loop_ref.enqueue_ready(node); });
       }
-    } else {
-      auto& loop_ref = current_loop();
-      waiters_.drain([&loop_ref](detail::ready_node& node) { loop_ref.enqueue_ready(node); });
     }
     return actual_n;
   }

@@ -12,13 +12,6 @@ import std;
 // consumer that wants a working, ready-to-use backend opts in with a
 // second import: `import est; import estext;`. A future bare-metal
 // backend would be its own similarly separate module.
-//
-// This also means hosted_stdcpp needs no special access est.cppm's own
-// partitions don't already have: `import est;` exposes the complete,
-// already-defined est::loop (unlike platform.cppm's own forward
-// declaration, needed there only because :platform sits *below* :loop in
-// est's own internal module DAG and can't import it - est itself has no
-// such restriction from the outside).
 export namespace estext {
 
 class hosted_stdcpp final : public est::platform::interface {

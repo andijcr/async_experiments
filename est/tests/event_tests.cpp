@@ -413,3 +413,23 @@ TEST_CASE("one_shot_event: set() returns 1 for the call that actually signals, 0
   REQUIRE(ev.set() == 0);
   REQUIRE(ev.set() == 0);
 }
+
+TEST_CASE("a counting_event with no waiters can be set() and dropped with no loop current",
+          "[event]") {
+  // Guards counting_event::set() resolving current_loop() only once it's
+  // known there's a queued waiter to hand off to, and ~counting_event()
+  // checking has_waiters() before resolving current_loop() at all -
+  // neither needs a loop when there's nothing queued, and must not fail
+  // current_loop()'s own precondition just because none happens to be
+  // registered any more.
+  est::counting_event<EventResetMode::manual> ev;
+  {
+    est::loop loop;
+    const auto loop_guard = est::make_current_loop(loop);
+    ev.set(); // no waiters queued - must not need current_loop()
+  } // loop_guard exits - no loop is current from here on
+
+  REQUIRE(ev.count() == 1);
+  // `ev` is destroyed at the end of this scope with no loop current -
+  // must not abort.
+}

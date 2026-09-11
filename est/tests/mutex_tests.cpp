@@ -413,3 +413,23 @@ TEST_CASE("mutex() default-constructs and uses est::current_loop()", "[mutex]") 
   REQUIRE(fut.ready());
   REQUIRE(m.locked());
 }
+
+TEST_CASE("an unlocked mutex with no waiters can be dropped after its loop stops being current",
+          "[mutex]") {
+  // Guards mutex::~mutex() checking has_waiters() before resolving
+  // current_loop(): a mutex with nothing queued needs no loop at all to
+  // be destroyed, and must not fail current_loop()'s own precondition
+  // just because none happens to be registered any more by the time it
+  // goes out of scope.
+  est::mutex m;
+  {
+    est::loop loop;
+    const auto guard = est::make_current_loop(loop);
+    m.lock().get(); // uncontended fast path
+    m.unlock();
+  } // guard exits - no loop is current from here on
+
+  REQUIRE_FALSE(m.locked());
+  // `m` is destroyed at the end of this scope with no loop current - must
+  // not abort.
+}

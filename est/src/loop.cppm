@@ -200,6 +200,17 @@ public:
   // both containers to empty, so a later call (from ~loop(), typically)
   // finds nothing left to do.
   //
+  // timers_.cancel(entry.id) before destroying each node, not just
+  // clearing pending_timers_ on its own: timers_ (the timer_queue min-heap
+  // schedule_timer() also records the deadline in) is a *separate*
+  // member, and this method can now run on a loop that keeps going
+  // afterward (called from make_current_loop()'s guard, not only from
+  // ~loop() right before the whole object - timers_ included - goes
+  // away). Without the cancel(), a still-live loop's own timers_ would
+  // keep a stale deadline for a node that no longer exists in
+  // pending_timers_ - fire_ready_timers()'s own check() exists exactly to
+  // catch that desync when it later tries to look the id back up.
+  //
   // pending_timers_ drained *before* ready_, not the more obvious other
   // way around: a timer node's destroy(allocator_, false) can complete
   // its promise with an exception (detail::sleep_resume_node,
@@ -217,6 +228,7 @@ public:
   // in this order is sufficient.
   void drain_pending() noexcept {
     for (const auto& entry : pending_timers_) {
+      timers_.cancel(entry.id);
       entry.node->destroy(allocator_, false);
     }
     pending_timers_.clear();

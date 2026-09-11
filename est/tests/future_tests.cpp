@@ -983,3 +983,25 @@ TEST_CASE("future<int>: two clones can each be co_awaited independently, both se
   REQUIRE(result_a.get() == 7);
   REQUIRE(result_b.get() == 7);
 }
+
+TEST_CASE("a completed future with no continuation ever registered can be dropped after its "
+          "loop stops being current",
+          "[future]") {
+  // Guards future_state<T>::~future_state() checking waiters_.empty()
+  // before resolving current_loop(): a future_state with nothing queued
+  // needs no loop at all to be destroyed, and must not fail
+  // current_loop()'s own precondition just because none happens to be
+  // registered any more by the time it goes out of scope.
+  std::optional<est::future<int>> outlives_the_loop;
+  {
+    est::loop loop;
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, future] = est::make_promise_future<int>();
+    promise.set_value(42);
+    outlives_the_loop.emplace(std::move(future));
+  } // loop_guard exits - no loop is current from here on
+
+  REQUIRE(outlives_the_loop->get() == 42);
+  // `outlives_the_loop` (and the promise it came from) is destroyed at
+  // the end of this scope, with no loop current - must not abort.
+}

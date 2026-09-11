@@ -223,6 +223,33 @@ TEST_CASE("sleep_until() resolves once run_until_idle() advances past the deadli
   REQUIRE(future.ready());
 }
 
+TEST_CASE("drain_pending() cancels abandoned timers so the loop can keep running safely",
+          "[loop]") {
+  // Guards loop::drain_pending() draining pending_timers_ without also
+  // canceling the matching timer_queue entry: without that,
+  // make_current_loop()'s guard abandoning a still-pending sleep_for()
+  // would leave a stale deadline in timers_ that a later run_until_idle()
+  // on the same, still-alive loop trips over in fire_ready_timers()'s own
+  // check("loop: fired timer id missing from pending_timers_") - reached
+  // here since drain_pending() (unlike the old ~loop()-only version) can
+  // now run on a loop that keeps going afterward.
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto platform_guard = est::platform::override_instance(fake);
+
+  est::loop loop;
+  {
+    const auto loop_guard = est::make_current_loop(loop);
+    auto future = est::sleep_for(10s); // abandoned - guard exits before it fires
+    (void)future;
+  } // loop_guard exits: drain_pending() destroys the pending timer node
+
+  // The loop is still alive and still usable - run_until_idle() must not
+  // find a stale deadline still sitting in the timer queue.
+  loop.run_until_idle();
+  SUCCEED("run_until_idle() returned without tripping the stale-timer check");
+}
+
 TEST_CASE("yield_execution() resolves once run_until_idle() drains it", "[loop]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);

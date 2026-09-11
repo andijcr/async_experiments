@@ -295,7 +295,17 @@ public:
   // not this future_state's - see loop.cppm). Without this, those
   // still-pending nodes are simply unreachable once this future_state
   // itself is gone - a permanent leak, not just a skipped notification.
+  // waiters_.empty() checked *before* resolving current_loop(), not just
+  // for a wasted lookup: a future_state that completed with no
+  // continuation ever registered (or all of them already drained) can
+  // legitimately be destroyed long after whatever loop was current when
+  // it was created has stopped being current at all - current_loop()
+  // would fail its own precondition in that case even though there is
+  // nothing here that actually needs a loop.
   ~future_state() {
+    if (waiters_.empty()) {
+      return;
+    }
     auto& loop_ref = current_loop();
     waiters_.drain(
         [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
