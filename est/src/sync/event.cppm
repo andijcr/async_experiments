@@ -239,6 +239,14 @@ public:
 // already consumed" - exactly the distinction a one-shot guarantee
 // needs to get right.
 //
+// set() past the first call is a no-op, not a checked precondition
+// violation - matching binary_event<Mode>::set()'s own idempotency
+// (review: forcing every caller to guard set() with its own "have I
+// already signaled this?" check, on pain of aborting the whole process,
+// would defeat the point of a primitive meant to let independent callers
+// - e.g. two unrelated cancellation sources racing to fire the same
+// one-shot signal - all safely call set() without coordinating first).
+//
 // reset() is deleted outright (again: hides the base's declaration from
 // unqualified lookup, same technique set() above already uses, not an
 // override) rather than merely documented-but-unchecked the way this
@@ -252,7 +260,9 @@ public:
   using binary_event<Mode>::binary_event;
 
   void set() {
-    check(!has_been_set_, "one_shot_event::set() called more than once");
+    if (has_been_set_) {
+      return;
+    }
     has_been_set_ = true;
     binary_event<Mode>::set();
   }

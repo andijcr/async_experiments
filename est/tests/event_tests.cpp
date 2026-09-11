@@ -274,3 +274,17 @@ TEST_CASE("one_shot_event<automatic>: a single set() satisfies exactly the first
   auto second = ev.wait(); // the single unit was already consumed by `first`
   REQUIRE_FALSE(second.ready());
 }
+
+TEST_CASE("one_shot_event: a second set() is a no-op, not a checked failure", "[event]") {
+  est::loop loop;
+  est::one_shot_event<EventResetMode::manual> ev(loop);
+
+  ev.set();
+  ev.set(); // must not abort - independent callers may race to fire the same signal
+  ev.set();
+  loop.run_until_idle();
+
+  REQUIRE(ev.signaled());
+  auto fut = ev.wait();
+  REQUIRE(fut.ready());
+}
