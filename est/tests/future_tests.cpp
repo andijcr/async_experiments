@@ -49,9 +49,8 @@ private:
 // future_state built against it holds a bare loop&, so the loop must
 // outlive it. Where a loop needs a specific memory_resource (the
 // counting_resource-based leak tests), it's built as est::loop{&resource}
-// - the same implicit polymorphic_allocator<std::byte> conversion the
-// resource pointer already supported when passed directly to
-// make_promise_future() before M3.
+// - the same implicit polymorphic_allocator<std::byte> conversion
+// est::loop's constructor takes directly.
 
 TEST_CASE("set_value then get() returns the value", "[future]") {
   est::loop loop;
@@ -64,19 +63,16 @@ TEST_CASE("set_value then get() returns the value", "[future]") {
 
 TEST_CASE("an unwrapped then() receives a reference into the stored value, not a copy",
           "[future]") {
-  // Regression test: the underlying future_state::get()'s deduced return
-  // type must be decltype(auto), not plain auto - plain auto strips
-  // references from the return expression's type (the same rule as
-  // `auto x = expr;`), which would silently turn the documented
-  // "non-consuming const T&" into a fresh copy of T on every call
-  // instead of a reference to the one stored value. Caught by a PR
-  // review comment, not a test, the first time. Observed here via two
-  // separate unwrapped then() registrations (each gets its own const
-  // int& argument straight from future_state::get(), not exposed to
-  // this test file directly) rather than by naming future_state itself,
-  // which - now that then()'s wrapped mode hands out an est::future<T>
-  // instead (see below) - is no longer part of the public API surface
-  // this test file can reach.
+  // Guards future_state::get()'s deduced return type: it must be
+  // decltype(auto), not plain auto - plain auto strips references from
+  // the return expression's type (the same rule as `auto x = expr;`),
+  // which would silently turn the documented "non-consuming const T&"
+  // into a fresh copy of T on every call instead of a reference to the
+  // one stored value. Observed here via two separate unwrapped then()
+  // registrations (each gets its own const int& argument straight from
+  // future_state::get(), not exposed to this test file directly) rather
+  // than by naming future_state itself, which is not part of the public
+  // API surface this test file can reach.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
   promise.set_value(42);
@@ -163,9 +159,9 @@ TEST_CASE("multiple then() registrations are all invoked on completion", "[futur
 }
 
 TEST_CASE("every then() registration observes the same, correct value via get()", "[future]") {
-  // Regression test: get() used to move the value out of future_state on
-  // its first call, so a second continuation reading it would see a
-  // moved-from value instead of the real one.
+  // Guards future_state::get()'s lvalue branch: a second continuation
+  // reading the value must see the real one, not a moved-from leftover
+  // from the first.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
   auto first = future.then([](est::future<int>& state) { return state.get(); });
@@ -209,10 +205,9 @@ TEST_CASE("dropping the future doesn't prevent the promise from completing", "[f
 }
 
 TEST_CASE("a registered continuation is freed even if never invoked (broken promise)", "[future]") {
-  // Regression test: future_state's destructor didn't drain its
-  // continuation list, so a then() registered on a future whose promise
-  // is dropped without ever completing leaked the continuation node
-  // forever - it just sat, unreachable, in the waiter list.
+  // Guards future_state's destructor draining its continuation list: a
+  // then() registered on a future whose promise is dropped without ever
+  // completing must not leak the continuation node.
   counting_resource resource;
   {
     est::loop loop{&resource};
@@ -227,12 +222,10 @@ TEST_CASE("a registered continuation is freed even if never invoked (broken prom
 
 TEST_CASE("a throwing continuation's exception is isolated to its own downstream future",
           "[future]") {
-  // Regression test: complete()'s drain loop used to abort entirely when
-  // a continuation threw, abandoning any later-queued sibling
-  // continuation. then() now catches a callback's exception and routes
-  // it into that continuation's own downstream future via
-  // set_exception() instead of letting it escape - a throwing
-  // continuation no longer stops its siblings from running.
+  // Guards complete()'s drain loop: then() catches a callback's
+  // exception and routes it into that continuation's own downstream
+  // future via set_exception() instead of letting it escape, so a
+  // throwing continuation must not stop its siblings from running.
   est::loop loop;
   auto [promise, future] = est::make_promise_future<int>(loop);
 
@@ -786,12 +779,12 @@ TEST_CASE("dropping an awaited future_state destroys the still-suspended corouti
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-// Issue #30: a coroutine's own promise_type no longer requires est::loop&
-// as its first parameter - it falls back to est::current_loop()
+// A coroutine's own promise_type doesn't require est::loop& as its
+// first parameter - it falls back to est::current_loop()
 // (est:util.current_loop) instead, matched via the same "promise
 // constructor arguments" rule that the loop-taking convention already
-// relies on (see promise_type's own doc comment). Both new overload
-// shapes (some-parameters-but-not-loop, and no-parameters-at-all) get
+// relies on (see promise_type's own doc comment). Both overload shapes
+// (some-parameters-but-not-loop, and no-parameters-at-all) get
 // their own test - the interesting risk here isn't behavior, it's
 // overload resolution: promise_type has three constructor/operator new
 // pairs now, and the wrong one silently winning would either fail to
