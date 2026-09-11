@@ -47,6 +47,10 @@ est::platform   — a monotonic clock + "what happens when a check fails" seam,
 est::shared_ptr — a single-allocation, non-atomic reference-counted pointer
 est::mutex      — an intrusive waiter list + lock word; lock() is awaitable,
                    guarding a critical section across a coroutine suspension
+est::counting_event —
+                   the same intrusive-waiter-list pattern generalized to a
+                   count; binary_event/one_shot_event layer stricter
+                   constraints on top without re-implementing any of it
 est::timer_queue — a min-heap of deadlines, driven by est::platform's clock
 est::loop       — owns a ready-queue and the timer_queue; the only thing that
                    ever actually invokes a continuation or fires a timer
@@ -89,6 +93,7 @@ constructs one, and `platform::override_instance()`s it
 | `est::shared_ptr<T>`, `est::ref_counted` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
 | `est::mutex`, `mutex::lock_awaiter`, `mutex::lock_resume_node` | `est/src/sync/mutex.cppm` |
+| `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |

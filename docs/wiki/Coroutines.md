@@ -810,3 +810,59 @@ confirmed use-after-free for a different one:
 > `mutex&`. Precondition instead of a fix: the loop must outlive every
 > mutex constructed against it, and a caller must not let the loop keep
 > running past a mutex's destruction while a waiter is still queued on it.
+
+### `est::counting_event<Mode>` reuses this pattern unchanged
+
+`est/src/sync/event.cppm`'s `counting_event<Mode>` (an awaitable counting
+semaphore, `Mode` selecting whether a successful `wait()` consumes one unit
+of the count or leaves it alone - the classic Win32 auto-reset/manual-reset
+distinction, generalized past a plain boolean) is built from exactly the
+pieces above: a `loop&`, an `intrusive_list<detail::ready_node> waiters_`,
+and `detail::event_resume_node final : public ready_node` whose `destroy()`
+completes an abandoned `promise<void>` with an exception for the identical
+reason `lock_resume_node`'s own doc comment gives - a
+coroutine suspended in `co_await event.wait()` holds the `future_state<void>`
+alive across the suspension, reachable only through that promise. `set()`
+defers through `loop.enqueue_ready()` rather than completing waiters
+inline, matching `unlock()`'s own reasoning above.
+
+`event_resume_node` lives in `est::detail`, not nested inside
+`counting_event<Mode>` the way `lock_resume_node` nests inside the
+non-template `mutex` - its `run()`/`destroy()` never touch `Mode` or
+anything else about the `counting_event` that enqueued them, so nesting it
+would only generate an identical type once per `Mode` instantiation for no
+reason (caught in review).
+
+`counting_event<Mode>` also takes a `max_count` (constructor argument,
+defaulted to an effectively-unbounded value): `set(n)` saturates at it -
+actually adding `min(n, max_count - count())` - rather than growing the
+count without limit, the same way `std::counting_semaphore<LeastMaxValue>`
+bounds `release()`, except saturating instead of the standard's own
+undefined-behavior-on-overflow contract. `set(n)` returns that actual
+amount (`0` for a no-op call, up to `n` otherwise) rather than `void`, so
+a caller of the base class - unlike `binary_event`/`one_shot_event`,
+which exist precisely so their own callers never have to check - can
+still tell whether a `set(n)` call was silently capped.
+`one_shot_event::set()` returns the same shape (`1` for the call that
+actually signals, `0` for a redundant one). `binary_event<Mode>` (count
+clamped to `{0, 1}`, the classic Win32 event object) is nothing more than
+a `counting_event<Mode>` constructed with `max_count = 1` - not a separate
+implementation, and no override of `set()` needed: the base class's own
+saturation at `max_count` already makes `set()` idempotent once signaled
+with no code of `binary_event`'s own (review: an earlier version gave
+`binary_event` its own no-argument `set()` that hid the base's `set(int n)`
+via plain C++ name hiding purely to reject a count past the `{0, 1}`
+clamp - `max_count` makes that hiding unnecessary, since saturation
+enforces the same clamp regardless of which overload a caller reaches).
+
+`one_shot_event<Mode>` (`set()` at most once, ever) still declares its own
+no-argument `set()`, hiding the inherited `set(int n)` from unqualified
+lookup - not a virtual override, since nothing in this hierarchy ever
+needs runtime dispatch - but for a different reason than `binary_event`
+originally had: `one_shot_event` tracks "has `set()` ever been called" in
+its own `has_been_set_` flag (`signaled()` alone can't tell "never set()"
+apart from "set() once, already consumed" for `Mode::automatic`), and a
+caller reaching the inherited `set(int n)` directly would bypass that
+flag entirely. `one_shot_event::reset()` is `= delete`d the same way,
+turning "don't call this" from a documented-but-unchecked precondition
+into a compile error.
