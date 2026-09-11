@@ -65,19 +65,22 @@ est::promise<T> — a thin, shared_ptr-backed producer/consumer pair; .then()
                    future<T> is also a coroutine's return type (no task<T>)
 ```
 
-Every future/promise pair is built via `est::make_promise_future<T>(loop&)` —
-an explicit `est::loop&` is threaded through everything (not a global
-singleton), so a caller owns exactly when and where continuations actually
-run. A caller that doesn't want to thread one through by hand can instead
-rely on `est::current_loop()` ([Loop and Timers](Loop-And-Timers.md))
-— every loop-taking function in this codebase has a matching no-`loop&`
-overload built on it. A loop only becomes "current" by an explicit
+Every future/promise pair is built via `est::make_promise_future<T>()` —
+there is no way to pass it (or `est::mutex`, `est::counting_event<Mode>`,
+`sleep_for()`/`sleep_until()`/`yield_execution()`, or a coroutine's own
+`promise_type`) an explicit `loop&` at all; every one of them resolves
+`est::current_loop()` ([Loop and Timers](Loop-And-Timers.md)) fresh, at the
+point of use, instead. A loop only becomes "current" by an explicit
 `est::make_current_loop(loop)` call (a free function, not a method on
 `est::loop` itself - deliberately kept out of `loop.cppm` entirely),
 scoped to that loop's own lifetime, not a global — except that the real
 (`estext::hosted_stdcpp`) backend also falls back to a loop of its own,
 lazily, when nothing has been explicitly registered, so `current_loop()`
-still works for a caller with no loop to register in the first place.
+still works for a caller with no loop to register in the first place. See
+[Loop and Timers](Loop-And-Timers.md) for the correctness hazard this
+design carries (and the fix for its sharpest form) and
+[Global Lookup Codegen](Global-Lookup-Codegen.md) for what it costs
+relative to the explicit-`loop&` design it replaced.
 
 `import est;` doesn't install a `platform::interface` on its own, either —
 in fact it doesn't even know a concrete backend exists. `estext` is a

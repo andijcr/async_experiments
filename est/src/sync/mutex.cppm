@@ -31,20 +31,14 @@ export namespace est {
 // through the same path any other `co_await`-of-an-already-ready-future
 // takes (`future_awaiter<T>::await_ready()`, `est:future`).
 //
-// Holds a `loop&` (same convention as future_state<T> - see that class's
-// own doc comment) rather than its own allocator: `lock()`/`acquire()`
-// each build a `future_state<T>` against it
-// (`make_promise_future<T>(loop_)`), and `unlock()`/`~mutex()` need its
-// allocator to destroy a waiter node. Same lifetime precondition as every
-// other loop-holding type in this codebase: the loop must outlive every
-// mutex constructed against it.
+// Holds no `loop&` of its own, unlike future_state<T> - every method
+// below resolves est::current_loop() fresh, at the point of use, rather
+// than caching a reference at construction time. There is no constructor
+// taking an explicit `loop&` either; a mutex is never tied to a specific
+// loop, only to whichever one is current when each operation runs.
 class mutex {
 public:
-  explicit mutex(loop& loop_ref) noexcept : loop_(loop_ref) {}
-
-  // Sugar over the constructor above using est::current_loop()
-  // (est:util.current_loop) instead of a caller-supplied loop&.
-  mutex() noexcept : mutex(current_loop()) {}
+  mutex() noexcept = default;
 
   mutex(const mutex&) = delete;
   auto operator=(const mutex&) -> mutex& = delete;
@@ -59,7 +53,9 @@ public:
   // itself silently - see lock_resume_node's own doc comment for why
   // that matters beyond just freeing the node itself.
   ~mutex() {
-    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator(), false); });
+    auto& loop_ref = current_loop();
+    waiters_.drain(
+        [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
   }
 
   [[nodiscard]] auto locked() const noexcept -> bool { return state_ != 0; }
@@ -109,9 +105,24 @@ public:
   // loop must outlive every mutex constructed against it, and a caller
   // must not let the loop keep running past a mutex's destruction while
   // a waiter is still queued on it.
+  //
+  // SECOND KNOWN LIMITATION, from not caching a loop& (this class's own
+  // doc comment): a waiter enqueued by lock()/acquire() carries an
+  // allocator and a future_state<T> built against whichever loop was
+  // current *then*. unlock() (and ~mutex(), above) instead resolve
+  // est::current_loop() fresh, *now*. If the current loop has changed
+  // in between - a caller nesting a second make_current_loop() scope
+  // around some unrelated work, say - the waiter is handed to, or
+  // destroyed through the allocator of, a different loop than the one
+  // its own future_state actually belongs to: at best a future that
+  // never resolves on the loop actually being run; at worst deallocating
+  // through the wrong memory_resource. A cached `loop&` member (what
+  // this class had before) made this hazard structurally impossible -
+  // every operation on one mutex used the one loop it was built against,
+  // full stop. Resolving current_loop() fresh does not.
   void unlock() noexcept {
     if (auto* waiter = waiters_.dequeue()) {
-      loop_.enqueue_ready(*waiter);
+      current_loop().enqueue_ready(*waiter);
       return;
     }
     state_ = 0;
@@ -130,7 +141,6 @@ public:
 
 private:
   int state_ = 0;
-  loop& loop_;
   intrusive_list<detail::ready_node> waiters_;
 };
 
@@ -180,13 +190,14 @@ private:
 };
 
 inline auto mutex::lock() -> future<void> {
-  auto [prom, fut] = make_promise_future<void>(loop_);
+  auto& loop_ref = current_loop();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
   if (state_ == 0) {
     state_ = 1;
     prom.set_value();
     return std::move(fut);
   }
-  auto* node = loop_.allocator().template new_object<lock_resume_node>(std::move(prom));
+  auto* node = loop_ref.allocator().template new_object<lock_resume_node>(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }
@@ -264,13 +275,15 @@ private:
 };
 
 inline auto mutex::acquire() -> future<lock_guard> {
-  auto [prom, fut] = make_promise_future<lock_guard>(loop_);
+  auto& loop_ref = current_loop();
+  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(loop_ref.allocator());
   if (state_ == 0) {
     state_ = 1;
     prom.set_value(lock_guard(*this));
     return std::move(fut);
   }
-  auto* node = loop_.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
+  auto* node =
+      loop_ref.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }

@@ -128,6 +128,63 @@ project-wide `-fvisibility=hidden` posture this codebase doesn't
 currently take, for a change that didn't measure faster on the path that
 matters.
 
+## Follow-up experiment: removing every cached `loop&`/allocator member
+
+The numbers above motivated a second experiment (branch
+`current-loop-only-experiment`): if `current_loop()` is this cheap to
+reach, what happens if nothing caches it any more - no `future_state<T>`
+`loop&` member, no `est::mutex`/`est::counting_event<Mode>` `loop&`
+member, no `memory_resource*` stashed alongside a coroutine frame for its
+`operator delete` to read back - and every one of those methods resolves
+`current_loop()` fresh, at the point of use, instead?
+
+**Codegen cost.** `current_loop()`/`.allocator()`/`platform::instance()`
+themselves are unchanged (re-disassembled on this branch - identical to
+the listings above) - this experiment didn't touch that mechanism, only
+who calls it and how often. What changed is the multiplier: a type like
+`est::mutex` used to pay for that lookup chain once, in its constructor,
+and store the result; now `lock()`, `unlock()`, `acquire()`, and `~mutex()`
+each pay it again, independently, every time they run. The same is true
+of `future_state<T>`'s `set_continuation()`, `allocator()`, `then()`,
+`complete()`, and `~future_state()`, and of the coroutine frame's own
+`operator new`/`operator delete`. None of this is free, even though each
+individual lookup is cheap (the ~10-instruction, 2-indirect-call chain
+measured above) - a chain of `N` `.then()` calls that used to touch a
+cached `loop&` a handful of times now re-resolves `current_loop()` once
+per method call across the whole chain.
+
+**Correctness cost - a real regression, not just a documented risk.**
+Resolving `current_loop()` fresh instead of caching a reference also
+turned a structural guarantee ("this object's loop reference is fixed at
+construction and never changes under it") into a live invariant a caller
+has to maintain by hand ("the current-loop registration must not change
+while this object, or anything it allocated, is still alive"). This
+wasn't just a theoretical hazard: it broke this codebase's own
+"destroying a loop/mutex/event with a coroutine still pending leaks
+nothing" test family outright - `SEGFAULT`/`Subprocess aborted` under
+plain `ctest`, from a coroutine frame's `operator delete` resolving
+`current_loop()` *after* `make_current_loop()`'s own RAII guard had
+already unregistered it (C++'s reverse-destruction-order rule means the
+guard, declared after the loop it guards, always unregisters before the
+loop's own destructor runs). See [Loop and Timers](Loop-And-Timers.md)'s
+"A structural hazard" section for the full mechanism and the fix
+(`loop::drain_pending()`, called by the guard before it unregisters) -
+closing it required a new public method and a real behavioral change (a
+loop's still-pending work is now destroyed as soon as it stops being
+`current_loop()`, not only when the loop itself is later destroyed), not
+just a documentation update.
+
+**Where this leaves the comparison**: the raw per-lookup cost is small and
+was already paid by every caller of the loop-taking design too (whichever
+loop a cached `loop&` member held still had to be *reached* at
+construction time via this same mechanism). What removing the cache
+actually bought is a smaller object (`future_state<T>`/`est::mutex`/
+`est::counting_event<Mode>` each shed one member) and no way to pass an
+explicit, non-current loop at all - and what it cost is repeated lookups
+on every hot-path call instead of one at construction, plus a genuine,
+previously-impossible crash that only a design-level fix (not a local
+patch) could close.
+
 ## Where this fits
 
 See [Loop and Timers](Loop-And-Timers.md) for what `current_loop()` is

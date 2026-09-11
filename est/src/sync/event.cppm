@@ -88,12 +88,18 @@ export namespace est {
 // exactly one more constraint on top of set()/wait()/reset(), reusing
 // this class's own waiters_ mechanism unchanged all the way down.
 //
-// Holds a `loop&` (same convention as future_state<T>/mutex - see
-// their own doc comments) rather than its own allocator: wait() builds a
-// future_state<void> against it, and set()/~counting_event() need its
-// allocator to enqueue/destroy waiter nodes. Same lifetime precondition
-// as every other loop-holding type in this codebase: the loop must
-// outlive every counting_event constructed against it.
+// Holds no `loop&` of its own (unlike future_state<T> - see that class's
+// own doc comment): wait()/set()/~counting_event() each resolve
+// est::current_loop() fresh, at the point of use. There is no
+// constructor taking an explicit `loop&` either. KNOWN HAZARD this
+// creates, same as est::mutex's own doc comment describes: a waiter
+// queued by wait() carries a future_state<void> built against whichever
+// loop was current *then*; set()/~counting_event() resolve
+// current_loop() fresh, *now* - if the current loop has changed in
+// between, a waiter can be handed to (or destroyed through the
+// allocator of) a different loop than the one it actually belongs to.
+// A cached `loop&` member ruled this out structurally; resolving fresh
+// does not.
 //
 // max_count bounds how high the count is ever allowed to climb: set(n)
 // (below) saturates at it rather than growing without limit, the same
@@ -113,15 +119,10 @@ export namespace est {
 // max_count = 1 - not a separate implementation.
 template <EventResetMode Mode> class counting_event {
 public:
-  explicit counting_event(loop& loop_ref, int max_count = std::numeric_limits<int>::max()) noexcept
-      : max_count_(max_count), loop_(loop_ref) {
+  explicit counting_event(int max_count = std::numeric_limits<int>::max()) noexcept
+      : max_count_(max_count) {
     check(max_count > 0, "counting_event: max_count must be positive");
   }
-
-  // Sugar over the constructor above using est::current_loop()
-  // (est:util.current_loop) instead of a caller-supplied loop&.
-  explicit counting_event(int max_count = std::numeric_limits<int>::max()) noexcept
-      : counting_event(current_loop(), max_count) {}
 
   counting_event(const counting_event&) = delete;
   auto operator=(const counting_event&) -> counting_event& = delete;
@@ -136,7 +137,9 @@ public:
   // deallocating itself silently - see its own doc comment for why that
   // matters beyond just freeing the node itself.
   ~counting_event() {
-    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator(), false); });
+    auto& loop_ref = current_loop();
+    waiters_.drain(
+        [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
   }
 
   [[nodiscard]] auto count() const noexcept -> int { return count_; }
@@ -191,16 +194,18 @@ public:
     }
     count_ += actual_n;
     if constexpr (Mode == EventResetMode::automatic) {
+      auto& loop_ref = current_loop();
       for (int i = 0; i < actual_n; ++i) {
         auto* waiter = waiters_.dequeue();
         if (waiter == nullptr) {
           break;
         }
         --count_;
-        loop_.enqueue_ready(*waiter);
+        loop_ref.enqueue_ready(*waiter);
       }
     } else {
-      waiters_.drain([this](detail::ready_node& node) { loop_.enqueue_ready(node); });
+      auto& loop_ref = current_loop();
+      waiters_.drain([&loop_ref](detail::ready_node& node) { loop_ref.enqueue_ready(node); });
     }
     return actual_n;
   }
@@ -221,7 +226,8 @@ public:
   // resuming immediately (no suspension, no allocation - see
   // future_awaiter<T>::await_ready(), est:future) if it already is.
   [[nodiscard]] auto wait() -> future<void> {
-    auto [prom, fut] = make_promise_future<void>(loop_);
+    auto& loop_ref = current_loop();
+    auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
     if (count_ > 0) {
       if constexpr (Mode == EventResetMode::automatic) {
         --count_;
@@ -229,7 +235,8 @@ public:
       prom.set_value();
       return std::move(fut);
     }
-    auto* node = loop_.allocator().template new_object<detail::event_resume_node>(std::move(prom));
+    auto* node =
+        loop_ref.allocator().template new_object<detail::event_resume_node>(std::move(prom));
     waiters_.enqueue(*node);
     return std::move(fut);
   }
@@ -237,7 +244,6 @@ public:
 private:
   int count_ = 0;
   int max_count_;
-  loop& loop_;
   intrusive_list<detail::ready_node> waiters_;
 };
 
@@ -250,16 +256,12 @@ private:
 // set()'s idempotent-once-signaled behavior for free, matching SetEvent()'s
 // own documented "calling it again before anything has consumed the
 // signal is a no-op" behavior with no code of this class's own. Only
-// adds signaled() (a named alias for count() > 0) and constructors that
-// hardcode max_count = 1 - inheriting counting_event<Mode>'s own
-// constructors via a using-declaration isn't an option here, since that
-// would also inherit their own (unbounded) max_count default.
+// adds signaled() (a named alias for count() > 0) and a constructor that
+// hardcodes max_count = 1 - inheriting counting_event<Mode>'s own
+// constructor via a using-declaration isn't an option here, since that
+// would also inherit its own (unbounded) max_count default.
 template <EventResetMode Mode> class binary_event : public counting_event<Mode> {
 public:
-  explicit binary_event(loop& loop_ref) noexcept : counting_event<Mode>(loop_ref, 1) {}
-
-  // Sugar over the constructor above using est::current_loop()
-  // (est:util.current_loop) instead of a caller-supplied loop&.
   binary_event() noexcept : counting_event<Mode>(1) {}
 
   [[nodiscard]] auto signaled() const noexcept -> bool { return this->count() > 0; }

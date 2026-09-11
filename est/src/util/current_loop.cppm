@@ -44,17 +44,29 @@ export namespace est {
 // temporarily shadows the outer" - simpler to reason about, and nothing
 // in this codebase has a legitimate reason to nest this way.
 //
-// The returned guard's cleanup lambda captures nothing (not even a
-// pointer to loop_ref): it unconditionally clears the slot back to
-// nullptr rather than reading anything off of loop_ref, so it stays
-// correct even if the guard somehow outlived the loop it was made from.
+// The returned guard's cleanup lambda calls loop_ref.drain_pending()
+// (est:loop) before clearing the slot, not just after - draining anything
+// loop_ref still has queued while it's still the registered current loop,
+// rather than leaving that for loop_ref's own destructor to find later,
+// possibly under a different (or no) current loop by then. Destroying a
+// still-suspended coroutine's resume node can itself need to destroy that
+// coroutine's frame, and a coroutine frame's operator delete always
+// resolves est::current_loop() fresh (detail::coroutine_frame_dealloc(),
+// est:future) rather than caching an allocator of its own - draining only
+// after this slot is cleared would resolve that lookup against whatever
+// loop is current *next* instead of loop_ref, silently deallocating
+// through the wrong loop's allocator. This does mean the lambda captures
+// loop_ref now (by reference, not by value) rather than nothing at all:
+// the guard must not outlive the loop it was made from, the same
+// precondition every other loop& in this codebase already carries.
 [[nodiscard]] auto make_current_loop(loop& loop_ref) noexcept {
   check(!detail::loop_is_current,
         "est::make_current_loop(): another loop is already current - only one "
         "loop can be current at a time");
   detail::loop_is_current = true;
   platform::instance().set_current_loop_context(&loop_ref);
-  return scope_exit([]() noexcept {
+  return scope_exit([&loop_ref]() noexcept {
+    loop_ref.drain_pending();
     detail::loop_is_current = false;
     platform::instance().set_current_loop_context(nullptr);
   });

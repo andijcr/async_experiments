@@ -50,23 +50,34 @@ private:
   shared_ptr<future_state<T>> state_;
 };
 
-// Constructs a fresh future_state<T> against `loop_ref` (using its
-// allocator - see future_state<T>'s own doc comment on why it holds a
-// loop& instead of an allocator directly) and returns the promise/future
-// pair that share it. This is the only way a future_state gets created -
-// promise<T>/future<T> only otherwise exist as the result of a move.
-template <class T> auto make_promise_future(loop& loop_ref) -> std::pair<promise<T>, future<T>> {
-  auto state = shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref);
+} // namespace est
+
+namespace est::detail {
+
+// Constructs a fresh future_state<T> using `allocator` and returns the
+// promise/future pair that share it. This is the only way a future_state
+// gets created - promise<T>/future<T> only otherwise exist as the result
+// of a move. Not exported: every public entry point (make_promise_future()
+// and the producer functions below) resolves est::current_loop() exactly
+// once itself and forwards its allocator here, rather than exposing a
+// second, explicit-loop&-taking public constructor alongside the
+// current-loop one - see docs/wiki/Loop-And-Timers.md for why only
+// current_loop() is the public story now.
+template <class T>
+auto make_promise_future_impl(std::pmr::polymorphic_allocator<std::byte> allocator)
+    -> std::pair<promise<T>, future<T>> {
+  auto state = shared_ptr<future_state<T>>::make(allocator);
   auto state_for_future = state; // copy bumps the ref count from 1 to 2
   return {promise<T>(std::move(state)), future<T>(std::move(state_for_future))};
 }
 
-// Sugar over the overload above using est::current_loop()
-// (est:util.current_loop) instead of a caller-supplied loop& - for a
-// caller that doesn't want to thread a loop& through by hand and is
-// content relying on whichever loop is current.
+} // namespace est::detail
+
+export namespace est {
+
+// Builds a fresh promise<T>/future<T> pair against est::current_loop().
 template <class T> auto make_promise_future() -> std::pair<promise<T>, future<T>> {
-  return make_promise_future<T>(current_loop());
+  return detail::make_promise_future_impl<T>(current_loop().allocator());
 }
 
 } // namespace est
@@ -147,58 +158,44 @@ private:
 export namespace est {
 
 // Returns a future<void> that becomes ready once `deadline` passes,
-// driven by `loop_ref`'s own timer_queue (est:loop) - the est::loop <->
-// est::future/est::promise bridge that keeps :loop itself free of any
-// dependency on est::future/est::promise (see :loop's own top comment on
-// why: :loop is the lower-level partition future_state<T> itself depends
-// on, so it cannot depend back on :future/:promise).
-[[nodiscard]] inline auto sleep_until(loop& loop_ref, loop::clock::time_point deadline)
-    -> future<void> {
-  auto [prom, fut] = make_promise_future<void>(loop_ref);
+// driven by est::current_loop()'s own timer_queue (est:loop) - the
+// est::loop <-> est::future/est::promise bridge that keeps :loop itself
+// free of any dependency on est::future/est::promise (see :loop's own
+// top comment on why: :loop is the lower-level partition future_state<T>
+// itself depends on, so it cannot depend back on :future/:promise).
+[[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
+  auto& loop_ref = current_loop();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
   auto* node = loop_ref.allocator().template new_object<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }
 
-// Sugar over the overload above using est::current_loop() instead of a caller-supplied loop&.
-[[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
-  return sleep_until(current_loop(), deadline);
-}
-
 // Returns a future<void> that becomes ready once `delay` elapses from
 // now (est::platform::instance().now(), the same clock est::timer_queue
 // itself is built on) - sugar over sleep_until() above.
-[[nodiscard]] inline auto sleep_for(loop& loop_ref, loop::clock::duration delay) -> future<void> {
-  return sleep_until(loop_ref, platform::instance().now() + delay);
-}
-
-// Sugar over the overload above using est::current_loop() instead of a caller-supplied loop&.
 [[nodiscard]] inline auto sleep_for(loop::clock::duration delay) -> future<void> {
-  return sleep_for(current_loop(), delay);
+  return sleep_until(platform::instance().now() + delay);
 }
 
-// Gives `loop_ref` the opportunity to run whatever else is already
-// ready before the calling coroutine resumes - `co_await
-// yield_execution(loop);` inside a loop that would otherwise monopolize
+// Gives est::current_loop() the opportunity to run whatever else is
+// already ready before the calling coroutine resumes - `co_await
+// yield_execution();` inside a loop that would otherwise monopolize
 // the ready-queue with back-to-back synchronous resumes (every
 // `co_await` on an already-ready future skips suspension entirely,
 // est:future's own `future_awaiter<T>::await_ready()`) lets other
 // pending work interleave instead. Re-enters ready_ directly via
-// detail::yield_resume_node rather than going through sleep_for(loop_ref,
-// 0): it has no real deadline to track, so there's no reason to pay for
-// a timer_queue heap insert/pop, pending_timers_'s own linear
-// search+erase on fire, or the platform::sleep_until() call run_impl()
-// makes before it ever checks pending_timers_.
-[[nodiscard]] inline auto yield_execution(loop& loop_ref) -> future<void> {
-  auto [prom, fut] = make_promise_future<void>(loop_ref);
+// detail::yield_resume_node rather than going through sleep_for(0): it
+// has no real deadline to track, so there's no reason to pay for a
+// timer_queue heap insert/pop, pending_timers_'s own linear search+erase
+// on fire, or the platform::sleep_until() call run_impl() makes before
+// it ever checks pending_timers_.
+[[nodiscard]] inline auto yield_execution() -> future<void> {
+  auto& loop_ref = current_loop();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
   auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
-}
-
-// Sugar over the overload above using est::current_loop() instead of a caller-supplied loop&.
-[[nodiscard]] inline auto yield_execution() -> future<void> {
-  return yield_execution(current_loop());
 }
 
 } // namespace est

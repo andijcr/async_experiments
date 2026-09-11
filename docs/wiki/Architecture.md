@@ -84,16 +84,17 @@ enforcement.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
-behind the "current loop" convenience (registering a loop as the
-one `make_promise_future()`/`sleep_for()`/a loop-less coroutine's
-`promise_type` fall back to, [The Loop and Timers](Loop-And-Timers.md)).
-Deliberately free functions in their own partition, not methods on
-`est::loop` itself: the two concerns - a primitive
-ready-queue-and-timers type, and an opt-in convenience for not threading a
-`loop&` by hand - have nothing to do with each other. Nothing unusual
-about where this partition sits, unlike `estext` below: it's an ordinary
-partition of `est` itself, free to `import :loop` directly (only
-`:platform`, and anything that must stay *below* `:loop`, can't).
+behind the "current loop" mechanism every loop-consuming function in this
+codebase (`make_promise_future()`, `sleep_for()`, `est::mutex`,
+`est::counting_event<Mode>`, a coroutine's own `promise_type`) resolves,
+unconditionally - none of them take or cache an explicit `loop&` of their
+own any more ([The Loop and Timers](Loop-And-Timers.md)). Deliberately
+free functions in their own partition, not methods on `est::loop` itself:
+a primitive ready-queue-and-timers type and this registration mechanism
+are two separate concerns. Nothing unusual about where this partition
+sits, unlike `estext` below: it's an ordinary partition of `est` itself,
+free to `import :loop` directly (only `:platform`, and anything that must
+stay *below* `:loop`, can't).
 
 ## `estext`: a second, separate module for concrete backends
 
@@ -253,7 +254,7 @@ mirrors `std::promise`/`std::future`'s own split, but goes one step further
 by making the shared state module-private — there's no way for calling code
 to name `future_state<T>` even by accident.
 
-`make_promise_future<T>(loop&)` (`est:promise`) is the *only* way a
+`make_promise_future<T>()` (`est:promise`) is the *only* way a
 `future_state<T>` gets created; `promise<T>`/`future<T>` otherwise only exist
 as the result of a move. See [Allocation Patterns](Allocation-Patterns.md)
 for exactly what that single call allocates.

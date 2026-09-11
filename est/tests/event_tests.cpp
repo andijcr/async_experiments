@@ -39,7 +39,8 @@ TEST_CASE("counting_event<automatic>: wait() on a signaled event resolves immedi
           "consumes one unit",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev;
   ev.set(2);
 
   auto fut = ev.wait();
@@ -50,7 +51,8 @@ TEST_CASE("counting_event<automatic>: wait() on a signaled event resolves immedi
 TEST_CASE("counting_event<automatic>: wait() on an unsignaled event suspends until set()",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev;
 
   auto fut = ev.wait();
   REQUIRE_FALSE(fut.ready());
@@ -70,7 +72,8 @@ TEST_CASE("counting_event<automatic>: wait() on an unsignaled event suspends unt
 TEST_CASE("counting_event<automatic>: set(n) hands off to up to n queued waiters in FIFO order",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev;
   std::vector<int> order;
 
   // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
@@ -114,7 +117,8 @@ TEST_CASE("counting_event<automatic>: set(n) hands off to up to n queued waiters
 TEST_CASE("counting_event<automatic>: set(n) with no queued waiters retains the full count",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev;
 
   ev.set(5);
   REQUIRE(ev.count() == 5);
@@ -125,7 +129,8 @@ TEST_CASE("counting_event<manual>: wait() does not consume the count - every wai
           "until reset()",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::manual> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::manual> ev;
   ev.set();
 
   auto first = ev.wait();
@@ -141,7 +146,8 @@ TEST_CASE("counting_event<manual>: wait() does not consume the count - every wai
 
 TEST_CASE("counting_event<manual>: set() wakes every currently queued waiter", "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::manual> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::manual> ev;
 
   auto fut1 = ev.wait();
   auto fut2 = ev.wait();
@@ -159,7 +165,8 @@ TEST_CASE("counting_event<manual>: set() wakes every currently queued waiter", "
 
 TEST_CASE("reset() clears the count without affecting an already-handed-off waiter", "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::manual> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::manual> ev;
 
   auto fut = ev.wait();
   ev.set();
@@ -172,9 +179,9 @@ TEST_CASE("reset() clears the count without affecting an already-handed-off wait
   REQUIRE(ev.count() == 0);
 }
 
-TEST_CASE("counting_event() with no loop argument uses est::current_loop()", "[event]") {
+TEST_CASE("counting_event() default-constructs and uses est::current_loop()", "[event]") {
   est::loop loop;
-  const auto guard = est::make_current_loop(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   est::counting_event<EventResetMode::automatic> ev;
   ev.set();
 
@@ -187,7 +194,8 @@ TEST_CASE("destroying a counting_event with a coroutine still queued on wait() l
   counting_resource resource;
   {
     est::loop loop{&resource};
-    est::counting_event<EventResetMode::automatic> ev(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    est::counting_event<EventResetMode::automatic> ev;
 
     // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
     auto coro = [](est::loop&,
@@ -212,7 +220,8 @@ TEST_CASE("binary_event<automatic>: set() is idempotent - a second set() before 
           "accumulate",
           "[event]") {
   est::loop loop;
-  est::binary_event<EventResetMode::automatic> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::binary_event<EventResetMode::automatic> ev;
 
   ev.set();
   ev.set();
@@ -227,7 +236,8 @@ TEST_CASE("binary_event<automatic>: set() is idempotent - a second set() before 
 TEST_CASE("binary_event<manual>: set() stays signaled for any number of waiters until reset()",
           "[event]") {
   est::loop loop;
-  est::binary_event<EventResetMode::manual> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::binary_event<EventResetMode::manual> ev;
 
   ev.set();
   ev.set(); // still idempotent
@@ -246,7 +256,8 @@ TEST_CASE("binary_event<manual>: set() stays signaled for any number of waiters 
 TEST_CASE("one_shot_event<manual>: a single set() satisfies every present and future waiter",
           "[event]") {
   est::loop loop;
-  est::one_shot_event<EventResetMode::manual> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::one_shot_event<EventResetMode::manual> ev;
 
   auto before = ev.wait();
   REQUIRE_FALSE(before.ready());
@@ -262,7 +273,8 @@ TEST_CASE("one_shot_event<manual>: a single set() satisfies every present and fu
 TEST_CASE("one_shot_event<automatic>: a single set() satisfies exactly the first waiter",
           "[event]") {
   est::loop loop;
-  est::one_shot_event<EventResetMode::automatic> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::one_shot_event<EventResetMode::automatic> ev;
 
   auto first = ev.wait();
   REQUIRE_FALSE(first.ready());
@@ -277,7 +289,8 @@ TEST_CASE("one_shot_event<automatic>: a single set() satisfies exactly the first
 
 TEST_CASE("one_shot_event: a second set() is a no-op, not a checked failure", "[event]") {
   est::loop loop;
-  est::one_shot_event<EventResetMode::manual> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::one_shot_event<EventResetMode::manual> ev;
 
   ev.set();
   ev.set(); // must not abort - independent callers may race to fire the same signal
@@ -292,8 +305,9 @@ TEST_CASE("one_shot_event: a second set() is a no-op, not a checked failure", "[
 TEST_CASE("counting_event: max_count() reflects the constructed value, unbounded by default",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> unbounded(loop);
-  est::counting_event<EventResetMode::automatic> bounded(loop, 3);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> unbounded;
+  est::counting_event<EventResetMode::automatic> bounded(3);
 
   REQUIRE(unbounded.max_count() == std::numeric_limits<int>::max());
   REQUIRE(bounded.max_count() == 3);
@@ -303,7 +317,8 @@ TEST_CASE("counting_event<automatic>: set(n) saturates at max_count instead of g
           "limit",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop, 3);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev(3);
 
   ev.set(10); // only 3 units actually fit
   REQUIRE(ev.count() == 3);
@@ -316,7 +331,8 @@ TEST_CASE("counting_event<automatic>: set(n) saturating at max_count still only 
           "many waiters as actually fit",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop, 2);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev(2);
   std::vector<int> order;
 
   // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
@@ -350,7 +366,8 @@ TEST_CASE("counting_event<automatic>: set(n) saturating at max_count still only 
 
 TEST_CASE("counting_event<manual>: set(n) saturates at max_count too", "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::manual> ev(loop, 2);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::manual> ev(2);
 
   ev.set(10);
   REQUIRE(ev.count() == 2);
@@ -358,8 +375,9 @@ TEST_CASE("counting_event<manual>: set(n) saturates at max_count too", "[event]"
 
 TEST_CASE("binary_event<Mode>: max_count() is always 1", "[event]") {
   est::loop loop;
-  est::binary_event<EventResetMode::automatic> automatic_ev(loop);
-  est::binary_event<EventResetMode::manual> manual_ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::binary_event<EventResetMode::automatic> automatic_ev;
+  est::binary_event<EventResetMode::manual> manual_ev;
 
   REQUIRE(automatic_ev.max_count() == 1);
   REQUIRE(manual_ev.max_count() == 1);
@@ -367,7 +385,8 @@ TEST_CASE("binary_event<Mode>: max_count() is always 1", "[event]") {
 
 TEST_CASE("counting_event<automatic>: set(n) returns the amount actually added", "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev;
 
   REQUIRE(ev.set(5) == 5);
   REQUIRE(ev.count() == 5);
@@ -377,7 +396,8 @@ TEST_CASE("counting_event<automatic>: set(n) returns the saturated amount, not n
           "max_count",
           "[event]") {
   est::loop loop;
-  est::counting_event<EventResetMode::automatic> ev(loop, 3);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev(3);
 
   REQUIRE(ev.set(10) == 3); // only 3 units actually fit
   REQUIRE(ev.set(10) == 0); // already full - nothing left to add
@@ -386,7 +406,8 @@ TEST_CASE("counting_event<automatic>: set(n) returns the saturated amount, not n
 TEST_CASE("one_shot_event: set() returns 1 for the call that actually signals, 0 after",
           "[event]") {
   est::loop loop;
-  est::one_shot_event<EventResetMode::manual> ev(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::one_shot_event<EventResetMode::manual> ev;
 
   REQUIRE(ev.set() == 1);
   REQUIRE(ev.set() == 0);

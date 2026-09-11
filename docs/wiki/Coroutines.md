@@ -20,8 +20,8 @@ Instead, `est::future<T>` itself is the coroutine return type, via a
 `future<T>::promise_type` nested class. A function can be written as:
 
 ```cpp
-est::future<int> read_and_double(est::loop& loop_ref, int input) {
-  co_await est::sleep_for(loop_ref, 10ms);
+est::future<int> read_and_double(int input) {
+  co_await est::sleep_for(10ms);
   co_return input * 2;
 }
 ```
@@ -33,87 +33,65 @@ of `sleep_for()`/`then()` chains. A caller genuinely cannot tell, from the
 type alone or from calling-stack behavior, whether a `future<T>` came from a
 coroutine or from ordinary continuation-passing code. That's the point.
 
-## The calling convention: `est::loop&` first, or `est::current_loop()`
+## The calling convention: always `est::current_loop()`
 
-An `est::future<T>`-returning coroutine function can take `est::loop&` as
-its first parameter - what `future<T>::promise_type`'s constructor and
-`operator new` originally, and still, pattern-match against, via C++20's
-"promise constructor arguments" rule: the compiler tries to construct
-`promise_type` from the same argument list the coroutine was actually
-called with, before ever falling back to a default constructor.
+An `est::future<T>`-returning coroutine function never takes an explicit
+`loop&` that `promise_type` actually reads - `current_loop()`
+([The Loop and Timers](Loop-And-Timers.md) - a free function, not a
+method on `est::loop` itself, deliberately kept out of `loop.cppm`
+entirely) is the only loop `promise_type` ever builds against, whatever
+parameter list the coroutine function itself declares:
 
 ```cpp
 class promise_type : public detail::future_promise_result<T> {
 public:
   template <class... Args>
-  explicit promise_type(loop& loop_ref, Args&... /*unused*/)
-      : detail::future_promise_result<T>(
-            shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)) {}
+  explicit promise_type(Args&... /*unused*/) : detail::future_promise_result<T>(make_state()) {}
   ...
   template <class... Args>
-  static auto operator new(std::size_t size, loop& loop_ref, Args&... /*unused*/) -> void* {
-    return detail::coroutine_frame_alloc(size, loop_ref.allocator());
+  static auto operator new(std::size_t size, Args&... /*unused*/) -> void* {
+    return detail::coroutine_frame_alloc(size, current_loop().allocator());
   }
   static void operator delete(void* ptr, std::size_t size) noexcept {
     detail::coroutine_frame_dealloc(ptr, size);
   }
+
+private:
+  static auto make_state() -> shared_ptr<future_state<T>> {
+    return shared_ptr<future_state<T>>::make(current_loop().allocator());
+  }
 };
 ```
 
-The trailing `Args&...` pack exists purely so this constructor/`operator
-new` pair matches *whatever else* the actual coroutine function declares
-(`read_and_double`'s `int input` above, say) — the pack is never read;
-`loop_ref` itself isn't stored either, only used here to build `state_`.
+The trailing `Args&...` pack exists purely so this one constructor/
+`operator new` pair matches *whatever* the actual coroutine function
+declares (`read_and_double`'s `int input` above, say, or nothing at all)
+via C++20's "promise constructor arguments" rule (the compiler tries to
+construct `promise_type` from the same argument list the coroutine was
+actually called with, before ever falling back to a default
+constructor) - the arguments themselves are never read.
 
-There are also two more ways to write a coroutine, for a caller
-content relying on whichever loop is current (`est::current_loop()`,
-[The Loop and Timers](Loop-And-Timers.md) - a free function, not a method
-on `est::loop` itself, deliberately kept out of `loop.cppm` entirely)
-instead of threading one through by hand - no `est::loop&` parameter at
-all, or no parameters whatsoever:
-
-```cpp
-template <class First, class... Rest>
-  requires(!std::same_as<std::remove_cvref_t<First>, loop>)
-explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(current_loop()) {}
-
-promise_type() : promise_type(current_loop()) {}
-```
-
-Both delegate to the `loop&`-taking constructor above rather than
-repeating its initializer, so all three constructors
-share the one place that actually builds `state_`. That constructor is
-already a template accepting an empty `Args...` pack, so
-`promise_type(current_loop())` (a single `loop&` argument) already
-matches it directly; the `requires`-constrained constructor is correctly
-excluded from that call by its own clause, since the argument's type
-genuinely is `loop`.
-
-(plus the matching `operator new` pair, same shapes - not delegated the
-same way, since each was already a single-line call straight to
-`detail::coroutine_frame_alloc()`, with nothing left to deduplicate). The
-`requires`
-clause on the first is load-bearing, not decoration: without it, this
-constructor and the `loop&`-taking one above would be genuinely
-ambiguous for a call that *does* pass a loop first - a bare parameter
-pack happily absorbs a leading `loop&` into `Rest` itself, so both
-candidates would deduce to the identical actual parameter list
-`(loop&, Rest&...)` for such a call, a tie conversion ranking alone
-can't break. Excluding a leading `loop&` specifically (`std::same_as`,
-matching the exact-type match the constructor above already relies on,
-not a broader "convertible to") keeps the two mutually exclusive by
-SFINAE instead of relying on any partial-ordering tie-break. A coroutine
-taking no parameters at all needs its own non-template overload, since
-the constrained one above still requires at least one `First`.
-
-There's no default constructor with no `requires` clause at all - a
-future<T>-returning coroutine always resolves to exactly one of the
-three shapes above, based purely on its own parameter list, never
-silently misbehaving.
+This used to be three constructor/`operator new` pairs, resolved by
+overload/SFINAE dispatch on whether the coroutine's first parameter was
+exactly `est::loop&`: one pattern-matched a leading `loop&` and built
+`future_state<T>` against it directly, the other two fell back to
+`current_loop()`. Collapsing to the single shape above is itself the
+result of an experiment (branch `current-loop-only-experiment`) that
+removed every explicit-`loop&`-taking constructor/factory function across
+this codebase, in favor of resolving `current_loop()` everywhere - see
+[Loop and Timers](Loop-And-Timers.md) for the correctness hazard that
+surfaced from it and the fix, and
+[Global Lookup Codegen](Global-Lookup-Codegen.md) for the codegen
+comparison. One real, deliberately-left-visible consequence: a coroutine
+function can still declare an `est::loop&` first parameter (existing code
+that predates the collapse does, in several places) - `promise_type`'s
+`Args&...` pack still matches it, it's just silently ignored now instead
+of read. Nothing catches a caller passing a `loop&` that isn't actually
+`est::current_loop()` here.
 
 `promise_type` doesn't hold its own `est::promise<T>` at all: it builds a
 `shared_ptr<future_state<T>>` directly (the same call
-`make_promise_future<T>(loop&)` makes internally) and talks to it straight
+`make_promise_future<T>()` makes internally) and talks to it straight
 through `return_value()`/`return_void()`/`unhandled_exception()`. A
 coroutine's `promise_type` *is* the producer side — `est::promise<T>` stays
 exactly as it was, for the non-coroutine producer path (`sleep_for()`, or
@@ -160,9 +138,10 @@ stack, up to its first genuine suspension point (a real `co_await` on
 something not yet ready) or all the way to `co_return`/an uncaught
 exception if it never awaits anything at all — exactly like an ordinary
 function computing a value before handing back a `future<T>`. A
-`[](loop&) -> future<int> { co_return 42; }` coroutine, for instance, never
-touches `est::loop` at all: the call returns an already-`ready()` future
-directly, no `run_until_idle()` needed to observe it.
+`[]() -> future<int> { co_return 42; }` coroutine, for instance, never
+touches its loop at all beyond the frame allocation itself: the call
+returns an already-`ready()` future directly, no `run_until_idle()`
+needed to observe it.
 
 A coroutine's synchronous prefix, up to its first real suspension point,
 is conceptually the same as the work an ordinary function does before
@@ -371,7 +350,7 @@ clever-looking fixes:
   void set_continuation(continuation_node& node) {
     if (ready()) {
       node.bind_owner(this->shared_from_this());
-      loop_.enqueue_ready(node);
+      current_loop().enqueue_ready(node);
       return;
     }
     waiters_.enqueue(node);
@@ -412,10 +391,10 @@ Because `co_await` works uniformly on any `future<T>`, a coroutine can await
 another coroutine's result directly:
 
 ```cpp
-est::future<int> inner(est::loop& loop_ref, int x) { co_return x * 2; }
+est::future<int> inner(int x) { co_return x * 2; }
 
-est::future<int> outer(est::loop& loop_ref) {
-  const int value = co_await inner(loop_ref, 21);
+est::future<int> outer() {
+  const int value = co_await inner(21);
   co_return value + 1;
 }
 ```
@@ -423,14 +402,14 @@ est::future<int> outer(est::loop& loop_ref) {
 or a `then()`-chain future built by ordinary, non-coroutine code:
 
 ```cpp
-auto [promise, future] = est::make_promise_future<int>(loop);
+auto [promise, future] = est::make_promise_future<int>();
 auto chained = future.then([](int v) { return v + 1; });
 
-est::future<int> coro(est::loop&, est::future<int> fut) {
+est::future<int> coro(est::future<int> fut) {
   const int value = co_await std::move(fut);
   co_return value * 10;
 }
-coro(loop, std::move(chained));
+coro(std::move(chained));
 ```
 
 Neither `inner`'s caller nor `chained`'s consumer needs to know or care that
@@ -440,10 +419,13 @@ the other side is a coroutine.
 
 Every resumption node's `destroy()` is called two ways: after a successful
 `run()`/`invoke()` (the normal case, described above), or by
-`future_state<T>::~future_state()`/`loop::~loop()` draining whatever's left
-when a `future_state`/`loop` is torn down without ever completing/draining
-(the same abandoned-future scenario the node hierarchy already handles for
-`then()`'s own continuation nodes). Freeing only the resumption node
+`future_state<T>::~future_state()`/`loop::drain_pending()` (called both by
+`~loop()` and by `make_current_loop()`'s own returned guard - see
+[Loop and Timers](Loop-And-Timers.md) for why the guard needs to call it
+too) draining whatever's left when a `future_state`/`loop` is torn down
+without ever completing/draining (the same abandoned-future scenario the
+node hierarchy already handles for `then()`'s own continuation nodes).
+Freeing only the resumption node
 itself in that second case, never the coroutine frame the handle points
 to, would permanently leak it. Each resumption node's
 `destroy()` is told whether it ever actually ran, to tell the two cases
@@ -500,18 +482,25 @@ already applied, before it was ever inspected; a bespoke fast path for
 `lock()` alone would break that guarantee:
 
 ```cpp
-[[nodiscard]] auto lock() -> future<void> {
-  auto [prom, fut] = make_promise_future<void>(loop_);
+auto mutex::lock() -> future<void> {
+  auto& loop_ref = current_loop();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
   if (state_ == 0) {
     state_ = 1;
     prom.set_value();               // fast path: uncontended, acquire immediately
     return std::move(fut);
   }
-  auto* node = loop_.allocator().template new_object<lock_resume_node>(std::move(prom));
+  auto* node = loop_ref.allocator().template new_object<lock_resume_node>(std::move(prom));
   waiters_.enqueue(*node);          // slow path: queue a heap-allocated resume node
   return std::move(fut);
 }
 ```
+
+`mutex` holds no `loop&` of its own to build `state_` against (nor does
+`future_state<T>` any more) - `current_loop()` is resolved once, right
+here, and reused for both the promise/future pair and the resume node's
+allocation. See [Loop and Timers](Loop-And-Timers.md) for what that
+"resolve fresh, don't cache" design costs and the hazard it introduces.
 
 `co_await mutex.lock();` works because `future<T>` is awaitable from any
 coroutine (`operator co_await()`, above) - and since
@@ -540,7 +529,7 @@ lock/unlock in turn) rather than clearing the lock word first:
 ```cpp
 void unlock() noexcept {
   if (auto* waiter = waiters_.dequeue()) {
-    loop_.enqueue_ready(*waiter);   // ownership passes directly - no window where it reads free
+    current_loop().enqueue_ready(*waiter);   // ownership passes directly - no window where it reads free
     return;
   }
   state_ = 0;
@@ -609,14 +598,16 @@ them for a caller who'd rather not have to remember the matching
 `unlock()` call:
 
 ```cpp
-[[nodiscard]] auto acquire() -> future<lock_guard> {
-  auto [prom, fut] = make_promise_future<lock_guard>(loop_);
+auto mutex::acquire() -> future<lock_guard> {
+  auto& loop_ref = current_loop();
+  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(loop_ref.allocator());
   if (state_ == 0) {
     state_ = 1;
     prom.set_value(lock_guard(*this));
     return std::move(fut);
   }
-  auto* node = loop_.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
+  auto* node =
+      loop_ref.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }
@@ -625,14 +616,11 @@ them for a caller who'd rather not have to remember the matching
 `lock_guard` is a move-only handle (`future<T>`/`promise<T>`'s own
 convention) whose destructor calls `unlock()` — suppressed after a move,
 the same "empty after move" contract `shared_ptr<T>` already documents.
-`acquire()` is deliberately *not* a coroutine itself: every `future<T>`-
-returning coroutine in this codebase takes `est::loop&` as an explicit
-first parameter (the calling-convention section above), which would make
-`co_await mutex.acquire()` an oddly-shaped call for something `mutex`
-already has its own `loop&` for internally. Instead it's built the same
+`acquire()` is deliberately *not* a coroutine itself: it's built the same
 way `lock()` is - no coroutine frame, no `promise_type`, just a plain
-function that either completes the promise immediately (the fast path) or
-queues a waiter node that completes it later.
+function that resolves `current_loop()` once and either completes the
+promise immediately (the fast path) or queues a waiter node that
+completes it later.
 
 `acquire_resume_node` sits in the exact same `waiters_` list
 `lock_resume_node` does (`intrusive_list<detail::ready_node>` doesn't care
@@ -659,7 +647,7 @@ than calling `run()`/`destroy()` on it directly:
 ```cpp
 void unlock() noexcept {
   if (auto* waiter = waiters_.dequeue()) {
-    loop_.enqueue_ready(*waiter);
+    current_loop().enqueue_ready(*waiter);
     return;
   }
   state_ = 0;
@@ -711,9 +699,13 @@ limitation rather than something either design fully solves:
 > outlives that mutex and keeps running during the gap, since `~mutex()`
 > itself drains `waiters_` via `destroy()`, never `run()` - that waiter's
 > eventual `run()` constructs a `lock_guard` over an already-dangling
-> `mutex&`. Precondition instead of a fix: the loop must outlive every
-> mutex constructed against it, and a caller must not let the loop keep
-> running past a mutex's destruction while a waiter is still queued on it.
+> `mutex&`. Precondition instead of a fix: whichever loop is current for
+> `unlock()` must outlive every mutex whose waiters it enqueues, and a
+> caller must not let that loop keep running past a mutex's destruction
+> while a waiter is still queued on it. `mutex` itself carries a second,
+> related hazard now that it resolves `current_loop()` fresh rather than
+> holding a `loop&` of its own - see its own doc comment
+> (`est/src/sync/mutex.cppm`) and [Loop and Timers](Loop-And-Timers.md).
 
 ### `est::counting_event<Mode>` reuses this pattern unchanged
 
@@ -721,14 +713,15 @@ limitation rather than something either design fully solves:
 semaphore, `Mode` selecting whether a successful `wait()` consumes one unit
 of the count or leaves it alone - the classic Win32 auto-reset/manual-reset
 distinction, generalized past a plain boolean) is built from exactly the
-pieces above: a `loop&`, an `intrusive_list<detail::ready_node> waiters_`,
-and `detail::event_resume_node final : public ready_node` whose `destroy()`
+pieces above: an `intrusive_list<detail::ready_node> waiters_` (no `loop&`
+member, same as `mutex` - see the previous section), and
+`detail::event_resume_node final : public ready_node` whose `destroy()`
 completes an abandoned `promise<void>` with an exception for the identical
 reason `lock_resume_node`'s own doc comment gives - a
 coroutine suspended in `co_await event.wait()` holds the `future_state<void>`
 alive across the suspension, reachable only through that promise. `set()`
-defers through `loop.enqueue_ready()` rather than completing waiters
-inline, matching `unlock()`'s own reasoning above.
+resolves `current_loop()` and defers through its `enqueue_ready()` rather
+than completing waiters inline, matching `unlock()`'s own reasoning above.
 
 `event_resume_node` lives in `est::detail`, not nested inside
 `counting_event<Mode>` the way `lock_resume_node` nests inside the

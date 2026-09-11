@@ -126,59 +126,26 @@ template <class T> class future_awaiter;
 // on it, so one shared implementation covers every T.
 //
 // operator delete only ever gets the frame's size back, never the
-// allocator that built it, so the memory_resource* actually used has to
-// be stashed somewhere operator delete can still find it - immediately
-// past the frame itself, the pattern cppreference's own coroutine page
-// documents for a stateful allocator ("Dynamic memory allocation for
-// coroutine state").
+// allocator that built it. Rather than stash a memory_resource* alongside
+// the frame for operator delete to read back, coroutine_frame_dealloc()
+// below simply resolves est::current_loop().allocator() fresh - the same
+// "no cached state, look it up at the point of use" design this whole
+// experiment applies elsewhere (future_state<T>, est::mutex,
+// est::counting_event). This carries the same cross-loop hazard those
+// carry, sharpened here: std::pmr::memory_resource::deallocate() requires
+// the *same resource instance* that performed the allocation, not merely
+// an equivalent one, so a coroutine allocated while one loop was current
+// and destroyed after a *different* loop became current is undefined
+// behavior, not just misrouted bookkeeping. Callers must not let a
+// coroutine outlive the current-loop registration it was created under.
 [[nodiscard]] inline auto
 coroutine_frame_alloc(std::size_t size, std::pmr::polymorphic_allocator<std::byte> allocator)
     -> void* {
-  using resource_ptr = std::pmr::memory_resource*;
-  // alignof(std::max_align_t), not std::max()'d (or std::min()'d) with
-  // anything: the standard guarantees max_align_t's alignment is at least
-  // as strict as every scalar type's, resource_ptr (a plain pointer)
-  // included, so it alone already covers the trailing resource_ptr's
-  // alignment. It also has to stand in for the coroutine frame's own
-  // alignment requirement, which this function has no way to query
-  // directly (the compiler passes only size, not alignment, to a custom
-  // promise_type::operator new) - std::min(alignof(resource_ptr), ...)
-  // would silently under-align the frame itself relative to whatever the
-  // compiler assumes, undefined behavior for any frame needing more than
-  // pointer alignment (which is the common case).
-  constexpr std::size_t align = alignof(std::max_align_t);
-  const std::size_t padded_size = (size + align - 1) / align * align;
-  auto* const resource = allocator.resource();
-  void* const frame = resource->allocate(padded_size + sizeof(resource_ptr), align);
-  // Placement-news the resource pointer into the padding just past the
-  // frame - the pointer arithmetic below is exactly the documented
-  // layout this pair of functions establishes, not an out-of-bounds risk
-  // (padded_size + sizeof(resource_ptr) bytes were just allocated for
-  // precisely this).
-  // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-pointer-arithmetic)
-  ::new (static_cast<std::byte*>(frame) + padded_size) resource_ptr(resource);
-  return frame;
+  return allocator.resource()->allocate(size, alignof(std::max_align_t));
 }
 
 inline void coroutine_frame_dealloc(void* frame, std::size_t size) noexcept {
-  using resource_ptr = std::pmr::memory_resource*;
-  // Must recompute the identical align/padded_size coroutine_frame_alloc()
-  // used - see that function's own comment on why this is
-  // alignof(std::max_align_t) alone, not std::max()'d or std::min()'d with
-  // anything.
-  constexpr std::size_t align = alignof(std::max_align_t);
-  const std::size_t padded_size = (size + align - 1) / align * align;
-  // Reads back the memory_resource* coroutine_frame_alloc() stashed just
-  // past the frame - safe by construction, not by RTTI (the
-  // reinterpret_cast) or out of bounds (the pointer arithmetic): every
-  // frame ever handed back by coroutine_frame_alloc() has one there, at
-  // exactly this offset.
-  // NOLINTBEGIN(cppcoreguidelines-pro-type-reinterpret-cast,cppcoreguidelines-pro-bounds-pointer-arithmetic)
-  auto* const resource_addr =
-      reinterpret_cast<resource_ptr*>(static_cast<std::byte*>(frame) + padded_size);
-  // NOLINTEND(cppcoreguidelines-pro-type-reinterpret-cast,cppcoreguidelines-pro-bounds-pointer-arithmetic)
-  std::pmr::memory_resource* const resource = *resource_addr;
-  resource->deallocate(frame, padded_size + sizeof(resource_ptr), align);
+  current_loop().allocator().resource()->deallocate(frame, size, alignof(std::max_align_t));
 }
 
 // A placeholder "success" alternative for future_state<void>'s result_
@@ -282,25 +249,21 @@ namespace est {
 // class here would be destroyed through the wrong type's destructor the
 // moment its own ref count reached zero.
 //
-// Holds a reference to the est::loop it was created against rather than
-// its own allocator - the allocator it uses is simply the loop's
-// (loop_.allocator()), an explicit dependency threaded
-// through make_promise_future(loop&) (est:promise) rather than a global
-// singleton like est::platform::instance(): unlike platform, a loop
-// carries real mutable state (its ready-queue, pending timers) a shared
-// global would accumulate cross-test contamination in.
+// Holds no est::loop reference of its own: every method below that needs
+// one (the destructor, set_continuation(), allocator(), then(),
+// complete()) resolves est::current_loop() (est:util.current_loop) fresh,
+// at the point of use, instead of caching a loop& member set once at
+// construction.
 //
-// Precondition, for the lifetime of every future_state (and therefore
-// every promise<T>/future<T>/then()-chain) built against a given loop:
-// that loop must outlive all of them. There is no way to check this at
-// runtime the way est::check() guards other preconditions elsewhere in
-// this codebase (a dangling reference can't be tested for validity) - a
-// caller returning a future/promise from a function whose loop is a
-// local variable, or otherwise letting one outlive its loop, gets
-// undefined behavior on the very next touch of loop_ (allocator(),
-// set_continuation(), even this class's own destructor). Callers must
-// arrange loop lifetime themselves; est::loop's own doc comment
-// (est:loop) describes the same dependency from the loop's side.
+// KNOWN HAZARD: because the loop is looked up fresh each time rather than
+// fixed at construction, a future_state created while one loop is current
+// can end up enqueuing to, or deallocating waiters via, a *different*
+// loop if the current-loop registration changes between two calls that
+// touch the same future_state (e.g. a continuation registered under loop
+// A completing after loop B has become current). A cached loop& member
+// made this structurally impossible; resolving fresh does not. Callers
+// are responsible for not interleaving distinct est::loop registrations
+// across the lifetime of a single future_state/promise/future chain.
 template <class T> class future_state final : public ref_counted {
 public:
   using continuation_node = detail::continuation_node<T>;
@@ -312,14 +275,13 @@ public:
 
   // `allocator`: forwarded straight to ref_counted's own constructor, not
   // used for anything else here - this class already gets its own
-  // allocator on demand via loop_.allocator() (see allocator() below).
-  // shared_ptr<future_state>::make()'s intrusive specialization (this
-  // class inherits est::ref_counted, est:util.shared_ptr) always passes
-  // it as this constructor's first argument automatically; a caller of
-  // make_promise_future() never spells it out.
-  explicit future_state(std::pmr::polymorphic_allocator<std::byte> allocator,
-                        loop& loop_ref) noexcept
-      : ref_counted(allocator), loop_(loop_ref) {}
+  // allocator on demand via current_loop().allocator() (see allocator()
+  // below). shared_ptr<future_state>::make()'s intrusive specialization
+  // (this class inherits est::ref_counted, est:util.shared_ptr) always
+  // passes it as this constructor's first argument automatically; a
+  // caller of make_promise_future() never spells it out.
+  explicit future_state(std::pmr::polymorphic_allocator<std::byte> allocator) noexcept
+      : ref_counted(allocator) {}
 
   future_state(const future_state&) = delete;
   auto operator=(const future_state&) -> future_state& = delete;
@@ -334,7 +296,9 @@ public:
   // still-pending nodes are simply unreachable once this future_state
   // itself is gone - a permanent leak, not just a skipped notification.
   ~future_state() {
-    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator(), false); });
+    auto& loop_ref = current_loop();
+    waiters_.drain(
+        [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
   }
 
   void set_value()
@@ -382,7 +346,7 @@ public:
   void set_continuation(continuation_node& node) {
     if (ready()) {
       node.bind_owner(this->shared_from_this());
-      loop_.enqueue_ready(node);
+      current_loop().enqueue_ready(node);
       return;
     }
     waiters_.enqueue(node);
@@ -486,7 +450,7 @@ public:
   }
 
   [[nodiscard]] auto allocator() const noexcept -> std::pmr::polymorphic_allocator<std::byte> {
-    return loop_.allocator();
+    return current_loop().allocator();
   }
 
   // Registers fn to run once ready. Two calling conventions, chosen by
@@ -528,12 +492,12 @@ public:
   template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
-    auto downstream =
-        shared_ptr<future_state<downstream_value_type>>::make(loop_.allocator(), loop_);
+    auto& loop_ref = current_loop();
+    auto downstream = shared_ptr<future_state<downstream_value_type>>::make(loop_ref.allocator());
     auto downstream_for_node = downstream; // copy: the node keeps its own reference too
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-    auto* node = loop_.allocator().template new_object<node_type>(std::forward<Fn>(fn),
-                                                                  std::move(downstream_for_node));
+    auto* node = loop_ref.allocator().template new_object<node_type>(
+        std::forward<Fn>(fn), std::move(downstream_for_node));
     set_continuation(*node);
     return future<downstream_value_type>(std::move(downstream));
   }
@@ -693,7 +657,8 @@ private:
   // every other reference to it (promise, future) is dropped in the
   // meantime.
   void complete() {
-    waiters_.drain([this](detail::ready_node& node) {
+    auto& loop_ref = current_loop();
+    waiters_.drain([this, &loop_ref](detail::ready_node& node) {
       // Safe by construction: every node ever enqueued here arrived
       // through set_continuation(continuation_node&) below, never
       // anything else, so it's always actually a continuation_node -
@@ -705,11 +670,10 @@ private:
       // NOLINTNEXTLINE(cppcoreguidelines-pro-type-static-cast-downcast)
       auto& typed_node = static_cast<continuation_node&>(node);
       typed_node.bind_owner(this->shared_from_this());
-      loop_.enqueue_ready(typed_node);
+      loop_ref.enqueue_ready(typed_node);
     });
   }
 
-  loop& loop_;
   // detail::ready_node, not continuation_node (the more specific type
   // set_continuation() below actually enqueues) - deliberately: this
   // future_state<T> is what continuation_node<T>::owner_ itself holds a
@@ -886,67 +850,28 @@ public:
   [[nodiscard]] auto operator co_await() noexcept -> detail::future_awaiter<T>;
 
   // The compiler-generated glue for a coroutine whose return type is
-  // est::future<T> - `est::future<int> foo(est::loop& loop_ref, ...) {
-  // co_await ...; co_return 42; }`. Deliberately not a separate task<T>
-  // wrapper type: the whole point is that a caller of foo() gets back a
-  // plain est::future<int>, indistinguishable from one built out of
-  // sleep_for()/then() chains - nothing about future<T>'s own interface
-  // changes; this class only exists for the compiler's coroutine
-  // machinery to find via the standard promise_type protocol.
+  // est::future<T> - `est::future<int> foo(...) { co_await ...; co_return
+  // 42; }`. Deliberately not a separate task<T> wrapper type: the whole
+  // point is that a caller of foo() gets back a plain est::future<int>,
+  // indistinguishable from one built out of sleep_for()/then() chains -
+  // nothing about future<T>'s own interface changes; this class only
+  // exists for the compiler's coroutine machinery to find via the
+  // standard promise_type protocol.
   //
-  // A coroutine function may take est::loop& as its first parameter -
-  // both this constructor and operator new below are templated to match
-  // it (plus however many further parameters the actual coroutine
-  // function takes) via the standard's "promise constructor arguments"/
-  // allocator-argument matching, which tries building promise_type from
-  // the coroutine call's own argument list before ever falling back to a
-  // default constructor. Or it may take no loop& at all - a second
-  // constructor/operator new pair below falls back to
-  // est::current_loop() (est:util.current_loop) instead, for a caller
-  // content relying on whichever loop is current rather than threading
-  // one through by hand. Or it may take no parameters
-  // whatsoever - a third, non-template pair covers that case, since a
-  // bare parameter pack can't match zero arguments against "at least one
-  // parameter."
+  // Always built against est::current_loop() (est:util.current_loop),
+  // whatever parameters the coroutine function itself takes - there is
+  // no way to pass this class an explicit `loop&` at all. The single
+  // constructor/operator new pair below is templated on an arbitrary
+  // (possibly empty) `Args&...` pack purely so it matches whatever
+  // parameter list the actual coroutine function declares, per the
+  // standard's "promise constructor arguments" rule (the compiler tries
+  // building promise_type from the coroutine call's own argument list
+  // before ever falling back to a default constructor) - the arguments
+  // themselves are never read.
   class promise_type : public detail::future_promise_result<T> {
   public:
-    // Args&... /*unused*/: only loop_ref is ever read - the pack exists
-    // purely so this constructor matches whatever further parameters the
-    // actual coroutine function declares, per the "promise constructor
-    // arguments" rule this whole design relies on (see this class's own
-    // doc comment above). loop_ref itself isn't stored - it's only ever
-    // needed here, to build state_; nothing in this class touches it
-    // again after construction.
     template <class... Args>
-    explicit promise_type(loop& loop_ref, Args&... /*unused*/)
-        : detail::future_promise_result<T>(
-              shared_ptr<future_state<T>>::make(loop_ref.allocator(), loop_ref)) {}
-
-    // A coroutine whose own first parameter isn't est::loop& falls back
-    // to est::current_loop() instead. Constrained to exclude a leading
-    // loop& specifically (std::same_as, not a broader "convertible to" -
-    // matching the exact-type match the constructor above already relies
-    // on) so this never competes with it for a call that *does* pass
-    // one: without the constraint, both constructors would deduce to the
-    // identical actual parameter list for such a call ((loop&, Rest&...)
-    // either way, since a bare parameter pack happily absorbs a leading
-    // loop& into Rest itself) - an ambiguity conversion ranking alone
-    // can't break, since the two candidates would be indistinguishable
-    // by it.
-    //
-    // Delegates to the constructor above (Args deduced empty) rather
-    // than repeating its body, so all three constructors share the one
-    // place that actually builds state_. current_loop()'s own
-    // precondition (a loop must actually be current) is checked exactly
-    // once either way.
-    template <class First, class... Rest>
-      requires(!std::same_as<std::remove_cvref_t<First>, loop>)
-    explicit promise_type(First& /*unused*/, Rest&... /*unused*/) : promise_type(current_loop()) {}
-
-    // A coroutine taking no parameters at all - the constructor above
-    // needs at least one (First is not optional), so this needs its own,
-    // non-template overload. Delegates the same way.
-    promise_type() : promise_type(current_loop()) {}
+    explicit promise_type(Args&... /*unused*/) : detail::future_promise_result<T>(make_state()) {}
 
     promise_type(const promise_type&) = delete;
     auto operator=(const promise_type&) -> promise_type& = delete;
@@ -987,29 +912,21 @@ public:
 
     // pmr-aware coroutine frame allocation - see
     // detail::coroutine_frame_alloc()/coroutine_frame_dealloc()'s own
-    // doc comment. Three overloads mirroring the three constructors
-    // above, matched against the exact same argument list by the same
-    // "promise constructor arguments" rule - the compiler picks whichever
-    // operator new and whichever constructor line up with the coroutine
-    // call's own arguments together, so these always agree on which loop
-    // to use.
+    // doc comment. Templated on an arbitrary (possibly empty) Args&...
+    // pack for the same "promise constructor arguments" reason the
+    // constructor above is - always allocates against est::current_loop().
     template <class... Args>
-    static auto operator new(std::size_t size, loop& loop_ref, Args&... /*unused*/) -> void* {
-      return detail::coroutine_frame_alloc(size, loop_ref.allocator());
-    }
-
-    template <class First, class... Rest>
-      requires(!std::same_as<std::remove_cvref_t<First>, loop>)
-    static auto operator new(std::size_t size, First& /*unused*/, Rest&... /*unused*/) -> void* {
-      return detail::coroutine_frame_alloc(size, current_loop().allocator());
-    }
-
-    static auto operator new(std::size_t size) -> void* {
+    static auto operator new(std::size_t size, Args&... /*unused*/) -> void* {
       return detail::coroutine_frame_alloc(size, current_loop().allocator());
     }
 
     static void operator delete(void* ptr, std::size_t size) noexcept {
       detail::coroutine_frame_dealloc(ptr, size);
+    }
+
+  private:
+    static auto make_state() -> shared_ptr<future_state<T>> {
+      return shared_ptr<future_state<T>>::make(current_loop().allocator());
     }
   };
 
