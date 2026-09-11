@@ -3,12 +3,9 @@ name: devenv image
 # Refreshes the ":latest" tag of the dev/CI container (docker/Dockerfile)
 # in GHCR for local development convenience, once it's landed on main.
 #
-# ci.yml is self-sufficient and does NOT depend on this workflow — it
-# builds and pushes its own commit-SHA-tagged image every run (with layer
-# caching, so it's cheap once the Dockerfile is unchanged). A workflow
-# that only builds on push-to-main can never produce an image for the PR
-# that first introduces the Dockerfile (chicken-and-egg), which is exactly
-# what broke PR #1's CI — see docs/PLAN.md, "Docker strategy".
+# ci.yml does NOT depend on this workflow — it builds and loads its own
+# image locally on every run (see ci.yml's own header comment), so a PR
+# that changes docker/Dockerfile is still gated against its own changes.
 
 on:
   push:

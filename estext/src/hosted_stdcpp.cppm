@@ -4,17 +4,14 @@ import est;
 import std;
 
 // estext: a genuinely separate module from est's own core (not one of
-// est's own partitions, re-exported or otherwise) - per review, this is
-// where a concrete platform::interface implementation that needs real
+// est's own partitions, re-exported or otherwise) - this is where a
+// concrete platform::interface implementation that needs real
 // hosted-OS/libc++ facilities (std::chrono, std::this_thread, std::cerr)
 // belongs, kept out of est itself entirely. `import est;` alone gives a
-// consumer the complete framework - est::loop, est::future<T>, est::check(),
-// platform::interface - with zero trace of hosted_stdcpp: no partition
-// silently re-exporting it, nothing for the linker to even consider
-// pulling in. A consumer that wants a working, ready-to-use backend
-// explicitly opts in with a second import: `import est; import estext;`.
-// A future bare-metal backend would be its own similarly separate module,
-// never needing to touch estext at all.
+// consumer the complete framework with zero trace of hosted_stdcpp; a
+// consumer that wants a working, ready-to-use backend opts in with a
+// second import: `import est; import estext;`. A future bare-metal
+// backend would be its own similarly separate module.
 //
 // This also means hosted_stdcpp needs no special access est.cppm's own
 // partitions don't already have: `import est;` exposes the complete,
@@ -54,28 +51,16 @@ public:
     }
   }
 
-  // One std::println call, not several - a reviewer comment on an
-  // earlier, multi-call version pointed out there's no reason to split
-  // this into 2-3 separate writes when a single format string says the
-  // same thing; always including `message` (even when empty, giving
-  // "assertion failed:  (in func)" with a blank between the colons) is a
-  // deliberate simplification, not an oversight - the empty case is rare
-  // enough (every current est::check() call site either always or never
-  // passes one) that a special-cased branch to avoid a stray blank isn't
-  // worth the extra code on a path that only exists to report a bug.
-  // Directly to std::cerr, not building an intermediate std::string
-  // first: the whole point of std::print's format_string overload is
-  // writing straight into the destination.
+  // One std::println call, writing directly to std::cerr rather than
+  // building an intermediate std::string first. Always includes
+  // `message` even when empty (giving "assertion failed:  (in func)"
+  // with a blank between the colons) rather than special-casing it - the
+  // empty case is rare enough that it isn't worth the extra code on a
+  // path that only exists to report a bug.
   //
-  // std::cerr (an ostream), not stderr (a FILE*): unlike stderr, std::cerr
-  // is a proper namespace-std entity, so it needs nothing beyond
-  // `import std;` to reach - no #include, unlike the FILE*-based stderr
-  // this replaced (see docs/PLAN.md). Confirmed with a standalone
-  // `import std;`-only program that actually triggers this path (not
-  // just compiles it) that std::cerr writes correctly with no <iostream>
-  // #include anywhere in the TU - the standard library's own static
-  // initialization for the standard streams isn't skipped just because
-  // the include was replaced by an import.
+  // std::cerr (an ostream), not stderr (a FILE*): std::cerr is a proper
+  // namespace-std entity, reachable via plain `import std;` with no
+  // #include needed.
   [[noreturn]] void assert_failure(std::string_view message,
                                    std::source_location location) const noexcept override {
     // std::println can throw (std::format_error, or an I/O failure) -
@@ -117,28 +102,21 @@ public:
   }
 
   // interface::get_current_loop_context()'s own doc comment
-  // (platform.cppm) explains what this slot is for and why it's typed
-  // `est::loop*` here. `explicit_loop_` is whatever a caller most
-  // recently registered via est::make_current_loop()
-  // (est:util.current_loop) - taking priority whenever set, since a
-  // caller that bothered to register a specific loop clearly wants that
-  // one used, not a fallback. When nothing has been explicitly
-  // registered, default_loop_ is lazily constructed on first use and
-  // returned instead - this is *the* payoff of hosted_stdcpp living in
-  // its own module, free to depend on est (including the complete
-  // est::loop) rather than being one of est's own partitions: a caller
-  // that never wants to think about est::loop at all - the original
-  // ergonomic goal of issue #30 - gets a genuinely working one for free,
-  // driven the same way any other
-  // (`est::current_loop().run_until_idle();`), rather than
-  // current_loop() simply failing its own "no loop is current"
-  // precondition until someone constructs one.
+  // (platform.cppm) explains what this slot is for. `explicit_loop_` is
+  // whatever a caller most recently registered via
+  // est::make_current_loop() (est:util.current_loop) - taking priority
+  // whenever set. When nothing has been explicitly registered,
+  // default_loop_ is lazily constructed on first use and returned
+  // instead, so a caller that never wants to think about est::loop at
+  // all still gets a genuinely working one
+  // (`est::current_loop().run_until_idle();`), driven the same way any
+  // other loop is.
   //
   // Deliberately not the same slot est::make_current_loop() clears back
   // to nullptr on: default_loop_, once constructed, lives for as long as
   // whichever hosted_stdcpp instance a consumer installed does - it isn't
   // torn down and rebuilt every time an explicit registration comes and
-  // goes, the way a naive single shared slot would force.
+  // goes.
   [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
     if (explicit_loop_ != nullptr) {
       return explicit_loop_;

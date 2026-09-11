@@ -1,16 +1,13 @@
 # CMake toolchain file for the pinned devenv Docker image
 # (docker/Dockerfile): Clang + libc++ on hosted Linux.
 #
-# This is the "hosted-Linux" backend referred to throughout docs/PLAN.md
-# (est::platform's only current implementation) - named accordingly so a
-# future bare-metal backend gets its own sibling toolchain file here
-# (docs/PLAN.md, "Stretch / explicitly deferred") rather than this one
-# growing #if-ery for a target it was never meant to describe.
+# Named "hosted-linux" so a future bare-metal backend gets its own sibling
+# toolchain file rather than this one growing #if-ery for a target it was
+# never meant to describe.
 #
-# Used via the "default"/"ci" CMake presets (CMakePresets.json), not via
-# CC/CXX environment variables baked into the image, so the compiler/
-# stdlib pin is declared once, in the repo, instead of being implicit in
-# whatever the container's shell environment happens to set up.
+# Applied via the "default"/"ci" CMake presets (CMakePresets.json) rather
+# than CC/CXX environment variables baked into the image, so the compiler/
+# stdlib pin is declared once, in the repo.
 
 set(CMAKE_C_COMPILER clang)
 set(CMAKE_CXX_COMPILER clang++)
@@ -33,19 +30,10 @@ set(CMAKE_EXE_LINKER_FLAGS_INIT "-stdlib=libc++")
 # the project-level opt-in that actually requests the std module once
 # this gate allows it, is set there instead).
 #
-# `import std;` was tried project-wide once before (docs/PLAN.md, M2
-# review round 5) and reverted: this gate and Clang 22.1.8 detection both
-# worked, but configure then failed with "Cannot find source file:
-# /lib/share/libc++/v1/std.cppm" - Debian's libc++-${LLVM_VERSION}-dev
-# package installs `libc++.modules.json` at the standard multiarch path
-# (so plain `-stdlib=libc++` finds it without needing the versioned
-# resource dir), but that JSON's `source-path` is relative to its own
-# directory and assumes a flat install prefix that Debian's packaging
-# doesn't actually have - `share/libc++/v1/` only exists under the
-# versioned `/usr/lib/llvm-${LLVM_VERSION}/`, not mirrored next to the
-# multiarch lib dir. docker/Dockerfile now symlinks
-# `/usr/lib/share/libc++/v1` to the real, versioned directory to paper
-# over this packaging gap, confirmed working end-to-end (configure +
-# build + test) in a from-scratch `docker build` - see docs/PLAN.md,
-# "import std; re-adopted, project-wide".
+# Depends on docker/Dockerfile's `/usr/lib/share/libc++/v1` symlink:
+# Debian's libc++-${LLVM_VERSION}-dev package ships a
+# `libc++.modules.json` whose `source-path` for the std module resolves
+# relative to a flat install prefix Debian's packaging doesn't actually
+# have, so that symlink is what makes the real, versioned module sources
+# resolvable. See that file's comment for the layout details.
 set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "0e5b6991-d74f-4b3d-a41c-cf096e0b2508")

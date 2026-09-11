@@ -16,14 +16,6 @@ template <class T> class shared_ptr;
 // shared_ptr<T> aliasing `this`, no separate block to recover the address
 // of at all.
 //
-// Replaces this project's earlier est::enable_shared_from_this<T> (a
-// template on T, storing a void* back-pointer to a *separate*
-// control_block, wired up by shared_ptr<T>::make() after construction).
-// That design needed the wiring step because T's own address wasn't the
-// block's address - the block was a distinct object wrapping T. Here
-// there is no separate block for a ref_counted T, so there's nothing to
-// wire up: T's address already is what shared_ptr<T> needs.
-//
 // Not a template: deducing this lets shared_from_this() deduce Self (the
 // actual derived T) straight from the call site, removing the need for
 // this class to carry T as a template parameter - and with it, the classic
@@ -47,16 +39,14 @@ public:
   auto operator=(ref_counted&&) -> ref_counted& = delete;
 
   // Precondition: self was actually constructed via shared_ptr<Self>::
-  // make() - see this class's own doc comment. Unlike the old
-  // enable_shared_from_this<T>'s equivalent check, this can't be
-  // debug-checked here: ref_count_ is always 1 immediately after
-  // construction, shared_ptr<T>::make()-allocated or not, so a bad call
-  // can't be told apart from a good one just by looking at it. Calling
-  // this on a T that wasn't shared_ptr<T>::make()-allocated (stack- or
-  // new-allocated directly instead) is undefined behavior the moment the
-  // returned shared_ptr's ref count reaches zero and tries to free memory
-  // this allocator never allocated in the first place - exactly
-  // std::enable_shared_from_this's own long-documented contract.
+  // make() - see this class's own doc comment. Can't be debug-checked
+  // here: ref_count_ is always 1 immediately after construction, so a
+  // bad call can't be told apart from a good one just by looking at it.
+  // Calling this on a T that wasn't shared_ptr<T>::make()-allocated is
+  // undefined behavior the moment the returned shared_ptr's ref count
+  // reaches zero and tries to free memory this allocator never allocated
+  // in the first place - the same contract std::enable_shared_from_this
+  // has.
   template <class Self> [[nodiscard]] auto shared_from_this(this Self& self) -> shared_ptr<Self> {
     ++self.ref_count_;
     return shared_ptr<Self>(&self);
@@ -96,11 +86,6 @@ private:
 // class for a T that does.
 template <class T> class shared_ptr {
 public:
-  // Named (rather than spelled out at each use below) partly for
-  // convention, partly so signatures using it stay short enough to
-  // sidestep clang-format version-specific line-wrap disagreements (see
-  // docs/PLAN.md's note on this happening more than once already for a
-  // similarly-shaped signature).
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
 
   shared_ptr() noexcept = default;
@@ -183,24 +168,17 @@ private:
 // (inherited from ref_counted), so this allocates and frees T directly.
 // Same public interface as the primary template above; which one applies
 // is resolved entirely at compile time and invisible to shared_ptr<T>'s
-// own callers - `est::shared_ptr<T>::make(allocator, args...)` reads
-// identically either way.
+// own callers.
 //
 // A T opting into this must accept `allocator_type` as its own
 // constructor's first parameter and forward it straight to ref_counted's
-// constructor - make() below always passes it as T's first argument, the
-// same way the primary template's control_block always takes it as its
-// own first argument. This is the one visible difference a ref_counted T
-// has to cooperate with; see est::future_state<T> (est:future) for a real
-// example - and must itself be marked `final` (the static_assert below),
-// for the same reason ref_counted's own destructor is deliberately
-// non-virtual: reset() below always deletes through a T* it constructed
-// itself, never through a ref_counted*, so it needs T's own destructor to
-// be the one that actually runs. A further-derived class would instead be
-// destroyed through T's (non-virtual) destructor once its ref count hit
-// zero - silently skipping the derived class's own destructor, exactly
-// the "delete through a base pointer with no virtual destructor" bug this
-// design otherwise avoids entirely by never deleting through a base
+// constructor - make() below always passes it as T's first argument. See
+// est::future_state<T> (est:future) for a real example. T must also be
+// marked `final` (the static_assert below): reset() always deletes
+// through a T* it constructed itself, never through a ref_counted*, so a
+// further-derived class would silently skip its own destructor -
+// exactly the "delete through a base pointer with no virtual destructor"
+// bug this design otherwise avoids by never deleting through a base
 // pointer at all.
 template <class T>
   requires std::derived_from<T, ref_counted>

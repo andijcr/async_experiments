@@ -1,7 +1,6 @@
 # Clang source-based coverage (-fprofile-instr-generate -fcoverage-mapping)
 # for est targets, gated behind EST_ENABLE_COVERAGE so normal builds pay
-# no instrumentation cost. See docs/PLAN.md, "gate CI on new-code
-# coverage".
+# no instrumentation cost.
 
 option(EST_ENABLE_COVERAGE "Build est with Clang source-based coverage instrumentation" OFF)
 

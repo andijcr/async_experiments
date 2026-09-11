@@ -7,44 +7,34 @@ import :util.scope_exit;
 // need from "the platform" - a monotonic clock, and an answer to "what
 // happens when a check fails." `interface` is deliberately the *only*
 // thing this module knows about a platform: a pure abstract base with no
-// concrete backend of its own. An earlier version defined `hosted_stdcpp`
-// right here too; per review, it now lives in its own module,
-// `:platform.hosted_stdcpp` - not for this class's own sake, but because
-// that backend's "current loop" fallback (issue #30, see its own doc
-// comment on get_current_loop_context() below) needs to *construct* an
-// actual est::loop, not just name the type - this module can forward-
-// declare est::loop just fine (below), since an exported forward
-// declaration in one partition of a module attaches to the real
-// definition in another partition of the *same* module without needing
-// an import edge between them (confirmed against this exact toolchain: a
-// plain, non-exported forward declaration does *not* work this way -
-// clang diagnoses it as redeclaring an entity with module-private
-// linkage). What `:platform` still can't do is construct one, call any
-// of its methods, or otherwise need it as a complete type - `:loop`
-// itself is what `:platform` never imports, keeping the dependency DAG a
-// strict one-way street. A concrete backend, being a *different*
-// partition, is free to `import :loop` for that; this one still isn't.
-// (This is the same split issue #6 once proposed and this codebase
-// closed as "no concrete payoff with only one backend" - docs/PLAN.md -
-// there's a real one now.)
+// concrete backend of its own. The one concrete backend, `hosted_stdcpp`,
+// lives in `estext`, a wholly separate module (`estext/src/
+// hosted_stdcpp.cppm`) - it needs to *construct* an actual est::loop for
+// its "current loop" fallback (get_current_loop_context() below), which
+// `:platform` itself can't do: `:platform` sits below `:loop` in est's
+// own internal module DAG and never imports it, keeping that DAG a
+// strict one-way street. `estext` isn't bound by that internal DAG - it
+// simply `import est;`s the finished product.
 //
 // This is virtual dispatch through a single global object, not a
-// compile-time template parameter (docs/PLAN.md records why: a prior,
-// narrower proposal - decl/def split with no change to the templating -
-// was rejected; this design actually drops est::timer_queue's Platform
+// compile-time template parameter - est::timer_queue has no Platform
 // template parameter, at the cost of one indirect call per now()/
-// assert_failure() instead of a direct one). A future bare-metal backend
-// is a second `final` class implementing `interface`, in its own module
-// alongside `hosted_stdcpp`, installed as the global instance at startup
-// (or compiled in at link time instead of hosted_stdcpp entirely -
-// "ideally at link time, but for simplicity it's a vtable" for now) - not
-// a framework redesign either way.
+// assert_failure() instead of a direct one. A future bare-metal backend
+// is a second `final` class implementing `interface`, in its own module,
+// installed as the global instance at startup - not a framework redesign
+// either way.
 
-// Forward declaration only, deliberately `export`ed - see this file's own
-// top comment for why this (and not a plain, non-exported declaration)
-// is what makes get_current_loop_context()/set_current_loop_context()
-// below able to name `est::loop*` directly, with no `:loop` import and no
-// `void*`+cast in sight.
+// Forward declaration only, deliberately `export`ed: an exported forward
+// declaration in one partition of a module attaches to the real
+// definition in another partition of the *same* module, with no import
+// edge needed between them (a plain, non-exported declaration does not
+// work this way - Clang diagnoses it as redeclaring an entity with
+// module-private linkage). This lets get_current_loop_context()/
+// set_current_loop_context() below name `est::loop*` directly, with no
+// `:loop` import and no `void*`+cast. Naming the type is fine; only
+// constructing or otherwise completing one would invert the DAG, and no
+// method here needs to - `estext` is the module that actually completes
+// the type.
 export namespace est {
 class loop;
 }
@@ -55,8 +45,8 @@ class interface;
 
 // Declared here (defined later, once detail::current_instance exists for
 // its body to reference) purely so printdbg() below - and, transitively,
-// hosted_stdcpp::detect_loop_stall() (:platform.hosted_stdcpp) - can call
-// it. See instance()'s own canonical doc comment further down for what it
+// hosted_stdcpp::detect_loop_stall() (estext) - can call it. See
+// instance()'s own canonical doc comment further down for what it
 // actually does.
 [[nodiscard]] auto instance() noexcept -> interface&;
 
@@ -71,29 +61,19 @@ class interface;
 // vprintdbg() on the reference instance() returns needs a complete type,
 // not just this forward declaration).
 //
-// Unlike an earlier version, this *is* backend-swappable - it's now a
-// thin wrapper deferring to whichever platform::interface is currently
-// installed, per review: "printdbg should defer to the interface." Only
-// the formatting step has to be a template (std::format_string<Ts...>'s
-// compile-time check needs the caller's own argument types); the actual
-// "where does this text go" decision now belongs to vprintdbg(), which
-// isn't.
+// Backend-swappable: a thin wrapper deferring to whichever
+// platform::interface is currently installed. Only the formatting step
+// has to be a template (std::format_string<Ts...>'s compile-time check
+// needs the caller's own argument types); the actual "where does this
+// text go" decision belongs to vprintdbg(), which isn't a template.
 template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept;
 
 // A pure interface, deliberately: every method below is pure virtual and
-// this class holds no data members of its own - per review, "the
-// implementation" (state included) belongs entirely to whichever concrete
-// backend needs it (hosted_stdcpp, :platform.hosted_stdcpp), not to this
-// abstraction. Two methods here (reset_loop_stall_detection()/
-// detect_loop_stall(), get_current_loop_context()/
-// set_current_loop_context()) used to have default bodies backed by
-// members declared right here - moved onto hosted_stdcpp instead,
-// alongside its other overrides, so this class stays what its name says:
-// an interface, not a partial implementation with some state
-// pre-supplied. A future bare-metal backend implements every one of these
-// itself, the same as it already had to for now()/sleep_until()/
-// assert_failure()/vprintdbg(); it just no longer gets two of them "for
-// free."
+// this class holds no data members of its own - "the implementation"
+// (state included) belongs entirely to whichever concrete backend needs
+// it (hosted_stdcpp, module estext), not to this abstraction. A future
+// bare-metal backend implements every method itself, the same as
+// hosted_stdcpp does.
 class interface {
 public:
   interface() = default;
@@ -136,19 +116,14 @@ public:
   // Marks the start of a fresh "how long does the next node/timer
   // callback take" measurement window - est::loop::run_one() calls this
   // immediately before running one, and detect_loop_stall() below
-  // immediately after, instead of measuring the gap itself with two
-  // now() calls the way an earlier version did. Moved here, onto
-  // platform, for the same reason now()/sleep_until() are platform
-  // hooks rather than est::loop calling std::chrono/std::this_thread
-  // directly: "how do we know a callback ran long" is a policy a backend
-  // should get to answer for itself. hosted_stdcpp's own override
-  // (:platform.hosted_stdcpp) just records now() into a member for its
-  // detect_loop_stall() to compare against - the only strategy that makes
-  // sense for a single-threaded, synchronous-checkpoint backend. A future
-  // backend could override both this method and detect_loop_stall() to
-  // run a watchdog on a background thread instead, checking for (and
-  // reporting) a stall in parallel while the callback is still running,
-  // rather than only finding out once it returns.
+  // immediately after. Moved onto platform for the same reason now()/
+  // sleep_until() are platform hooks rather than est::loop calling
+  // std::chrono/std::this_thread directly: "how do we know a callback
+  // ran long" is a policy a backend should get to answer for itself.
+  // hosted_stdcpp's own override just records now() into a member for
+  // its detect_loop_stall() to compare against - the only strategy that
+  // makes sense for a single-threaded, synchronous-checkpoint backend. A
+  // future backend could run a watchdog on a background thread instead.
   virtual void reset_loop_stall_detection() noexcept = 0;
 
   // Checked by est::loop::run_one() right after a node/timer callback
@@ -160,32 +135,25 @@ public:
   // diagnostic instead of "the whole program mysteriously stalled."
   // `threshold` is passed in here rather than baked into
   // reset_loop_stall_detection(), so est::loop's own
-  // long_running_threshold (docs/PLAN.md, M3) stays the single source of
-  // truth for the value, unchanged by which backend is installed.
+  // long_running_threshold stays the single source of truth for the
+  // value, unchanged by which backend is installed.
   virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
 
-  // est::loop's own "current loop" slot (issue #30) - held wherever the
-  // installed interface implementation keeps it (hosted_stdcpp's own
-  // member, :platform.hosted_stdcpp), rather than as a free-standing
-  // global living alongside current_instance further down: :platform
-  // already tracks "the current one" for interface itself via
-  // current_instance/instance(), so this reuses that same idea instead of
-  // inventing a parallel piece of global state. See est::loop's own top
-  // comment for why this exists at all, and why it's deliberately not
-  // thread_local (docs/PLAN.md's bare-metal embedded port stretch goal -
-  // freestanding, no OS - may have no well-defined thread_local support).
+  // est::loop's own "current loop" slot - held wherever the installed
+  // interface implementation keeps it (hosted_stdcpp's own member,
+  // module estext), rather than as a free-standing global living
+  // alongside current_instance further down: :platform already tracks
+  // "the current one" for interface itself via current_instance/
+  // instance(), so this reuses that same idea. Deliberately not
+  // thread_local, same as everything else in this single-threaded
+  // codebase.
   //
   // A genuinely typed est::loop*, not an opaque void* - see the forward
-  // declaration above (and this file's own top comment) for how this
-  // module gets to name est::loop without importing :loop: naming the
-  // type is fine, constructing or otherwise completing one is what would
-  // actually invert the dependency DAG, and no method here needs to.
-  // Whichever concrete backend implements this is the one place that
-  // actually completes the type (:platform.hosted_stdcpp's own `import
-  // :loop;`) - the only call sites that ever write into this slot are
-  // est::loop::make_current()'s own guard (storing `this`, then `nullptr`
-  // when the guard is destroyed) and, for hosted_stdcpp specifically, its
-  // own lazily-constructed fallback loop.
+  // declaration above for how this module names est::loop without
+  // importing :loop. The only call sites that write into this slot are
+  // est::loop::make_current()'s own guard (storing `this`, then
+  // `nullptr` when the guard is destroyed) and, for hosted_stdcpp
+  // specifically, its own lazily-constructed fallback loop.
   [[nodiscard]] virtual auto get_current_loop_context() const noexcept -> est::loop* = 0;
 
   virtual void set_current_loop_context(est::loop* context) noexcept = 0;
@@ -222,27 +190,22 @@ template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args
 // assignable by any `import est;` consumer bypassing instance()/
 // override_instance() below.
 namespace est::platform::detail {
-// No default backend constructed here, unlike an earlier version: the
-// only backend that exists, hosted_stdcpp, now lives in its own module
-// (:platform.hosted_stdcpp, this file's own top comment explains why),
-// which :platform can't import without inverting the dependency DAG the
-// other way. Starts null; est.cppm's own module initializer is what
-// actually installs hosted_stdcpp as the real default, once, before any
-// user code can run (its own comment explains how) - instance() below is
-// only ever safe to call after that has happened, which `import est;`
-// itself guarantees.
+// No default backend constructed here: the only backend that exists,
+// hosted_stdcpp, lives in its own module (estext), which :platform can't
+// import without inverting the dependency DAG. Starts null; a program's
+// own `main()` installs a concrete interface via override_instance()
+// before running any code that calls instance() - see
+// examples/hello_world/main.cpp or est/tests/test_main.cpp.
 inline interface* current_instance = nullptr;
 } // namespace est::platform::detail
 
 export namespace est::platform {
 
 // The globally accessible platform object est::check()/est::timer_queue
-// actually call through - defaults to hosted_stdcpp, installed by
-// est.cppm's own module initializer (:platform.hosted_stdcpp) rather than
-// by this module itself (detail::current_instance's own doc comment
-// explains why). Tests retarget it for a scope via override_instance(),
-// below; a future bare-metal backend would install its own implementation
-// here at startup instead.
+// actually call through. Nothing is installed until a consumer's own
+// `main()` calls override_instance() with a concrete backend (typically
+// estext::hosted_stdcpp) - see detail::current_instance's own doc
+// comment.
 [[nodiscard]] inline auto instance() noexcept -> interface& {
   return *detail::current_instance;
 }

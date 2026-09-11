@@ -2,29 +2,21 @@ name: ci
 
 # Gates PRs: clang-format, clang-tidy, build, and unit tests, all run
 # inside the pinned devenv image (docker/Dockerfile) so CI and local dev
-# share exactly the same toolchain. See docs/PLAN.md.
+# share exactly the same toolchain.
 #
 # The devenv image is built and `load`ed into the runner's local Docker
 # daemon (not pushed to a registry) and driven with plain `docker run`,
 # rather than the job-level `container:` directive pulling a pre-pushed
-# image. Two reasons, both found by adversarial review of the first
-# version of this workflow (see docs/PLAN.md, "Revised after..."):
-#   1. `container:` needs an image already sitting in a registry before
-#      the job's steps run, which either re-introduces the bootstrap
-#      problem or requires push (packages: write) permission — and a
-#      pull_request run triggered from a fork always gets a read-only
-#      GITHUB_TOKEN, so a push-based design silently breaks CI for
-#      exactly the external contributors it needs to work for.
-#   2. Building locally with layer caching (cache-from/to: gha) is just
-#      as cheap once the Dockerfile is unchanged, without ever needing
-#      write access to the package registry from a PR run.
+# image. `container:` needs an image already sitting in a registry, which
+# needs push (packages: write) permission - and a pull_request run
+# triggered from a fork always gets a read-only GITHUB_TOKEN, so a
+# push-based design would silently break CI for external contributors.
+# Building locally with layer caching (cache-from/to: gha) is just as
+# cheap once the Dockerfile is unchanged.
 #
 # clang-tidy runs AFTER the build, not before: analyzing a TU that
 # `import`s a module needs that module's already-compiled BMI, which only
-# exists once `cmake --build` has produced it. Running clang-tidy first
-# (the original version of this workflow did) fails on every PR with
-# "module 'est' not found" — also found by adversarial review, and
-# reproduced locally before this fix.
+# exists once `cmake --build` has produced it.
 #
 # Each `docker run` below runs as the runner's own UID:GID (not the
 # image's baked-in `est` user, UID 1000) so files written into the
@@ -34,14 +26,13 @@ name: ci
 #
 # The coverage step gates on *new-code* (diff/patch) coverage, not
 # overall repository coverage: the "ci" preset itself builds with
-# Clang's source-based coverage instrumentation (-fprofile-instr-generate
-# -fcoverage-mapping - see docs/PLAN.md, "gate CI on new-code coverage"),
-# so the single build+test above already produces .profraw alongside the
-# format/tidy-gated binaries - no separate configure+build+test pass
-# needed. The profraw is exported to lcov via llvm-cov, then intersected
-# with the PR's diff via diff-cover so only the lines a PR actually
-# touches are held to the threshold. Needs full git history
-# (fetch-depth: 0) for diff-cover to compute the diff against origin/main.
+# Clang's source-based coverage instrumentation
+# (-fprofile-instr-generate -fcoverage-mapping), so the build+test above
+# already produces .profraw alongside the format/tidy-gated binaries. The
+# profraw is exported to lcov via llvm-cov, then intersected with the
+# PR's diff via diff-cover so only the lines a PR actually touches are
+# held to the threshold. Needs full git history (fetch-depth: 0) for
+# diff-cover to compute the diff against origin/main.
 #
 # The final two steps are a second, separate configure+build+test pass
 # using the "sanitize" preset (-fsanitize=address,undefined on est and
@@ -84,7 +75,7 @@ jobs:
           # mode=min (not max): the Dockerfile is single-stage, so there is
           # no intermediate build stage for mode=max to additionally cache -
           # it would just export the same final-image layers with more
-          # overhead. See docs/PLAN.md, "issue #21: CI cache timing".
+          # overhead.
           cache-to: type=gha,mode=min
 
       - name: clang-format check

@@ -1,9 +1,8 @@
 include(FetchContent)
 
-# Idempotent across multiple add_subdirectory() calls with the same
-# target name in one configure run (est/tests/CMakeLists.txt's own doc
-# comment) - safe to declare again here even though est/tests/
-# CMakeLists.txt may already have done so earlier in this same configure.
+# FetchContent_Declare is idempotent across multiple calls with the same
+# name in one configure run, so this is safe even though est/tests/
+# CMakeLists.txt may already have declared Catch2 earlier.
 FetchContent_Declare(
   Catch2
   GIT_REPOSITORY https://github.com/catchorg/Catch2.git
@@ -21,8 +20,7 @@ add_executable(spreadsheet_tests
 # Catch2::Catch2, not Catch2::Catch2WithMain: test_main.cpp supplies its
 # own main(), installing a platform::interface before any TEST_CASE runs
 # (sheet_tests.cpp's resolve_blocking() cases need a real, live platform,
-# not just est::check()'s null-check) - est/tests/test_main.cpp's own doc
-# comment explains why this can't link Catch2's pre-built main() too.
+# not just est::check()'s null-check).
 target_link_libraries(spreadsheet_tests PRIVATE
   est::est
   estext::estext
@@ -33,8 +31,8 @@ est_set_warnings(spreadsheet_tests)
 est_enable_coverage(spreadsheet_tests)
 est_enable_sanitizers(spreadsheet_tests)
 
-# Same -Wc2y-extensions workaround as est/tests/CMakeLists.txt - Catch2's
-# TEST_CASE macro expands to __COUNTER__-based code Clang 22 flags.
+# -Wc2y-extensions workaround - see est/tests/CMakeLists.txt's own
+# comment on the same flags.
 target_compile_options(spreadsheet_tests PRIVATE -Wno-unknown-warning-option -Wno-c2y-extensions)
 
 list(APPEND CMAKE_MODULE_PATH "${catch2_SOURCE_DIR}/extras")
