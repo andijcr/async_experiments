@@ -64,21 +64,7 @@ public:
   void
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
 
-  // A real, working slot, not a no-op: est::make_current_loop()/
-  // est::current_loop() (est:util.current_loop) are actually exercised
-  // against this fake in several tests below, going through
-  // get_current_loop_context()/set_current_loop_context()
-  // (est::platform::interface's own doc comment) - a no-op here would
-  // silently break current_loop() for every one of them.
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
-    return current_loop_context;
-  }
-  void set_current_loop_context(est::loop* context) noexcept override {
-    current_loop_context = context;
-  }
-
   mutable std::chrono::steady_clock::time_point current;
-  est::loop* current_loop_context = nullptr;
 };
 
 // A platform whose now() advances by `step` on every single call - used
@@ -125,20 +111,9 @@ public:
     }
   }
 
-  // A real, working slot: est::loop is constructed under this fake too
-  // (see get_current_loop_context()'s own doc comment on fake_platform,
-  // above, for why a no-op here isn't an option).
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
-    return current_loop_context;
-  }
-  void set_current_loop_context(est::loop* context) noexcept override {
-    current_loop_context = context;
-  }
-
   mutable std::chrono::steady_clock::time_point current;
   std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);
   mutable std::chrono::steady_clock::time_point stall_start;
-  est::loop* current_loop_context = nullptr;
 };
 
 } // namespace
@@ -436,7 +411,7 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
 // (est:util.current_loop) and the no-loop sugar built on current_loop().
 // est::check()'s own failure path (make_current_loop()-ing a second loop
 // while one is already current, or calling current_loop() with none
-// registered and no fallback available) isn't unit-testable in this
+// registered at all - there is no fallback) isn't unit-testable in this
 // codebase - it terminates the process, same as every other checked
 // precondition (est/tests/check_tests.cpp's own doc comment) - so only
 // the happy path is covered here.
@@ -476,23 +451,5 @@ TEST_CASE("sleep_for()/sleep_until()/yield_execution() with no loop argument use
   loop.run_until_idle();
   REQUIRE(slept_for.ready());
   REQUIRE(slept_until.ready());
-  REQUIRE(yielded.ready());
-}
-
-TEST_CASE("current_loop() with nothing explicitly registered falls back to hosted_stdcpp's "
-          "own default loop",
-          "[loop]") {
-  // No est::make_current_loop() call anywhere in this test, and no
-  // override_instance() either - the one test in this file that runs
-  // against the real, default platform::instance() (hosted_stdcpp),
-  // specifically to exercise its own get_current_loop_context() fallback
-  // (module estext) rather than a fake's or an explicitly registered
-  // loop. yield_execution(), not sleep_for()/sleep_until(): this runs
-  // against the real backend, so a timer-based wait would be a genuine
-  // (if short) wall-clock sleep - yield_execution() resolves through the
-  // ready-queue alone, no real deadline involved.
-  auto yielded = est::yield_execution();
-  REQUIRE_FALSE(yielded.ready());
-  est::current_loop().run_until_idle();
   REQUIRE(yielded.ready());
 }

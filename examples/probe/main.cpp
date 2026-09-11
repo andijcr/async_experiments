@@ -21,6 +21,15 @@ import std;
   return est::current_loop().allocator().resource();
 }
 
+// current_allocator() - the direct thread_local read, added by the
+// current-loop-only-experiment's thread_local migration specifically so
+// call sites that only need an allocator (most of est's own internals,
+// below) don't have to dereference through the loop pointer first the way
+// probe_loop_allocator() above still does.
+[[gnu::noinline]] auto probe_current_allocator() -> void* {
+  return est::current_allocator().resource();
+}
+
 [[gnu::noinline]] auto probe_platform_instance() -> est::platform::interface* {
   return &est::platform::instance();
 }
@@ -65,63 +74,20 @@ import std;
 // allocation isn't provably safe) - this is the probe that actually
 // exercises coroutine_frame_alloc()/coroutine_frame_dealloc(), each
 // resolving current_loop() independently rather than sharing one lookup.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
 [[gnu::noinline]] auto probe_coroutine_suspending(est::future<int>& fut) -> est::future<int> {
   const int value = co_await fut;
   co_return value + 1;
 }
 
-// Prototype only - not wired into est itself, purely to get a real,
-// apples-to-apples disassembly of a thread_local-based replacement for the
-// platform::interface-virtual-dispatch current_loop()/allocator()/
-// platform::instance() mechanism above: one thread_local context struct
-// holding raw pointers to the loop, its allocator's memory_resource, and
-// the active platform::interface, set by a single scoped setup function
-// instead of two separate runtime-registration calls
-// (make_current_loop() + platform::override_instance()).
-namespace probe_tls {
-
-struct execution_context {
-  est::loop* loop_ptr = nullptr;
-  std::pmr::memory_resource* resource_ptr = nullptr;
-  est::platform::interface* platform_ptr = nullptr;
-};
-
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-inline thread_local execution_context tls_context;
-
-[[nodiscard, gnu::noinline]] auto setup(est::loop& loop_ref,
-                                        est::platform::interface& platform_ref) noexcept {
-  tls_context = {.loop_ptr = &loop_ref,
-                 .resource_ptr = loop_ref.allocator().resource(),
-                 .platform_ptr = &platform_ref};
-  return est::scope_exit([]() noexcept { tls_context = {}; });
-}
-
-[[nodiscard]] inline auto current_loop() noexcept -> est::loop& { return *tls_context.loop_ptr; }
-
-[[nodiscard]] inline auto current_allocator() noexcept -> std::pmr::polymorphic_allocator<std::byte> {
-  return std::pmr::polymorphic_allocator<std::byte>(tls_context.resource_ptr);
-}
-
-[[nodiscard]] inline auto current_platform() noexcept -> est::platform::interface& {
-  return *tls_context.platform_ptr;
-}
-
-} // namespace probe_tls
-
-[[gnu::noinline]] auto probe_tls_current_loop() -> est::loop* { return &probe_tls::current_loop(); }
-
-[[gnu::noinline]] auto probe_tls_allocator() -> void* {
-  return probe_tls::current_allocator().resource();
-}
-
-[[gnu::noinline]] auto probe_tls_platform_instance() -> est::platform::interface* {
-  return &probe_tls::current_platform();
-}
-
-// The real mechanism's own equivalent setup cost, isolated the same way -
-// today's two separate runtime-registration calls, noinline'd so they
-// survive as real call sites instead of folding into main().
+// The registration/setup cost itself - est::make_current_loop() and
+// est::platform::override_instance(), each noinline'd so they survive as
+// real call sites instead of folding into main(). Both now write into
+// thread_local storage directly (est:util.current_loop, :platform) rather
+// than routing a loop pointer through platform::interface's own vtable
+// the way an earlier version of this mechanism did - see
+// docs/wiki/Loop-And-Timers.md and docs/wiki/Global-Lookup-Codegen.md for
+// the before/after.
 [[gnu::noinline]] auto probe_make_current_loop(est::loop& loop_ref) noexcept {
   return est::make_current_loop(loop_ref);
 }
@@ -135,29 +101,36 @@ auto main() -> int {
   const auto platform_guard = est::platform::override_instance(platform_instance);
 
   try {
-    std::println("{}", static_cast<void*>(probe_current_loop()));
-    std::println("{}", probe_loop_allocator());
-    std::println("{}", static_cast<void*>(probe_platform_instance()));
-    std::println("{}", probe_make_promise_future().get());
-    probe_mutex_lock().get();
-    probe_mutex_unlock_uncontended();
-    std::println("{}", probe_coroutine().get());
+    {
+      // No implicit fallback loop any more (est:util.current_loop) - every
+      // probe below that touches current_loop()/current_allocator(),
+      // directly or indirectly, needs one explicitly registered first.
+      est::loop loop;
+      const auto loop_guard = est::make_current_loop(loop);
 
-    auto [prom, fut] = est::make_promise_future<int>();
-    auto suspended = probe_coroutine_suspending(fut); // suspends - fut isn't ready yet
-    prom.set_value(41);
-    est::current_loop().run_until_idle(); // resumes it, frame freed
-    std::println("{}", suspended.get());
+      std::println("{}", static_cast<void*>(probe_current_loop()));
+      std::println("{}", probe_loop_allocator());
+      std::println("{}", probe_current_allocator());
+      std::println("{}", static_cast<void*>(probe_platform_instance()));
+      std::println("{}", probe_make_promise_future().get());
+      probe_mutex_lock().get();
+      probe_mutex_unlock_uncontended();
+      std::println("{}", probe_coroutine().get());
+
+      auto [prom, fut] = est::make_promise_future<int>();
+      auto suspended = probe_coroutine_suspending(fut); // suspends - fut isn't ready yet
+      prom.set_value(41);
+      est::current_loop().run_until_idle(); // resumes it, frame freed
+      std::println("{}", suspended.get());
+    } // loop_guard released - loop_is_current back to false for the setup-cost probes below
 
     est::loop mcl_loop;
-    { const auto guard = probe_make_current_loop(mcl_loop); }
-    { const auto guard = probe_override_instance(platform_instance); }
-
-    est::loop tls_loop;
-    const auto tls_guard = probe_tls::setup(tls_loop, platform_instance);
-    std::println("{}", static_cast<void*>(probe_tls_current_loop()));
-    std::println("{}", probe_tls_allocator());
-    std::println("{}", static_cast<void*>(probe_tls_platform_instance()));
+    {
+      const auto guard = probe_make_current_loop(mcl_loop);
+    }
+    {
+      const auto guard = probe_override_instance(platform_instance);
+    }
   } catch (...) {
     return EXIT_FAILURE;
   }

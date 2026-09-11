@@ -9,35 +9,26 @@ import :util.scope_exit;
 // thing this module knows about a platform: a pure abstract base with no
 // concrete backend of its own. The one concrete backend, `hosted_stdcpp`,
 // lives in `estext`, a wholly separate module (`estext/src/
-// hosted_stdcpp.cppm`) - it needs to *construct* an actual est::loop for
-// its "current loop" fallback (get_current_loop_context() below), which
-// `:platform` itself can't do: `:platform` sits below `:loop` in est's
-// own internal module DAG and never imports it, keeping that DAG a
-// strict one-way street. `estext` isn't bound by that internal DAG - it
-// simply `import est;`s the finished product.
+// hosted_stdcpp.cppm`).
 //
-// This is virtual dispatch through a single global object, not a
+// This is virtual dispatch through a `thread_local` object, not a
 // compile-time template parameter - est::timer_queue has no Platform
 // template parameter, at the cost of one indirect call per now()/
-// assert_failure() instead of a direct one. A future bare-metal backend
-// is a second `final` class implementing `interface`, in its own module,
-// installed as the global instance at startup - not a framework redesign
-// either way.
-
-// Forward declaration only, deliberately `export`ed: an exported forward
-// declaration in one partition of a module attaches to the real
-// definition in another partition of the *same* module, with no import
-// edge needed between them (a plain, non-exported declaration does not
-// work this way - Clang diagnoses it as redeclaring an entity with
-// module-private linkage). This lets get_current_loop_context()/
-// set_current_loop_context() below name `est::loop*` directly, with no
-// `:loop` import and no `void*`+cast. Naming the type is fine; only
-// constructing or otherwise completing one would invert the DAG, and no
-// method here needs to - `estext` is the module that actually completes
-// the type.
-export namespace est {
-class loop;
-}
+// assert_failure() instead of a direct one. `thread_local` (not a single
+// process-global) so a multi-core, no-MMU target can give each core its
+// own installed backend independently, without any of them synchronizing
+// on shared mutable state to do it - see override_instance()'s own doc
+// comment. A future bare-metal backend is a second `final` class
+// implementing `interface`, in its own module, installed the same way -
+// not a framework redesign either way.
+//
+// est::loop's own "current loop" registration used to live behind this
+// interface too (get_current_loop_context()/set_current_loop_context(),
+// removed) - `:util.current_loop` now owns that directly via its own
+// `thread_local` storage instead, needing nothing from `:platform` at
+// all. That also removes the one reason this module used to need an
+// exported forward declaration of `est::loop`: nothing here names it any
+// more.
 
 export namespace est::platform {
 
@@ -138,25 +129,6 @@ public:
   // long_running_threshold stays the single source of truth for the
   // value, unchanged by which backend is installed.
   virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
-
-  // est::loop's own "current loop" slot - held wherever the installed
-  // interface implementation keeps it (hosted_stdcpp's own member,
-  // module estext), rather than as a free-standing global living
-  // alongside current_instance further down: :platform already tracks
-  // "the current one" for interface itself via current_instance/
-  // instance(), so this reuses that same idea. Deliberately not
-  // thread_local, same as everything else in this single-threaded
-  // codebase.
-  //
-  // A genuinely typed est::loop*, not an opaque void* - see the forward
-  // declaration above for how this module names est::loop without
-  // importing :loop. The only call sites that write into this slot are
-  // est::loop::make_current()'s own guard (storing `this`, then
-  // `nullptr` when the guard is destroyed) and, for hosted_stdcpp
-  // specifically, its own lazily-constructed fallback loop.
-  [[nodiscard]] virtual auto get_current_loop_context() const noexcept -> est::loop* = 0;
-
-  virtual void set_current_loop_context(est::loop* context) noexcept = 0;
 };
 
 // The actual body, deferred until here (see the forward declaration's own
@@ -192,36 +164,46 @@ template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args
 namespace est::platform::detail {
 // No default backend constructed here: the only backend that exists,
 // hosted_stdcpp, lives in its own module (estext), which :platform can't
-// import without inverting the dependency DAG. Starts null; a program's
-// own `main()` installs a concrete interface via override_instance()
-// before running any code that calls instance() - see
-// examples/hello_world/main.cpp or est/tests/test_main.cpp.
-inline interface* current_instance = nullptr;
+// import without inverting the dependency DAG. Starts null on every
+// thread/core; each one's own entry point installs a concrete interface
+// via override_instance() before running any code that calls instance() -
+// see examples/hello_world/main.cpp or est/tests/test_main.cpp.
+//
+// thread_local, not a single process-global: a plain global would need
+// every core on a shared-memory, no-MMU multicore target to agree on (and
+// serialize writes to) one slot, even though each core only ever installs
+// its own backend once and never touches another core's. thread_local
+// gives each core - or, on a hosted OS, each thread - an independent slot
+// for the price of one relative-addressed load, no synchronization
+// needed, the same reasoning current_loop() (est:util.current_loop)
+// applies to its own storage.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline thread_local interface* current_instance = nullptr;
 } // namespace est::platform::detail
 
 export namespace est::platform {
 
-// The globally accessible platform object est::check()/est::timer_queue
-// actually call through. Nothing is installed until a consumer's own
-// `main()` calls override_instance() with a concrete backend (typically
+// The active platform object est::check()/est::timer_queue actually call
+// through, for whichever thread/core calls instance(). Nothing is
+// installed until that thread/core's own entry point calls
+// override_instance() with a concrete backend (typically
 // estext::hosted_stdcpp) - see detail::current_instance's own doc
 // comment.
 [[nodiscard]] inline auto instance() noexcept -> interface& {
   return *detail::current_instance;
 }
 
-// Points instance() at `replacement` until the returned guard is
-// destroyed, restoring whatever was current before - nests correctly,
-// since each returned guard only remembers what it personally replaced.
-// Built on est::scope_exit rather than a hand-rolled RAII type: the
-// swap-then-restore shape is exactly what scope_exit already exists for
-// (see its own doc comment).
+// Points instance() at `replacement`, for the calling thread/core only,
+// until the returned guard is destroyed, restoring whatever was current
+// before - nests correctly, since each returned guard only remembers what
+// it personally replaced. Built on est::scope_exit rather than a
+// hand-rolled RAII type: the swap-then-restore shape is exactly what
+// scope_exit already exists for (see its own doc comment).
 //
-// This mutates process-global state, which is exactly the tradeoff of
-// swapping a single global object instead of threading a reference/
-// template parameter through every consumer: safe for this project's
-// single-threaded, serially-run Catch2 binary (never two tests touching
-// the global at once), not meant for concurrent use.
+// Mutates only this thread's/core's own thread_local slot, not shared
+// state another one could be reading concurrently - safe to call from
+// every core of a shared-memory target independently and concurrently,
+// each installing its own backend, with nothing to synchronize.
 [[nodiscard]] inline auto override_instance(interface& replacement) noexcept {
   interface* const previous = std::exchange(detail::current_instance, &replacement);
   return scope_exit([previous]() noexcept { detail::current_instance = previous; });

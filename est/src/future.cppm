@@ -128,7 +128,7 @@ template <class T> class future_awaiter;
 // operator delete only ever gets the frame's size back, never the
 // allocator that built it. Rather than stash a memory_resource* alongside
 // the frame for operator delete to read back, coroutine_frame_dealloc()
-// below simply resolves est::current_loop().allocator() fresh - the same
+// below simply resolves est::current_allocator() fresh - the same
 // "no cached state, look it up at the point of use" design this whole
 // experiment applies elsewhere (future_state<T>, est::mutex,
 // est::counting_event). This carries the same cross-loop hazard those
@@ -145,7 +145,7 @@ coroutine_frame_alloc(std::size_t size, std::pmr::polymorphic_allocator<std::byt
 }
 
 inline void coroutine_frame_dealloc(void* frame, std::size_t size) noexcept {
-  current_loop().allocator().resource()->deallocate(frame, size, alignof(std::max_align_t));
+  current_allocator().resource()->deallocate(frame, size, alignof(std::max_align_t));
 }
 
 // A placeholder "success" alternative for future_state<void>'s result_
@@ -275,7 +275,7 @@ public:
 
   // `allocator`: forwarded straight to ref_counted's own constructor, not
   // used for anything else here - this class already gets its own
-  // allocator on demand via current_loop().allocator() (see allocator()
+  // allocator on demand via current_allocator() (see allocator()
   // below). shared_ptr<future_state>::make()'s intrusive specialization
   // (this class inherits est::ref_counted, est:util.shared_ptr) always
   // passes it as this constructor's first argument automatically; a
@@ -450,7 +450,7 @@ public:
   }
 
   [[nodiscard]] auto allocator() const noexcept -> std::pmr::polymorphic_allocator<std::byte> {
-    return current_loop().allocator();
+    return current_allocator();
   }
 
   // Registers fn to run once ready. Two calling conventions, chosen by
@@ -914,10 +914,10 @@ public:
     // detail::coroutine_frame_alloc()/coroutine_frame_dealloc()'s own
     // doc comment. Templated on an arbitrary (possibly empty) Args&...
     // pack for the same "promise constructor arguments" reason the
-    // constructor above is - always allocates against est::current_loop().
+    // constructor above is - always allocates against est::current_allocator().
     template <class... Args>
     static auto operator new(std::size_t size, Args&... /*unused*/) -> void* {
-      return detail::coroutine_frame_alloc(size, current_loop().allocator());
+      return detail::coroutine_frame_alloc(size, current_allocator());
     }
 
     static void operator delete(void* ptr, std::size_t size) noexcept {
@@ -926,7 +926,7 @@ public:
 
   private:
     static auto make_state() -> shared_ptr<future_state<T>> {
-      return shared_ptr<future_state<T>>::make(current_loop().allocator());
+      return shared_ptr<future_state<T>>::make(current_allocator());
     }
   };
 

@@ -124,29 +124,26 @@ backend would be its own similarly separate module, never touching
 `estext` - `est` itself stays the one thing every backend module depends
 on, never the reverse.
 
-`hosted_stdcpp` needing to name `est::loop` (its own "current loop"
-fallback, [The Loop and Timers](Loop-And-Timers.md)) is exactly why it
-can't be one of `est`'s own partitions in the first place: `:platform`
-sits below `:loop` in `est`'s *internal* DAG above specifically so it
-never has to import `:loop`, and a partition of `est` is bound by that
-same internal DAG. `estext` isn't a partition of `est` at all - it's a
-wholly separate module that simply `import est;`s the finished product,
-so it sees the complete, already-defined `est::loop` with no special
-access needed (unlike `:platform` itself, which forward-declares
-`est::loop` - `export namespace est { class loop; }`, `platform.cppm`'s
-own top comment on why an *exported* forward declaration in one partition
-attaches to the real definition in another partition of the *same*
-module - purely so
-`get_current_loop_context()`/`set_current_loop_context()` can return/take
-a genuinely typed `est::loop*` instead of an opaque `void*`, without
-`:platform` ever importing `:loop`).
+`hosted_stdcpp` needing real hosted-OS/libc++ facilities (`std::chrono`,
+`std::this_thread`, `std::cerr`) `est` itself has no business depending
+on is why it can't be one of `est`'s own partitions in the first place -
+`est` stays usable on a future bare-metal target that has none of those.
+`estext` isn't a partition of `est` at all - it's a wholly separate
+module that simply `import est;`s the finished product. `:platform`
+itself (`est`'s own partition) no longer names `est::loop` at all: an
+earlier version routed `est::loop`'s "current loop" registration through
+`platform::interface`'s own virtual methods (needing an exported forward
+declaration of `est::loop` here purely so those methods could return/take
+a genuinely typed `est::loop*`), but that mechanism now lives entirely in
+`:util.current_loop` as its own `thread_local` storage - see
+[The Loop and Timers](Loop-And-Timers.md) - so `:platform` needs nothing
+from `:loop` any more, and neither does `estext`.
 
 Making `hosted_stdcpp` one of `est`'s own partitions instead - even
-though "only `:platform` can't import `:loop`, but a different partition
-of the same module can" - would still leave `hosted_stdcpp` inside
-`est`'s own module boundary, always compiled and logically exported as
-part of it. A genuinely separate module makes the boundary real rather
-than incidental.
+though nothing about the *current* module DAG would forbid it - would
+still leave `hosted_stdcpp` inside `est`'s own module boundary, always
+compiled and logically exported as part of it. A genuinely separate
+module makes the boundary real rather than incidental.
 
 `import est;` also does *not* install a default `platform::interface` as
 a side effect - that decision belongs to the

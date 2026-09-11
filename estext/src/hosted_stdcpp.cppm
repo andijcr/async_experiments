@@ -101,44 +101,8 @@ public:
     }
   }
 
-  // interface::get_current_loop_context()'s own doc comment
-  // (platform.cppm) explains what this slot is for. `explicit_loop_` is
-  // whatever a caller most recently registered via
-  // est::make_current_loop() (est:util.current_loop) - taking priority
-  // whenever set. When nothing has been explicitly registered,
-  // default_loop_ is lazily constructed on first use and returned
-  // instead, so a caller that never wants to think about est::loop at
-  // all still gets a genuinely working one
-  // (`est::current_loop().run_until_idle();`), driven the same way any
-  // other loop is.
-  //
-  // Deliberately not the same slot est::make_current_loop() clears back
-  // to nullptr on: default_loop_, once constructed, lives for as long as
-  // whichever hosted_stdcpp instance a consumer installed does - it isn't
-  // torn down and rebuilt every time an explicit registration comes and
-  // goes.
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
-    if (explicit_loop_ != nullptr) {
-      return explicit_loop_;
-    }
-    if (!default_loop_.has_value()) {
-      default_loop_.emplace();
-    }
-    return &*default_loop_;
-  }
-
-  void set_current_loop_context(est::loop* context) noexcept override { explicit_loop_ = context; }
-
 private:
   std::chrono::steady_clock::time_point stall_start_;
-  est::loop* explicit_loop_ = nullptr;
-  // mutable: get_current_loop_context() is const (interface's own
-  // signature - every other backend answers "what's current" without
-  // needing to mutate anything either), but lazily constructing the
-  // fallback loop on first use, rather than eagerly at hosted_stdcpp
-  // construction time, means a program that never touches the implicit
-  // convenience API at all never pays for an est::loop it doesn't use.
-  mutable std::optional<est::loop> default_loop_;
 };
 
 } // namespace estext

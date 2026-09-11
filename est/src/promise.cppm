@@ -77,7 +77,7 @@ export namespace est {
 
 // Builds a fresh promise<T>/future<T> pair against est::current_loop().
 template <class T> auto make_promise_future() -> std::pair<promise<T>, future<T>> {
-  return detail::make_promise_future_impl<T>(current_loop().allocator());
+  return detail::make_promise_future_impl<T>(current_allocator());
 }
 
 } // namespace est

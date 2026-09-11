@@ -50,7 +50,7 @@ public:
   ...
   template <class... Args>
   static auto operator new(std::size_t size, Args&... /*unused*/) -> void* {
-    return detail::coroutine_frame_alloc(size, current_loop().allocator());
+    return detail::coroutine_frame_alloc(size, current_allocator());
   }
   static void operator delete(void* ptr, std::size_t size) noexcept {
     detail::coroutine_frame_dealloc(ptr, size);
@@ -58,10 +58,16 @@ public:
 
 private:
   static auto make_state() -> shared_ptr<future_state<T>> {
-    return shared_ptr<future_state<T>>::make(current_loop().allocator());
+    return shared_ptr<future_state<T>>::make(current_allocator());
   }
 };
 ```
+
+`current_allocator()` (est:util.current_loop), not
+`current_loop().allocator()`: a direct `thread_local` read of the cached
+`memory_resource*` instead of one `thread_local` read for the loop
+pointer plus a further memory read through it for its allocator - see
+[Loop and Timers](Loop-And-Timers.md) for the full mechanism.
 
 The trailing `Args&...` pack exists purely so this one constructor/
 `operator new` pair matches *whatever* the actual coroutine function

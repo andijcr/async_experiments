@@ -69,18 +69,20 @@ Every future/promise pair is built via `est::make_promise_future<T>()` —
 there is no way to pass it (or `est::mutex`, `est::counting_event<Mode>`,
 `sleep_for()`/`sleep_until()`/`yield_execution()`, or a coroutine's own
 `promise_type`) an explicit `loop&` at all; every one of them resolves
-`est::current_loop()` ([Loop and Timers](Loop-And-Timers.md)) fresh, at the
-point of use, instead. A loop only becomes "current" by an explicit
-`est::make_current_loop(loop)` call (a free function, not a method on
-`est::loop` itself - deliberately kept out of `loop.cppm` entirely),
-scoped to that loop's own lifetime, not a global — except that the real
-(`estext::hosted_stdcpp`) backend also falls back to a loop of its own,
-lazily, when nothing has been explicitly registered, so `current_loop()`
-still works for a caller with no loop to register in the first place. See
-[Loop and Timers](Loop-And-Timers.md) for the correctness hazard this
-design carries (and the fix for its sharpest form) and
-[Global Lookup Codegen](Global-Lookup-Codegen.md) for what it costs
-relative to the explicit-`loop&` design it replaced.
+`est::current_loop()`/`est::current_allocator()`
+([Loop and Timers](Loop-And-Timers.md)) fresh, at the point of use,
+instead - a pair of `thread_local` reads, one per core (or, hosted, per
+thread), not a runtime-swappable global. A loop only becomes "current" by
+an explicit `est::make_current_loop(loop)` call (a free function, not a
+method on `est::loop` itself - deliberately kept out of `loop.cppm`
+entirely), scoped to that loop's own lifetime; there is no fallback for a
+caller that never registers one - `current_loop()`/`current_allocator()`
+fail their precondition instead. See
+[Loop and Timers](Loop-And-Timers.md) for the correctness hazard an
+earlier, non-`thread_local` version of this design carried (and the fix
+for its sharpest form) and
+[Global Lookup Codegen](Global-Lookup-Codegen.md) for what each version
+actually costs, measured.
 
 `import est;` doesn't install a `platform::interface` on its own, either —
 in fact it doesn't even know a concrete backend exists. `estext` is a
@@ -104,6 +106,6 @@ constructs one, and `platform::override_instance()`s it
 | `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
-| `est::current_loop()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
+| `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `sleep_for()`/`sleep_until()` | `est/src/promise.cppm` |

@@ -185,6 +185,89 @@ on every hot-path call instead of one at construction, plus a genuine,
 previously-impossible crash that only a design-level fix (not a local
 patch) could close.
 
+## The `thread_local` migration
+
+The "Follow-up experiment" above answered "does removing every cached
+`loop&` make things worse" with a qualified yes - real per-call cost,
+plus a genuine crash. The natural next question: is the *lookup
+mechanism itself* (`platform::interface`'s virtual
+`get_current_loop_context()`/`set_current_loop_context()`, a global
+`current_instance` pointer) the best available, or just the one this
+codebase happened to build first? Motivated by a concrete target
+(shared-memory, no-MMU multicore, one loop per core - where a plain
+global is actively wrong, since every core would fight over the same
+slot), this codebase now stores the current loop, its allocator's
+`memory_resource*`, and the active `platform::interface*` in
+`thread_local` variables instead - `est:util.current_loop`'s own
+`execution_context` and `:platform`'s `current_instance`, both
+`thread_local` now, and `platform::interface` no longer has
+`get_current_loop_context()`/`set_current_loop_context()` at all. See
+[Loop and Timers](Loop-And-Timers.md) for the full design; this section
+only adds the measured cost, the same way the rest of this page does.
+
+Re-disassembled on the real, migrated code (not a mockup - `examples/probe`'s
+`probe_current_loop()`/`probe_loop_allocator()`/`probe_current_allocator()`/
+`probe_platform_instance()` call directly into `est::current_loop()`/
+`est::current_allocator()`/`est::platform::instance()`):
+
+```asm
+; est::current_loop()
+mov    %fs:<offset>,%rax   ; one thread-local load
+ret
+```
+
+```asm
+; est::current_allocator() - direct cached resource_ptr, no loop dereference
+mov    %fs:<offset>,%rax   ; one thread-local load
+ret
+```
+
+```asm
+; est::platform::instance()
+mov    %fs:<offset>,%rax   ; one thread-local load
+ret
+```
+
+Two instructions, one load, zero indirect branches, zero `call`/`ret` pairs -
+for all three. Compare against the numbers earlier on this page: `current_loop()`
+alone drops from 3 instructions/1 indirect tail-jump to 2 instructions/0
+dispatch; `.allocator()` reached through the loop (`current_loop().allocator()`,
+still available, `probe_loop_allocator()`) drops from 7 instructions/1 real
+call to 3 instructions/0 dispatch; `current_allocator()` - the new, direct
+path most internal callers actually use now - is 2 instructions, cheaper
+than even the old `current_loop()` alone was. `platform::instance()` was
+already a plain global load before (2 instructions) and stays exactly that
+cost with `thread_local` - the per-core isolation is free on this
+toolchain/target (x86-64 Linux/glibc, `%fs`-relative addressing), though
+that specific equivalence is not guaranteed to hold on every target (see
+the caveat below).
+
+The registration side (`est::make_current_loop()`, `est::platform::override_instance()`)
+shows the same pattern:
+
+```asm
+; est::make_current_loop(loop&) - was 13 instructions incl. 1 virtual call
+mov    (%rsi),%rax
+mov    %rsi,%fs:<loop_ptr offset>
+mov    %rax,%fs:<resource_ptr offset>
+mov    %rsi,(%rdi)          ; return the scope_exit guard
+ret
+```
+
+Five instructions, zero calls - versus 13 instructions and one virtual
+call in the pre-migration version. `override_instance()` was already
+cheap (a plain global swap, 4 instructions) and stays the same shape,
+just `thread_local` now instead of process-global.
+
+**Caveat, repeated from the earlier design discussion and still
+unresolved**: this is measured on the host toolchain (glibc TLS via the
+`%fs` segment on x86-64 Linux), not the bare-metal, no-MMU target this
+change is ultimately for. The win is real *here*, and the mechanism
+(read a per-core base pointer, no synchronization) is architecturally
+sound for that target in principle - but it depends on that target's own
+toolchain implementing `thread_local` similarly cheaply, which has not
+been verified.
+
 ## Where this fits
 
 See [Loop and Timers](Loop-And-Timers.md) for what `current_loop()` is
