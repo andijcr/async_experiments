@@ -95,13 +95,28 @@ export namespace est {
 // allocator to enqueue/destroy waiter nodes. Same lifetime precondition
 // as every other loop-holding type in this codebase: the loop must
 // outlive every counting_event constructed against it.
+//
+// max_count bounds how high the count is ever allowed to climb: set(n)
+// (below) saturates at it rather than growing without limit, the same
+// way std::counting_semaphore<LeastMaxValue> bounds release() - except
+// saturating instead of std::counting_semaphore's own undefined-behavior-
+// on-overflow contract, matching this codebase's general preference for a
+// defined, checked outcome over UB wherever the standard library itself
+// permits UB. Defaults to an effectively-unbounded value (a plain
+// semaphore/counting event with no meaningful ceiling); est::binary_event
+// (below) is nothing more than a counting_event<Mode> constructed with
+// max_count = 1 - not a separate implementation.
 template <EventResetMode Mode> class counting_event {
 public:
-  explicit counting_event(loop& loop_ref) noexcept : loop_(loop_ref) {}
+  explicit counting_event(loop& loop_ref, int max_count = std::numeric_limits<int>::max()) noexcept
+      : max_count_(max_count), loop_(loop_ref) {
+    check(max_count > 0, "counting_event: max_count must be positive");
+  }
 
   // Issue #30: sugar over the constructor above using est::current_loop()
   // (est:util.current_loop) instead of a caller-supplied loop&.
-  counting_event() noexcept : counting_event(current_loop()) {}
+  explicit counting_event(int max_count = std::numeric_limits<int>::max()) noexcept
+      : counting_event(current_loop(), max_count) {}
 
   counting_event(const counting_event&) = delete;
   auto operator=(const counting_event&) -> counting_event& = delete;
@@ -121,19 +136,32 @@ public:
 
   [[nodiscard]] auto count() const noexcept -> int { return count_; }
 
+  [[nodiscard]] auto max_count() const noexcept -> int { return max_count_; }
+
   [[nodiscard]] auto has_waiters() const noexcept -> bool { return !waiters_.empty(); }
 
-  // Increments the count by n (default 1) and wakes waiters:
-  //  - automatic: hands the increment directly to up to n currently
-  //    queued waiters, one unit each - exactly like mutex::unlock()
-  //    hands the lock directly to the next waiter, generalized to up to
-  //    n of them. Any surplus (n greater than the number of currently
-  //    queued waiters) stays in the count for a later wait() to consume
-  //    immediately via its own fast path, one unit per call.
+  // Increments the count by up to n (default 1), saturating at
+  // max_count - i.e. actually adding min(n, max_count - count()) - and
+  // wakes waiters:
+  //  - automatic: hands the (possibly saturated) increment directly to
+  //    that many currently queued waiters, one unit each - exactly like
+  //    mutex::unlock() hands the lock directly to the next waiter,
+  //    generalized to more than one of them. Any surplus (more added
+  //    than the number of currently queued waiters) stays in the count
+  //    for a later wait() to consume immediately via its own fast path,
+  //    one unit per call.
   //  - manual: wakes *every* currently queued waiter unconditionally -
   //    there is nothing to "consume" for a manual-reset signal - and
   //    leaves the count exactly as incremented, so every *future*
   //    wait() also takes the fast path, until reset().
+  // A set() that can't add anything (count() already at max_count) is a
+  // no-op - not a checked precondition violation - the same reasoning
+  // one_shot_event::set() below applies to a redundant call: a caller
+  // shouldn't have to guard set() with its own "is there room?" check
+  // just to safely call it from more than one place. This is also
+  // exactly what makes est::binary_event's set() idempotent once
+  // signaled, with no code of its own: max_count = 1 already saturates
+  // after the first successful call.
   // Deferred through est::loop::enqueue_ready() rather than completed
   // directly here, for the identical reason mutex::unlock() defers
   // (see its own doc comment): detail::event_resume_node::run() only ever
@@ -144,9 +172,13 @@ public:
   // never invoke a continuation inline).
   void set(int n = 1) {
     check(n > 0, "counting_event::set(n) requires n > 0");
-    count_ += n;
+    const int actual_n = std::min(n, max_count_ - count_);
+    if (actual_n <= 0) {
+      return;
+    }
+    count_ += actual_n;
     if constexpr (Mode == EventResetMode::automatic) {
-      for (int i = 0; i < n; ++i) {
+      for (int i = 0; i < actual_n; ++i) {
         auto* waiter = waiters_.dequeue();
         if (waiter == nullptr) {
           break;
@@ -166,8 +198,9 @@ public:
   // it); only a count that hasn't yet been consumed by a waiter is
   // cleared. Equally meaningful for either Mode: automatic's own
   // wait() already self-clears one unit per successful wait, but
-  // nothing stops a caller from wanting to drop a surplus (n larger
-  // than the number of waiters at set() time) without waiting it out.
+  // nothing stops a caller from wanting to drop a surplus (more added
+  // by set() than there were waiters to hand it to) without waiting it
+  // out.
   void reset() noexcept { count_ = 0; }
 
   // Suspends the calling coroutine until the count is greater than zero,
@@ -189,39 +222,33 @@ public:
 
 private:
   int count_ = 0;
+  int max_count_;
   loop& loop_;
   intrusive_list<detail::ready_node> waiters_;
 };
 
 // A counting_event<Mode> whose count never exceeds one - the classic
 // Win32 event object (CreateEvent/SetEvent/ResetEvent), generalized only
-// by which reset mode Mode selects. set() (no argument, hiding the base
-// class's set(int n) entirely - see below) is idempotent once already
-// signaled: calling it again before anything has consumed the signal is
-// a no-op, matching SetEvent()'s own documented behavior, rather than
-// accumulating a count the way counting_event<Mode>::set(n) would.
-// wait()/reset() are inherited unchanged - both already do exactly the
-// right thing for a count clamped to {0, 1}, with nothing left for this
-// class to add.
+// by which reset mode Mode selects. Not a separate implementation with
+// its own set()/wait()/reset(): literally counting_event<Mode> constructed
+// with max_count = 1, nothing else - the base class's own set(n)
+// saturating at max_count (see its own doc comment) already gives
+// set()'s idempotent-once-signaled behavior for free, matching SetEvent()'s
+// own documented "calling it again before anything has consumed the
+// signal is a no-op" behavior with no code of this class's own. Only
+// adds signaled() (a named alias for count() > 0) and constructors that
+// hardcode max_count = 1 - inheriting counting_event<Mode>'s own
+// constructors via a using-declaration isn't an option here, since that
+// would also inherit their own (unbounded) max_count default.
 template <EventResetMode Mode> class binary_event : public counting_event<Mode> {
 public:
-  using counting_event<Mode>::counting_event;
+  explicit binary_event(loop& loop_ref) noexcept : counting_event<Mode>(loop_ref, 1) {}
+
+  // Issue #30: sugar over the constructor above using est::current_loop()
+  // (est:util.current_loop) instead of a caller-supplied loop&.
+  binary_event() noexcept : counting_event<Mode>(1) {}
 
   [[nodiscard]] auto signaled() const noexcept -> bool { return this->count() > 0; }
-
-  // Declaring set() here hides *every* overload of the base class's own
-  // set(int n) from ordinary (unqualified) lookup on a binary_event - not
-  // an override (counting_event<Mode>::set() isn't virtual; nothing in
-  // this hierarchy needs runtime dispatch, since every caller always
-  // knows the concrete type it's holding), just plain C++ name hiding.
-  // `binary_event_instance.set(3)` is therefore a compile error, not a
-  // silently-accepted way to smuggle a count past the {0, 1} clamp this
-  // class exists to enforce.
-  void set() {
-    if (!signaled()) {
-      counting_event<Mode>::set(1);
-    }
-  }
 };
 
 // A binary_event<Mode> that may be set() at most once, ever - the
@@ -240,12 +267,13 @@ public:
 // needs to get right.
 //
 // set() past the first call is a no-op, not a checked precondition
-// violation - matching binary_event<Mode>::set()'s own idempotency
-// (review: forcing every caller to guard set() with its own "have I
-// already signaled this?" check, on pain of aborting the whole process,
-// would defeat the point of a primitive meant to let independent callers
-// - e.g. two unrelated cancellation sources racing to fire the same
-// one-shot signal - all safely call set() without coordinating first).
+// violation - matching counting_event<Mode>::set()'s own saturating
+// idempotency once max_count is reached, one layer down (review: forcing
+// every caller to guard set() with its own "have I already signaled
+// this?" check, on pain of aborting the whole process, would defeat the
+// point of a primitive meant to let independent callers - e.g. two
+// unrelated cancellation sources racing to fire the same one-shot signal
+// - all safely call set() without coordinating first).
 //
 // reset() is deleted outright (again: hides the base's declaration from
 // unqualified lookup, same technique set() above already uses, not an

@@ -288,3 +288,79 @@ TEST_CASE("one_shot_event: a second set() is a no-op, not a checked failure", "[
   auto fut = ev.wait();
   REQUIRE(fut.ready());
 }
+
+TEST_CASE("counting_event: max_count() reflects the constructed value, unbounded by default",
+          "[event]") {
+  est::loop loop;
+  est::counting_event<EventResetMode::automatic> unbounded(loop);
+  est::counting_event<EventResetMode::automatic> bounded(loop, 3);
+
+  REQUIRE(unbounded.max_count() == std::numeric_limits<int>::max());
+  REQUIRE(bounded.max_count() == 3);
+}
+
+TEST_CASE("counting_event<automatic>: set(n) saturates at max_count instead of growing without "
+          "limit",
+          "[event]") {
+  est::loop loop;
+  est::counting_event<EventResetMode::automatic> ev(loop, 3);
+
+  ev.set(10); // only 3 units actually fit
+  REQUIRE(ev.count() == 3);
+
+  ev.set(); // already full - a no-op, not an overflow
+  REQUIRE(ev.count() == 3);
+}
+
+TEST_CASE("counting_event<automatic>: set(n) saturating at max_count still only hands off as "
+          "many waiters as actually fit",
+          "[event]") {
+  est::loop loop;
+  est::counting_event<EventResetMode::automatic> ev(loop, 2);
+  std::vector<int> order;
+
+  // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto waiter = [](est::loop&,
+                   est::counting_event<EventResetMode::automatic>& event_ref,
+                   std::vector<int>& order_ref,
+                   int id) -> est::future<void> {
+    co_await event_ref.wait();
+    order_ref.push_back(id);
+    co_return;
+  };
+  // NOLINTEND(cppcoreguidelines-avoid-reference-coroutine-parameters)
+
+  auto fut1 = waiter(loop, ev, order, 1);
+  loop.run_until_idle();
+  auto fut2 = waiter(loop, ev, order, 2);
+  loop.run_until_idle();
+  auto fut3 = waiter(loop, ev, order, 3);
+  loop.run_until_idle();
+
+  ev.set(5); // max_count = 2 - only the first two queued waiters get a unit
+  loop.run_until_idle();
+
+  REQUIRE(order == std::vector{1, 2});
+  REQUIRE(ev.count() == 0);  // nothing left over - the saturated amount was fully handed off
+  REQUIRE(ev.has_waiters()); // the third waiter is still queued
+  REQUIRE(fut1.ready());
+  REQUIRE(fut2.ready());
+  REQUIRE_FALSE(fut3.ready());
+}
+
+TEST_CASE("counting_event<manual>: set(n) saturates at max_count too", "[event]") {
+  est::loop loop;
+  est::counting_event<EventResetMode::manual> ev(loop, 2);
+
+  ev.set(10);
+  REQUIRE(ev.count() == 2);
+}
+
+TEST_CASE("binary_event<Mode>: max_count() is always 1", "[event]") {
+  est::loop loop;
+  est::binary_event<EventResetMode::automatic> automatic_ev(loop);
+  est::binary_event<EventResetMode::manual> manual_ev(loop);
+
+  REQUIRE(automatic_ev.max_count() == 1);
+  REQUIRE(manual_ev.max_count() == 1);
+}
