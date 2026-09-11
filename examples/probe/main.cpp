@@ -70,6 +70,66 @@ import std;
   co_return value + 1;
 }
 
+// Prototype only - not wired into est itself, purely to get a real,
+// apples-to-apples disassembly of a thread_local-based replacement for the
+// platform::interface-virtual-dispatch current_loop()/allocator()/
+// platform::instance() mechanism above: one thread_local context struct
+// holding raw pointers to the loop, its allocator's memory_resource, and
+// the active platform::interface, set by a single scoped setup function
+// instead of two separate runtime-registration calls
+// (make_current_loop() + platform::override_instance()).
+namespace probe_tls {
+
+struct execution_context {
+  est::loop* loop_ptr = nullptr;
+  std::pmr::memory_resource* resource_ptr = nullptr;
+  est::platform::interface* platform_ptr = nullptr;
+};
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline thread_local execution_context tls_context;
+
+[[nodiscard, gnu::noinline]] auto setup(est::loop& loop_ref,
+                                        est::platform::interface& platform_ref) noexcept {
+  tls_context = {.loop_ptr = &loop_ref,
+                 .resource_ptr = loop_ref.allocator().resource(),
+                 .platform_ptr = &platform_ref};
+  return est::scope_exit([]() noexcept { tls_context = {}; });
+}
+
+[[nodiscard]] inline auto current_loop() noexcept -> est::loop& { return *tls_context.loop_ptr; }
+
+[[nodiscard]] inline auto current_allocator() noexcept -> std::pmr::polymorphic_allocator<std::byte> {
+  return std::pmr::polymorphic_allocator<std::byte>(tls_context.resource_ptr);
+}
+
+[[nodiscard]] inline auto current_platform() noexcept -> est::platform::interface& {
+  return *tls_context.platform_ptr;
+}
+
+} // namespace probe_tls
+
+[[gnu::noinline]] auto probe_tls_current_loop() -> est::loop* { return &probe_tls::current_loop(); }
+
+[[gnu::noinline]] auto probe_tls_allocator() -> void* {
+  return probe_tls::current_allocator().resource();
+}
+
+[[gnu::noinline]] auto probe_tls_platform_instance() -> est::platform::interface* {
+  return &probe_tls::current_platform();
+}
+
+// The real mechanism's own equivalent setup cost, isolated the same way -
+// today's two separate runtime-registration calls, noinline'd so they
+// survive as real call sites instead of folding into main().
+[[gnu::noinline]] auto probe_make_current_loop(est::loop& loop_ref) noexcept {
+  return est::make_current_loop(loop_ref);
+}
+
+[[gnu::noinline]] auto probe_override_instance(est::platform::interface& platform_ref) noexcept {
+  return est::platform::override_instance(platform_ref);
+}
+
 auto main() -> int {
   estext::hosted_stdcpp platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
@@ -88,6 +148,16 @@ auto main() -> int {
     prom.set_value(41);
     est::current_loop().run_until_idle(); // resumes it, frame freed
     std::println("{}", suspended.get());
+
+    est::loop mcl_loop;
+    { const auto guard = probe_make_current_loop(mcl_loop); }
+    { const auto guard = probe_override_instance(platform_instance); }
+
+    est::loop tls_loop;
+    const auto tls_guard = probe_tls::setup(tls_loop, platform_instance);
+    std::println("{}", static_cast<void*>(probe_tls_current_loop()));
+    std::println("{}", probe_tls_allocator());
+    std::println("{}", static_cast<void*>(probe_tls_platform_instance()));
   } catch (...) {
     return EXIT_FAILURE;
   }
