@@ -30,12 +30,23 @@
         "EST_ENABLE_SANITIZERS": "ON",
         "EST_BUILD_EXAMPLES": "OFF"
       }
+    },
+    {
+      "name": "lto",
+      "displayName": "Release build with LTO (ThinLTO via CMAKE_INTERPROCEDURAL_OPTIMIZATION)",
+      "inherits": "default",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "ON",
+        "EST_BUILD_TESTS": "OFF"
+      }
     }
   ],
   "buildPresets": [
     { "name": "default", "configurePreset": "default" },
     { "name": "ci", "configurePreset": "ci" },
-    { "name": "sanitize", "configurePreset": "sanitize" }
+    { "name": "sanitize", "configurePreset": "sanitize" },
+    { "name": "lto", "configurePreset": "lto" }
   ],
   "testPresets": [
     { "name": "default", "configurePreset": "default", "output": { "outputOnFailure": true } },
