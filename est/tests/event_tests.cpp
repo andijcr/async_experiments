@@ -364,3 +364,31 @@ TEST_CASE("binary_event<Mode>: max_count() is always 1", "[event]") {
   REQUIRE(automatic_ev.max_count() == 1);
   REQUIRE(manual_ev.max_count() == 1);
 }
+
+TEST_CASE("counting_event<automatic>: set(n) returns the amount actually added", "[event]") {
+  est::loop loop;
+  est::counting_event<EventResetMode::automatic> ev(loop);
+
+  REQUIRE(ev.set(5) == 5);
+  REQUIRE(ev.count() == 5);
+}
+
+TEST_CASE("counting_event<automatic>: set(n) returns the saturated amount, not n, once capped by "
+          "max_count",
+          "[event]") {
+  est::loop loop;
+  est::counting_event<EventResetMode::automatic> ev(loop, 3);
+
+  REQUIRE(ev.set(10) == 3); // only 3 units actually fit
+  REQUIRE(ev.set(10) == 0); // already full - nothing left to add
+}
+
+TEST_CASE("one_shot_event: set() returns 1 for the call that actually signals, 0 after",
+          "[event]") {
+  est::loop loop;
+  est::one_shot_event<EventResetMode::manual> ev(loop);
+
+  REQUIRE(ev.set() == 1);
+  REQUIRE(ev.set() == 0);
+  REQUIRE(ev.set() == 0);
+}

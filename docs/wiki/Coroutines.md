@@ -838,7 +838,13 @@ defaulted to an effectively-unbounded value): `set(n)` saturates at it -
 actually adding `min(n, max_count - count())` - rather than growing the
 count without limit, the same way `std::counting_semaphore<LeastMaxValue>`
 bounds `release()`, except saturating instead of the standard's own
-undefined-behavior-on-overflow contract. `binary_event<Mode>` (count
+undefined-behavior-on-overflow contract. `set(n)` returns that actual
+amount (`0` for a no-op call, up to `n` otherwise) rather than `void`, so
+a caller of the base class - unlike `binary_event`/`one_shot_event`,
+which exist precisely so their own callers never have to check - can
+still tell whether a `set(n)` call was silently capped.
+`one_shot_event::set()` returns the same shape (`1` for the call that
+actually signals, `0` for a redundant one). `binary_event<Mode>` (count
 clamped to `{0, 1}`, the classic Win32 event object) is nothing more than
 a `counting_event<Mode>` constructed with `max_count = 1` - not a separate
 implementation, and no override of `set()` needed: the base class's own

@@ -168,6 +168,14 @@ public:
   // exactly what makes est::binary_event's set() idempotent once
   // signaled, with no code of its own: max_count = 1 already saturates
   // after the first successful call.
+  //
+  // Returns the amount actually added (min(n, max_count - count()), the
+  // same value stored into count()/handed to waiters above) - 0 for a
+  // no-op call, up to n otherwise - so a caller that cares whether it was
+  // silently capped (unlike est::binary_event/est::one_shot_event, which
+  // exist precisely so their own callers don't have to care) can check
+  // the result instead of it being entirely unobservable.
+  //
   // Deferred through est::loop::enqueue_ready() rather than completed
   // directly here, for the identical reason mutex::unlock() defers
   // (see its own doc comment): detail::event_resume_node::run() only ever
@@ -176,11 +184,11 @@ public:
   // to bound recursion - deferring anyway keeps this consistent with
   // every other completion path in this codebase (M3, docs/PLAN.md:
   // never invoke a continuation inline).
-  void set(int n = 1) {
+  auto set(int n = 1) -> int {
     check(n > 0, "counting_event::set(n) requires n > 0");
     const int actual_n = std::min(n, max_count_ - count_);
     if (actual_n <= 0) {
-      return;
+      return 0;
     }
     count_ += actual_n;
     if constexpr (Mode == EventResetMode::automatic) {
@@ -195,6 +203,7 @@ public:
     } else {
       waiters_.drain([this](detail::ready_node& node) { loop_.enqueue_ready(node); });
     }
+    return actual_n;
   }
 
   // Clears the count without touching anything already handed off - any
@@ -293,12 +302,18 @@ template <EventResetMode Mode> class one_shot_event : public binary_event<Mode> 
 public:
   using binary_event<Mode>::binary_event;
 
-  void set() {
+  // Returns 1 for the call that actually signals (mirroring
+  // counting_event<Mode>::set()'s own "amount actually added" return
+  // value - always 1 here, since binary_event<Mode>::set() can only ever
+  // add its single unit on this, the first and only call reaching it) or
+  // 0 for a redundant call that has_been_set_ turned into a no-op before
+  // ever reaching binary_event<Mode>::set() at all.
+  auto set() -> int {
     if (has_been_set_) {
-      return;
+      return 0;
     }
     has_been_set_ = true;
-    binary_event<Mode>::set();
+    return binary_event<Mode>::set();
   }
 
   void reset() = delete;
