@@ -309,12 +309,19 @@ this split exists):
 ```cpp
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
   auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
-  auto* node = loop_ref.allocator().template new_object<detail::sleep_resume_node>(std::move(prom));
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
+  auto* node = allocator.template new_object<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }
 ```
+
+`current_loop()` is still resolved here (`schedule_timer()` needs the
+loop itself), but the allocations go through `current_allocator()`
+directly rather than `loop_ref.allocator()` - the same "reach the
+allocator without a detour through the loop pointer" pattern used
+everywhere current_loop() isn't independently needed.
 
 `sleep_resume_node` holds the `promise<void>` directly rather than
 wrapping a generic closure - needed so `destroy(allocator, ran)` can
@@ -336,8 +343,9 @@ all:
 ```cpp
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
-  auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
+  auto* node = allocator.template new_object<detail::yield_resume_node>(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }

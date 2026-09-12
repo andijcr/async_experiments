@@ -295,20 +295,21 @@ public:
   // not this future_state's - see loop.cppm). Without this, those
   // still-pending nodes are simply unreachable once this future_state
   // itself is gone - a permanent leak, not just a skipped notification.
-  // waiters_.empty() checked *before* resolving current_loop(), not just
-  // for a wasted lookup: a future_state that completed with no
+  // waiters_.empty() checked *before* resolving current_allocator(), not
+  // just for a wasted lookup: a future_state that completed with no
   // continuation ever registered (or all of them already drained) can
   // legitimately be destroyed long after whatever loop was current when
-  // it was created has stopped being current at all - current_loop()
+  // it was created has stopped being current at all - current_allocator()
   // would fail its own precondition in that case even though there is
-  // nothing here that actually needs a loop.
+  // nothing here that actually needs one. Only the allocator, not the
+  // loop itself, is needed to destroy an abandoned waiter node -
+  // current_loop() is never resolved here at all.
   ~future_state() {
     if (waiters_.empty()) {
       return;
     }
-    auto& loop_ref = current_loop();
-    waiters_.drain(
-        [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
+    auto allocator = current_allocator();
+    waiters_.drain([allocator](detail::ready_node& node) { node.destroy(allocator, false); });
   }
 
   void set_value()
@@ -499,15 +500,19 @@ public:
   // invoking it to its own ready-queue drain pass instead - the returned
   // future<U> reuses this future_state's own loop, so a chain of then()
   // calls all resolve on that one loop.
+  // Only current_allocator() is needed to build the downstream state and
+  // its node - current_loop() itself is never resolved here;
+  // set_continuation() below resolves it fresh on its own, only if this
+  // future_state already turns out to be ready.
   template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
-    auto& loop_ref = current_loop();
-    auto downstream = shared_ptr<future_state<downstream_value_type>>::make(loop_ref.allocator());
+    auto allocator = current_allocator();
+    auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator);
     auto downstream_for_node = downstream; // copy: the node keeps its own reference too
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-    auto* node = loop_ref.allocator().template new_object<node_type>(
-        std::forward<Fn>(fn), std::move(downstream_for_node));
+    auto* node = allocator.template new_object<node_type>(std::forward<Fn>(fn),
+                                                          std::move(downstream_for_node));
     set_continuation(*node);
     return future<downstream_value_type>(std::move(downstream));
   }

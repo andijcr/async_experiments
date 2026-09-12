@@ -165,8 +165,9 @@ export namespace est {
 // itself depends on, so it cannot depend back on :future/:promise).
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
   auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
-  auto* node = loop_ref.allocator().template new_object<detail::sleep_resume_node>(std::move(prom));
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
+  auto* node = allocator.template new_object<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }
@@ -192,8 +193,9 @@ export namespace est {
 // it ever checks pending_timers_.
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
-  auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
+  auto* node = allocator.template new_object<detail::yield_resume_node>(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }

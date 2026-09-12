@@ -489,24 +489,27 @@ already applied, before it was ever inspected; a bespoke fast path for
 
 ```cpp
 auto mutex::lock() -> future<void> {
-  auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
   if (state_ == 0) {
     state_ = 1;
     prom.set_value();               // fast path: uncontended, acquire immediately
     return std::move(fut);
   }
-  auto* node = loop_ref.allocator().template new_object<lock_resume_node>(std::move(prom));
+  auto* node = allocator.template new_object<lock_resume_node>(std::move(prom));
   waiters_.enqueue(*node);          // slow path: queue a heap-allocated resume node
   return std::move(fut);
 }
 ```
 
 `mutex` holds no `loop&` of its own to build `state_` against (nor does
-`future_state<T>` any more) - `current_loop()` is resolved once, right
-here, and reused for both the promise/future pair and the resume node's
-allocation. See [Loop and Timers](Loop-And-Timers.md) for what that
-"resolve fresh, don't cache" design costs and the hazard it introduces.
+`future_state<T>` any more) - and `lock()` doesn't even need
+`current_loop()` itself here, only `current_allocator()`: the fast path
+completes the promise inline, and the slow path only enqueues into this
+mutex's own `waiters_`, never onto a loop's ready-queue directly (that
+happens later, from `unlock()`, which does need `current_loop()`). See
+[Loop and Timers](Loop-And-Timers.md) for what "resolve fresh, don't
+cache" costs and the hazard it introduces.
 
 `co_await mutex.lock();` works because `future<T>` is awaitable from any
 coroutine (`operator co_await()`, above) - and since
@@ -605,15 +608,14 @@ them for a caller who'd rather not have to remember the matching
 
 ```cpp
 auto mutex::acquire() -> future<lock_guard> {
-  auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(loop_ref.allocator());
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(allocator);
   if (state_ == 0) {
     state_ = 1;
     prom.set_value(lock_guard(*this));
     return std::move(fut);
   }
-  auto* node =
-      loop_ref.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
+  auto* node = allocator.template new_object<acquire_resume_node>(*this, std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }

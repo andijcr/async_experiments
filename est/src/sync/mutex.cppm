@@ -32,10 +32,13 @@ export namespace est {
 // takes (`future_awaiter<T>::await_ready()`, `est:future`).
 //
 // Holds no `loop&` of its own, unlike future_state<T> - every method
-// below resolves est::current_loop() fresh, at the point of use, rather
-// than caching a reference at construction time. There is no constructor
-// taking an explicit `loop&` either; a mutex is never tied to a specific
-// loop, only to whichever one is current when each operation runs.
+// below resolves est::current_loop()/est::current_allocator() fresh, at
+// the point of use, rather than caching anything at construction time -
+// only current_allocator(), not current_loop() itself, where a method
+// never actually needs the loop (see lock()/acquire()/~mutex()'s own
+// comments). There is no constructor taking an explicit `loop&` either;
+// a mutex is never tied to a specific loop, only to whichever one is
+// current when each operation runs.
 class mutex {
 public:
   mutex() noexcept = default;
@@ -52,18 +55,20 @@ public:
   // its promise with an exception first, rather than just deallocating
   // itself silently - see lock_resume_node's own doc comment for why
   // that matters beyond just freeing the node itself.
-  // waiters_.empty() checked *before* resolving current_loop() - a mutex
-  // with nothing queued can legitimately be destroyed long after whatever
-  // loop was current when it was created has stopped being current at
-  // all, and current_loop() would fail its own precondition in that case
-  // even though nothing here actually needs a loop.
+  // waiters_.empty() checked *before* resolving current_allocator() - a
+  // mutex with nothing queued can legitimately be destroyed long after
+  // whatever loop was current when it was created has stopped being
+  // current at all, and current_allocator() would fail its own
+  // precondition in that case even though nothing here actually needs
+  // one. Only the allocator, not the loop itself, is needed to destroy
+  // an abandoned waiter node - current_loop() is never resolved here at
+  // all.
   ~mutex() {
     if (waiters_.empty()) {
       return;
     }
-    auto& loop_ref = current_loop();
-    waiters_.drain(
-        [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
+    auto allocator = current_allocator();
+    waiters_.drain([allocator](detail::ready_node& node) { node.destroy(allocator, false); });
   }
 
   [[nodiscard]] auto locked() const noexcept -> bool { return state_ != 0; }
@@ -197,15 +202,19 @@ private:
   promise<void> promise_;
 };
 
+// Only current_allocator() is needed here, never current_loop() itself -
+// the fast path completes the promise inline, and the slow path only
+// enqueues into this mutex's own waiters_, not onto any loop's
+// ready-queue (that happens later, from unlock()).
 inline auto mutex::lock() -> future<void> {
-  auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
   if (state_ == 0) {
     state_ = 1;
     prom.set_value();
     return std::move(fut);
   }
-  auto* node = loop_ref.allocator().template new_object<lock_resume_node>(std::move(prom));
+  auto* node = allocator.template new_object<lock_resume_node>(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }
@@ -282,16 +291,17 @@ private:
   promise<lock_guard> promise_;
 };
 
+// Same reasoning as lock() above: only current_allocator() is needed,
+// never current_loop() itself.
 inline auto mutex::acquire() -> future<lock_guard> {
-  auto& loop_ref = current_loop();
-  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(loop_ref.allocator());
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(allocator);
   if (state_ == 0) {
     state_ = 1;
     prom.set_value(lock_guard(*this));
     return std::move(fut);
   }
-  auto* node =
-      loop_ref.allocator().template new_object<acquire_resume_node>(*this, std::move(prom));
+  auto* node = allocator.template new_object<acquire_resume_node>(*this, std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }

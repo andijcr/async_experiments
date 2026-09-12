@@ -90,7 +90,10 @@ export namespace est {
 //
 // Holds no `loop&` of its own (unlike future_state<T> - see that class's
 // own doc comment): wait()/set()/~counting_event() each resolve
-// est::current_loop() fresh, at the point of use. There is no
+// est::current_loop()/est::current_allocator() fresh, at the point of
+// use - only current_allocator(), not current_loop() itself, where a
+// method never actually needs the loop (wait()/~counting_event(); set()
+// still needs current_loop() for enqueue_ready()). There is no
 // constructor taking an explicit `loop&` either. KNOWN HAZARD this
 // creates, same as est::mutex's own doc comment describes: a waiter
 // queued by wait() carries a future_state<void> built against whichever
@@ -136,19 +139,20 @@ public:
   // completes its promise with an exception first, rather than just
   // deallocating itself silently - see its own doc comment for why that
   // matters beyond just freeing the node itself.
-  // waiters_.empty() checked *before* resolving current_loop() - a
+  // waiters_.empty() checked *before* resolving current_allocator() - a
   // counting_event with nothing queued can legitimately be destroyed
   // long after whatever loop was current when it was created has stopped
-  // being current at all, and current_loop() would fail its own
-  // precondition in that case even though nothing here actually needs a
-  // loop.
+  // being current at all, and current_allocator() would fail its own
+  // precondition in that case even though nothing here actually needs
+  // one. Only the allocator, not the loop itself, is needed to destroy
+  // an abandoned waiter node - current_loop() is never resolved here at
+  // all.
   ~counting_event() {
     if (waiters_.empty()) {
       return;
     }
-    auto& loop_ref = current_loop();
-    waiters_.drain(
-        [&loop_ref](detail::ready_node& node) { node.destroy(loop_ref.allocator(), false); });
+    auto allocator = current_allocator();
+    waiters_.drain([allocator](detail::ready_node& node) { node.destroy(allocator, false); });
   }
 
   [[nodiscard]] auto count() const noexcept -> int { return count_; }
@@ -240,10 +244,14 @@ public:
 
   // Suspends the calling coroutine until the count is greater than zero,
   // resuming immediately (no suspension, no allocation - see
-  // future_awaiter<T>::await_ready(), est:future) if it already is.
+  // future_awaiter<T>::await_ready(), est:future) if it already is. Only
+  // current_allocator() is needed here, never current_loop() itself - the
+  // fast path completes the promise inline, and the slow path only
+  // enqueues into this event's own waiters_, not onto any loop's
+  // ready-queue (that happens later, from set()).
   [[nodiscard]] auto wait() -> future<void> {
-    auto& loop_ref = current_loop();
-    auto [prom, fut] = detail::make_promise_future_impl<void>(loop_ref.allocator());
+    auto allocator = current_allocator();
+    auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
     if (count_ > 0) {
       if constexpr (Mode == EventResetMode::automatic) {
         --count_;
@@ -251,8 +259,7 @@ public:
       prom.set_value();
       return std::move(fut);
     }
-    auto* node =
-        loop_ref.allocator().template new_object<detail::event_resume_node>(std::move(prom));
+    auto* node = allocator.template new_object<detail::event_resume_node>(std::move(prom));
     waiters_.enqueue(*node);
     return std::move(fut);
   }
