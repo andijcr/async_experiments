@@ -203,17 +203,16 @@ private:
 };
 
 // Only current_allocator() is needed here, never current_loop() itself -
-// the fast path completes the promise inline, and the slow path only
-// enqueues into this mutex's own waiters_, not onto any loop's
-// ready-queue (that happens later, from unlock()).
+// the fast path completes the promise inline (make_ready_future()), and
+// the slow path only enqueues into this mutex's own waiters_, not onto
+// any loop's ready-queue (that happens later, from unlock()).
 inline auto mutex::lock() -> future<void> {
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
   if (state_ == 0) {
     state_ = 1;
-    prom.set_value();
-    return std::move(fut);
+    return make_ready_future<void>();
   }
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
   auto* node = allocator.template new_object<lock_resume_node>(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
@@ -294,13 +293,12 @@ private:
 // Same reasoning as lock() above: only current_allocator() is needed,
 // never current_loop() itself.
 inline auto mutex::acquire() -> future<lock_guard> {
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(allocator);
   if (state_ == 0) {
     state_ = 1;
-    prom.set_value(lock_guard(*this));
-    return std::move(fut);
+    return make_ready_future<lock_guard>(*this);
   }
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(allocator);
   auto* node = allocator.template new_object<acquire_resume_node>(*this, std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);

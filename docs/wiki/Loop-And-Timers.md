@@ -362,6 +362,47 @@ yield_execution();` holds the only other reference to its
 `future_state<void>`, so silently dropping the promise would strand that
 coroutine's frame forever if the loop is destroyed first.
 
+### `make_ready_future<T>(args...)`
+
+`est::mutex::lock()`/`acquire()`'s own uncontended fast paths and
+`est::counting_event<Mode>::wait()`'s own already-signaled fast path each
+need an already-ready `future<T>` built from a value they already have in
+hand. `make_ready_future<T>(args...)` (`est:promise`) is that pattern
+factored out - `make_promise_future<T>()` followed by
+`promise<T>::set_value(T(args...))`, in one call:
+
+```cpp
+template <class T, class... Args>
+[[nodiscard]] auto make_ready_future(Args&&... args) -> future<T> {
+  auto [prom, fut] = make_promise_future<T>();
+  if constexpr (std::is_void_v<T>) {
+    prom.set_value();
+  } else {
+    prom.set_value(T(std::forward<Args>(args)...));
+  }
+  return std::move(fut);
+}
+```
+
+One overload covers every `T`, `void` included, since `make_promise_future<T>()`
+itself now takes no explicit `loop&` to disambiguate against - there's
+nothing for an `Args...` pack to be mistaken for. `mutex::lock()`'s fast
+path, for instance:
+
+```cpp
+inline auto mutex::lock() -> future<void> {
+  if (state_ == 0) {
+    state_ = 1;
+    return make_ready_future<void>();
+  }
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
+  auto* node = allocator.template new_object<lock_resume_node>(std::move(prom));
+  waiters_.enqueue(*node);
+  return std::move(fut);
+}
+```
+
 `schedule_timer()` records the deadline in `est::timer_queue`'s own
 min-heap *and* the node in `loop`'s own `pending_timers_` list, keyed by the
 timer queue's own id:

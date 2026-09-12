@@ -80,6 +80,23 @@ template <class T> auto make_promise_future() -> std::pair<promise<T>, future<T>
   return detail::make_promise_future_impl<T>(current_allocator());
 }
 
+// Builds an already-ready future<T> against est::current_loop(),
+// constructing its value in place from `args...` - sugar over
+// make_promise_future<T>() followed by promise<T>::set_value(T(args...)),
+// for a caller that doesn't need to hold the promise itself.
+template <class T, class... Args>
+[[nodiscard]] auto make_ready_future(Args&&... args) -> future<T> {
+  static_assert(!std::is_void_v<T> || sizeof...(Args) == 0,
+                "make_ready_future<void>() takes no arguments");
+  auto [prom, fut] = make_promise_future<T>();
+  if constexpr (std::is_void_v<T>) {
+    prom.set_value();
+  } else {
+    prom.set_value(T(std::forward<Args>(args)...));
+  }
+  return std::move(fut);
+}
+
 } // namespace est
 
 namespace est::detail {

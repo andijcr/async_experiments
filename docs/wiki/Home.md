@@ -108,4 +108,4 @@ constructs one, and `platform::override_instance()`s it
 | `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
-| `est::promise<T>`, `make_promise_future()`, `sleep_for()`/`sleep_until()` | `est/src/promise.cppm` |
+| `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `sleep_for()`/`sleep_until()` | `est/src/promise.cppm` |
