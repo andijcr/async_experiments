@@ -58,10 +58,10 @@ public:
   // did run (loop::destroy_guard() below deletes those directly, no
   // abandon() call). Default is a no-op; a node whose completion needs
   // to differ on this abandoned path - est:future's future_resume_node<T>/
-  // concrete_continuation<Fn, U>/flatten_forwarder<T>, est:sync.event's
-  // event_resume_node, est:promise's sleep_resume_node/yield_resume_node -
-  // overrides it instead of every call site branching on a `ran` flag
-  // itself.
+  // concrete_continuation<Fn, U>/flatten_forwarder<T>, est:promise's
+  // sleep_resume_node/promise_resume_node (the latter shared with
+  // est:sync.event) - overrides it instead of every call site branching
+  // on a `ran` flag itself.
   virtual void abandon() noexcept {}
 };
 

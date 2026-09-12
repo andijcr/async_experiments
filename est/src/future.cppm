@@ -638,7 +638,7 @@ private:
     // at teardown) before ever completing. downstream_ must still be
     // completed here, not silently dropped, for the identical reason
     // every other resume node in this codebase (future_resume_node<T>,
-    // further down this file; detail::event_resume_node, est:sync.event)
+    // further down this file; detail::promise_resume_node, est:promise)
     // already completes an abandoned promise instead of just dropping
     // it: a coroutine co_await-ing the future<U> this then() call
     // returned holds that same future_state<U> alive across its own
@@ -1031,7 +1031,7 @@ namespace est::detail {
 // awaited future is already resolved by the time co_await evaluates it).
 // Separately heap-allocated via an allocator (like every other ready_node
 // this codebase queues - concrete_continuation<Fn, U>,
-// est:promise's sleep_resume_node/yield_resume_node), *not* embedded
+// est:promise's sleep_resume_node/promise_resume_node), *not* embedded
 // inside the coroutine frame it resumes: an awaiter object embedded in a
 // coroutine's own frame only lives for the duration of *its own*
 // co_await expression - once run() resumes the coroutine past that

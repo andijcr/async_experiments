@@ -28,7 +28,8 @@ complex `.then()` chain actually cost."
    path, always.
 2. **`new Concrete(args...)`** — a *direct*, un-shared allocation for a
    continuation or timer node (`concrete_continuation<Fn, U>`,
-   `est:promise`'s `sleep_resume_node`/`yield_resume_node`). These are
+   `est:promise`'s `sleep_resume_node`/`promise_resume_node`, the latter
+   shared with `est:sync.event`). These are
    never wrapped in a `shared_ptr` — a node has exactly one owner at a
    time (first the `future_state` it's pending on, then the loop's
    ready-queue or pending-timer list), so plain ownership-by-pointer plus

@@ -73,7 +73,7 @@ public:
   // this method returned. Costs two more allocations than the old
   // hand-written acquire_resume_node did (a concrete_continuation<Fn,
   // lock_guard> node plus its own downstream future_state<lock_guard>, on
-  // top of event_.wait()'s own future_state<void>+event_resume_node) - a
+  // top of event_.wait()'s own future_state<void>+detail::promise_resume_node) - a
   // deliberate trade of contended-path allocation count for not
   // re-implementing the waiter queue/resume node/abandonment-completion
   // machinery a second time; see docs/PLAN.md's "Issue #66 & #67" entry.

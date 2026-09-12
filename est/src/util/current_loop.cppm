@@ -139,8 +139,8 @@ namespace est::detail {
 // both resolving est::current_allocator() fresh - the shared
 // implementation every concrete est::detail::ready_node/timer_node
 // (est:loop) inherits instead of hand-rolling the same pair itself:
-// est:promise's sleep_resume_node/yield_resume_node, est:sync.event's
-// event_resume_node, and est:future's future_resume_node<T>/
+// est:promise's sleep_resume_node/promise_resume_node (the latter shared
+// with est:sync.event), and est:future's future_resume_node<T>/
 // concrete_continuation<Fn, U>/flatten_forwarder<T>. See ready_node's
 // own doc comment (est:loop) for why this can't live on ready_node/
 // timer_node themselves instead: that would need current_allocator(),

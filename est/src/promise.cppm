@@ -108,14 +108,21 @@ namespace est::detail {
 // set_exception() on it. Without this, a coroutine doing `co_await
 // sleep_for(10s);`, abandoned when its loop is destroyed before the
 // timer ever fires, would leak its own frame forever - the same
-// abandon()-driven exception-completion detail::event_resume_node
-// (est:sync.event) and detail::yield_resume_node below also rely on,
-// for the identical reason: the awaiting coroutine
+// abandon()-driven exception-completion detail::promise_resume_node
+// below also relies on, for the identical reason: the awaiting coroutine
 // holds the only other reference to this promise's future_state<void>
 // (the future<void> temporary co_await awaits is spilled into the
 // coroutine's own frame across the suspension), so silently dropping the
 // promise instead of completing it would strand that frame with nothing
 // left to free it.
+//
+// Not folded into promise_resume_node below (issue #77's own suggestion):
+// the two differ in more than just the abandonment message -
+// sleep_resume_node needs a timer_node base (fire(), scheduled via
+// schedule_timer()) where promise_resume_node needs a ready_node one
+// (run(), scheduled via enqueue_ready()), and a shared base can't
+// straddle both without either type losing its own single most useful
+// property (being exactly the node type its own loop container expects).
 class sleep_resume_node final : public timer_node,
                                 public current_allocator_new_delete<sleep_resume_node> {
 public:
@@ -137,42 +144,54 @@ private:
   promise<void> promise_;
 };
 
-// The node behind yield_execution() (below): a plain ready_node holding
-// a promise<void>, handed straight to loop_ref.enqueue_ready() instead
-// of routed through schedule_timer() - yield_execution() has no deadline
-// to track, so the timer_queue heap insert, pending_timers_'s own linear
-// search+erase on fire, and the platform::sleep_until() call run_impl()
-// makes before it ever checks pending_timers_ are all pure overhead for
-// something that only ever needs "run after whatever's already ready."
-// est::intrusive_list<T>'s FIFO order (see its own doc comment) is what
-// makes handing this straight to ready_ safe: enqueue_ready() appends at
-// the tail, so everything already queued when yield_execution() was
-// called runs first.
+// The node behind yield_execution() (below) and counting_event<Mode>::
+// wait()'s slow path (est:sync.event) alike: a plain ready_node holding
+// a promise<void>, completed with promise_.set_value() on a successful
+// run() or, on abandonment, with an exception built from a fixed message
+// supplied at construction. Both call sites used to hand-roll their own,
+// byte-identical copy of this exact node (yield_resume_node here,
+// event_resume_node in est:sync.event), differing only in that message -
+// collapsed into this one shared type per issue #77. (sleep_resume_node,
+// above, stays separate - see its own doc comment for why.)
 //
-// abandon() completing the promise with an exception (rather than
-// silently dropping it, the "broken promise, future simply never becomes
-// ready" default every other est::promise<T> in this codebase otherwise
-// has) matters for the identical reason sleep_resume_node's own doc
-// comment (just above) and detail::event_resume_node's own doc comment
-// (est:sync.event) both give.
-class yield_resume_node final : public ready_node,
-                                public current_allocator_new_delete<yield_resume_node> {
+// abandoned_message_ is stored as a std::string_view, not a std::string:
+// every call site passes a string literal (static storage duration), so
+// there's nothing to own or copy - std::runtime_error's own constructor
+// is what actually allocates a copy, and only if abandon() is ever
+// reached at all.
+//
+// Not nested inside est::mutex or est::counting_event<Mode> the way an
+// earlier version of one of these two (mutex::lock_resume_node, now
+// gone - est::mutex is built directly on est::counting_event since issue
+// #67) once was: run()/abandon() never touch anything about whichever
+// type enqueued this node, so a single free class in est::detail serves
+// every caller instead of minting an identical type per caller.
+class promise_resume_node final : public ready_node,
+                                  public current_allocator_new_delete<promise_resume_node> {
 public:
-  explicit yield_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
+  promise_resume_node(promise<void> prom, std::string_view abandoned_message) noexcept
+      : promise_(std::move(prom)), abandoned_message_(abandoned_message) {}
 
   void run() final { promise_.set_value(); }
 
+  // std::string(string_view)'s own allocation could in principle throw
+  // std::length_error/bad_alloc; an intended fail-fast (terminate) on
+  // that, not something to route around, the same reasoning
+  // future_state<T>::get_exception()'s own NOLINT (est:future) already
+  // documents for a different noexcept function in this codebase.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
   void abandon() noexcept final {
-    promise_.set_exception(std::make_exception_ptr(
-        std::runtime_error("loop destroyed while yield_execution() was pending")));
+    promise_.set_exception(
+        std::make_exception_ptr(std::runtime_error(std::string(abandoned_message_))));
   }
 
   // operator new/delete inherited from current_allocator_new_delete<T>
   // (est:util.current_loop) - see sleep_resume_node's own doc comment
-  // (just above) for why.
+  // (above) for why.
 
 private:
   promise<void> promise_;
+  std::string_view abandoned_message_;
 };
 
 } // namespace est::detail
@@ -207,7 +226,7 @@ export namespace est {
 // `co_await` on an already-ready future skips suspension entirely,
 // est:future's own `future_awaiter<T>::await_ready()`) lets other
 // pending work interleave instead. Re-enters ready_ directly via
-// detail::yield_resume_node rather than going through sleep_for(0): it
+// detail::promise_resume_node rather than going through sleep_for(0): it
 // has no real deadline to track, so there's no reason to pay for a
 // timer_queue heap insert/pop, pending_timers_'s own linear search+erase
 // on fire, or the platform::sleep_until() call run_impl() makes before
@@ -215,7 +234,8 @@ export namespace est {
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::yield_resume_node(std::move(prom));
+  auto* node = new detail::promise_resume_node(
+      std::move(prom), "loop destroyed while yield_execution() was pending");
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }
