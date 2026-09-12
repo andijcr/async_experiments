@@ -45,18 +45,27 @@ import std;
 // est::counting_event/a coroutine's own promise_type now each resolve it
 // independently, per method, instead of caching it once at construction -
 // these two probes show what that repeated resolution actually compiles to.
+//
+// `mutex_ref` is a parameter, not a local `est::mutex`, for both probes
+// below - unlike probe_mutex_lock()'s old shape (before issue #66/#67
+// merged lock()/acquire() into one `future<lock_guard>`-returning
+// lock()), a local mutex here would dangle: the returned future<lock_guard>
+// (or the guard main() moves out of it) holds a `mutex*` that has to
+// outlive the call.
 
-// Uncontended fast path only - a fresh, never-locked mutex.
-[[gnu::noinline]] auto probe_mutex_lock() -> est::future<void> {
-  est::mutex m;
-  return m.lock();
+// Uncontended fast path only - lock() on a never-locked mutex.
+[[gnu::noinline]] auto probe_mutex_lock(est::mutex& mutex_ref)
+    -> est::future<est::mutex::lock_guard> {
+  return mutex_ref.lock();
 }
 
-// No queued waiter - the branch that never touches current_loop() at all,
-// for contrast with lock() above (which always does, even uncontended).
-[[gnu::noinline]] void probe_mutex_unlock_uncontended() {
-  est::mutex m;
-  m.unlock();
+// Dropping an already-held lock_guard with no queued waiter - the release
+// side, for contrast with lock() above. mutex::unlock() itself is private
+// now (issue #66) - a lock_guard's own destructor is the only way left to
+// reach it, so this probes that path instead of calling unlock() directly
+// the way an earlier version of this probe did.
+[[gnu::noinline]] void probe_mutex_lock_guard_drop(est::mutex::lock_guard guard) {
+  (void)guard; // destructor runs here
 }
 
 // A real coroutine (not make_promise_future() called directly). Never
@@ -113,8 +122,8 @@ auto main() -> int {
       std::println("{}", probe_current_allocator());
       std::println("{}", static_cast<void*>(probe_platform_instance()));
       std::println("{}", probe_make_promise_future().get());
-      probe_mutex_lock().get();
-      probe_mutex_unlock_uncontended();
+      est::mutex probe_mutex;
+      probe_mutex_lock_guard_drop(probe_mutex_lock(probe_mutex).get());
       std::println("{}", probe_coroutine().get());
 
       auto [prom, fut] = est::make_promise_future<int>();

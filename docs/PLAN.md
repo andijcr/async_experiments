@@ -4083,6 +4083,162 @@ still does exactly what it did before.
 **Verified in the pinned Docker devenv:** existing test suite passes
 unchanged (pure refactor); `clang-format`/`clang-tidy` clean; full suite
 passes under the `sanitize` preset (ASan+UBSan) too.
+### Issue #66 & #67: `est::mutex` rebuilt on top of `est::counting_event` (done)
+
+Two issues taken together, since #67 ("build mutex on top of event -
+should simplify stuff") is what made #66 ("remove `mutex::acquire`, make
+`mutex::lock` return `lock_guard` - make unlock visible only to lock
+guard") easy to actually do: once `mutex` no longer owns its own waiter
+list, there's no reason left for it to expose two overlapping ways to
+acquire it.
+
+**#67 first.** `est::mutex` used to be its own hand-written copy of
+exactly the pieces `est::counting_event<Mode>` already has: an intrusive
+waiter list, a `ready_node`-derived resume node (`lock_resume_node`/
+`acquire_resume_node`), `abandon()` completing an abandoned waiter with
+an exception rather than silently dropping it. The mapping onto
+`counting_event<Mode>` turned out exact, not approximate:
+`binary_event<EventResetMode::automatic>` (max_count = 1) already has
+"unlocked = one unit available, locked = none available," and automatic
+mode's own `set()` - hand the freed unit directly to the next queued
+waiter, never reading as free in between - is already precisely the
+handoff semantics `unlock()` needs. `mutex` is now nothing but:
+
+```cpp
+class mutex {
+  ...
+  [[nodiscard]] auto lock() -> future<lock_guard> {
+    if (event_.try_wait()) {
+      return make_ready_future<lock_guard>(*this);
+    }
+    return event_.wait().then([this] { return lock_guard(*this); });
+  }
+private:
+  void unlock() noexcept { event_.set(); }
+  binary_event<EventResetMode::automatic> event_;
+};
+```
+
+`counting_event<Mode>` gained one new method for this, `try_wait()`:
+the synchronous half of `wait()` (the `count_ > 0` check plus the
+automatic-mode decrement), split out on its own so a caller wanting the
+fast path without a `future<void>` it would immediately discard - exactly
+`mutex::lock()`'s own situation - doesn't have to build and throw one
+away. `wait()` itself was refactored to call it, rather than duplicating
+the check.
+
+**Then #66.** `lock()` (a plain `future<void>`) and `acquire()` (a
+`future<lock_guard>`) collapsed into one method, `lock() ->
+future<lock_guard>`: every call site in this codebase already wanted the
+RAII guard, so the lower-level pair only ever added a way to forget the
+matching `unlock()` call. `unlock()` itself moved to `private` -
+`lock_guard` (a nested class, sharing its enclosing class's access) is
+the only remaining caller, so dropping the guard `lock()` returns is now
+the *only* way to release a lock this class exposes at all.
+
+**The allocation-count tradeoff, made explicit rather than silently
+accepted.** `lock()`'s fast (uncontended) path costs exactly what it
+always did - one allocation, the returned `future_state<lock_guard>`
+itself - because it goes through `try_wait()` directly rather than
+`wait()` (which would otherwise build and discard a `future<void>` just
+to build a second, different future in its place). The *contended* path
+is genuinely more expensive than the hand-written version it replaced:
+`event_.wait().then(...)` needs `event_.wait()`'s own
+`future_state<void>` + `event_resume_node`, *plus* `.then()`'s own
+downstream `future_state<lock_guard>` + `concrete_continuation<Fn,
+lock_guard>` node to turn that `future<void>` into the `future<lock_guard>`
+`lock()` returns - four allocations where the old, purpose-built
+`acquire_resume_node` needed two. Accepted deliberately: the alternative
+was re-implementing the waiter queue, resume node, and
+abandonment-completion machinery a second time, exactly what #67 asked
+to stop doing, for a cost that only a *contended* `lock()` call - already
+the slow path - ever pays.
+
+**Issue #46 (the dangling-`mutex&`-in-deferred-completion hazard) is
+untouched by this, not fixed by it.** The `.then()` callback,
+`[this] { return lock_guard(*this); }`, still captures a raw `mutex*` and
+still only actually runs once `est::loop` drains the node some time
+after `unlock()`/`event_.set()` enqueued it - the identical "needs the
+mutex still alive once the deferred completion runs" precondition
+`acquire_resume_node::run()` used to carry, now living in a different
+node. #46 stays open, tracking that gap wherever it ends up living next.
+
+**A real, previously-undiscovered leak surfaced by this refactor, and
+fixed as part of it.** The first version of the contended-path test
+("destroying a mutex with a coroutine co_await-ing lock() still pending
+leaks nothing") failed: 8 allocations, 4 deallocations. Root cause:
+`future_state<T>::concrete_continuation<Fn, U>` (and its sibling,
+`detail::flatten_forwarder<T>`) had no `abandon()` override at all -
+`ready_node::abandon()`'s default no-op body left `downstream_` silently
+dropped on abandonment instead of completed - already flagged in both
+classes' own doc comments as "a real, separate question this class
+doesn't yet answer," but never actually exercised by any existing test,
+since nothing before this refactor `co_await`-ed a `.then()`-chained
+future whose *upstream* future_state could be torn down out from under
+it. `mutex::lock()`'s slow path is exactly that shape:
+`event_.wait().then(...)`, with a coroutine `co_await`-ing the result.
+When the mutex (and its `event_`'s underlying `future_state<void>`) were
+destroyed with that coroutine still suspended, the abandoned
+`concrete_continuation` node's default `abandon()` left `downstream_`
+uncompleted - stranding the coroutine's frame with nothing left to free
+it, exactly the "neither side can free the other first" hazard every
+other resume node in this codebase (`future_resume_node<T>`,
+`detail::event_resume_node`, this class's own former
+`lock_resume_node`/`acquire_resume_node`) already defends against with a
+real `abandon()` override.
+
+Fixed in `est/src/future.cppm`: both classes now override `abandon()` to
+complete `downstream_` with an exception, matching every other resume
+node's own convention. Fixed symmetrically in `flatten_forwarder<T>` too,
+even though nothing had yet triggered *that* copy of the same bug - it
+was the same open question, the same fix, and leaving one half fixed
+while the other stayed silently broken would just be waiting for the
+next real trigger. A new, targeted regression test for the
+`flatten_forwarder<T>` side ("dropping an abandoned inner future_state
+completes the flattened future, no leak", `est/tests/future_tests.cpp`)
+was added alongside it, since nothing else in the existing suite
+exercised that specific path either.
+
+Docs rewritten to match, and restructured (`counting_event<Mode>` now
+described before `mutex`, since the dependency direction flipped):
+`docs/wiki/Coroutines.md` (the old "`est::mutex::lock()` becomes
+awaitable" section split into a `counting_event<Mode>`-first section plus
+a new, much shorter "`est::mutex`: `lock()` built on top of
+`binary_event<automatic>`" one), `docs/wiki/Architecture.md` (dependency
+graph edge flipped from `event --> mutex`-shaped duplication to
+`mutex --> event`, prose rewritten), `docs/wiki/Home.md` (five-second
+summary and the source-location table), `docs/wiki/Loop-And-Timers.md`
+and `docs/wiki/Continuation-Node-Mechanism.md` (passing mentions of
+`est::mutex`'s "own" waiter list, now `est::counting_event<Mode>`'s),
+`docs/wiki/Global-Lookup-Codegen.md` (one stale claim about which
+methods resolve `current_loop()`, predating this refactor but caught
+while touching the same paragraph). `examples/probe/main.cpp`'s two
+mutex probes were also reshaped: `probe_mutex_lock()` now takes an
+`est::mutex&` parameter rather than a local mutex (a local would dangle -
+`lock()`'s returned `future<lock_guard>` holds a `mutex*` now, unlike the
+old `future<void>`), and `probe_mutex_unlock_uncontended()` (which called
+the now-private `unlock()` directly) became `probe_mutex_lock_guard_drop()`,
+probing the release path through a dropped `lock_guard` instead.
+
+`est/tests/mutex_tests.cpp` rewritten throughout: every `acquire()` call
+site renamed to `lock()`; every direct `mutex_ref.unlock()` call replaced
+with capturing the guard `co_await mutex_ref.lock()` returns into a local
+and letting it drop via scope exit (a coroutine finishing, or an inner
+block ending) instead; the old lock()-specific "destroying a mutex with a
+coroutine still queued on lock() leaks nothing" test dropped as now
+redundant with its acquire()-based twin (same code path, now that the
+two methods are one), and "unlock() releases the lock when nothing is
+waiting" folded into "dropping the lock_guard unlocks the mutex" (same
+scenario, the latter already covering it once `unlock()` can no longer
+be called directly). Net test count: 14 before, 12 after - not a
+coverage loss, since both removed cases were testing scenarios a
+remaining test already covers via the now-unified API.
+
+**Verified in the pinned Docker devenv:** 173/173 tests pass (one new,
+the `flatten_forwarder<T>` abandonment regression test above);
+`clang-format`/`clang-tidy` clean; 140/140 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 100% (103/103 changed lines covered).
 
 ---
 

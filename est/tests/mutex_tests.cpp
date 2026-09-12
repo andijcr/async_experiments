@@ -34,18 +34,21 @@ private:
 
 } // namespace
 
-// est::mutex::lock() returns a plain est::future<void>, so it can be
-// used from perfectly ordinary, non-coroutine code too (polled via
-// ready()/get(), or chained with then()), not just via
-// co_await. Most tests below still drive their scenario through a small
-// coroutine anyway (an ordinary lambda returning est::future<void> -
-// est::future<T>'s own doc comment on operator co_await()/promise_type
-// explains why a plain function works as a coroutine here), since that's
-// the shape a real caller managing a critical section across a
-// suspension point actually has. None of these lambdas capture anything -
-// see future_tests.cpp's own coroutine section for why (a capturing
-// lambda's closure isn't guaranteed to outlive the coroutine frame it
-// starts). est::loop& is the one unavoidable reference parameter
+// est::mutex::lock() returns a future<lock_guard> - the lock is released
+// automatically once the guard is dropped, there is no separate manual
+// unlock() left to call (issue #66: unlock() is private, reachable only
+// through lock_guard itself). Most tests below still drive their scenario
+// through a small coroutine anyway (an ordinary lambda returning
+// est::future<void> - est::future<T>'s own doc comment on operator
+// co_await()/promise_type explains why a plain function works as a
+// coroutine here), since that's the shape a real caller managing a
+// critical section across a suspension point actually has - the guard is
+// captured into a local variable and released by simply letting it go out
+// of scope (the coroutine finishing, or an inner block ending), the same
+// way any other RAII handle in this codebase is. None of these lambdas
+// capture anything - see future_tests.cpp's own coroutine section for why
+// (a capturing lambda's closure isn't guaranteed to outlive the coroutine
+// frame it starts). est::loop& is the one unavoidable reference parameter
 // (required by future<T>::promise_type's own calling convention) -
 // NOLINT'd per declaration, matching the same already-accepted "a loop&
 // is safe given its own documented lifetime precondition" stance.
@@ -62,9 +65,10 @@ TEST_CASE("co_await lock() acquires immediately when unlocked", "[mutex]") {
   est::mutex m;
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-  auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
-    co_await mutex_ref.lock();
-    co_return;
+  auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<bool> {
+    auto guard = co_await mutex_ref.lock();
+    const bool locked_while_held = mutex_ref.locked();
+    co_return locked_while_held;
   };
 
   // No suspension anywhere in this coroutine: initial_suspend() never
@@ -74,26 +78,36 @@ TEST_CASE("co_await lock() acquires immediately when unlocked", "[mutex]") {
   // run_until_idle() needed to observe any of it.
   auto fut = coro(loop, m);
   REQUIRE(fut.ready());
-  REQUIRE(m.locked());
-  REQUIRE_FALSE(m.has_waiters());
+  REQUIRE(fut.get());
+  REQUIRE_FALSE(m.locked()); // the coroutine's guard was dropped on return
 }
 
-TEST_CASE("unlock() releases the lock when nothing is waiting", "[mutex]") {
+TEST_CASE("dropping the lock_guard unlocks the mutex", "[mutex]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   est::mutex m;
 
-  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-  auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
-    co_await mutex_ref.lock();
-    mutex_ref.unlock();
-    co_return;
-  };
-
-  coro(loop, m);
-  loop.run_until_idle();
+  {
+    auto guard = m.lock().get();
+    REQUIRE(m.locked());
+  }
   REQUIRE_FALSE(m.locked());
-  REQUIRE_FALSE(m.has_waiters());
+}
+
+TEST_CASE("moving a lock_guard transfers ownership of the unlock", "[mutex]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
+
+  auto first = m.lock().get();
+  {
+    auto second = std::move(first);
+    REQUIRE(m.locked());
+    // `second` goes out of scope here and unlocks - `first`, moved-from,
+    // must not also try to (it would be a double-unlock, handing the lock
+    // to a waiter twice or clearing an already-clear count()).
+  }
+  REQUIRE_FALSE(m.locked());
 }
 
 // A long, deliberately linear sequence of independent steps (create two
@@ -108,30 +122,29 @@ TEST_CASE("a second co_await lock() suspends until the first coroutine unlocks",
   auto [release_promise, release_future] = est::make_promise_future<void>();
   std::vector<int> order;
 
-  // Acquires, records itself, then stays suspended (holding the lock)
+  // Acquires, records itself, then stays suspended (holding the guard)
   // until the test explicitly completes `release` - the controlled
   // stand-in for "some other work happens while the lock is held" that
   // lets this test observe contention deterministically, without a real
-  // or fake clock.
+  // or fake clock. The guard drops (releasing the lock) once the
+  // coroutine finishes, right after `release` resolves.
   // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto first = [](est::loop&,
                   est::mutex& mutex_ref,
                   std::vector<int>& order_ref,
                   est::future<void> release) -> est::future<void> {
-    co_await mutex_ref.lock();
+    auto guard = co_await mutex_ref.lock();
     order_ref.push_back(1);
     co_await std::move(release);
-    mutex_ref.unlock();
-    co_return;
+    co_return; // guard drops here, releasing the lock
   };
   // NOLINTEND(cppcoreguidelines-avoid-reference-coroutine-parameters)
   // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto second =
       [](est::loop&, est::mutex& mutex_ref, std::vector<int>& order_ref) -> est::future<void> {
-    co_await mutex_ref.lock();
+    auto guard = co_await mutex_ref.lock();
     order_ref.push_back(2);
-    mutex_ref.unlock();
-    co_return;
+    co_return; // guard drops here
   };
   // NOLINTEND(cppcoreguidelines-avoid-reference-coroutine-parameters)
 
@@ -147,7 +160,7 @@ TEST_CASE("a second co_await lock() suspends until the first coroutine unlocks",
   REQUIRE(m.locked()); // still held by `first`, unchanged by the failed fast path
 
   release_promise.set_value();
-  loop.run_until_idle(); // first resumes, unlocks (handing off to second), second finishes
+  loop.run_until_idle(); // first resumes, drops its guard (handing off to second), second finishes
 
   REQUIRE(order == std::vector{1, 2});
   REQUIRE_FALSE(m.locked());
@@ -168,19 +181,17 @@ TEST_CASE("unlock() resumes queued waiters in FIFO order", "[mutex]") {
   // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto holder =
       [](est::loop&, est::mutex& mutex_ref, est::future<void> release) -> est::future<void> {
-    co_await mutex_ref.lock();
+    auto guard = co_await mutex_ref.lock();
     co_await std::move(release);
-    mutex_ref.unlock();
-    co_return;
+    co_return; // guard drops here, releasing the lock
   };
   auto waiter = [](est::loop&,
                    est::mutex& mutex_ref,
                    std::vector<int>& order_ref,
                    int id) -> est::future<void> {
-    co_await mutex_ref.lock();
+    auto guard = co_await mutex_ref.lock();
     order_ref.push_back(id);
-    mutex_ref.unlock();
-    co_return;
+    co_return; // guard drops here
   };
   // NOLINTEND(cppcoreguidelines-avoid-reference-coroutine-parameters)
 
@@ -190,7 +201,7 @@ TEST_CASE("unlock() resumes queued waiters in FIFO order", "[mutex]") {
   // Each waiter is created and run to its own suspension point one at a
   // time (rather than all three back to back before a single
   // run_until_idle()) so this test's own call order maps directly onto
-  // enqueue order into mutex's waiter list, without also having to
+  // enqueue order into the mutex's waiter list, without also having to
   // reason about est::loop's ready-queue's own drain order among several
   // freshly-created, not-yet-started coroutines.
   auto fut1 = waiter(loop, m, order, 1);
@@ -217,12 +228,12 @@ TEST_CASE("unlock() resumes queued waiters in FIFO order", "[mutex]") {
   REQUIRE(fut3.ready());
 }
 
-TEST_CASE("acquire() on an unlocked mutex returns an already-ready future", "[mutex]") {
+TEST_CASE("lock() on an unlocked mutex returns an already-ready future", "[mutex]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   est::mutex m;
 
-  auto fut = m.acquire();
+  auto fut = m.lock();
   REQUIRE(fut.ready()); // fast path - completes the promise immediately
   REQUIRE(m.locked());
 
@@ -231,41 +242,13 @@ TEST_CASE("acquire() on an unlocked mutex returns an already-ready future", "[mu
   (void)guard;
 }
 
-TEST_CASE("dropping the lock_guard unlocks the mutex", "[mutex]") {
+TEST_CASE("lock() on a locked mutex defers until the holder's guard is dropped", "[mutex]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   est::mutex m;
 
-  {
-    auto guard = m.acquire().get();
-    REQUIRE(m.locked());
-  }
-  REQUIRE_FALSE(m.locked());
-}
-
-TEST_CASE("moving a lock_guard transfers ownership of the unlock", "[mutex]") {
-  est::loop loop;
-  const auto loop_guard = est::make_current_loop(loop);
-  est::mutex m;
-
-  auto first = m.acquire().get();
-  {
-    auto second = std::move(first);
-    REQUIRE(m.locked());
-    // `second` goes out of scope here and unlocks - `first`, moved-from,
-    // must not also try to (it would be a double-unlock, handing the lock
-    // to a waiter twice or clearing an already-clear state_).
-  }
-  REQUIRE_FALSE(m.locked());
-}
-
-TEST_CASE("acquire() on a locked mutex defers until the holder's guard is dropped", "[mutex]") {
-  est::loop loop;
-  const auto loop_guard = est::make_current_loop(loop);
-  est::mutex m;
-
-  auto holder = m.acquire().get();
-  auto fut = m.acquire();
+  auto holder = m.lock().get();
+  auto fut = m.lock();
   REQUIRE_FALSE(fut.ready()); // queued - unlike the fast path above
   REQUIRE(m.has_waiters());
 
@@ -273,25 +256,25 @@ TEST_CASE("acquire() on a locked mutex defers until the holder's guard is droppe
   REQUIRE_FALSE(fut.ready());
 
   // Moving `holder` into a block-scoped variable and letting it go out of
-  // scope is the point: its destructor is what calls unlock().
+  // scope is the point: its destructor is what releases the lock.
   {
     auto dropped = std::move(holder);
   }
-  loop.run_until_idle(); // the waiter's acquire_resume_node runs, completing `fut`
+  loop.run_until_idle(); // the waiter's continuation runs, completing `fut`
   REQUIRE(fut.ready());
   auto second = std::move(fut).get();
   REQUIRE(m.locked());
   (void)second;
 }
 
-TEST_CASE("acquire() can be co_await'ed from inside a coroutine", "[mutex]") {
+TEST_CASE("lock() can be co_await'ed from inside a coroutine", "[mutex]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   est::mutex m;
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<bool> {
-    auto guard = co_await mutex_ref.acquire();
+    auto guard = co_await mutex_ref.lock();
     const bool locked_while_held = mutex_ref.locked();
     co_return locked_while_held;
   };
@@ -303,44 +286,43 @@ TEST_CASE("acquire() can be co_await'ed from inside a coroutine", "[mutex]") {
   REQUIRE_FALSE(m.locked()); // the coroutine's guard was dropped on return
 }
 
-TEST_CASE("destroying a mutex with a future<lock_guard> still queued on acquire() leaks nothing",
+TEST_CASE("destroying a mutex with a future<lock_guard> still queued on lock() leaks nothing",
           "[mutex]") {
-  // The acquire()-based twin of the lock()-based leak test below: a waiter
-  // queued via acquire() rather than lock() must be freed the same way.
   counting_resource resource;
   {
     est::loop loop{&resource};
     const auto loop_guard = est::make_current_loop(loop);
     est::mutex m;
 
-    auto holder = m.acquire().get(); // never dropped - holds the lock forever
-    auto waiter_fut = m.acquire();
+    auto holder = m.lock().get(); // never dropped - holds the lock forever
+    auto waiter_fut = m.lock();
     REQUIRE_FALSE(waiter_fut.ready());
     REQUIRE(m.has_waiters());
     // `m` (and `loop`) are destroyed at the end of this scope with
-    // `waiter_fut`'s acquire_resume_node still queued, never resumed.
+    // `waiter_fut`'s continuation still queued, never resumed.
     (void)holder;
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-TEST_CASE("destroying a mutex with a coroutine co_await-ing acquire() still pending leaks nothing",
+TEST_CASE("destroying a mutex with a coroutine co_await-ing lock() still pending leaks nothing",
           "[mutex]") {
   // A sharper version of the leak test above: there, the pending waiter
   // was a plain future<lock_guard> checked directly, never co_await'ed -
-  // acquire_resume_node's promise_ was the *only* owner of its
+  // its own continuation node's promise_ was the *only* owner of its
   // future_state<lock_guard>, so dropping it (via ~mutex()'s drain) was
   // always enough to free everything. A coroutine suspended via
   // co_await, by contrast, holds its own reference to that same
   // future_state (the future<lock_guard> temporary co_await awaits is
   // spilled into the coroutine's own frame across the suspension) - so
-  // dropping *just* acquire_resume_node's own reference leaves the
+  // dropping *just* that continuation's own reference leaves the
   // future_state (and the coroutine frame keeping it alive) with nowhere
   // left to go, unless destroy() actually completes the promise (with an
   // exception, here) instead of silently dropping it - see
-  // acquire_resume_node's own doc comment (est/src/sync/mutex.cppm) for
-  // the full reasoning. Without that fix, this test leaks the waiting
+  // detail::event_resume_node's own doc comment (est/src/sync/event.cppm)
+  // for the full reasoning est::mutex now inherits by building on
+  // est::binary_event. Without that fix, this test leaks the waiting
   // coroutine's entire frame.
   counting_resource resource;
   {
@@ -348,56 +330,21 @@ TEST_CASE("destroying a mutex with a coroutine co_await-ing acquire() still pend
     const auto loop_guard = est::make_current_loop(loop);
     est::mutex m;
 
-    auto holder = m.acquire().get(); // never dropped - holds the lock forever
+    auto holder = m.lock().get(); // never dropped - holds the lock forever
 
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
     auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
-      auto guard = co_await mutex_ref.acquire();
+      auto guard = co_await mutex_ref.lock();
       co_return; // never reached - holder above never unlocks
     };
     auto waiter_fut = coro(loop, m);
-    loop.run_until_idle(); // waiter finds it locked, suspends, queued in m's waiters_
+    loop.run_until_idle(); // waiter finds it locked, suspends, queued in the mutex's waiters
 
     REQUIRE_FALSE(waiter_fut.ready());
     REQUIRE(m.has_waiters());
     (void)holder;
     // `m` (and `loop`) are destroyed at the end of this scope with the
-    // coroutine still suspended in co_await mutex_ref.acquire(), never resumed.
-  }
-  REQUIRE(resource.allocations > 0);
-  REQUIRE(resource.allocations == resource.deallocations);
-}
-
-TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks nothing", "[mutex]") {
-  // Guards ~mutex()'s waiters_ drain: a coroutine still queued in
-  // mutex::waiters_ when the mutex is destroyed must be destroyed
-  // (never resumed), or it and its lock_resume_node would leak.
-  counting_resource resource;
-  {
-    est::loop loop{&resource};
-    const auto loop_guard = est::make_current_loop(loop);
-    est::mutex m;
-
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-    auto holder = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
-      co_await mutex_ref.lock();
-      co_return; // never unlocks - holds the lock forever, deliberately
-    };
-    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-    auto waiter = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
-      co_await mutex_ref.lock();
-      co_return; // never reached - the holder above never unlocks
-    };
-
-    holder(loop, m);
-    loop.run_until_idle(); // holder acquires the lock and finishes, still holding it
-
-    auto waiter_fut = waiter(loop, m);
-    loop.run_until_idle(); // waiter finds it locked, suspends, queued in m's waiters_
-
-    REQUIRE(m.has_waiters());
-    // `m` (and `loop`) are destroyed at the end of this scope with
-    // `waiter`'s coroutine still queued, never resumed.
+    // coroutine still suspended in co_await mutex_ref.lock(), never resumed.
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
@@ -405,29 +352,37 @@ TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks noth
 
 TEST_CASE("mutex() default-constructs and uses est::current_loop()", "[mutex]") {
   est::loop loop;
-  const auto guard = est::make_current_loop(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   est::mutex m;
   REQUIRE_FALSE(m.locked());
 
   auto fut = m.lock();
   REQUIRE(fut.ready());
+  auto held = std::move(fut).get();
   REQUIRE(m.locked());
+  (void)held;
 }
 
 TEST_CASE("an unlocked mutex with no waiters can be dropped after its loop stops being current",
           "[mutex]") {
-  // Guards mutex::~mutex() checking has_waiters() before resolving
-  // current_loop(): a mutex with nothing queued needs no loop at all to
-  // be destroyed, and must not fail current_loop()'s own precondition
-  // just because none happens to be registered any more by the time it
-  // goes out of scope.
+  // Guards mutex::~mutex() (really counting_event<Mode>::~counting_event(),
+  // which mutex's own event_ member inherits) checking has_waiters()
+  // before resolving current_loop(): a mutex with nothing queued needs no
+  // loop at all to be destroyed, and must not fail current_loop()'s own
+  // precondition just because none happens to be registered any more by
+  // the time it goes out of scope.
   est::mutex m;
   {
     est::loop loop;
-    const auto guard = est::make_current_loop(loop);
-    m.lock().get(); // uncontended fast path
-    m.unlock();
-  } // guard exits - no loop is current from here on
+    const auto loop_guard = est::make_current_loop(loop);
+    (void)m.lock().get(); // uncontended fast path; the returned lock_guard is
+                          // a temporary - dropped immediately, releasing the
+                          // lock right here (same effect an explicit
+                          // unlock() call would have had, back when one was
+                          // public) - (void) discards the [[nodiscard]]
+                          // lock_guard explicitly, same as every other
+                          // deliberately-unused lock_guard in this file
+  } // loop_guard exits - no loop is current from here on
 
   REQUIRE_FALSE(m.locked());
   // `m` is destroyed at the end of this scope with no loop current - must

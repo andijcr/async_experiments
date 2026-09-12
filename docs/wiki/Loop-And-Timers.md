@@ -151,8 +151,8 @@ doc comment on why that failure path isn't unit-tested here), not "the
 inner one temporarily shadows the outer."
 
 Every one of `make_promise_future<T>()`, `sleep_for()`/`sleep_until()`,
-`yield_execution()` (all `est:promise`), `est::mutex`'s and
-`est::counting_event<Mode>`'s constructors, and a coroutine's own
+`yield_execution()` (all `est:promise`), `est::counting_event<Mode>::set()`
+(and, through it, `est::mutex::unlock()`), and a coroutine's own
 `promise_type` (`est:future`) resolves `current_loop()` this way - there is
 no explicit-`loop&`-taking alternative left for any of them (see
 [Coroutines](Coroutines.md)'s own calling-convention section for the one
@@ -237,8 +237,9 @@ experiment's findings.
 
 `loop::enqueue_ready(detail::ready_node&)` pushes onto `ready_`, an
 `est::intrusive_list<detail::ready_node>` — the same generic intrusive-list
-container `est::mutex` and `est::future_state<T>` each use for their own
-queues (see [Architecture](Architecture.md)), templated here on
+container `est::counting_event<Mode>` (which `est::mutex` now builds
+`lock()` on top of - issue #67) and `est::future_state<T>` each use for
+their own queues (see [Architecture](Architecture.md)), templated here on
 `detail::ready_node` specifically so `dequeue()` already hands back a
 `detail::ready_node*` directly, no cast needed. `run_until_idle()`/`run()`
 drain it via `drain_ready()`:
@@ -330,8 +331,7 @@ destroyed (`abandon()` is only ever called on that path - see
 generic, type-erased callback would give `abandon()` no way to know it's
 holding a promise at all, and a silent drop instead would have exactly
 the stranded-coroutine-frame hazard described in
-[Coroutines](Coroutines.md)'s `lock_resume_node`/`acquire_resume_node`
-section.
+[Coroutines](Coroutines.md)'s `event_resume_node` section.
 
 `yield_execution()` gives `current_loop()` the chance to run
 whatever else is already ready before the calling coroutine resumes. It
@@ -355,7 +355,7 @@ everything already queued when `yield_execution()` is called runs first
 (see [Architecture](Architecture.md) and `intrusive_list<T>`'s own doc
 comment for why the list is FIFO). `yield_resume_node::abandon()`
 completes its promise with an exception rather than silently dropping
-it, for the same reason `mutex::lock_resume_node`'s own doc comment
+it, for the same reason `detail::event_resume_node`'s own doc comment
 gives (`docs/wiki/Coroutines.md`) - a coroutine suspended via `co_await
 yield_execution();` holds the only other reference to its
 `future_state<void>`, so silently dropping the promise would strand that
@@ -363,11 +363,12 @@ coroutine's frame forever if the loop is destroyed first.
 
 ### `make_ready_future<T>(args...)`
 
-`est::mutex::lock()`/`acquire()`'s own uncontended fast paths and
-`est::counting_event<Mode>::wait()`'s own already-signaled fast path each
-need an already-ready `future<T>` built from a value they already have in
-hand. `make_ready_future<T>(args...)` (`est:promise`) is that pattern
-factored out - `make_promise_future<T>()` followed by
+`est::counting_event<Mode>::wait()`'s own already-signaled fast path
+(which `est::mutex::lock()`'s own fast path builds on top of via
+`try_wait()` - see [Coroutines](Coroutines.md)) needs an already-ready
+`future<T>` built from a value it already has in hand.
+`make_ready_future<T>(args...)` (`est:promise`) is that pattern factored
+out - `make_promise_future<T>()` followed by
 `promise<T>::set_value(T(args...))`, in one call:
 
 ```cpp
@@ -385,17 +386,16 @@ template <class T, class... Args>
 
 One overload covers every `T`, `void` included, since `make_promise_future<T>()`
 itself now takes no explicit `loop&` to disambiguate against - there's
-nothing for an `Args...` pack to be mistaken for. `mutex::lock()`'s fast
-path, for instance:
+nothing for an `Args...` pack to be mistaken for. `counting_event<Mode>::
+wait()`'s fast path, for instance:
 
 ```cpp
-inline auto mutex::lock() -> future<void> {
-  if (state_ == 0) {
-    state_ = 1;
+[[nodiscard]] auto wait() -> future<void> {
+  if (try_wait()) {
     return make_ready_future<void>();
   }
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new lock_resume_node(std::move(prom));
+  auto* node = new detail::event_resume_node(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }

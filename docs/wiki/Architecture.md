@@ -14,8 +14,8 @@ graph BT
   scope_exit[":util.scope_exit"]
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, ref_counted"]
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
-  mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::acquire, mutex::lock_guard"]
   event[":sync.event<br/>counting_event&lt;Mode&gt;, binary_event&lt;Mode&gt;, one_shot_event&lt;Mode&gt;"]
+  mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
   current_loop[":util.current_loop<br/>make_current_loop(loop&amp;), current_loop()"]
@@ -23,17 +23,15 @@ graph BT
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
 
   check --> platform
-  mutex --> intrusive_list
-  mutex --> loop
-  mutex --> future
-  mutex --> promise
-  mutex --> current_loop
   event --> check
   event --> intrusive_list
   event --> loop
   event --> future
   event --> promise
   event --> current_loop
+  mutex --> future
+  mutex --> promise
+  mutex --> event
   timer --> platform
   loop --> check
   loop --> platform
@@ -60,27 +58,27 @@ The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
 above them** — even though a loop's whole job is running futures'
 continuations. See "Why `:loop` doesn't depend on `:future`" below; it's the
 key to understanding how the continuation mechanism is split across files.
-`:sync.mutex` depends on `:loop` too ([Coroutines](Coroutines.md)) — an
-awaitable `lock()` needs somewhere to defer a waiter's resumption to, and
+`:sync.event` depends on `:loop` ([Coroutines](Coroutines.md)) — an
+awaitable `wait()` needs somewhere to defer a waiter's resumption to, and
 `est::loop::enqueue_ready()` is that somewhere; `:loop` still knows nothing
-about `:sync.mutex` in return. `:sync.mutex` also depends on `:future`/
-`:promise` for `acquire() -> future<lock_guard>`
-— an alternative to `lock()`/`unlock()` returning a move-only RAII handle
-instead of requiring `co_await`, built directly on `est::promise<lock_guard>`
-rather than a coroutine of its own, the same "producer without co_await"
-pattern `sleep_until()` (`:promise`) already uses.
+about `:sync.event` in return. It depends on `:future`/`:promise` for
+`wait() -> future<void>`, built directly on `est::promise<void>` rather
+than a coroutine of its own, the same "producer without `co_await`"
+pattern `sleep_until()` (`:promise`) already uses; on `:util.intrusive_list`
+for its own waiter queue; and on `:check` directly for `set(n)`'s `n > 0`
+precondition and `one_shot_event::set()`'s at-most-once enforcement.
 
-`:sync.event` (`counting_event<Mode>`, `binary_event<Mode>`,
-`one_shot_event<Mode>` - an awaitable counting semaphore and the
-auto-reset/manual-reset event types built on top of it) depends on the same
-partitions `:sync.mutex` does, for the same reasons - it reuses
-`:sync.mutex`'s own `loop&`/`intrusive_list<detail::ready_node>`/resume-node
-pattern outright rather than introducing a new one (see
-["`est::counting_event<Mode>` reuses this pattern
-unchanged"](Coroutines.md#estcounting_eventmode-reuses-this-pattern-unchanged)).
-It additionally depends on `:check` directly, unlike `:sync.mutex`, for
-`set(n)`'s `n > 0` precondition and `one_shot_event::set()`'s at-most-once
-enforcement.
+`:sync.mutex` depends on `:sync.event` — `est::mutex` isn't its own
+implementation any more (issue #67): it holds a single
+`est::binary_event<EventResetMode::automatic>` member and builds `lock()`
+directly on `wait()`/`try_wait()`/`set()`, rather than re-implementing
+an intrusive waiter list, a resume node, and abandonment-completion
+handling a second time (see [Coroutines](Coroutines.md#est-mutex-lock-built-on-top-of-binary_eventautomatic)).
+`:sync.mutex` needs nothing from `:loop`/`:util.intrusive_list`/
+`:util.current_loop` directly any more either - every one of those is
+now reached only through `:sync.event`. It still depends on `:future`/
+`:promise` directly, for `future<lock_guard>`/`make_ready_future<lock_guard>`
+(`lock()`'s own return type and fast path) and `.then()` (the slow path).
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
@@ -224,18 +222,21 @@ holds the `promise<void>` itself) to bridge a fired timer into a
 → `:promise`.
 
 This is also *why* `est::loop`'s ready-queue, `est::future_state<T>`'s
-"not yet ready" queue, and `est::mutex`'s own waiter list all share one
-root node type and one list container - `est::intrusive_list_node` and
+"not yet ready" queue, and `est::counting_event<Mode>`'s own waiter list
+(which `est::mutex` now builds `lock()` on top of directly, rather than
+keeping a waiter list of its own - issue #67) all share one root node
+type and one list container - `est::intrusive_list_node` and
 `est::intrusive_list<T>` (`est:util.intrusive_list`), a genuinely generic
 utility rather than something specific to any one of its users. `ready_node :
-public intrusive_list_node` directly, and `est::mutex`'s own waiter
-queue is typed `intrusive_list<detail::ready_node>` too - the same
+public intrusive_list_node` directly, and `est::counting_event<Mode>`'s own
+waiter queue is typed `intrusive_list<detail::ready_node>` too - the same
 type `est::loop`'s ready-queue and `est::future_state<T>`'s continuation
 queue already use, not just a sibling built on the same base - so the same
 enqueue/dequeue mechanics serve all three, with none of them depending on
 either of the others. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md)
 for the full type hierarchy this produces, and [Coroutines](Coroutines.md)
-for how `est::mutex`'s waiters became `ready_node`s in the first place.
+for how `est::counting_event<Mode>`'s waiters became `ready_node`s in the
+first place.
 
 ## The producer/consumer split: `promise<T>` / `future<T>` / `future_state<T>`
 

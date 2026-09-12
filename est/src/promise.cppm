@@ -108,9 +108,9 @@ namespace est::detail {
 // set_exception() on it. Without this, a coroutine doing `co_await
 // sleep_for(10s);`, abandoned when its loop is destroyed before the
 // timer ever fires, would leak its own frame forever - the same
-// abandon()-driven exception-completion mutex::lock_resume_node/
-// acquire_resume_node (est:sync.mutex) and detail::yield_resume_node
-// below also rely on, for the identical reason: the awaiting coroutine
+// abandon()-driven exception-completion detail::event_resume_node
+// (est:sync.event) and detail::yield_resume_node below also rely on,
+// for the identical reason: the awaiting coroutine
 // holds the only other reference to this promise's future_state<void>
 // (the future<void> temporary co_await awaits is spilled into the
 // coroutine's own frame across the suspension), so silently dropping the
@@ -153,8 +153,8 @@ private:
 // silently dropping it, the "broken promise, future simply never becomes
 // ready" default every other est::promise<T> in this codebase otherwise
 // has) matters for the identical reason sleep_resume_node's own doc
-// comment (just above) and mutex::lock_resume_node's own doc comment
-// (est:sync.mutex) both give.
+// comment (just above) and detail::event_resume_node's own doc comment
+// (est:sync.event) both give.
 class yield_resume_node final : public ready_node,
                                 public current_allocator_new_delete<yield_resume_node> {
 public:

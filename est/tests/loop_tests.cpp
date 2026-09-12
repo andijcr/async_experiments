@@ -364,8 +364,8 @@ TEST_CASE("a loop dropped with ready work and pending timers still queued frees 
 TEST_CASE("destroying a loop with a coroutine co_await-ing yield_execution() still pending "
           "leaks nothing",
           "[loop]") {
-  // Same hazard as mutex's acquire_resume_node (est/tests/mutex_tests.cpp,
-  // "destroying a mutex with a coroutine co_await-ing acquire() still
+  // Same hazard as est:sync.event's event_resume_node (est/tests/mutex_tests.cpp,
+  // "destroying a mutex with a coroutine co_await-ing lock() still
   // pending leaks nothing") - a coroutine suspended via co_await holds
   // its own reference to yield_execution()'s future_state<void> (the
   // future<void> temporary co_await awaits is spilled into the

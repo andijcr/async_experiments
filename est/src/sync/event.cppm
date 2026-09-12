@@ -27,12 +27,13 @@ namespace est::detail {
 // The waiter node behind counting_event<Mode>::wait()'s slow path (not yet
 // signaled): queued in counting_event<Mode>::waiters_, completing an
 // est::promise<void> once set() hands it a unit. No coroutine_handle in
-// sight here, mirroring mutex::lock_resume_node exactly - wait() itself is
-// no coroutine-only primitive, so this node only ever has to know how to
-// complete a promise.
+// sight here - wait() itself is no coroutine-only primitive, so this node
+// only ever has to know how to complete a promise. est::mutex (est:sync.mutex)
+// builds its own lock() directly on top of this class via
+// est::binary_event<EventResetMode::automatic> rather than keeping a
+// resume node of its own - it never nests or duplicates this one.
 //
-// Deliberately *not* nested inside counting_event<Mode> (unlike
-// mutex::lock_resume_node inside the non-template mutex): run()/abandon()
+// Deliberately *not* nested inside counting_event<Mode>: run()/abandon()
 // only ever touch promise_, never Mode or anything else about the
 // counting_event that enqueued them, so hoisting it out here avoids an
 // identical resume_node type per Mode instantiation. Matches
@@ -42,11 +43,12 @@ namespace est::detail {
 //
 // abandon() completing the promise with an exception (rather than simply
 // deallocating the node) matters for the identical reason
-// mutex::lock_resume_node's own doc comment gives in full: a coroutine
-// suspended on the future<void> wait() returned holds that future_state
-// alive via its own frame, reachable only once this future_state itself
-// completes - silently dropping the promise instead would strand that
-// frame forever, with neither side able to free the other first.
+// future_resume_node<T>'s own doc comment gives in full (est:future): a
+// coroutine suspended on the future<void> wait() returned holds that
+// future_state alive via its own frame, reachable only once this
+// future_state itself completes - silently dropping the promise instead
+// would strand that frame forever, with neither side able to free the
+// other first.
 // Completing it here (called only from ~counting_event()'s/loop::~loop()'s
 // abandonment drain, never after set()'s own successful hand-off) always
 // drains the future_state's own pending continuation onto the loop's
@@ -77,14 +79,15 @@ private:
 export namespace est {
 
 // A cooperative-scheduling counting event: an awaitable generalization of
-// a counting semaphore, built the same way est::mutex is (est:sync.mutex,
-// see its own top comment for the underlying rationale) - a plain int
-// count, an est::intrusive_list<detail::ready_node> waiters_ queue, and
+// a counting semaphore - a plain int count, an
+// est::intrusive_list<detail::ready_node> waiters_ queue, and
 // detail::event_resume_node (above) completing an est::promise<void> once
-// a waiter is satisfied. wait() returns a plain future<void>, exactly
-// like mutex::lock() - already-satisfied wait() resumes immediately,
-// through future_awaiter<T>'s own already-ready fast path (est:future),
-// with no extra allocation or suspension.
+// a waiter is satisfied. est::mutex (est:sync.mutex) is built directly on
+// top of this class (a binary_event<EventResetMode::automatic> member),
+// not a separate, similarly-shaped implementation of its own. wait()
+// returns a plain future<void> - already-satisfied wait() resumes
+// immediately, through future_awaiter<T>'s own already-ready fast path
+// (est:future), with no extra allocation or suspension.
 //
 // est::binary_event<Mode> and est::one_shot_event<Mode> (both below) are
 // derived from this - not separate implementations - each one layering
@@ -244,6 +247,25 @@ public:
   // out.
   void reset() noexcept { count_ = 0; }
 
+  // Attempts to consume one unit synchronously, without ever constructing
+  // a future or enqueuing a waiter - the non-awaiting half of wait(),
+  // split out on its own for a caller (est::mutex::lock(), est:sync.mutex)
+  // that wants to special-case the already-available case itself rather
+  // than pay for a future_state<void> it would immediately discard. Matches
+  // std::counting_semaphore::try_wait()'s naming/shape, generalized the
+  // same way wait() itself generalizes acquire() to suspend instead of
+  // block. true and count() decremented (automatic) or left alone
+  // (manual) if a unit was available; false, no change, otherwise.
+  [[nodiscard]] auto try_wait() noexcept -> bool {
+    if (count_ <= 0) {
+      return false;
+    }
+    if constexpr (Mode == EventResetMode::automatic) {
+      --count_;
+    }
+    return true;
+  }
+
   // Suspends the calling coroutine until the count is greater than zero,
   // resuming immediately (no suspension, no allocation - see
   // future_awaiter<T>::await_ready(), est:future) if it already is. Only
@@ -252,10 +274,7 @@ public:
   // the slow path only enqueues into this event's own waiters_, not onto
   // any loop's ready-queue (that happens later, from set()).
   [[nodiscard]] auto wait() -> future<void> {
-    if (count_ > 0) {
-      if constexpr (Mode == EventResetMode::automatic) {
-        --count_;
-      }
+    if (try_wait()) {
       return make_ready_future<void>();
     }
     auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());

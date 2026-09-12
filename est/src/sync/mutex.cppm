@@ -2,10 +2,8 @@ export module est:sync.mutex;
 
 import std;
 import :future;
-import :loop;
 import :promise;
-import :util.current_loop;
-import :util.intrusive_list;
+import :sync.event;
 
 export namespace est {
 
@@ -16,217 +14,102 @@ export namespace est {
 // two coroutines each doing "read some shared structure, co_await
 // something, write it back" can still interleave at that suspension
 // point and corrupt it, exactly the way two OS threads would without a
-// lock. `co_await mutex.lock();` is this framework's answer to that,
-// built entirely on primitives this codebase already has -
-// est::detail::ready_node (est:loop) for the waiter/resume queue,
-// est::intrusive_list for the queue itself, est::promise<T>/est::future<T>
-// for the result itself. acquire() packages the same lock()/unlock()
-// pair as a future<lock_guard> instead, for a caller that would rather
-// have the lock released automatically (RAII) than remember to call
-// unlock() itself.
+// lock. `co_await mutex.lock();` is this framework's answer to that.
 //
-// lock() returns a plain `future<void>`, built the same way `acquire()`
-// is - no bespoke awaiter type: `co_await mutex.lock()` on an
-// uncontended mutex resumes immediately, with no extra node allocated,
-// through the same path any other `co_await`-of-an-already-ready-future
-// takes (`future_awaiter<T>::await_ready()`, `est:future`).
+// Built directly on est::binary_event<EventResetMode::automatic>
+// (est:sync.event) rather than its own bespoke waiter-list/resume-node
+// pair (issue #67): "unlocked" is exactly "one unit available," "locked"
+// is "no unit available," lock() is wait(), and unlock() is set() -
+// automatic mode's own "hand the unit directly to the next queued
+// waiter, never reading as free in between" behavior (counting_event<Mode>
+// ::set()'s own doc comment, est:sync.event) is already exactly the
+// handoff semantics a mutex needs. No remaining code here re-implements
+// any part of the waiter queue, the resume node, or the abandoned-waiter
+// exception-completion path - event_'s own destructor/wait()/set()
+// already are that code.
 //
-// Holds no `loop&` of its own, unlike future_state<T> - every method
-// below resolves est::current_loop()/est::current_allocator() fresh, at
-// the point of use, rather than caching anything at construction time -
-// only current_allocator(), not current_loop() itself, where a method
-// never actually needs the loop (see lock()/acquire()/~mutex()'s own
-// comments). There is no constructor taking an explicit `loop&` either;
-// a mutex is never tied to a specific loop, only to whichever one is
-// current when each operation runs.
+// lock() returns `future<lock_guard>` directly - there is no separate
+// lock()-returns-future<void> plus acquire()-returns-future<lock_guard>
+// pair any more (issue #66): a lock without a guard to release it has no
+// use in this codebase (every call site immediately wants the RAII
+// handle), so there is nothing a second, lower-level primitive would add
+// besides a way to forget to unlock(). unlock() itself is private,
+// reachable only through lock_guard's own destructor/move-assignment (a
+// nested class already shares its enclosing class's access) - the only
+// way to release the lock this class exposes at all now.
 class mutex {
 public:
-  mutex() noexcept = default;
+  // event_ starts at max_count (1) but count() 0 (not yet signaled, see
+  // counting_event<Mode>'s own doc comment) - one set() here brings it to
+  // 1, "available," matching an unlocked mutex's own starting state.
+  // Never resolves current_loop(): set() only does that once something is
+  // actually queued in waiters_, never true for a mutex that was just
+  // constructed.
+  mutex() noexcept { event_.set(); }
 
   mutex(const mutex&) = delete;
   auto operator=(const mutex&) -> mutex& = delete;
   mutex(mutex&&) = delete;
   auto operator=(mutex&&) -> mutex& = delete;
+  ~mutex() = default;
 
-  // Destroys (without granting the lock) any waiter still queued on
-  // lock() or acquire() - mirrors future_state<T>::~future_state() and
-  // loop::~loop() (both drain their own pending lists the same way, for
-  // the same reason). Each waiter node's own abandon() (below) completes
-  // its promise with an exception first, rather than just deallocating
-  // itself silently - see lock_resume_node's own doc comment for why
-  // that matters beyond just freeing the node itself.
-  // waiters_.empty() checked first - a mutex with nothing queued can
-  // legitimately be destroyed long after whatever loop was current when
-  // it was created has stopped being current at all, and deleting an
-  // abandoned waiter node resolves est::current_allocator() fresh,
-  // inside that node's own operator delete (est::detail::ready_node's
-  // own doc comment, est:loop), which would fail its own precondition in
-  // that case even though nothing here actually needs one. current_loop()
-  // itself is never resolved here at all.
-  ~mutex() {
-    if (waiters_.empty()) {
-      return;
-    }
-    waiters_.drain(detail::abandon_ready_node);
-  }
+  [[nodiscard]] auto locked() const noexcept -> bool { return event_.count() == 0; }
 
-  [[nodiscard]] auto locked() const noexcept -> bool { return state_ != 0; }
+  [[nodiscard]] auto has_waiters() const noexcept -> bool { return event_.has_waiters(); }
 
-  [[nodiscard]] auto has_waiters() const noexcept -> bool { return !waiters_.empty(); }
-
-  class lock_resume_node;
   class lock_guard;
-  class acquire_resume_node;
 
   // Acquires the lock, resolving once it's held - suspending the calling
-  // coroutine first (if `co_await`ed) when it's already held. Built
-  // directly on est::promise<void>/est::future<void>, not a coroutine of
-  // its own or a bespoke awaiter type - see this class's own doc comment
-  // for why. The fast path (uncontended) completes the promise
-  // immediately and returns an already-ready future; the slow path
-  // queues a lock_resume_node in waiters_, completed later by unlock().
-  // Defined out-of-line, below lock_resume_node - needs to be a complete
-  // type first.
-  [[nodiscard]] auto lock() -> future<void>;
-
-  // Releases the lock. If a waiter is queued, hands the lock directly to
-  // it instead of clearing state_ - the resumed waiter becomes the new
-  // holder without any window where the lock reads as free, so a third
-  // party couldn't legally lock() in between even in a hypothetical
-  // multi-loop future.
+  // coroutine first (if `co_await`ed) when it's already held. The fast
+  // path (uncontended) consumes the available unit synchronously via
+  // try_wait() and returns an already-ready future, with no future/
+  // node allocated beyond the returned future_state<lock_guard> itself -
+  // matching this class's previous zero-extra-allocation fast path
+  // exactly (see [Allocation Patterns](../wiki/Allocation-Patterns.md)).
+  // The slow path defers through event_.wait().then(...) instead: once
+  // that future<void> resolves (event_'s own waiter mechanism, unlock()
+  // handing the unit directly to the next queued waiter), the attached
+  // continuation builds the lock_guard and completes the future<lock_guard>
+  // this method returned. Costs two more allocations than the old
+  // hand-written acquire_resume_node did (a concrete_continuation<Fn,
+  // lock_guard> node plus its own downstream future_state<lock_guard>, on
+  // top of event_.wait()'s own future_state<void>+event_resume_node) - a
+  // deliberate trade of contended-path allocation count for not
+  // re-implementing the waiter queue/resume node/abandonment-completion
+  // machinery a second time; see docs/PLAN.md's "Issue #66 & #67" entry.
   //
-  // Deferred through est::loop::enqueue_ready() rather than completed
-  // directly here: completing synchronously would run() the waiter
-  // unconditionally, even one that's a coroutine later abandoned
-  // (destroyed without ever consuming its future<lock_guard>).
-  // Abandonment is only safe because abandon() (never run()) completes
-  // with an exception instead of a real value - see lock_resume_node's
-  // own doc comment. Deferring through the loop keeps that guard rail
-  // intact: whether a queued waiter is later run() (the loop drains it
-  // normally) or abandon()ed and deleted (the loop or this mutex is torn
-  // down first) is decided at drain time, not decided in advance here.
+  // The `.then()` callback captures `this` (a `mutex*`) - the exact same
+  // "needs the mutex still alive once the deferred completion actually
+  // runs" precondition the old acquire_resume_node::run() carried, not a
+  // new hazard this refactor introduced; see issue #46 (still open,
+  // unaffected by this change) and docs/wiki/Coroutines.md's own section
+  // on it.
   //
-  // KNOWN LIMITATION left open by keeping this deferred:
-  // acquire_resume_node::run() still needs a live mutex& to construct the
-  // lock_guard it completes with. If this mutex is destroyed after
-  // unlock() enqueues a waiter but before the loop actually drains it -
-  // only possible if the loop outlives this mutex and keeps running
-  // during that gap, since ~mutex() itself drains waiters_ via abandon()/
-  // delete, never run() - that waiter's run() would construct a
-  // lock_guard over an already-dangling mutex&. Left as a documented
-  // precondition: the
-  // loop must outlive every mutex constructed against it, and a caller
-  // must not let the loop keep running past a mutex's destruction while
-  // a waiter is still queued on it.
-  //
-  // SECOND KNOWN LIMITATION, from not caching a loop& (this class's own
-  // doc comment): a waiter enqueued by lock()/acquire() carries an
-  // allocator and a future_state<T> built against whichever loop was
-  // current *then*. unlock() (and ~mutex(), above) instead resolve
-  // est::current_loop() fresh, *now*. If the current loop has changed
-  // in between - a caller nesting a second make_current_loop() scope
-  // around some unrelated work, say - the waiter is handed to, or
-  // destroyed through the allocator of, a different loop than the one
-  // its own future_state actually belongs to: at best a future that
-  // never resolves on the loop actually being run; at worst deallocating
-  // through the wrong memory_resource. A cached `loop&` member (what
-  // this class had before) made this hazard structurally impossible -
-  // every operation on one mutex used the one loop it was built against,
-  // full stop. Resolving current_loop() fresh does not.
-  void unlock() noexcept {
-    if (auto* waiter = waiters_.dequeue()) {
-      current_loop().enqueue_ready(*waiter);
-      return;
-    }
-    state_ = 0;
-  }
-
-  // acquire() is lock()/unlock() packaged as a future<lock_guard> instead
-  // of a manual pair - a caller that doesn't want to remember to call
-  // unlock() itself gets a RAII handle instead, exactly like every other
-  // guard type in this codebase (est::scope_exit). Built the same way
-  // lock() is - see acquire_resume_node's own doc comment for the one
-  // place its shape differs from lock_resume_node's.
-  //
-  // Defined out-of-line, below lock_guard/acquire_resume_node - both need
-  // to be complete types first.
-  [[nodiscard]] auto acquire() -> future<lock_guard>;
+  // Defined out-of-line, below lock_guard - needs to be a complete type
+  // first (future<lock_guard>/make_ready_future<lock_guard>/.then() all
+  // need it complete, not just forward-declared as it is here).
+  [[nodiscard]] auto lock() -> future<lock_guard>;
 
 private:
-  int state_ = 0;
-  intrusive_list<detail::ready_node> waiters_;
+  // Releases the lock: event_.set() hands the freed unit directly to the
+  // next queued waiter, if any (never reading as free in between - see
+  // this class's own top comment), or leaves it available for the next
+  // lock() otherwise. Private - lock_guard (a nested class, sharing this
+  // class's access) is the only caller, so the only way to release a
+  // lock acquired through this class is to drop the guard lock()
+  // returned.
+  void unlock() noexcept { event_.set(); }
+
+  binary_event<EventResetMode::automatic> event_;
 };
 
-// The waiter node behind lock()'s slow path (mutex already locked):
-// queued in mutex::waiters_, completing a est::promise<void> once
-// unlock() hands it the lock.
-//
-// abandon() completing the promise with an exception (rather than simply
-// deallocating the node) matters specifically for the case where run()
-// never happened: this node was still sitting in mutex::waiters_ when
-// the mutex itself was torn down, never handed the lock. Silently
-// dropping the promise instead (the "broken promise, future simply never
-// becomes ready" contract every other est::promise<T> in this codebase
-// otherwise has) would leave a coroutine suspended on the resulting
-// future<void> via co_await stranded forever: its pending
-// future_resume_node<T> (est:future) sits inside this future_state's own
-// waiters_, reachable only once the future_state completes, and nothing
-// else holds a reference to free the coroutine's frame. Completing the
-// promise here drains the future_state's own pending continuation onto
-// est::loop's ready_ queue instead, where it's either genuinely resumed
-// (if the loop outlives this mutex and keeps running) or safely
-// destroyed, never run, by est::loop's own destructor-time drain
-// (loop::~loop()). abandon() (est::detail::ready_node's own doc comment,
-// est:loop) is exactly what stops this from double-completing an
-// already-successfully-completed promise: it's never called on a node
-// the loop already drained via `run()` (unlock() handed it the lock) -
-// only on one still sitting in `waiters_` or still queued on the loop's
-// own ready_ list when `~mutex()`'s or `~loop()`'s own drain reaches it
-// without `run()` ever having been called.
-class mutex::lock_resume_node final
-    : public detail::ready_node,
-      public detail::current_allocator_new_delete<lock_resume_node> {
-public:
-  explicit lock_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
-
-  void run() final { promise_.set_value(); }
-
-  void abandon() noexcept final {
-    promise_.set_exception(
-        std::make_exception_ptr(std::runtime_error("mutex destroyed while lock() was pending")));
-  }
-
-  // operator new/delete inherited from detail::current_allocator_new_delete<T>
-  // (est:util.current_loop) - see that class's own doc comment for why
-  // every concrete ready_node/timer_node needs its own pair rather than
-  // one shared at the ready_node base itself.
-
-private:
-  promise<void> promise_;
-};
-
-// Only current_allocator() is needed here, never current_loop() itself -
-// the fast path completes the promise inline (make_ready_future()), and
-// the slow path only enqueues into this mutex's own waiters_, not onto
-// any loop's ready-queue (that happens later, from unlock()).
-inline auto mutex::lock() -> future<void> {
-  if (state_ == 0) {
-    state_ = 1;
-    return make_ready_future<void>();
-  }
-  auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new lock_resume_node(std::move(prom));
-  waiters_.enqueue(*node);
-  return std::move(fut);
-}
-
-// RAII handle returned by mutex::acquire(): the mutex is held for as long
-// as one of these is alive, unlocked automatically from the destructor -
-// no separate unlock() call for a caller to remember, unlike lock()/
-// unlock() themselves (the lower-level, manual primitive). Move-only,
-// matching every other single-owner handle in this codebase (future<T>,
-// promise<T>): copying would let two guards each believe they owned
-// unlocking the same mutex, double-unlocking it once both were
+// RAII handle returned by mutex::lock(): the mutex is held for as long as
+// one of these is alive, unlocked automatically from the destructor - no
+// separate unlock() call for a caller to remember (issue #66 - there is
+// no lower-level manual pair any more, unlock() itself is private).
+// Move-only, matching every other single-owner handle in this codebase
+// (future<T>, promise<T>): copying would let two guards each believe they
+// owned unlocking the same mutex, double-unlocking it once both were
 // destroyed.
 class mutex::lock_guard {
 public:
@@ -258,54 +141,11 @@ private:
   mutex* mutex_;
 };
 
-// The waiter node behind acquire()'s slow path (mutex already locked):
-// queued in mutex::waiters_ exactly like lock_resume_node, completing a
-// est::promise<lock_guard> instead of a est::promise<void> - the only
-// real difference between the two. Needs a mutex& (lock_resume_node
-// doesn't) purely to construct that lock_guard once run() knows unlock()
-// has actually handed it the lock; see lock_resume_node's own doc
-// comment for why abandon() needs the same exception-completion on the
-// abandoned (never handed the lock) path. mutex_ staying valid for
-// run()'s use relies on the precondition unlock()'s own doc comment
-// documents as a known, open limitation.
-class mutex::acquire_resume_node final
-    : public detail::ready_node,
-      public detail::current_allocator_new_delete<acquire_resume_node> {
-public:
-  acquire_resume_node(mutex& mutex_ref, promise<lock_guard> prom) noexcept
-      : mutex_(mutex_ref), promise_(std::move(prom)) {}
-
-  // Called only once unlock() has already handed this waiter the lock
-  // (mutex::unlock() hands off rather than clearing state_ - see its own
-  // doc comment), so constructing the lock_guard here doesn't need to
-  // touch state_ itself at all.
-  void run() final { promise_.set_value(lock_guard(mutex_)); }
-
-  void abandon() noexcept final {
-    promise_.set_exception(
-        std::make_exception_ptr(std::runtime_error("mutex destroyed while acquire() was pending")));
-  }
-
-  // operator new/delete inherited from detail::current_allocator_new_delete<T>
-  // (est:util.current_loop) - see lock_resume_node's own doc comment
-  // (just above) for why.
-
-private:
-  mutex& mutex_;
-  promise<lock_guard> promise_;
-};
-
-// Same reasoning as lock() above: only current_allocator() is needed,
-// never current_loop() itself.
-inline auto mutex::acquire() -> future<lock_guard> {
-  if (state_ == 0) {
-    state_ = 1;
+inline auto mutex::lock() -> future<lock_guard> {
+  if (event_.try_wait()) {
     return make_ready_future<lock_guard>(*this);
   }
-  auto [prom, fut] = detail::make_promise_future_impl<lock_guard>(current_allocator());
-  auto* node = new acquire_resume_node(*this, std::move(prom));
-  waiters_.enqueue(*node);
-  return std::move(fut);
+  return event_.wait().then([this] { return lock_guard(*this); });
 }
 
 } // namespace est

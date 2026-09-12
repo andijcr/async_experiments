@@ -142,9 +142,11 @@ member, no `memory_resource*` stashed alongside a coroutine frame for its
 themselves are unchanged (re-disassembled on this branch - identical to
 the listings above) - this experiment didn't touch that mechanism, only
 who calls it and how often. What changed is the multiplier: a type like
-`est::mutex` used to pay for that lookup chain once, in its constructor,
-and store the result; now `lock()`, `unlock()`, `acquire()`, and `~mutex()`
-each pay it again, independently, every time they run. The same is true
+`est::counting_event<Mode>` (`est::mutex` builds `lock()` on top of it
+directly now - issue #67, after this experiment) used to pay for that
+lookup chain once, in its constructor, and store the result; now
+`wait()`, `set()`, and `~counting_event()` each pay it again,
+independently, every time they run. The same is true
 of `future_state<T>`'s `set_continuation()`, `allocator()`, `then()`,
 `complete()`, and `~future_state()`, and of the coroutine frame's own
 `operator new`/`operator delete`. None of this is free, even though each

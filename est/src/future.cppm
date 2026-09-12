@@ -121,10 +121,22 @@ public:
     }
   }
 
-  // No abandon() override - see concrete_continuation<Fn, U>'s own doc
-  // comment (further down this file) on why dropping downstream_
-  // unconditionally here is the current behavior, not a settled answer.
-  //
+  // Called only when run() never happened: the inner future_state<T>
+  // this node was registered on (via set_continuation(), bypassing
+  // future<T>/then() entirely - see this class's own top comment) was
+  // itself abandoned before ever completing. downstream_ must still be
+  // completed here, not silently dropped - see concrete_continuation<Fn,
+  // U>'s own doc comment (further down this file) for the full reasoning:
+  // a coroutine co_await-ing the outer future<T> this flatten forwards
+  // into holds downstream_'s own future_state alive across its own
+  // suspension, so dropping just this node's reference to it - without
+  // completing it - would strand that coroutine's frame with nothing left
+  // to free it.
+  void abandon() noexcept override {
+    downstream_->set_exception(std::make_exception_ptr(
+        std::runtime_error("flattened future abandoned before its inner future completed")));
+  }
+
   // operator new/delete inherited from current_allocator_new_delete<T>
   // (est:util.current_loop) - see that class's own doc comment for why
   // every concrete ready_node/timer_node needs its own pair rather than
@@ -619,13 +631,32 @@ private:
       }
     }
 
-    // No abandon() override: downstream_ is currently just dropped on
-    // abandonment either way, unlike est::mutex's resume nodes or
-    // future_resume_node<T> below - whether a coroutine co_await-ing a
-    // `.then()`-chained future can be stranded the same way if the
-    // *upstream* future_state is dropped first is a real, separate
-    // question this class doesn't yet answer.
-    //
+    // Called only when run() never invoked fn_ at all: this node's
+    // upstream future_state<T> - the one then() was called on - was
+    // itself abandoned (its owning future_state/loop torn down, or this
+    // node still sitting unrun in est::loop's own ready_/pending_timers_
+    // at teardown) before ever completing. downstream_ must still be
+    // completed here, not silently dropped, for the identical reason
+    // every other resume node in this codebase (future_resume_node<T>,
+    // further down this file; detail::event_resume_node, est:sync.event)
+    // already completes an abandoned promise instead of just dropping
+    // it: a coroutine co_await-ing the future<U> this then() call
+    // returned holds that same future_state<U> alive across its own
+    // suspension (spilled into its frame - see future_resume_node<T>'s
+    // own doc comment), reachable only through this node's downstream_
+    // reference until something completes it. Originally left as an open
+    // question ("a real, separate question this class doesn't yet
+    // answer") until est::mutex::lock()'s own then()-based slow path
+    // (issue #67) turned it from a theoretical gap into a real,
+    // test-caught leak - a coroutine co_await-ing mutex_ref.lock() left
+    // permanently stranded when the mutex (and its underlying
+    // future_state<void>) were torn down before that lock() ever
+    // resolved.
+    void abandon() noexcept override {
+      downstream_->set_exception(std::make_exception_ptr(
+          std::runtime_error("then() abandoned before its upstream future completed")));
+    }
+
     // operator new/delete inherited from current_allocator_new_delete<T>
     // (est:util.current_loop) - see that class's own doc comment for why
     // every concrete ready_node/timer_node needs its own pair rather than
@@ -943,9 +974,9 @@ public:
     // here lets the compiler destroy the coroutine frame immediately and
     // automatically once the body finishes. Safe to do so unconditionally:
     // every node that ever resumes this coroutine (future_resume_node<T>
-    // below, mutex::lock_resume_node/acquire_resume_node) is separately
-    // heap-allocated, entirely independent of the frame this suspend
-    // point destroys - see future_resume_node<T>'s own doc comment for
+    // below) is separately heap-allocated, entirely independent of the
+    // frame this suspend point destroys - see future_resume_node<T>'s
+    // own doc comment for
     // why it has to be heap-allocated rather than embedded in the frame
     // it resumes - so there is nothing left in this frame for anything
     // to touch afterward.
