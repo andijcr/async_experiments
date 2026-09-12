@@ -26,16 +26,21 @@ complex `.then()` chain actually cost."
    allocation to worry about, unlike `std::shared_ptr<T>` built via `new
    T` then wrapped — `make()` is already the `make_shared`-equivalent
    path, always.
-2. **`allocator.new_object<Concrete>(args...)`** — a *direct*, un-shared
-   allocation for a continuation or timer node (`concrete_continuation<Fn,
-   U>`, `est:promise`'s `sleep_resume_node`/`yield_resume_node`). These
-   are never wrapped in a `shared_ptr` — a node has exactly one owner at a
+2. **`new Concrete(args...)`** — a *direct*, un-shared allocation for a
+   continuation or timer node (`concrete_continuation<Fn, U>`,
+   `est:promise`'s `sleep_resume_node`/`yield_resume_node`). These are
+   never wrapped in a `shared_ptr` — a node has exactly one owner at a
    time (first the `future_state` it's pending on, then the loop's
    ready-queue or pending-timer list), so plain ownership-by-pointer plus
-   an explicit virtual `destroy(allocator, ran)` call is enough; see
+   a virtual destructor is enough. Every concrete node type has its own
+   `operator new`/`operator delete`, resolving `est::current_allocator()`
+   fresh (the same pattern a coroutine frame's own allocation uses) -
+   inherited from `detail::current_allocator_new_delete<T>`
+   (`est:util.current_loop`) rather than hand-rolled per class. See
    [Continuation Node Mechanism](Continuation-Node-Mechanism.md) for why
-   `destroy()` has to be virtual at all (deallocating the *actual* derived
-   type through a `ready_node*`/`timer_node*` base pointer).
+   that mixin can't instead live on `ready_node`/`timer_node` themselves,
+   and why it's what makes `delete` through a `ready_node*`/`timer_node*`
+   base pointer correctly sized for the *actual* derived type.
 
 ## Allocation cost per operation
 
@@ -60,8 +65,7 @@ node directly on the inner future's own `future_state<U>`, reached through
 `future_state<X>` instantiation for exactly this one internal call site):
 
 ```cpp
-auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
-    downstream_);
+auto* node = new detail::flatten_forwarder<U>(downstream_);
 result.state_->set_continuation(*node);
 ```
 

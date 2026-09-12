@@ -3866,6 +3866,224 @@ unchanged in count (this is a pure internal refactor - no test observes
 full suite passes under the `sanitize` preset (ASan+UBSan) too;
 `diff-cover` coverage gate passes against `main`.
 
+### `ready_node`/`timer_node::destroy()` replaced with a plain virtual destructor + `abandon()` (done)
+
+Follow-up on "`ready_node`/`timer_node::destroy()` takes `ran` as a
+parameter; issue #50 fixed" above: `destroy(allocator, ran)` still had to
+exist as a hand-rolled virtual method purely so each concrete node could
+deallocate itself through its own most-derived type - `ready_node`/
+`timer_node`'s own doc comments called this out directly ("the whole
+reason `destroy()` is virtual instead of the caller deallocating through
+a `detail::ready_node&`"). Plain C++ already has a mechanism for exactly
+this: a class with a virtual destructor deallocates through the *dynamic*
+type's own visible `operator delete`, with the dynamic type's own correct
+size - never the static (base) one - when deleted through a base
+pointer/reference. `est::future<T>::promise_type` was already relying on
+this same idea for its own coroutine frame (`coroutine_frame_alloc()`/
+`coroutine_frame_dealloc()`, resolving `est::current_allocator()` fresh);
+this generalizes it to every `ready_node`/`timer_node` in the codebase.
+
+`ready_node`/`timer_node` themselves can't define a *shared* `operator
+new`/`operator delete` doing this, though - that would need
+`est::current_allocator()` (`est:util.current_loop`), which itself
+imports `:loop`, so `:loop` importing it back would be circular (the same
+constraint this file's own top comment on `:loop`/`:future` already
+documents, one level further down the DAG). So every concrete node type
+- `mutex::lock_resume_node`/`acquire_resume_node`, `est:promise`'s
+`sleep_resume_node`/`yield_resume_node`, `est:sync.event`'s
+`event_resume_node`, `est:future`'s `future_resume_node<T>`/
+`concrete_continuation<Fn, U>`/`flatten_forwarder<T>` - now defines its
+own pair instead, each one the same six lines:
+
+```cpp
+static auto operator new(std::size_t size) -> void* {
+  return current_allocator().resource()->allocate(size, alignof(lock_resume_node));
+}
+static void operator delete(void* ptr, std::size_t size) noexcept {
+  current_allocator().resource()->deallocate(ptr, size, alignof(lock_resume_node));
+}
+```
+
+`destroy()`'s other job - completing a held `promise<T>` with an
+exception when a node is deleted without ever having `run()`/`fire()`d -
+splits out into a new `virtual void abandon() noexcept {}`
+on `ready_node`/`timer_node`, defaulted to a no-op. Every call site that
+used to pass `ran` now either calls `abandon()` first (a drain that never
+ran the node - `~future_state()`, `~mutex()`, `~counting_event()`,
+`loop::drain_pending()`) or skips straight to `delete` (`loop::
+destroy_guard()`, used by `run_one()`/`fire_ready_timers()` right after
+`run()`/`fire()` - which never counts as abandoned). This removes the
+`bool ran` parameter entirely - a node with abandonment logic
+(`lock_resume_node`/`acquire_resume_node`, `sleep_resume_node`/
+`yield_resume_node`, `event_resume_node`, `future_resume_node<T>`)
+overrides `abandon()` with just its exception-completing (or, for
+`future_resume_node<T>`, frame-freeing) logic and nothing else; a node
+without one (`concrete_continuation<Fn, U>`, `flatten_forwarder<T>`)
+simply doesn't override it, rather than taking the parameter and
+ignoring it.
+
+`future_state<T>::allocator()` (a thin `current_allocator()` wrapper) is
+now dead code - its only two callers (`then()`'s node allocation,
+`fulfill()`'s flattening node allocation) both switched to a plain `new`,
+which resolves the allocator internally - so it's removed rather than
+left unused.
+
+No behavior changes as a result: allocation and deallocation still
+resolve `est::current_allocator()` fresh at the same points as before
+(now inside each concrete node's own `operator new`/`operator delete`
+rather than pre-resolved by the caller and threaded through an explicit
+parameter), and `abandon()` runs at exactly the same points `destroy(...,
+false)` used to. `loop::drain_pending()`'s own doc comment on why it must
+run *before* `make_current_loop()`'s guard clears the current-loop slot
+now covers node deletion itself, not just the coroutine frame a node's
+`abandon()` might go on to free - both resolve `current_allocator()`
+fresh, so both need the same ordering guarantee.
+
+Docs updated everywhere `destroy(allocator, ran)`/`bool ran` was shown or
+named: `docs/wiki/Coroutines.md`, `Continuation-Node-Mechanism.md`,
+`Allocation-Patterns.md`, `Architecture.md`, `Loop-And-Timers.md`.
+
+**Verified in the pinned Docker devenv:** existing test suite passes
+unchanged (a pure refactor of already-tested abandonment/allocation
+behavior, no new observable behavior to add a test for);
+`clang-format`/`clang-tidy` clean across every touched file; full suite
+passes under the `sanitize` preset (ASan+UBSan) too, confirming every
+concrete node's `operator new`/`operator delete` pairs allocate and
+deallocate through matching sizes; both example binaries still run
+correctly.
+
+### `current_allocator_new_delete<T>` mixin: the 8 hand-rolled operator new/delete pairs above deduplicated (done)
+
+Code-review follow-up on the entry above: every one of the 8 concrete
+node types that gained an `operator new`/`operator delete` pair there
+(`mutex::lock_resume_node`/`acquire_resume_node`, `est:promise`'s
+`sleep_resume_node`/`yield_resume_node`, `est:sync.event`'s
+`event_resume_node`, `est:future`'s `future_resume_node<T>`/
+`concrete_continuation<Fn, U>`/`flatten_forwarder<T>`) hand-rolled the
+identical six lines, differing only in which class name got substituted
+into `alignof(...)`. Factored into one CRTP mixin instead:
+
+```cpp
+template <class Derived> class current_allocator_new_delete {
+public:
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(Derived));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(Derived));
+  }
+};
+```
+
+Added to `est:util.current_loop` (`est/src/util/current_loop.cppm`), not
+a new partition of its own: it needs nothing beyond `current_allocator()`,
+already defined right there, and every one of the four partitions with a
+node class to update (`:future`, `:promise`, `:sync.mutex`, `:sync.event`)
+already imports `:util.current_loop`. `est::detail::ready_node`/
+`timer_node` (`:loop`) still can't inherit it themselves, for the
+identical circular-dependency reason their own doc comments already give
+for not defining a shared default in the first place: the mixin needs
+`current_allocator()`, and `:util.current_loop` imports `:loop`, so
+`:loop` importing it back would be circular. Each of the 8 classes now
+just adds `public current_allocator_new_delete<TheClassItself>` to its
+base-class list (`detail::current_allocator_new_delete<T>` from the two
+call sites - `mutex::lock_resume_node`/`acquire_resume_node` and
+`future_state<T>::concrete_continuation<Fn, U>` - not already inside
+`namespace est::detail` themselves) instead of defining the pair by hand;
+no behavior change, since the inherited pair does exactly what the
+hand-rolled one did.
+
+Docs updated: `docs/wiki/Allocation-Patterns.md` and
+`Continuation-Node-Mechanism.md` (both described the pair as "every
+concrete node type defines its own"), plus two stale doc-comment
+cross-references to a since-removed `future_state<T>::allocator()`
+method caught by the same review pass (`est/src/future.cppm`).
+
+**`current_allocator_new_delete<T>`'s own special members, settled by
+`clang-tidy`:** the mixin has no data, so its first cut left every
+special member implicit (rule of zero) apart from a private default
+constructor (+ `friend Derived`) guarding against unrelated construction
+- but `clang-tidy` flagged that as `cppcoreguidelines-special-member-
+functions` ("declares one, not the others") the moment a destructor was
+added explicitly to quiet a *different* check
+(`performance-trivially-destructible`, which wants an explicit
+`=default` destructor even though the fully-implicit one is already
+trivial). The two checks want contradictory things for this exact shape
+(private constructor + `friend Derived`) - genuinely, not just a matter
+of ordering: adding the destructor `performance-trivially-destructible`
+asks for immediately re-triggers `cppcoreguidelines-special-member-
+functions`, and removing it to satisfy that one re-triggers the first
+again. Settled by keeping rule-of-zero (the actually-correct state) and
+suppressing the false positive with a `NOLINTNEXTLINE` directly above
+the class - which itself needs to be the literal line before the class
+declaration, not several explanatory-comment lines above it:
+`NOLINTNEXTLINE` only suppresses the one line immediately following the
+comment, a mistake this branch's own history made once already before
+being fixed.
+
+**Verified in the pinned Docker devenv:** existing test suite passes
+unchanged (pure refactor, no new observable behavior);
+`clang-format`/`clang-tidy` clean; full suite passes under the
+`sanitize` preset (ASan+UBSan) too.
+
+### `abandon()`-then-`delete` deduplicated into `abandon_ready_node()`/`abandon_timer_node()` (done)
+
+Second code-review follow-up: every drain-without-running call site
+introduced by the `destroy()` → `abandon()` refactor above
+(`future_state<T>::~future_state()`, `mutex::~mutex()`,
+`counting_event<Mode>::~counting_event()`, and both containers
+`loop::drain_pending()` itself drains) repeated the identical two-line
+body - `node.abandon(); delete &node;` (or `delete entry.node;` for a
+`timer_node*`) - either inline or as a one-off lambda passed to
+`intrusive_list<ready_node>::drain()`. Lifted into two free functions
+living in `:loop` (`est/src/loop.cppm`), right next to `ready_node`/
+`timer_node`'s own definitions - the natural home, since they're the
+classes that define the `abandon()` contract in the first place:
+
+```cpp
+inline void abandon_ready_node(ready_node& node) noexcept {
+  node.abandon();
+  delete &node;
+}
+inline void abandon_timer_node(timer_node& node) noexcept {
+  node.abandon();
+  delete &node;
+}
+```
+
+Two separate, non-overloaded functions rather than one function
+overloaded on `ready_node&`/`timer_node&`: every `waiters_.drain(...)`
+call site passes the function directly (`waiters_.drain(detail::
+abandon_ready_node);`) rather than wrapping it in a lambda, and
+`intrusive_list<T>::drain(Fn fn)` deduces its own `Fn` template
+parameter from that argument - deduction that only works when the name
+resolves to exactly one type. An overloaded name has no single type
+until *after* overload resolution has already run, so passing an
+overloaded name straight to a deducing `Fn` parameter is ill-formed, not
+a matter of which overload a reader would expect to be picked. Since
+`timer_node`'s own abandonment never goes through `intrusive_list<T>`
+(`loop::drain_pending()`'s `pending_timers_` is a plain
+`std::pmr::vector`, not an intrusive list), only `abandon_ready_node` is
+ever passed this way in practice - `abandon_timer_node` is always called
+directly - but keeping both non-overloaded avoids the trap regardless.
+
+Considered and rejected: lifting this into `est::intrusive_list<T>`
+itself (a `drain_abandoning()` method, say). `:util.intrusive_list` is
+deliberately a generic utility with no notion of `abandon()` or
+allocator-routed deletion - coupling it to `ready_node`'s specific
+lifecycle contract would be the wrong layer for it, even though every
+current instantiation happens to be `intrusive_list<detail::ready_node>`
+in practice.
+
+No behavior change: each call site now reads `waiters_.drain(detail::
+abandon_ready_node);` (or a direct call to one of the two functions)
+instead of a hand-written lambda/pair of statements, but every code path
+still does exactly what it did before.
+
+**Verified in the pinned Docker devenv:** existing test suite passes
+unchanged (pure refactor); `clang-format`/`clang-tidy` clean; full suite
+passes under the `sanitize` preset (ASan+UBSan) too.
+
 ---
 
 ## Verification for M0

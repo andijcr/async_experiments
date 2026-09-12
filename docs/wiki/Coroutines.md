@@ -179,8 +179,8 @@ heap-allocated* resumption node (`future_resume_node<T>`,
 registering the awaiter itself.
 
 That split is required, not just a style choice. `est::loop::run_one()`
-calls `node.run()` and then, via a `scope_exit` guard,
-`node.destroy(allocator_)` — *after* `run()` has already returned:
+calls `node.run()` and then, via a `scope_exit` guard, `delete`s `node` —
+*after* `run()` has already returned:
 
 ```cpp
 void run_one(detail::ready_node& node) {
@@ -188,7 +188,7 @@ void run_one(detail::ready_node& node) {
   ...
   node.run();
   ...
-} // guard fires here, calling node.destroy(allocator_)
+} // guard fires here, calling `delete &node`
 ```
 
 If `node` were embedded in the very coroutine frame that `run()`'s
@@ -196,13 +196,12 @@ If `node` were embedded in the very coroutine frame that `run()`'s
 own suspension point* would let the compiler reuse that exact frame
 storage for whatever the coroutine's later code constructs — its next
 awaiter, a local variable — since the two objects' lifetimes don't
-overlap. By the time `destroy_guard`'s destructor calls
-`node.destroy(...)`, that memory could already hold something else
-entirely, and calling a virtual function through it would be undefined
-behavior.
+overlap. By the time `destroy_guard`'s destructor runs `delete`, that
+memory could already hold something else entirely, and calling a virtual
+function (the destructor itself) through it would be undefined behavior.
 
 A separately allocated node has its own independent lifetime, entirely
-unrelated to the coroutine frame it resumes — `run()`-then-`destroy()` is
+unrelated to the coroutine frame it resumes — `run()`-then-`delete` is
 exactly as safe here as it already is for every other `ready_node` in this
 codebase (`concrete_continuation<Fn, U>`, `est:promise`'s `sleep_resume_node`/
 `yield_resume_node`). This
@@ -280,12 +279,11 @@ public:
   void run() final {
     handle_.resume();
   }
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
-    if (!ran) {
-      handle_.destroy();   // see "Abandoned coroutines are destroyed, not leaked" below
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept override {
+    handle_.destroy();   // see "Abandoned coroutines are destroyed, not leaked" below
   }
+  static auto operator new(std::size_t size) -> void*;   // resolves current_allocator()
+  static void operator delete(void* ptr, std::size_t size) noexcept;
 private:
   std::coroutine_handle<> handle_;
 };
@@ -426,8 +424,9 @@ the other side is a coroutine.
 
 ### Abandoned coroutines are destroyed, not leaked
 
-Every resumption node's `destroy()` is called two ways: after a successful
-`run()` (the normal case, described above), or by
+Every resumption node's `abandon()` is called exactly once, right before
+it's deleted, but only on one of two paths: never after a successful
+`run()` (the normal case, described above), but always from
 `future_state<T>::~future_state()`/`loop::drain_pending()` (called both by
 `~loop()` and by `make_current_loop()`'s own returned guard - see
 [Loop and Timers](Loop-And-Timers.md) for why the guard needs to call it
@@ -436,9 +435,7 @@ without ever completing/draining (the same abandoned-future scenario the
 node hierarchy already handles for `then()`'s own continuation nodes).
 Freeing only the resumption node
 itself in that second case, never the coroutine frame the handle points
-to, would permanently leak it. Each resumption node's
-`destroy()` is told whether it ever actually ran, to tell the two cases
-apart -
+to, would permanently leak it -
 
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
@@ -446,12 +443,9 @@ public:
   void run() final {
     handle_.resume();
   }
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
-    if (!ran) {
-      handle_.destroy();   // never resumed - still fully intact; this is
-                            // the only chance to free its frame
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept override {
+    handle_.destroy();   // never resumed - still fully intact; this is
+                          // the only chance to free its frame
   }
   ...
 };
@@ -459,17 +453,18 @@ public:
 
 If `run()` never happened, the coroutine is still exactly where
 `await_suspend()` left it - fully intact, suspended, never touched -
-so destroying it here is both safe and necessary. If `run()`
-*did* happen, this `destroy()` call must not touch `handle_` again: the
-coroutine either already self-destroyed (`promise_type::final_suspend()`'s
-`std::suspend_never` - `handle_` is now dangling, so even calling `.done()`
-on it would be a use-after-free) or suspended again on something else
-entirely, which now owns resuming (and eventually destroying) it. `ran` is
-what lets one `destroy()` implementation tell those two completely
-different situations apart without ever having to safely query a handle
-that might already be gone - passed in by the caller (`ready_node::
-destroy()`'s own doc comment, est:loop) rather than tracked with a private
-flag each node sets on its own `run()`, since every call site
+so destroying it in `abandon()` is both safe and necessary. If `run()`
+*did* happen, `abandon()` is never called at all, since the loop deletes
+such a node directly instead (`loop::destroy_guard()`) - which matters
+because touching `handle_` at that point would be wrong: the coroutine
+either already self-destroyed (`promise_type::final_suspend()`'s
+`std::suspend_never` - `handle_` is now dangling, so even calling
+`.done()` on it would be a use-after-free) or suspended again on
+something else entirely, which now owns resuming (and eventually
+destroying) it. Splitting this into `abandon()` (only called on the
+not-run path) rather than one `destroy()` told whether it ever ran
+(`ready_node::abandon()`'s own doc comment, est:loop) means every node's
+own logic never has to branch on that itself - the call site
 already knows statically which situation it's in.
 
 ## `est::mutex::lock()` becomes awaitable
@@ -499,7 +494,7 @@ auto mutex::lock() -> future<void> {
     prom.set_value();               // fast path: uncontended, acquire immediately
     return std::move(fut);
   }
-  auto* node = allocator.template new_object<lock_resume_node>(std::move(prom));
+  auto* node = new lock_resume_node(std::move(prom));
   waiters_.enqueue(*node);          // slow path: queue a heap-allocated resume node
   return std::move(fut);
 }
@@ -572,17 +567,14 @@ side can free the other first - not a `shared_ptr` cycle in the strict
 sense (no object holds a `shared_ptr` back to the thing keeping it
 alive), but a practical one: both stay allocated forever.
 
-`destroy()` breaks that by actually completing the promise (with an
+`abandon()` breaks that by actually completing the promise (with an
 exception, since the true outcome is "this waiter never got the lock, and
-the mutex it was queued on no longer exists") before deallocating:
+the mutex it was queued on no longer exists") before the node is deleted:
 
 ```cpp
-void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
-  if (!ran) {
-    promise_.set_exception(std::make_exception_ptr(
-        std::runtime_error("mutex destroyed while lock() was pending")));
-  }
-  allocator.delete_object(this);
+void abandon() noexcept final {
+  promise_.set_exception(std::make_exception_ptr(
+      std::runtime_error("mutex destroyed while lock() was pending")));
 }
 ```
 
@@ -593,14 +585,15 @@ mutex and keeps running - the coroutine then observes the exception
 exactly like any other failure propagating across `co_await`, per
 "an exception in the awaited future propagates across `co_await`" above)
 or safely destroyed, never run, by `est::loop`'s own destructor-time
-drain - either way, the frame is no longer stranded. `ran` (the same
-parameter `est:future`'s own `future_resume_node<T>` reads, passed in by
-the caller rather than tracked with a private flag - `ready_node::
-destroy()`'s own doc comment, est:loop) is what stops this from
-double-completing an already-successfully-completed promise: `run()`
-and `destroy()` are
-always both called, in that order, for any node the loop actually
-processes (see [Continuation Node Mechanism](Continuation-Node-Mechanism.md)).
+drain - either way, the frame is no longer stranded. Splitting the
+not-run path into its own `abandon()` (`est:future`'s own
+`future_resume_node<T>` overrides the identical method - `ready_node::
+abandon()`'s own doc comment, est:loop) is what stops this from
+double-completing an already-successfully-completed promise: `abandon()`
+is only ever called on a node the loop drains *without* first calling
+`run()` on it; a node the loop does `run()` is deleted directly instead,
+no `abandon()` call at all (see
+[Continuation Node Mechanism](Continuation-Node-Mechanism.md)).
 
 ### `acquire()`: the same lock, packaged as a RAII `future<lock_guard>`
 
@@ -618,7 +611,7 @@ auto mutex::acquire() -> future<lock_guard> {
     prom.set_value(lock_guard(*this));
     return std::move(fut);
   }
-  auto* node = allocator.template new_object<acquire_resume_node>(*this, std::move(prom));
+  auto* node = new acquire_resume_node(*this, std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }
@@ -637,8 +630,8 @@ completes it later.
 `lock_resume_node` does (`intrusive_list<detail::ready_node>` doesn't care
 which concrete type it holds) - `unlock()` hands the lock to whichever
 one is next in FIFO order without needing to know which kind it got. It
-needs the same `ran`-guarded exception-completion `destroy()` that
-`lock_resume_node` does, for the identical reason - a coroutine doing
+needs the same exception-completing `abandon()` that `lock_resume_node`
+has, for the identical reason - a coroutine doing
 `auto guard = co_await mutex.acquire();` holds the same kind of
 frame-spilled `future<lock_guard>` temporary across its own suspension,
 so an abandoned `acquire_resume_node` has to complete its promise, not
@@ -653,7 +646,7 @@ mutex.acquire();` - exactly like `lock()`, it just isn't required to be.
 ### `unlock()`: deferred through the loop, not completed inline - and a known, open limitation
 
 `unlock()` hands a dequeued waiter to `est::loop::enqueue_ready()` rather
-than calling `run()`/`destroy()` on it directly:
+than calling `run()` (then deleting it) directly:
 
 ```cpp
 void unlock() noexcept {
@@ -675,8 +668,8 @@ loop). A queued waiter drained by `run()` after that point would
 construct a `lock_guard` over an already-dangling `mutex&` - a real,
 documented limitation (below).
 
-`unlock()` doesn't call `run()` (then `destroy()`) on the waiter directly
-to close that window, even though `set_value()`'s own `complete()`
+`unlock()` doesn't call `run()` (then delete) on the waiter directly to
+close that window, even though `set_value()`'s own `complete()`
 (`est:future`) never runs anything synchronously, so completing here
 wouldn't run the waiter's own downstream code on this stack either. Doing
 so would introduce a *worse* hazard: `acquire_resume_node::run()` would
@@ -684,7 +677,7 @@ then always construct a real `lock_guard` synchronously inside
 `unlock()`, even for a waiter that turns out to be a coroutine later
 abandoned (destroyed without ever consuming its `future<lock_guard>`,
 e.g. via `~loop()`'s own destructor-time drain of a still-suspended
-frame). Abandonment is only safe because `destroy()` (never `run()`)
+frame). Abandonment is only safe because `abandon()` (never `run()`)
 completes with an exception instead of a real value - see the previous
 section - and that guard rail stops applying the moment `run()` runs
 unconditionally inside `unlock()`, ahead of whether the waiter will ever
@@ -696,9 +689,9 @@ already deliberately supports for every other `future<T>`, and one
 considerably easier to hit in practice than the window synchronous
 completion would close. Deferring through the loop keeps abandonment's
 guard rail intact: whether a queued waiter is later `run()` (drained
-normally) or `destroy()`'d (the loop or the mutex is torn down first) is
-decided at drain time by whichever actually happens first, not decided
-in advance inside `unlock()`.
+normally) or `abandon()`ed and deleted (the loop or the mutex is torn
+down first) is decided at drain time by whichever actually happens
+first, not decided in advance inside `unlock()`.
 
 Neither design is airtight - each protects one abandonment/lifetime
 scenario at the cost of the other - so this is a documented, open
@@ -708,7 +701,7 @@ limitation rather than something either design fully solves:
 > `mutex&`. If a mutex is destroyed after `unlock()` enqueues a waiter but
 > before the loop actually drains it - only reachable if the loop
 > outlives that mutex and keeps running during the gap, since `~mutex()`
-> itself drains `waiters_` via `destroy()`, never `run()` - that waiter's
+> itself drains `waiters_` via `abandon()`/delete, never `run()` - that waiter's
 > eventual `run()` constructs a `lock_guard` over an already-dangling
 > `mutex&`. Precondition instead of a fix: whichever loop is current for
 > `unlock()` must outlive every mutex whose waiters it enqueues, and a
@@ -726,7 +719,7 @@ of the count or leaves it alone - the classic Win32 auto-reset/manual-reset
 distinction, generalized past a plain boolean) is built from exactly the
 pieces above: an `intrusive_list<detail::ready_node> waiters_` (no `loop&`
 member, same as `mutex` - see the previous section), and
-`detail::event_resume_node final : public ready_node` whose `destroy()`
+`detail::event_resume_node final : public ready_node` whose `abandon()`
 completes an abandoned `promise<void>` with an exception for the identical
 reason `lock_resume_node`'s own doc comment gives - a
 coroutine suspended in `co_await event.wait()` holds the `future_state<void>`
@@ -736,7 +729,7 @@ than completing waiters inline, matching `unlock()`'s own reasoning above.
 
 `event_resume_node` lives in `est::detail`, not nested inside
 `counting_event<Mode>` the way `lock_resume_node` nests inside the
-non-template `mutex` - its `run()`/`destroy()` never touch `Mode` or
+non-template `mutex` - its `run()`/`abandon()` never touch `Mode` or
 anything else about the `counting_event` that enqueued them, so nesting it
 would only generate an identical type once per `Mode` instantiation for no
 reason.

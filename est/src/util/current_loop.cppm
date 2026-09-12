@@ -117,8 +117,8 @@ export namespace est {
 // current_loop().allocator(), without the loop-pointer dereference in
 // between: the memory_resource* make_current_loop() cached is read
 // directly out of thread-local storage instead. Every internal caller
-// that only needs an allocator, not the loop itself (future_state<T>'s
-// own allocator(), a coroutine frame's operator new/delete, ...), uses
+// that only needs an allocator, not the loop itself (a coroutine frame's
+// operator new/delete, every ready_node/timer_node's own, ...), uses
 // this instead of current_loop().allocator() for exactly that reason -
 // see est:future's own doc comments on coroutine_frame_alloc()/
 // coroutine_frame_dealloc() for why the two can resolve to different
@@ -132,3 +132,59 @@ export namespace est {
 }
 
 } // namespace est
+
+namespace est::detail {
+
+// A CRTP mixin giving Derived its own `operator new`/`operator delete`,
+// both resolving est::current_allocator() fresh - the shared
+// implementation every concrete est::detail::ready_node/timer_node
+// (est:loop) inherits instead of hand-rolling the same pair itself:
+// est::mutex's lock_resume_node/acquire_resume_node, est:promise's
+// sleep_resume_node/yield_resume_node, est:sync.event's
+// event_resume_node, and est:future's future_resume_node<T>/
+// concrete_continuation<Fn, U>/flatten_forwarder<T>. See ready_node's
+// own doc comment (est:loop) for why this can't live on ready_node/
+// timer_node themselves instead: that would need current_allocator(),
+// and :loop cannot import :util.current_loop without a circular module
+// dependency, since :util.current_loop already imports :loop.
+//
+// alignof(Derived), not alignof(std::max_align_t): unlike
+// detail::coroutine_frame_alloc()/coroutine_frame_dealloc() (est:future,
+// allocating a compiler-generated coroutine frame whose exact type is
+// never named), every concrete node type using this mixin is a plain,
+// ordinary class - its own real alignment is already known at the point
+// this template is instantiated for it, so there is no reason to
+// over-align generically instead.
+//
+// Only the default constructor is declared, and only to make it private:
+// rule-of-zero otherwise - this mixin carries no data, so an implicitly
+// generated (and trivial) copy, move, and destructor are all harmless,
+// and declaring any of them explicitly just to keep them alongside a
+// hand-written destructor would make the destructor no longer trivial
+// for no actual benefit. The private constructor + `friend Derived`
+// still does the one bit of hardening worth having: nothing but Derived
+// itself (or something Derived further friends) can construct this base
+// standalone, let alone derive from it unrelated to Derived. clang-tidy's
+// performance-trivially-destructible still wants an explicit `=default`
+// destructor here regardless - a false positive for this exact shape,
+// since adding one would immediately trip
+// cppcoreguidelines-special-member-functions right back (declaring one
+// special member but not the other four); the two checks want
+// contradictory things for this class, and rule-of-zero is the one
+// that's actually correct.
+// NOLINTNEXTLINE(performance-trivially-destructible)
+template <class Derived> class current_allocator_new_delete {
+public:
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(Derived));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(Derived));
+  }
+
+private:
+  current_allocator_new_delete() = default;
+  friend Derived;
+};
+
+} // namespace est::detail
