@@ -65,11 +65,13 @@ excerpts below for the real, fully-qualified signatures.)
   however it does that), a virtual destructor, and `abandon()` (a hook
   called on a node that never ran, right before it's deleted — see "Node
   lifecycle" below). Deallocation itself is a plain `delete` through this
-  base: every concrete node type defines its own `operator new`/
-  `operator delete`, which is what makes that safe and correctly sized —
-  see [Allocation Patterns](Allocation-Patterns.md) for the full
-  mechanism. `:loop` knows nothing more about what a `ready_node` actually
-  *is* — that's the whole point (see
+  base: every concrete node type has its own `operator new`/`operator
+  delete` (inherited from `detail::current_allocator_new_delete<T>`,
+  `est:util.current_loop` — see that class's own doc comment for why it
+  can't instead live on `ready_node` itself), which is what makes that
+  safe and correctly sized — see [Allocation Patterns](Allocation-Patterns.md)
+  for the full mechanism. `:loop` knows nothing more about what a
+  `ready_node` actually *is* — that's the whole point (see
   [Architecture](Architecture.md#why-loop-doesnt-depend-on-future)).
 - **`continuation_node<T>`** (`est:future`) is the first T-dependent layer,
   and a thin one: it adds only `owner_` (a `shared_ptr<future_state<T>>`,
@@ -82,8 +84,7 @@ excerpts below for the real, fully-qualified signatures.)
   `(T, Fn, U)` triple a real `.then()` call site produces. It's the layer
   that finally knows the actual callback (`fn_`) and where its result goes
   (`downstream_`, a `shared_ptr<future_state<U>>`). `run()` is implemented
-  here, reading `owner_` directly from `continuation_node<T>`, alongside
-  its own `operator new`/`operator delete`.
+  here, reading `owner_` directly from `continuation_node<T>`.
 
 An earlier version of this hierarchy had `continuation_node<T>` implement
 `run()` once, for every `T`, as `invoke(*owner_)`, with each concrete node
@@ -354,7 +355,9 @@ all of that: a free class template in `est::detail`, alongside
 registered directly via `set_continuation()`:
 
 ```cpp
-template <class T> class flatten_forwarder final : public continuation_node<T> {
+template <class T>
+class flatten_forwarder final : public continuation_node<T>,
+                                 public current_allocator_new_delete<flatten_forwarder<T>> {
 public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
       : downstream_(std::move(downstream)) {}
@@ -374,13 +377,6 @@ public:
     } catch (...) {
       downstream_->set_exception(std::current_exception());
     }
-  }
-
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(flatten_forwarder));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(flatten_forwarder));
   }
 
 private:

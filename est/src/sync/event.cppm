@@ -51,7 +51,8 @@ namespace est::detail {
 // abandonment drain, never after set()'s own successful hand-off) always
 // drains the future_state's own pending continuation onto the loop's
 // ready queue, so the frame is never stranded either way.
-class event_resume_node final : public ready_node {
+class event_resume_node final : public ready_node,
+                                public current_allocator_new_delete<event_resume_node> {
 public:
   explicit event_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
@@ -62,16 +63,10 @@ public:
         std::runtime_error("counting_event destroyed while wait() was pending")));
   }
 
-  // Resolves est::current_allocator() fresh - see est::detail::ready_node's
-  // own doc comment (est:loop) for why every concrete node type needs its
-  // own operator new/delete like this, rather than one shared at the
-  // ready_node base.
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(event_resume_node));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(event_resume_node));
-  }
+  // operator new/delete inherited from current_allocator_new_delete<T>
+  // (est:util.current_loop) - see that class's own doc comment for why
+  // every concrete ready_node/timer_node needs its own pair rather than
+  // one shared at the ready_node base itself.
 
 private:
   promise<void> promise_;

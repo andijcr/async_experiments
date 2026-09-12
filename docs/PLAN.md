@@ -3952,6 +3952,58 @@ concrete node's `operator new`/`operator delete` pairs allocate and
 deallocate through matching sizes; both example binaries still run
 correctly.
 
+### `current_allocator_new_delete<T>` mixin: the 8 hand-rolled operator new/delete pairs above deduplicated (done)
+
+Code-review follow-up on the entry above: every one of the 8 concrete
+node types that gained an `operator new`/`operator delete` pair there
+(`mutex::lock_resume_node`/`acquire_resume_node`, `est:promise`'s
+`sleep_resume_node`/`yield_resume_node`, `est:sync.event`'s
+`event_resume_node`, `est:future`'s `future_resume_node<T>`/
+`concrete_continuation<Fn, U>`/`flatten_forwarder<T>`) hand-rolled the
+identical six lines, differing only in which class name got substituted
+into `alignof(...)`. Factored into one CRTP mixin instead:
+
+```cpp
+template <class Derived> class current_allocator_new_delete {
+public:
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(Derived));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(Derived));
+  }
+};
+```
+
+Added to `est:util.current_loop` (`est/src/util/current_loop.cppm`), not
+a new partition of its own: it needs nothing beyond `current_allocator()`,
+already defined right there, and every one of the four partitions with a
+node class to update (`:future`, `:promise`, `:sync.mutex`, `:sync.event`)
+already imports `:util.current_loop`. `est::detail::ready_node`/
+`timer_node` (`:loop`) still can't inherit it themselves, for the
+identical circular-dependency reason their own doc comments already give
+for not defining a shared default in the first place: the mixin needs
+`current_allocator()`, and `:util.current_loop` imports `:loop`, so
+`:loop` importing it back would be circular. Each of the 8 classes now
+just adds `public current_allocator_new_delete<TheClassItself>` to its
+base-class list (`detail::current_allocator_new_delete<T>` from the two
+call sites - `mutex::lock_resume_node`/`acquire_resume_node` and
+`future_state<T>::concrete_continuation<Fn, U>` - not already inside
+`namespace est::detail` themselves) instead of defining the pair by hand;
+no behavior change, since the inherited pair does exactly what the
+hand-rolled one did.
+
+Docs updated: `docs/wiki/Allocation-Patterns.md` and
+`Continuation-Node-Mechanism.md` (both described the pair as "every
+concrete node type defines its own"), plus two stale doc-comment
+cross-references to a since-removed `future_state<T>::allocator()`
+method caught by the same review pass (`est/src/future.cppm`).
+
+**Verified in the pinned Docker devenv:** existing test suite passes
+unchanged (pure refactor, no new observable behavior);
+`clang-format`/`clang-tidy` clean; full suite passes under the
+`sanitize` preset (ASan+UBSan) too.
+
 ---
 
 ## Verification for M0

@@ -186,7 +186,9 @@ private:
 // only on one still sitting in `waiters_` or still queued on the loop's
 // own ready_ list when `~mutex()`'s or `~loop()`'s own drain reaches it
 // without `run()` ever having been called.
-class mutex::lock_resume_node final : public detail::ready_node {
+class mutex::lock_resume_node final
+    : public detail::ready_node,
+      public detail::current_allocator_new_delete<lock_resume_node> {
 public:
   explicit lock_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
@@ -197,16 +199,10 @@ public:
         std::make_exception_ptr(std::runtime_error("mutex destroyed while lock() was pending")));
   }
 
-  // Resolves est::current_allocator() fresh - see est::detail::ready_node's
-  // own doc comment (est:loop) for why every concrete node type needs its
-  // own operator new/delete like this, rather than one shared at the
-  // ready_node base.
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(lock_resume_node));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(lock_resume_node));
-  }
+  // operator new/delete inherited from detail::current_allocator_new_delete<T>
+  // (est:util.current_loop) - see that class's own doc comment for why
+  // every concrete ready_node/timer_node needs its own pair rather than
+  // one shared at the ready_node base itself.
 
 private:
   promise<void> promise_;
@@ -275,7 +271,9 @@ private:
 // abandoned (never handed the lock) path. mutex_ staying valid for
 // run()'s use relies on the precondition unlock()'s own doc comment
 // documents as a known, open limitation.
-class mutex::acquire_resume_node final : public detail::ready_node {
+class mutex::acquire_resume_node final
+    : public detail::ready_node,
+      public detail::current_allocator_new_delete<acquire_resume_node> {
 public:
   acquire_resume_node(mutex& mutex_ref, promise<lock_guard> prom) noexcept
       : mutex_(mutex_ref), promise_(std::move(prom)) {}
@@ -291,14 +289,9 @@ public:
         std::make_exception_ptr(std::runtime_error("mutex destroyed while acquire() was pending")));
   }
 
-  // Own operator new/delete, resolving est::current_allocator() fresh -
-  // see lock_resume_node's own doc comment (just above) for why.
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(acquire_resume_node));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(acquire_resume_node));
-  }
+  // operator new/delete inherited from detail::current_allocator_new_delete<T>
+  // (est:util.current_loop) - see lock_resume_node's own doc comment
+  // (just above) for why.
 
 private:
   mutex& mutex_;

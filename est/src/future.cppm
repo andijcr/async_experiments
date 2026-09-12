@@ -93,7 +93,9 @@ protected:
 // call site, so there's nothing left to genericize over. Templated on T
 // alone - every flatten at the same T reuses this one instantiation
 // instead of minting a fresh one per (T, Fn, U) call site.
-template <class T> class flatten_forwarder final : public continuation_node<T> {
+template <class T>
+class flatten_forwarder final : public continuation_node<T>,
+                                public current_allocator_new_delete<flatten_forwarder<T>> {
 public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
       : downstream_(std::move(downstream)) {}
@@ -122,18 +124,11 @@ public:
   // No abandon() override - see concrete_continuation<Fn, U>'s own doc
   // comment (further down this file) on why dropping downstream_
   // unconditionally here is the current behavior, not a settled answer.
-
-  // Resolves est::current_allocator() fresh, same pattern
-  // detail::coroutine_frame_alloc()/coroutine_frame_dealloc() use for a
-  // coroutine frame - see ready_node's own doc comment (est:loop) for why
-  // this is what makes `delete` through a plain ready_node& correctly
-  // sized and allocator-routed for this concrete type.
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(flatten_forwarder));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(flatten_forwarder));
-  }
+  //
+  // operator new/delete inherited from current_allocator_new_delete<T>
+  // (est:util.current_loop) - see that class's own doc comment for why
+  // every concrete ready_node/timer_node needs its own pair rather than
+  // one shared at the ready_node/timer_node base itself.
 
 private:
   shared_ptr<future_state<T>> downstream_;
@@ -304,8 +299,10 @@ public:
 
   // `allocator`: forwarded straight to ref_counted's own constructor, not
   // used for anything else here - this class already gets its own
-  // allocator on demand via current_allocator() (see allocator()
-  // below). shared_ptr<future_state>::make()'s intrusive specialization
+  // allocator on demand via current_allocator(), called fresh wherever
+  // it's actually needed (then(), the destructor, ...) rather than
+  // stored or exposed as a method of its own.
+  // shared_ptr<future_state>::make()'s intrusive specialization
   // (this class inherits est::ref_counted, est:util.shared_ptr) always
   // passes it as this constructor's first argument automatically; a
   // caller of make_promise_future() never spells it out.
@@ -381,8 +378,9 @@ public:
     complete();
   }
 
-  // Registers a continuation node (already allocated via allocator()) to
-  // run once ready. If already ready, hands it straight to est::loop's
+  // Registers a continuation node (already allocated, via its own
+  // operator new) to run once ready. If already ready, hands it straight
+  // to est::loop's
   // ready-queue instead of queueing it locally - either way, this
   // future_state never invokes a continuation itself; est::loop always
   // does, on its own drain pass, never inline on this call stack.
@@ -579,7 +577,10 @@ private:
   // type - already flattened out of Fn's raw future<U> result, if any -
   // computed once by then() above and reused here so this class doesn't
   // need to repeat that dispatch.
-  template <class Fn, class U> class concrete_continuation final : public continuation_node {
+  template <class Fn, class U>
+  class concrete_continuation final
+      : public continuation_node,
+        public detail::current_allocator_new_delete<concrete_continuation<Fn, U>> {
   public:
     concrete_continuation(Fn fn, shared_ptr<future_state<U>> downstream)
         : fn_(std::move(fn)), downstream_(std::move(downstream)) {}
@@ -628,17 +629,10 @@ private:
     // *upstream* future_state is dropped first is a real, separate
     // question this class doesn't yet answer.
     //
-    // Own operator new/delete, resolving est::current_allocator() fresh -
-    // see flatten_forwarder<T>'s own doc comment (above) for why this,
-    // not a shared base implementation, is what makes `delete` through a
-    // plain ready_node& correctly sized and allocator-routed for this
-    // concrete type.
-    static auto operator new(std::size_t size) -> void* {
-      return current_allocator().resource()->allocate(size, alignof(concrete_continuation));
-    }
-    static void operator delete(void* ptr, std::size_t size) noexcept {
-      current_allocator().resource()->deallocate(ptr, size, alignof(concrete_continuation));
-    }
+    // operator new/delete inherited from current_allocator_new_delete<T>
+    // (est:util.current_loop) - see that class's own doc comment for why
+    // every concrete ready_node/timer_node needs its own pair rather than
+    // one shared at the ready_node/timer_node base itself.
 
   private:
     // Invokes fn_ with the given arguments (state, a value, or nothing)
@@ -1022,7 +1016,9 @@ namespace est::detail {
 // undefined behavior. A separately allocated node has its own real,
 // independent lifetime, so run()-then-delete is exactly as safe here as
 // it already is for every other ready_node in this codebase.
-template <class T> class future_resume_node final : public continuation_node<T> {
+template <class T>
+class future_resume_node final : public continuation_node<T>,
+                                 public current_allocator_new_delete<future_resume_node<T>> {
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
 
@@ -1038,18 +1034,10 @@ public:
   // wrong either way.
   void abandon() noexcept override { handle_.destroy(); }
 
-  // Resolves est::current_allocator() fresh, same pattern
-  // detail::coroutine_frame_alloc()/coroutine_frame_dealloc() use for the
-  // coroutine frame this node itself resumes - see ready_node's own doc
-  // comment (est:loop) for why this is what makes `delete` through a
-  // plain ready_node& correctly sized and allocator-routed for this
-  // concrete type.
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(future_resume_node));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(future_resume_node));
-  }
+  // operator new/delete inherited from current_allocator_new_delete<T>
+  // (est:util.current_loop) - see that class's own doc comment for why
+  // every concrete ready_node/timer_node needs its own pair rather than
+  // one shared at the ready_node/timer_node base itself.
 
 private:
   std::coroutine_handle<> handle_;

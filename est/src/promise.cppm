@@ -116,7 +116,8 @@ namespace est::detail {
 // coroutine's own frame across the suspension), so silently dropping the
 // promise instead of completing it would strand that frame with nothing
 // left to free it.
-class sleep_resume_node final : public timer_node {
+class sleep_resume_node final : public timer_node,
+                                public current_allocator_new_delete<sleep_resume_node> {
 public:
   explicit sleep_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
@@ -127,16 +128,10 @@ public:
         std::runtime_error("loop destroyed while sleep_for()/sleep_until() was pending")));
   }
 
-  // Resolves est::current_allocator() fresh - see est::detail::ready_node's
-  // own doc comment (est:loop) for why every concrete node type needs its
-  // own operator new/delete like this, rather than one shared at the
-  // ready_node/timer_node base.
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(sleep_resume_node));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(sleep_resume_node));
-  }
+  // operator new/delete inherited from current_allocator_new_delete<T>
+  // (est:util.current_loop) - see that class's own doc comment for why
+  // every concrete ready_node/timer_node needs its own pair rather than
+  // one shared at the ready_node/timer_node base itself.
 
 private:
   promise<void> promise_;
@@ -160,7 +155,8 @@ private:
 // has) matters for the identical reason sleep_resume_node's own doc
 // comment (just above) and mutex::lock_resume_node's own doc comment
 // (est:sync.mutex) both give.
-class yield_resume_node final : public ready_node {
+class yield_resume_node final : public ready_node,
+                                public current_allocator_new_delete<yield_resume_node> {
 public:
   explicit yield_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
@@ -171,14 +167,9 @@ public:
         std::runtime_error("loop destroyed while yield_execution() was pending")));
   }
 
-  // Own operator new/delete, resolving est::current_allocator() fresh -
-  // see sleep_resume_node's own doc comment (just above) for why.
-  static auto operator new(std::size_t size) -> void* {
-    return current_allocator().resource()->allocate(size, alignof(yield_resume_node));
-  }
-  static void operator delete(void* ptr, std::size_t size) noexcept {
-    current_allocator().resource()->deallocate(ptr, size, alignof(yield_resume_node));
-  }
+  // operator new/delete inherited from current_allocator_new_delete<T>
+  // (est:util.current_loop) - see sleep_resume_node's own doc comment
+  // (just above) for why.
 
 private:
   promise<void> promise_;

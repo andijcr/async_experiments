@@ -28,19 +28,20 @@ namespace est::detail {
 // Destroyed through a plain `delete` on this base pointer/reference
 // (loop::destroy_guard(), drain_pending() below) - safe despite the
 // virtual destructor being the only thing this base declares, because
-// every concrete node type also defines its own `operator new`/
-// `operator delete` (resolving est::current_allocator(), the same
+// every concrete node type also has its own `operator new`/`operator
+// delete` (usually inherited from detail::current_allocator_new_delete<T>,
+// est:util.current_loop - resolving est::current_allocator(), the same
 // pattern detail::coroutine_frame_alloc()/coroutine_frame_dealloc()
 // use for a coroutine frame, est:future): a class with a virtual
 // destructor always deallocates through the dynamic type's own visible
 // deallocation function, with the dynamic type's own correct size,
 // never the static (base) one - `delete` through a base pointer is
 // exactly what a virtual destructor exists to make safe. This base
-// itself cannot define a shared default doing the same thing: that
-// would need est::current_allocator() (est:util.current_loop), which
-// itself imports :loop, so :loop importing it back would be circular
-// (see this file's own top comment on the same constraint for
-// est::future).
+// itself cannot inherit that same mixin, nor define an equivalent
+// default directly: either would need est::current_allocator()
+// (est:util.current_loop), which itself imports :loop, so :loop
+// importing it back would be circular (see this file's own top comment
+// on the same constraint for est::future).
 class ready_node : public intrusive_list_node {
 public:
   ready_node() = default;

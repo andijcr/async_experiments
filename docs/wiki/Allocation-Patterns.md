@@ -32,12 +32,14 @@ complex `.then()` chain actually cost."
    never wrapped in a `shared_ptr` — a node has exactly one owner at a
    time (first the `future_state` it's pending on, then the loop's
    ready-queue or pending-timer list), so plain ownership-by-pointer plus
-   a virtual destructor is enough. Every concrete node type defines its
-   own `operator new`/`operator delete`, resolving `est::current_allocator()`
-   fresh (the same pattern a coroutine frame's own allocation uses) - see
+   a virtual destructor is enough. Every concrete node type has its own
+   `operator new`/`operator delete`, resolving `est::current_allocator()`
+   fresh (the same pattern a coroutine frame's own allocation uses) -
+   inherited from `detail::current_allocator_new_delete<T>`
+   (`est:util.current_loop`) rather than hand-rolled per class. See
    [Continuation Node Mechanism](Continuation-Node-Mechanism.md) for why
-   that, not a shared implementation on `ready_node`/`timer_node`
-   themselves, is what makes `delete` through a `ready_node*`/`timer_node*`
+   that mixin can't instead live on `ready_node`/`timer_node` themselves,
+   and why it's what makes `delete` through a `ready_node*`/`timer_node*`
    base pointer correctly sized for the *actual* derived type.
 
 ## Allocation cost per operation
