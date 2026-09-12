@@ -3796,6 +3796,76 @@ clean across every touched and new file (`est/src/util/current_loop.cppm`,
 byte-identical to `main`; full suite passes under the `sanitize` preset
 (ASan+UBSan) too; both example binaries still run correctly.
 
+### Issue #63: `continuation_node<T>`/`concrete_continuation<Fn, U>` revisited (done)
+
+The issue's own question: `Fn` alone already determines both `T` (the
+callback's parameter) and `U` (its flattened result), so does
+`continuation_node<T>`'s split - a shared `run()` at the `T`-only layer,
+forwarding to a separately virtual `invoke(future_state<T>&)` each
+`concrete_continuation<Fn, U>` implements - still pull its weight? The
+issue floated two directions if not: `bind_owner()`/`owner_` as a mixin,
+or dropping the split entirely and duplicating that plumbing by hand "for
+less codegen." It also explicitly allowed "don't" as a valid outcome.
+
+Looking at what `run()` actually did settled it: `void run() final {
+invoke(*owner_); }` - and `invoke()`'s only ever caller was that one line.
+The `future_state<T>& state` parameter every `invoke()` override took was
+therefore always just `*owner_`, read back through a parameter instead of
+read directly. So the "one shared implementation instead of once per
+`(Fn, U)`" the type hierarchy's own doc comment justified this split
+with was sharing a single pointer-dereference-and-call - real, but not
+worth what it costs: `est::loop`'s ready-queue holds nothing more specific
+than a `ready_node&` (`ready_.dequeue()`, `run_one()`), so `run()`'s own
+dispatch there can never statically know which concrete type it's about
+to make a *second*, separately virtual `invoke()` call into - not
+something ThinLTO whole-program devirtualization (`docs/wiki/
+Global-Lookup-Codegen.md`'s own methodology, used to check exactly this
+kind of claim in the current-loop-only-experiment work) can fix either,
+since multiple different concrete node types genuinely coexist in the
+same ready-queue at once. Every continuation this framework ever runs -
+every `.then()`, every flattening forward, every coroutine resumption -
+was paying for two indirect calls to get to one line of actual work.
+
+Resolved by dropping the split, not turning it into a mixin: `bind_owner()`/
+`owner_` stay on `continuation_node<T>`, `protected` now instead of
+`private` so each concrete node can read `owner_` directly, but
+`continuation_node<T>` no longer implements `run()` or declares `invoke()`
+at all. `concrete_continuation<Fn, U>` (nested in `future_state<T>`),
+`flatten_forwarder<T>`, and `future_resume_node<T>` each now implement
+`ready_node::run()` themselves - `run()` `final`, reading `*owner_`
+directly, everything else about each of their bodies unchanged. A
+distinct mixin base for `bind_owner()`/`owner_` alone (the issue's other
+suggested direction) would have been strictly more ceremony for the same
+result: sharing that plumbing was already free before this change (a
+plain data member and a non-virtual setter, never a second vtable slot),
+so `continuation_node<T>` trimmed down to just that is already the
+mixin - no separate class needed. The actual saving is the removed
+`invoke()` virtual call itself, on every single continuation run, for the
+cost of a few bytes of duplicated `*owner_` dereference logic across
+three call sites instead of one - not something worth measuring further
+with `examples/probe`/LTO disassembly the way the `current_loop()`
+lookup cost was: unlike that case, there's no ambiguity here for a
+disassembly to resolve - two indirect calls through two separate vtable
+slots is strictly more than one, on every path, by construction.
+
+No behavior changed: every `run()` body is byte-for-byte what its
+`invoke()` predecessor was, minus the now-redundant `future_state<T>&`
+parameter (replaced by `*this->owner_`, read from the same member the
+removed parameter was always aliasing). Docs updated: `docs/wiki/
+Continuation-Node-Mechanism.md` (the type hierarchy diagram and prose,
+the node-lifecycle sequence diagram, the "two calling conventions" and
+"flattening" sections' code excerpts), `docs/wiki/Coroutines.md`
+(`future_resume_node<T>`'s two shown snippets and its sequence diagram),
+`docs/wiki/Architecture.md` and `docs/wiki/Loop-And-Timers.md` (passing
+mentions of `invoke()`).
+
+**Verified in the pinned Docker devenv:** full test suite passes,
+unchanged in count (this is a pure internal refactor - no test observes
+`continuation_node<T>`/`concrete_continuation<Fn, U>` directly, only
+`future<T>`'s own public surface); `clang-format`/`clang-tidy` clean;
+full suite passes under the `sanitize` preset (ASan+UBSan) too;
+`diff-cover` coverage gate passes against `main`.
+
 ---
 
 ## Verification for M0
