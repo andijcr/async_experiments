@@ -88,19 +88,23 @@ export namespace est {
 // enqueue_ready() instead of invoking a continuation inline on the
 // fulfilling call stack.
 //
-// An explicit object a caller constructs and threads through
-// make_promise_future<T>(loop&) (est:promise), not a global singleton
-// like est::platform::instance(): unlike platform (a stateless vtable
-// swap), a loop carries real mutable state (the ready-queue, pending
-// timers) a shared global would accumulate cross-test contamination in -
-// every test that needs one constructs its own.
+// An explicit object a caller constructs, not a global singleton like
+// est::platform::instance(): unlike platform (a stateless vtable swap), a
+// loop carries real mutable state (the ready-queue, pending timers) a
+// shared global would accumulate cross-test contamination in - every test
+// that needs one constructs its own. A caller registers it as
+// est::current_loop() via est::make_current_loop() (est:util.current_loop)
+// for make_promise_future()/sleep_for()/mutex/counting_event/a coroutine's
+// own promise_type to find; nothing here depends on that registration
+// directly.
 //
 // Precondition: a loop must outlive every future_state<T> (and therefore
-// every promise<T>/future<T>/then()-chain) built against it via
-// make_promise_future() - est:future's future_state<T> holds a bare
-// loop&, not shared ownership, and there is no way to check a dangling
-// reference at runtime. See future_state<T>'s own doc comment (est:future)
-// for the same precondition from that side.
+// every promise<T>/future<T>/then()-chain), est::mutex, or
+// est::counting_event that ever resolved this loop via current_loop() -
+// none of them hold a loop& of their own; each resolves current_loop()
+// fresh at the point of use instead (see their own doc comments for the
+// cross-loop hazard that design carries). There is no way to check a
+// dangling reference at runtime.
 class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
@@ -116,28 +120,10 @@ public:
   // Destroys (without running) anything still queued - mirrors
   // future_state<T>'s own destructor: a loop dropped mid-program simply
   // abandons whatever it hadn't gotten to yet, rather than leaking it.
-  //
-  // pending_timers_ drained *before* ready_, not the more obvious other
-  // way around: a timer node's destroy(allocator_, false) can complete
-  // its promise with an exception (detail::sleep_resume_node,
-  // est:promise), and that completion, like any other, drains the
-  // future_state's own waiters onto *this* loop's ready_ via
-  // enqueue_ready(). Draining pending_timers_ first means anything it
-  // cascades into ready_ lands there before ready_.drain() runs - and
-  // drain() re-checks after every node it destroys
-  // (`intrusive_list<T>::drain()`'s own while-loop), so it picks up
-  // anything appended during its own pass. The reverse order would leave
-  // a cascade appended after ready_.drain() has already finished,
-  // leaking whatever it was keeping alive (a coroutine's own frame,
-  // concretely). Nothing in this codebase's node types ever cascades the
-  // other direction (ready_ back into pending_timers_), so a single pass
-  // in this order is sufficient.
-  ~loop() {
-    for (const auto& entry : pending_timers_) {
-      entry.node->destroy(allocator_, false);
-    }
-    ready_.drain([this](detail::ready_node& node) { node.destroy(allocator_, false); });
-  }
+  // Always safe to call directly: drain_pending() below (also called by
+  // est::make_current_loop()'s own returned guard, est:util.current_loop)
+  // is idempotent, so it doesn't matter whether that already ran.
+  ~loop() { drain_pending(); }
 
   [[nodiscard]] auto allocator() const noexcept -> allocator_type { return allocator_; }
 
@@ -191,6 +177,63 @@ public:
   // the next one or sleeping for the next timer deadline. No effect when
   // the loop isn't currently inside run()/run_until_idle().
   void stop() noexcept { stop_requested_ = true; }
+
+  // Destroys (without running) every still-queued ready continuation and
+  // pending timer, through this loop's own allocator - exactly what
+  // ~loop() itself does (and still calls this for, unconditionally, so a
+  // caller that never touches this method directly sees no change).
+  // Exposed as its own method so est::make_current_loop()'s own returned
+  // guard (est:util.current_loop) can call it *before* unregistering this
+  // loop as est::current_loop(), not only implicitly via ~loop() after:
+  // destroying a still-suspended coroutine's resume node here may itself
+  // need to destroy that coroutine's frame, and a coroutine frame's
+  // operator delete always resolves est::current_loop() fresh rather than
+  // caching an allocator of its own (detail::coroutine_frame_dealloc(),
+  // est:future) - draining only later, from ~loop(), after the guard has
+  // already cleared the current-loop slot, would resolve that lookup
+  // against whatever loop (if any) is current *next*, silently
+  // deallocating the frame through the wrong loop's allocator instead of
+  // this one's. See coroutine_frame_alloc()/coroutine_frame_dealloc()'s
+  // own doc comment for the full hazard this sidesteps.
+  //
+  // Idempotent: safe to call more than once. A first call already drains
+  // both containers to empty, so a later call (from ~loop(), typically)
+  // finds nothing left to do.
+  //
+  // timers_.cancel(entry.id) before destroying each node, not just
+  // clearing pending_timers_ on its own: timers_ (the timer_queue min-heap
+  // schedule_timer() also records the deadline in) is a *separate*
+  // member, and this method can now run on a loop that keeps going
+  // afterward (called from make_current_loop()'s guard, not only from
+  // ~loop() right before the whole object - timers_ included - goes
+  // away). Without the cancel(), a still-live loop's own timers_ would
+  // keep a stale deadline for a node that no longer exists in
+  // pending_timers_ - fire_ready_timers()'s own check() exists exactly to
+  // catch that desync when it later tries to look the id back up.
+  //
+  // pending_timers_ drained *before* ready_, not the more obvious other
+  // way around: a timer node's destroy(allocator_, false) can complete
+  // its promise with an exception (detail::sleep_resume_node,
+  // est:promise), and that completion, like any other, drains the
+  // future_state's own waiters onto *this* loop's ready_ via
+  // enqueue_ready(). Draining pending_timers_ first means anything it
+  // cascades into ready_ lands there before ready_.drain() runs - and
+  // drain() re-checks after every node it destroys
+  // (`intrusive_list<T>::drain()`'s own while-loop), so it picks up
+  // anything appended during its own pass. The reverse order would leave
+  // a cascade appended after ready_.drain() has already finished,
+  // leaking whatever it was keeping alive (a coroutine's own frame,
+  // concretely). Nothing in this codebase's node types ever cascades the
+  // other direction (ready_ back into pending_timers_), so a single pass
+  // in this order is sufficient.
+  void drain_pending() noexcept {
+    for (const auto& entry : pending_timers_) {
+      timers_.cancel(entry.id);
+      entry.node->destroy(allocator_, false);
+    }
+    pending_timers_.clear();
+    ready_.drain([this](detail::ready_node& node) { node.destroy(allocator_, false); });
+  }
 
 private:
   struct pending_entry {

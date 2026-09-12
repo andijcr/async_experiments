@@ -64,21 +64,7 @@ public:
   void
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
 
-  // A real, working slot, not a no-op: est::make_current_loop()/
-  // est::current_loop() (est:util.current_loop) are actually exercised
-  // against this fake in several tests below, going through
-  // get_current_loop_context()/set_current_loop_context()
-  // (est::platform::interface's own doc comment) - a no-op here would
-  // silently break current_loop() for every one of them.
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
-    return current_loop_context;
-  }
-  void set_current_loop_context(est::loop* context) noexcept override {
-    current_loop_context = context;
-  }
-
   mutable std::chrono::steady_clock::time_point current;
-  est::loop* current_loop_context = nullptr;
 };
 
 // A platform whose now() advances by `step` on every single call - used
@@ -125,20 +111,9 @@ public:
     }
   }
 
-  // A real, working slot: est::loop is constructed under this fake too
-  // (see get_current_loop_context()'s own doc comment on fake_platform,
-  // above, for why a no-op here isn't an option).
-  [[nodiscard]] auto get_current_loop_context() const noexcept -> est::loop* override {
-    return current_loop_context;
-  }
-  void set_current_loop_context(est::loop* context) noexcept override {
-    current_loop_context = context;
-  }
-
   mutable std::chrono::steady_clock::time_point current;
   std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);
   mutable std::chrono::steady_clock::time_point stall_start;
-  est::loop* current_loop_context = nullptr;
 };
 
 } // namespace
@@ -158,7 +133,8 @@ TEST_CASE("run_until_idle() returns immediately when there is no ready work or p
 
 TEST_CASE("a then() continuation only runs once the loop drains, never inline", "[loop]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   bool invoked = false;
   auto chained = future.then([&](est::future<int>& state) {
     invoked = true;
@@ -175,7 +151,8 @@ TEST_CASE("a then() continuation only runs once the loop drains, never inline", 
 TEST_CASE("run() drains ready work exactly like run_until_idle() (no I/O yet to differ on)",
           "[loop]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(1);
   bool invoked = false;
   auto chained = future.then([&](est::future<int>& state) {
@@ -190,8 +167,9 @@ TEST_CASE("run() drains ready work exactly like run_until_idle() (no I/O yet to 
 
 TEST_CASE("stop() interrupts the current drain pass before further ready work runs", "[loop]") {
   est::loop loop;
-  auto [promise_a, future_a] = est::make_promise_future<int>(loop);
-  auto [promise_b, future_b] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise_a, future_a] = est::make_promise_future<int>();
+  auto [promise_b, future_b] = est::make_promise_future<int>();
   promise_a.set_value(1);
   promise_b.set_value(2);
 
@@ -221,7 +199,8 @@ TEST_CASE("sleep_for() resolves once run_until_idle() advances past the deadline
   const auto guard = est::platform::override_instance(fake);
 
   est::loop loop;
-  auto future = est::sleep_for(loop, 10s);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto future = est::sleep_for(10s);
   REQUIRE_FALSE(future.ready());
 
   loop.run_until_idle();
@@ -235,17 +214,46 @@ TEST_CASE("sleep_until() resolves once run_until_idle() advances past the deadli
   const auto guard = est::platform::override_instance(fake);
 
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   const auto deadline = fake.current + 5s;
-  auto future = est::sleep_until(loop, deadline);
+  auto future = est::sleep_until(deadline);
   REQUIRE_FALSE(future.ready());
 
   loop.run_until_idle();
   REQUIRE(future.ready());
 }
 
+TEST_CASE("drain_pending() cancels abandoned timers so the loop can keep running safely",
+          "[loop]") {
+  // Guards loop::drain_pending() draining pending_timers_ without also
+  // canceling the matching timer_queue entry: without that,
+  // make_current_loop()'s guard abandoning a still-pending sleep_for()
+  // would leave a stale deadline in timers_ that a later run_until_idle()
+  // on the same, still-alive loop trips over in fire_ready_timers()'s own
+  // check("loop: fired timer id missing from pending_timers_") - reached
+  // here since drain_pending() (unlike the old ~loop()-only version) can
+  // now run on a loop that keeps going afterward.
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto platform_guard = est::platform::override_instance(fake);
+
+  est::loop loop;
+  {
+    const auto loop_guard = est::make_current_loop(loop);
+    auto future = est::sleep_for(10s); // abandoned - guard exits before it fires
+    (void)future;
+  } // loop_guard exits: drain_pending() destroys the pending timer node
+
+  // The loop is still alive and still usable - run_until_idle() must not
+  // find a stale deadline still sitting in the timer queue.
+  loop.run_until_idle();
+  SUCCEED("run_until_idle() returned without tripping the stale-timer check");
+}
+
 TEST_CASE("yield_execution() resolves once run_until_idle() drains it", "[loop]") {
   est::loop loop;
-  auto future = est::yield_execution(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto future = est::yield_execution();
   REQUIRE_FALSE(future.ready());
 
   loop.run_until_idle();
@@ -260,16 +268,17 @@ TEST_CASE("yield_execution() lets already-ready work run first", "[loop]") {
   // yield_execution() is called runs first, however many rounds that
   // takes (drain_ready() loops until ready_ is empty, not just once).
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   std::vector<int> order;
 
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(1);
   auto already_ready = future.then([&](est::future<int>&) {
     order.push_back(1);
     return 0;
   });
 
-  auto yielded = est::yield_execution(loop).then([&] { order.push_back(2); });
+  auto yielded = est::yield_execution().then([&] { order.push_back(2); });
 
   loop.run_until_idle();
   REQUIRE(order == std::vector{1, 2});
@@ -281,8 +290,9 @@ TEST_CASE("a then() registered on a timer-driven future runs once the timer fire
   const auto guard = est::platform::override_instance(fake);
 
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   bool invoked = false;
-  auto chained = est::sleep_for(loop, 5s).then([&] {
+  auto chained = est::sleep_for(5s).then([&] {
     invoked = true;
     return 1;
   });
@@ -298,10 +308,11 @@ TEST_CASE("multiple pending timers all fire, earliest deadline first", "[loop]")
   const auto guard = est::platform::override_instance(fake);
 
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   std::vector<int> order;
-  auto late = est::sleep_for(loop, 30s).then([&] { order.push_back(3); });
-  auto early = est::sleep_for(loop, 10s).then([&] { order.push_back(1); });
-  auto mid = est::sleep_for(loop, 20s).then([&] { order.push_back(2); });
+  auto late = est::sleep_for(30s).then([&] { order.push_back(3); });
+  auto early = est::sleep_for(10s).then([&] { order.push_back(1); });
+  auto mid = est::sleep_for(20s).then([&] { order.push_back(2); });
 
   loop.run_until_idle();
   REQUIRE(order == std::vector{1, 2, 3});
@@ -319,7 +330,8 @@ TEST_CASE(
   const auto guard = est::platform::override_instance(fake);
 
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(1);
   auto chained = future.then([](est::future<int>& state) { return state.get() + 1; });
 
@@ -337,10 +349,11 @@ TEST_CASE("a loop dropped with ready work and pending timers still queued frees 
   counting_resource resource;
   {
     est::loop loop{&resource};
-    auto [promise, future] = est::make_promise_future<int>(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, future] = est::make_promise_future<int>();
     promise.set_value(1);
     auto chained = future.then([](est::future<int>&) { return 0; }); // lands in ready_, never run
-    auto sleeping = est::sleep_for(loop, 10s); // lands in pending_timers_, never fires
+    auto sleeping = est::sleep_for(10s); // lands in pending_timers_, never fires
     (void)chained;
     (void)sleeping;
   }
@@ -366,10 +379,11 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing yield_execution() sti
   counting_resource resource;
   {
     est::loop loop{&resource};
+    const auto loop_guard = est::make_current_loop(loop);
 
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-    auto coro = [](est::loop& loop_ref) -> est::future<void> {
-      co_await est::yield_execution(loop_ref);
+    auto coro = [](est::loop&) -> est::future<void> {
+      co_await est::yield_execution();
       co_return; // never reached - loop is destroyed before this ever drains
     };
     auto fut = coro(loop);
@@ -377,7 +391,7 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing yield_execution() sti
     REQUIRE_FALSE(fut.ready());
     (void)fut;
     // `loop` is destroyed at the end of this scope with the coroutine
-    // still suspended in co_await yield_execution(loop), never resumed.
+    // still suspended in co_await yield_execution(), never resumed.
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
@@ -401,10 +415,11 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
   counting_resource resource;
   {
     est::loop loop{&resource};
+    const auto loop_guard = est::make_current_loop(loop);
 
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
-    auto coro = [](est::loop& loop_ref) -> est::future<void> {
-      co_await est::sleep_for(loop_ref, 10s);
+    auto coro = [](est::loop&) -> est::future<void> {
+      co_await est::sleep_for(10s);
       co_return; // never reached - loop is destroyed before the timer fires
     };
     auto fut = coro(loop);
@@ -412,8 +427,8 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
     REQUIRE_FALSE(fut.ready());
     (void)fut;
     // `loop` is destroyed at the end of this scope with the coroutine
-    // still suspended in co_await sleep_for(loop, 10s), the timer never
-    // having fired.
+    // still suspended in co_await sleep_for(10s), the timer never having
+    // fired.
   }
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
@@ -423,7 +438,7 @@ TEST_CASE("destroying a loop with a coroutine co_await-ing sleep_for() still pen
 // (est:util.current_loop) and the no-loop sugar built on current_loop().
 // est::check()'s own failure path (make_current_loop()-ing a second loop
 // while one is already current, or calling current_loop() with none
-// registered and no fallback available) isn't unit-testable in this
+// registered at all - there is no fallback) isn't unit-testable in this
 // codebase - it terminates the process, same as every other checked
 // precondition (est/tests/check_tests.cpp's own doc comment) - so only
 // the happy path is covered here.
@@ -463,23 +478,5 @@ TEST_CASE("sleep_for()/sleep_until()/yield_execution() with no loop argument use
   loop.run_until_idle();
   REQUIRE(slept_for.ready());
   REQUIRE(slept_until.ready());
-  REQUIRE(yielded.ready());
-}
-
-TEST_CASE("current_loop() with nothing explicitly registered falls back to hosted_stdcpp's "
-          "own default loop",
-          "[loop]") {
-  // No est::make_current_loop() call anywhere in this test, and no
-  // override_instance() either - the one test in this file that runs
-  // against the real, default platform::instance() (hosted_stdcpp),
-  // specifically to exercise its own get_current_loop_context() fallback
-  // (module estext) rather than a fake's or an explicitly registered
-  // loop. yield_execution(), not sleep_for()/sleep_until(): this runs
-  // against the real backend, so a timer-based wait would be a genuine
-  // (if short) wall-clock sleep - yield_execution() resolves through the
-  // ready-queue alone, no real deadline involved.
-  auto yielded = est::yield_execution();
-  REQUIRE_FALSE(yielded.ready());
-  est::current_loop().run_until_idle();
   REQUIRE(yielded.ready());
 }

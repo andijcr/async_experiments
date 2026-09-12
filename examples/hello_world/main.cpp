@@ -21,7 +21,8 @@ auto main() -> int {
 
   try {
     est::loop loop;
-    auto [promise, future] = est::make_promise_future<int>(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, future] = est::make_promise_future<int>();
     promise.set_value(42);
     std::println("est::future value: {}", future.get());
   } catch (...) {

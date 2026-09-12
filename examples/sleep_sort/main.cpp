@@ -7,7 +7,7 @@ import std;
 // state), so <cstdlib> stays a plain #include.
 #include <cstdlib>
 
-// Sleep sort, 1 to 10: schedules one est::sleep_for(loop, n * unit) per
+// Sleep sort, 1 to 10: schedules one est::sleep_for(n * unit) per
 // number, each followed by a then() that prints n. The numbers are shuffled
 // before scheduling and printed in that shuffled (unsorted) order first, so
 // the sorted output that follows is visibly not just an artifact of the
@@ -40,6 +40,7 @@ auto main() -> int {
     std::println("input: {}", numbers);
 
     est::loop loop;
+    const auto loop_guard = est::make_current_loop(loop);
     using namespace std::chrono_literals;
 
     constexpr auto unit = 100ms;
@@ -49,7 +50,7 @@ auto main() -> int {
       // chain stays alive on its own - the timer node's own promise (not
       // this handle) is what keeps the underlying future_state alive
       // until it fires (see docs/wiki/Allocation-Patterns.md).
-      est::sleep_for(loop, n * unit).then([n] { std::println("{}", n); });
+      est::sleep_for(n * unit).then([n] { std::println("{}", n); });
     }
 
     loop.run_until_idle();

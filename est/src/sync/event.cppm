@@ -88,12 +88,21 @@ export namespace est {
 // exactly one more constraint on top of set()/wait()/reset(), reusing
 // this class's own waiters_ mechanism unchanged all the way down.
 //
-// Holds a `loop&` (same convention as future_state<T>/mutex - see
-// their own doc comments) rather than its own allocator: wait() builds a
-// future_state<void> against it, and set()/~counting_event() need its
-// allocator to enqueue/destroy waiter nodes. Same lifetime precondition
-// as every other loop-holding type in this codebase: the loop must
-// outlive every counting_event constructed against it.
+// Holds no `loop&` of its own (unlike future_state<T> - see that class's
+// own doc comment): wait()/set()/~counting_event() each resolve
+// est::current_loop()/est::current_allocator() fresh, at the point of
+// use - only current_allocator(), not current_loop() itself, where a
+// method never actually needs the loop (wait()/~counting_event(); set()
+// still needs current_loop() for enqueue_ready()). There is no
+// constructor taking an explicit `loop&` either. KNOWN HAZARD this
+// creates, same as est::mutex's own doc comment describes: a waiter
+// queued by wait() carries a future_state<void> built against whichever
+// loop was current *then*; set()/~counting_event() resolve
+// current_loop() fresh, *now* - if the current loop has changed in
+// between, a waiter can be handed to (or destroyed through the
+// allocator of) a different loop than the one it actually belongs to.
+// A cached `loop&` member ruled this out structurally; resolving fresh
+// does not.
 //
 // max_count bounds how high the count is ever allowed to climb: set(n)
 // (below) saturates at it rather than growing without limit, the same
@@ -113,15 +122,10 @@ export namespace est {
 // max_count = 1 - not a separate implementation.
 template <EventResetMode Mode> class counting_event {
 public:
-  explicit counting_event(loop& loop_ref, int max_count = std::numeric_limits<int>::max()) noexcept
-      : max_count_(max_count), loop_(loop_ref) {
+  explicit counting_event(int max_count = std::numeric_limits<int>::max()) noexcept
+      : max_count_(max_count) {
     check(max_count > 0, "counting_event: max_count must be positive");
   }
-
-  // Sugar over the constructor above using est::current_loop()
-  // (est:util.current_loop) instead of a caller-supplied loop&.
-  explicit counting_event(int max_count = std::numeric_limits<int>::max()) noexcept
-      : counting_event(current_loop(), max_count) {}
 
   counting_event(const counting_event&) = delete;
   auto operator=(const counting_event&) -> counting_event& = delete;
@@ -135,8 +139,20 @@ public:
   // completes its promise with an exception first, rather than just
   // deallocating itself silently - see its own doc comment for why that
   // matters beyond just freeing the node itself.
+  // waiters_.empty() checked *before* resolving current_allocator() - a
+  // counting_event with nothing queued can legitimately be destroyed
+  // long after whatever loop was current when it was created has stopped
+  // being current at all, and current_allocator() would fail its own
+  // precondition in that case even though nothing here actually needs
+  // one. Only the allocator, not the loop itself, is needed to destroy
+  // an abandoned waiter node - current_loop() is never resolved here at
+  // all.
   ~counting_event() {
-    waiters_.drain([this](detail::ready_node& node) { node.destroy(loop_.allocator(), false); });
+    if (waiters_.empty()) {
+      return;
+    }
+    auto allocator = current_allocator();
+    waiters_.drain([allocator](detail::ready_node& node) { node.destroy(allocator, false); });
   }
 
   [[nodiscard]] auto count() const noexcept -> int { return count_; }
@@ -183,6 +199,12 @@ public:
   // to bound recursion - deferring anyway keeps this consistent with
   // every other completion path in this codebase: never invoke a
   // continuation inline.
+  // current_loop() resolved only once it's known there's at least one
+  // queued waiter to hand off to, not unconditionally on every successful
+  // set() - a caller that sets an event with nothing queued (the common
+  // case for a manual-reset event set ahead of its first wait()) doesn't
+  // need a loop current at all, and current_loop() would fail its own
+  // precondition in that case otherwise.
   auto set(int n = 1) -> int {
     check(n > 0, "counting_event::set(n) requires n > 0");
     const int actual_n = std::min(n, max_count_ - count_);
@@ -190,17 +212,20 @@ public:
       return 0;
     }
     count_ += actual_n;
-    if constexpr (Mode == EventResetMode::automatic) {
-      for (int i = 0; i < actual_n; ++i) {
-        auto* waiter = waiters_.dequeue();
-        if (waiter == nullptr) {
-          break;
+    if (!waiters_.empty()) {
+      auto& loop_ref = current_loop();
+      if constexpr (Mode == EventResetMode::automatic) {
+        for (int i = 0; i < actual_n; ++i) {
+          auto* waiter = waiters_.dequeue();
+          if (waiter == nullptr) {
+            break;
+          }
+          --count_;
+          loop_ref.enqueue_ready(*waiter);
         }
-        --count_;
-        loop_.enqueue_ready(*waiter);
+      } else {
+        waiters_.drain([&loop_ref](detail::ready_node& node) { loop_ref.enqueue_ready(node); });
       }
-    } else {
-      waiters_.drain([this](detail::ready_node& node) { loop_.enqueue_ready(node); });
     }
     return actual_n;
   }
@@ -219,9 +244,14 @@ public:
 
   // Suspends the calling coroutine until the count is greater than zero,
   // resuming immediately (no suspension, no allocation - see
-  // future_awaiter<T>::await_ready(), est:future) if it already is.
+  // future_awaiter<T>::await_ready(), est:future) if it already is. Only
+  // current_allocator() is needed here, never current_loop() itself - the
+  // fast path completes the promise inline, and the slow path only
+  // enqueues into this event's own waiters_, not onto any loop's
+  // ready-queue (that happens later, from set()).
   [[nodiscard]] auto wait() -> future<void> {
-    auto [prom, fut] = make_promise_future<void>(loop_);
+    auto allocator = current_allocator();
+    auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
     if (count_ > 0) {
       if constexpr (Mode == EventResetMode::automatic) {
         --count_;
@@ -229,7 +259,7 @@ public:
       prom.set_value();
       return std::move(fut);
     }
-    auto* node = loop_.allocator().template new_object<detail::event_resume_node>(std::move(prom));
+    auto* node = allocator.template new_object<detail::event_resume_node>(std::move(prom));
     waiters_.enqueue(*node);
     return std::move(fut);
   }
@@ -237,7 +267,6 @@ public:
 private:
   int count_ = 0;
   int max_count_;
-  loop& loop_;
   intrusive_list<detail::ready_node> waiters_;
 };
 
@@ -250,16 +279,12 @@ private:
 // set()'s idempotent-once-signaled behavior for free, matching SetEvent()'s
 // own documented "calling it again before anything has consumed the
 // signal is a no-op" behavior with no code of this class's own. Only
-// adds signaled() (a named alias for count() > 0) and constructors that
-// hardcode max_count = 1 - inheriting counting_event<Mode>'s own
-// constructors via a using-declaration isn't an option here, since that
-// would also inherit their own (unbounded) max_count default.
+// adds signaled() (a named alias for count() > 0) and a constructor that
+// hardcodes max_count = 1 - inheriting counting_event<Mode>'s own
+// constructor via a using-declaration isn't an option here, since that
+// would also inherit its own (unbounded) max_count default.
 template <EventResetMode Mode> class binary_event : public counting_event<Mode> {
 public:
-  explicit binary_event(loop& loop_ref) noexcept : counting_event<Mode>(loop_ref, 1) {}
-
-  // Sugar over the constructor above using est::current_loop()
-  // (est:util.current_loop) instead of a caller-supplied loop&.
   binary_event() noexcept : counting_event<Mode>(1) {}
 
   [[nodiscard]] auto signaled() const noexcept -> bool { return this->count() > 0; }

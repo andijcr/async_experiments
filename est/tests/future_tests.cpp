@@ -39,22 +39,23 @@ private:
 
 } // namespace
 
-// Every test below declares its own est::loop and threads it into
-// make_promise_future<T>(): a continuation registered via then() is
-// never invoked inline on the call stack that fulfills its
-// promise any more - est::loop defers it to its own ready-queue, so a
-// test that wants to observe a continuation's side effects must call
-// loop.run_until_idle() first. `loop` is always declared before its
-// promise/future pair (and stays in scope for as long as they do): every
-// future_state built against it holds a bare loop&, so the loop must
-// outlive it. Where a loop needs a specific memory_resource (the
+// Every test below declares its own est::loop, then registers it as
+// est::current_loop() via make_current_loop() before calling
+// make_promise_future<T>() (which, like every other loop-consuming
+// function in this codebase, always resolves current_loop() rather than
+// taking a loop& parameter): a continuation registered via then() is
+// never invoked inline on the call stack that fulfills its promise -
+// est::loop defers it to its own ready-queue, so a test that wants to
+// observe a continuation's side effects must call loop.run_until_idle()
+// first. Where a loop needs a specific memory_resource (the
 // counting_resource-based leak tests), it's built as est::loop{&resource}
 // - the same implicit polymorphic_allocator<std::byte> conversion
 // est::loop's constructor takes directly.
 
 TEST_CASE("set_value then get() returns the value", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   REQUIRE_FALSE(future.ready());
   promise.set_value(42);
   REQUIRE(future.ready());
@@ -74,7 +75,8 @@ TEST_CASE("an unwrapped then() receives a reference into the stored value, not a
   // than by naming future_state itself, which is not part of the public
   // API surface this test file can reach.
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(42);
 
   const int* first_address = nullptr;
@@ -89,7 +91,8 @@ TEST_CASE("an unwrapped then() receives a reference into the stored value, not a
 
 TEST_CASE("set_exception then get() rethrows", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
   REQUIRE(future.ready());
   REQUIRE_THROWS_AS(future.get(), std::runtime_error);
@@ -97,7 +100,8 @@ TEST_CASE("set_exception then get() rethrows", "[future]") {
 
 TEST_CASE("then() registered before set_value runs once the loop drains", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   bool invoked = false;
   auto chained = future.then([&](est::future<int>& state) {
     invoked = true;
@@ -114,7 +118,8 @@ TEST_CASE("then() registered before set_value runs once the loop drains", "[futu
 
 TEST_CASE("then() registered on an already-ready future still defers to the loop", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(9);
 
   bool invoked = false;
@@ -130,7 +135,8 @@ TEST_CASE("then() registered on an already-ready future still defers to the loop
 
 TEST_CASE("then() observes a stored exception via get()", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool invoked = false;
@@ -146,7 +152,8 @@ TEST_CASE("then() observes a stored exception via get()", "[future]") {
 
 TEST_CASE("multiple then() registrations are all invoked on completion", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   int count = 0;
   auto first = future.then([&](est::future<int>&) { return ++count; });
   auto second = future.then([&](est::future<int>&) { return ++count; });
@@ -163,7 +170,8 @@ TEST_CASE("every then() registration observes the same, correct value via get()"
   // reading the value must see the real one, not a moved-from leftover
   // from the first.
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto first = future.then([](est::future<int>& state) { return state.get(); });
   auto second = future.then([](est::future<int>& state) { return state.get(); });
 
@@ -175,7 +183,8 @@ TEST_CASE("every then() registration observes the same, correct value via get()"
 
 TEST_CASE("then() returns a future that can itself be chained", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto chained = future.then([](est::future<int>& state) { return state.get() * 2; })
                      .then([](est::future<int>& state) { return state.get() + 1; });
   promise.set_value(10);
@@ -185,7 +194,8 @@ TEST_CASE("then() returns a future that can itself be chained", "[future]") {
 
 TEST_CASE("promise/future are move-only and moving transfers ownership", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto promise2 = std::move(promise);
   auto future2 = std::move(future);
 
@@ -195,7 +205,8 @@ TEST_CASE("promise/future are move-only and moving transfers ownership", "[futur
 
 TEST_CASE("dropping the future doesn't prevent the promise from completing", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   {
     auto dropped = std::move(future); // destroyed at the end of this scope
   }
@@ -211,7 +222,8 @@ TEST_CASE("a registered continuation is freed even if never invoked (broken prom
   counting_resource resource;
   {
     est::loop loop{&resource};
-    auto [promise, future] = est::make_promise_future<int>(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, future] = est::make_promise_future<int>();
     future.then([](est::future<int>&) { return 0; });
     // promise, future and loop all destroyed here, never completed - the
     // continuation never even reaches est::loop's own ready-queue.
@@ -227,7 +239,8 @@ TEST_CASE("a throwing continuation's exception is isolated to its own downstream
   // future via set_exception() instead of letting it escape, so a
   // throwing continuation must not stop its siblings from running.
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
 
   // Registration order doesn't matter to what this test proves (both
   // continuations run regardless of which drains first) - the
@@ -254,7 +267,8 @@ TEST_CASE("a throwing continuation's node and downstream future are freed, not l
   counting_resource resource;
   {
     est::loop loop{&resource};
-    auto [promise, future] = est::make_promise_future<int>(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, future] = est::make_promise_future<int>();
     auto chained = future.then([](est::future<int>&) -> int { throw std::runtime_error("boom"); });
     promise.set_value(1);
     loop.run_until_idle();
@@ -269,12 +283,13 @@ TEST_CASE("a throwing continuation's node and downstream future are freed, not l
 
 TEST_CASE("failed() is false on success and true once set_exception() runs", "[future]") {
   est::loop loop;
-  auto [value_promise, value_future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [value_promise, value_future] = est::make_promise_future<int>();
   REQUIRE_FALSE(value_future.failed());
   value_promise.set_value(1);
   REQUIRE_FALSE(value_future.failed());
 
-  auto [error_promise, error_future] = est::make_promise_future<int>(loop);
+  auto [error_promise, error_future] = est::make_promise_future<int>();
   error_promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
   REQUIRE(error_future.failed());
 }
@@ -282,7 +297,8 @@ TEST_CASE("failed() is false on success and true once set_exception() runs", "[f
 TEST_CASE("then() with a plain-value callback (unwrapped) runs with the parent's value",
           "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(21);
   auto chained = future.then([](int value) { return value * 2; });
   loop.run_until_idle();
@@ -293,7 +309,8 @@ TEST_CASE(
     "then() with a plain-value callback (unwrapped) is skipped and auto-propagates on failure",
     "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool invoked = false;
@@ -311,7 +328,8 @@ TEST_CASE(
 TEST_CASE("a wrapped (future<T>&) then() callback can inspect failed() instead of catching",
           "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool saw_failure = false;
@@ -334,7 +352,8 @@ TEST_CASE("a wrapped (future<T>&) then() callback can inspect failed() instead o
 TEST_CASE("a generic callback defaults to unwrapped, not wrapped, when both are viable",
           "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(21);
 
   auto chained = future.then([](auto& value) { return value * 2; });
@@ -345,7 +364,8 @@ TEST_CASE("a generic callback defaults to unwrapped, not wrapped, when both are 
 TEST_CASE("a generic callback, defaulted to unwrapped, is skipped and auto-propagates on failure",
           "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
 
   bool invoked = false;
@@ -362,7 +382,8 @@ TEST_CASE("a generic callback, defaulted to unwrapped, is skipped and auto-propa
 
 TEST_CASE("future<void>: set_value()/get() round-trip with nothing to carry", "[future][void]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<void>();
   REQUIRE_FALSE(future.ready());
   promise.set_value();
   REQUIRE(future.ready());
@@ -373,7 +394,8 @@ TEST_CASE("future<void>: set_value()/get() round-trip with nothing to carry", "[
 
 TEST_CASE("future<void>: set_exception()/get() rethrows", "[future][void]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<void>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
   REQUIRE(future.failed());
   REQUIRE_THROWS_AS(future.get(), std::runtime_error);
@@ -381,7 +403,8 @@ TEST_CASE("future<void>: set_exception()/get() rethrows", "[future][void]") {
 
 TEST_CASE("future<void>: an unwrapped (no-argument) then() runs on success", "[future][void]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<void>();
   bool invoked = false;
   auto chained = future.then([&] {
     invoked = true;
@@ -396,7 +419,8 @@ TEST_CASE("future<void>: an unwrapped (no-argument) then() runs on success", "[f
 TEST_CASE("future<void>: an unwrapped (no-argument) then() is skipped and propagates on failure",
           "[future][void]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<void>();
   bool invoked = false;
   auto chained = future.then([&] {
     invoked = true;
@@ -410,7 +434,8 @@ TEST_CASE("future<void>: an unwrapped (no-argument) then() is skipped and propag
 
 TEST_CASE("future<void>: a wrapped then() always runs and can inspect failed()", "[future][void]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<void>();
   bool saw_failure = false;
   auto chained = future.then([&](est::future<void>& state) {
     saw_failure = state.failed();
@@ -424,7 +449,8 @@ TEST_CASE("future<void>: a wrapped then() always runs and can inspect failed()",
 
 TEST_CASE("a void-returning then() callback produces a future<void>", "[future][void]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   bool invoked = false;
   auto chained = future.then([&](int value) {
     invoked = true;
@@ -441,9 +467,10 @@ TEST_CASE("a void-returning then() callback produces a future<void>", "[future][
 TEST_CASE("then() returning a future<U> flattens into future<U>, not future<future<U>>",
           "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
-  auto chained = future.then([&loop](int value) {
-    auto [inner_promise, inner_future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  auto chained = future.then([](int value) {
+    auto [inner_promise, inner_future] = est::make_promise_future<int>();
     inner_promise.set_value(value * 10);
     // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
     // move-on-return
@@ -462,9 +489,10 @@ TEST_CASE("then() returning a future<U> flattens into future<U>, not future<futu
 TEST_CASE("flattening a then() that returns a future<unique_ptr<T>> moves, not copies, the value",
           "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
-  auto chained = future.then([&loop](int value) {
-    auto [inner_promise, inner_future] = est::make_promise_future<std::unique_ptr<int>>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  auto chained = future.then([](int value) {
+    auto [inner_promise, inner_future] = est::make_promise_future<std::unique_ptr<int>>();
     inner_promise.set_value(std::make_unique<int>(value + 1));
     // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
     // move-on-return
@@ -482,9 +510,10 @@ TEST_CASE("flattening a then() that returns a future<unique_ptr<T>> moves, not c
 
 TEST_CASE("flattening propagates the inner future's failure into the outer future", "[future]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
-  auto chained = future.then([&loop](int value) {
-    auto [inner_promise, inner_future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  auto chained = future.then([](int value) {
+    auto [inner_promise, inner_future] = est::make_promise_future<int>();
     (void)value;
     inner_promise.set_exception(std::make_exception_ptr(std::runtime_error("inner boom")));
     // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
@@ -499,11 +528,12 @@ TEST_CASE("flattening propagates the inner future's failure into the outer futur
 
 TEST_CASE("then() returning future<void> flattens into future<void>", "[future][void]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   bool inner_ran = false;
   auto chained = future.then([&](int value) {
     (void)value;
-    auto [inner_promise, inner_future] = est::make_promise_future<void>(loop);
+    auto [inner_promise, inner_future] = est::make_promise_future<void>();
     inner_ran = true;
     inner_promise.set_value();
     // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
@@ -521,9 +551,10 @@ TEST_CASE("flattening a chained then() frees every node involved, no leak", "[fu
   counting_resource resource;
   {
     est::loop loop{&resource};
-    auto [promise, future] = est::make_promise_future<int>(loop);
-    auto chained = future.then([&loop](int value) {
-      auto [inner_promise, inner_future] = est::make_promise_future<int>(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, future] = est::make_promise_future<int>();
+    auto chained = future.then([](int value) {
+      auto [inner_promise, inner_future] = est::make_promise_future<int>();
       inner_promise.set_value(value + 1);
       // NOLINTNEXTLINE(bugprone-use-after-move) - a structured binding never gets implicit
       // move-on-return
@@ -547,28 +578,31 @@ TEST_CASE("flattening a chained then() frees every node involved, no leak", "[fu
 }
 
 // est::future<T> itself is a coroutine's return type - no separate
-// task<T> wrapper - via future<T>::promise_type. Every coroutine below
-// is a plain lambda taking est::loop& as its first parameter;
-// est::future<T>'s own doc comment on promise_type explains why that
-// first parameter is required (it's what promise_type's own
-// constructor/operator new pattern-match against) and why a plain
-// function (a lambda's non-static call operator included) works as a
-// coroutine here with no extra ceremony. None of these capture
-// anything - state a
-// coroutine needs crosses in as an ordinary by-value/by-reference
-// parameter instead, since a capturing lambda's closure lives outside
-// the coroutine frame it starts and isn't guaranteed to outlive it
-// (clang-tidy's cppcoreguidelines-avoid-capturing-lambda-coroutines
-// flags exactly this - real advice, followed here rather than
-// suppressed, even though every capture below happens to be provably
-// safe within its own test's scope). est::loop& itself is the one
-// unavoidable reference parameter (required by the calling convention
-// above) - NOLINT'd per declaration below, matching this codebase's
-// already-accepted "a loop& is safe given its own documented lifetime
-// precondition" stance (est::future_state<T>, est::mutex, ...).
+// task<T> wrapper - via future<T>::promise_type. Every coroutine below is
+// a plain lambda still taking est::loop& as its first parameter, exactly
+// as it did back when promise_type pattern-matched that first parameter
+// to build its future_state<T> against. It no longer does: promise_type
+// always resolves est::current_loop() now (see its own doc comment), so
+// this parameter is purely vestigial - promise_type's templated
+// constructor/operator new accept and silently ignore whatever arguments
+// the coroutine call passes, `est::loop&` included. Left in deliberately
+// (rather than mechanically stripped from every call site) as a live
+// example of the ergonomic hazard this design change introduces: a
+// caller can pass a loop& here that is not the current one, and nothing
+// - not a compile error, not a runtime check - says so; the coroutine
+// silently runs against current_loop() instead. None of these lambdas
+// capture anything - state a coroutine needs crosses in as an ordinary
+// by-value/by-reference parameter instead, since a capturing lambda's
+// closure lives outside the coroutine frame it starts and isn't
+// guaranteed to outlive it (clang-tidy's
+// cppcoreguidelines-avoid-capturing-lambda-coroutines flags exactly
+// this - real advice, followed here rather than suppressed, even though
+// every capture below happens to be provably safe within its own test's
+// scope).
 
 TEST_CASE("a coroutine returning est::future<int> can co_return a value", "[future][coroutine]") {
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
 
@@ -589,6 +623,7 @@ TEST_CASE("then() can be chained onto a future returned by a coroutine", "[futur
   // coroutine can co_await another coroutine's future, chaining values"
   // above).
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&) -> est::future<int> { co_return 42; };
 
@@ -601,6 +636,7 @@ TEST_CASE("then() can be chained onto a future returned by a coroutine", "[futur
 TEST_CASE("a coroutine returning est::future<void> can co_return with no value",
           "[future][coroutine][void]") {
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   bool ran = false;
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, bool& ran_ref) -> est::future<void> {
@@ -620,6 +656,7 @@ TEST_CASE("a coroutine returning est::future<void> can co_return with no value",
 TEST_CASE("an exception thrown in a coroutine's body surfaces through get()",
           "[future][coroutine]") {
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&) -> est::future<int> {
     throw std::runtime_error("boom");
@@ -637,6 +674,7 @@ TEST_CASE("an exception thrown in a coroutine's body surfaces through get()",
 TEST_CASE("a coroutine can co_await another coroutine's future, chaining values",
           "[future][coroutine]") {
   est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto inner = [](est::loop&, int x) -> est::future<int> { co_return x * 2; };
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
@@ -656,7 +694,8 @@ TEST_CASE("a coroutine can co_await another coroutine's future, chaining values"
 TEST_CASE("a coroutine can co_await a future built from a then() chain, genuinely suspending",
           "[future][coroutine]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto chained = future.then([](int v) { return v + 1; });
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, est::future<int> fut) -> est::future<int> {
@@ -677,7 +716,8 @@ TEST_CASE("a coroutine can co_await a future built from a then() chain, genuinel
 
 TEST_CASE("an exception in the awaited future propagates across co_await", "[future][coroutine]") {
   est::loop loop;
-  auto [promise, awaited] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, awaited] = est::make_promise_future<int>();
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, est::future<int> fut) -> est::future<int> {
     const int value = co_await std::move(fut); // rethrows once `fut` fails
@@ -701,7 +741,8 @@ TEST_CASE("a coroutine's frame and resume nodes are all freed through the loop's
   counting_resource resource;
   {
     est::loop loop{&resource};
-    auto [promise, awaited] = est::make_promise_future<int>(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, awaited] = est::make_promise_future<int>();
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
     auto coro = [](est::loop&, est::future<int> fut) -> est::future<int> {
       const int value = co_await std::move(fut);
@@ -731,7 +772,8 @@ TEST_CASE("co_await on an already-ready future resumes inline, no loop round-tri
   // that isn't being waited for" stance promise_type::initial_suspend()
   // takes at the other end of a coroutine's lifetime.
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   promise.set_value(5);
 
   bool resumed = false;
@@ -761,7 +803,8 @@ TEST_CASE("dropping an awaited future_state destroys the still-suspended corouti
   counting_resource resource;
   {
     est::loop loop{&resource};
-    auto pair = std::optional(est::make_promise_future<int>(loop));
+    const auto loop_guard = est::make_current_loop(loop);
+    auto pair = std::optional(est::make_promise_future<int>());
 
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
     auto coro = [](est::loop&, est::future<int>& fut) -> est::future<int> {
@@ -779,21 +822,19 @@ TEST_CASE("dropping an awaited future_state destroys the still-suspended corouti
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-// A coroutine's own promise_type doesn't require est::loop& as its
-// first parameter - it falls back to est::current_loop()
-// (est:util.current_loop) instead, matched via the same "promise
-// constructor arguments" rule that the loop-taking convention already
-// relies on (see promise_type's own doc comment). Both overload shapes
-// (some-parameters-but-not-loop, and no-parameters-at-all) get
-// their own test - the interesting risk here isn't behavior, it's
-// overload resolution: promise_type has three constructor/operator new
-// pairs now, and the wrong one silently winning would either fail to
-// compile (caught immediately) or, worse, compile and quietly ignore the
-// intended loop.
+// A coroutine's own promise_type never takes an est::loop& parameter at
+// all - it always builds its future_state<T> (and allocates its own
+// frame) against est::current_loop() (est:util.current_loop), whatever
+// parameters the coroutine function itself declares, via the standard's
+// "promise constructor arguments" rule (see promise_type's own doc
+// comment). Both a coroutine that takes other parameters and one that
+// takes none get their own test below, purely for coverage of that rule
+// matching either shape - there is no other overload for it to be
+// confused with.
 
-TEST_CASE("a coroutine with no loop& parameter uses est::current_loop()", "[future][coroutine]") {
+TEST_CASE("a coroutine with parameters uses est::current_loop()", "[future][coroutine]") {
   est::loop loop;
-  const auto guard = est::make_current_loop(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   auto coro = [](int value) -> est::future<int> { co_return value + 1; };
 
   auto fut = coro(41);
@@ -803,7 +844,7 @@ TEST_CASE("a coroutine with no loop& parameter uses est::current_loop()", "[futu
 
 TEST_CASE("a coroutine with no parameters at all uses est::current_loop()", "[future][coroutine]") {
   est::loop loop;
-  const auto guard = est::make_current_loop(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   auto coro = []() -> est::future<int> { co_return 42; };
 
   auto fut = coro();
@@ -811,7 +852,7 @@ TEST_CASE("a coroutine with no parameters at all uses est::current_loop()", "[fu
   REQUIRE(fut.get() == 42);
 }
 
-TEST_CASE("a loop-less coroutine genuinely suspends and resumes via est::current_loop()",
+TEST_CASE("a coroutine genuinely suspends and resumes via est::current_loop()",
           "[future][coroutine]") {
   // Not just "runs synchronously to completion" (both tests above never
   // hit a real suspension point) - this one actually suspends on a
@@ -819,7 +860,7 @@ TEST_CASE("a loop-less coroutine genuinely suspends and resumes via est::current
   // proving the frame was allocated against the *same* loop
   // current_loop() names, not some other one.
   est::loop loop;
-  const auto guard = est::make_current_loop(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   auto [promise, future] = est::make_promise_future<int>();
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
@@ -839,7 +880,8 @@ TEST_CASE("a loop-less coroutine genuinely suspends and resumes via est::current
 
 TEST_CASE("clone() aliases the same future_state: both see the same result", "[future][clone]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto other = future.clone();
   REQUIRE_FALSE(future.ready());
   REQUIRE_FALSE(other.ready());
@@ -854,7 +896,8 @@ TEST_CASE("clone() aliases the same future_state: both see the same result", "[f
 TEST_CASE("clone() taken before the future is ready still observes a later set_value()",
           "[future][clone]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto other = future.clone();
   promise.set_value(7);
   REQUIRE(other.get() == 7);
@@ -863,7 +906,8 @@ TEST_CASE("clone() taken before the future is ready still observes a later set_v
 TEST_CASE("both a future and its clone can register independent then() callbacks",
           "[future][clone]") {
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto other = future.clone();
   int seen_by_first = 0;
   int seen_by_second = 0;
@@ -884,7 +928,8 @@ TEST_CASE("future<void>: two clones can each be co_awaited independently",
   // there's no moved-from-leftovers hazard the way there would be for a
   // value-carrying future<T> (see future<T>::clone()'s own doc comment).
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<void>();
   auto clone_a = future.clone();
   auto clone_b = future.clone();
 
@@ -918,7 +963,8 @@ TEST_CASE("future<int>: two clones can each be co_awaited independently, both se
   // whichever clone resumes second still reads the real value, not
   // moved-from leftovers the way it would for a non-scalar T.
   est::loop loop;
-  auto [promise, future] = est::make_promise_future<int>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
   auto clone_a = future.clone();
   auto clone_b = future.clone();
 
@@ -936,4 +982,26 @@ TEST_CASE("future<int>: two clones can each be co_awaited independently, both se
   REQUIRE(result_b.ready());
   REQUIRE(result_a.get() == 7);
   REQUIRE(result_b.get() == 7);
+}
+
+TEST_CASE("a completed future with no continuation ever registered can be dropped after its "
+          "loop stops being current",
+          "[future]") {
+  // Guards future_state<T>::~future_state() checking waiters_.empty()
+  // before resolving current_loop(): a future_state with nothing queued
+  // needs no loop at all to be destroyed, and must not fail
+  // current_loop()'s own precondition just because none happens to be
+  // registered any more by the time it goes out of scope.
+  std::optional<est::future<int>> outlives_the_loop;
+  {
+    est::loop loop;
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [promise, future] = est::make_promise_future<int>();
+    promise.set_value(42);
+    outlives_the_loop.emplace(std::move(future));
+  } // loop_guard exits - no loop is current from here on
+
+  REQUIRE(outlives_the_loop->get() == 42);
+  // `outlives_the_loop` (and the promise it came from) is destroyed at
+  // the end of this scope, with no loop current - must not abort.
 }

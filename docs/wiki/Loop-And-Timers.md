@@ -9,79 +9,112 @@ actually invokes one. See
 [Continuation Node Mechanism](Continuation-Node-Mechanism.md) for the node
 side of this; this page covers the loop side.
 
-## Why an explicit `loop&`, not a global singleton
+## Why `est::current_loop()`, not a global singleton
 
 `est::platform::instance()` is a global, swappable pointer — safe, because a
 `platform::interface` is stateless policy (a clock read, a `sleep_until`
 call, an abort). `est::loop` is not: it owns a ready-queue and a set of
 pending timers, real mutable state that a shared global would leak between
 any two unrelated call sites (or, worse, between tests). So a loop is an
-object a caller constructs explicitly and threads through
-`make_promise_future<T>(loop&)` — every `future_state<T>` holds a bare
-`loop&`, and every downstream state a `.then()` call creates reuses that
-same reference (a chain never crosses loops).
+object a caller constructs explicitly.
 
-**This makes loop lifetime a real precondition**: a loop must outlive every
-`future_state`/`promise`/`future`/`then()`-chain built against it. There's
-no way to check a dangling reference at runtime the way `est::check()`
-guards other preconditions in this codebase — a caller returning a future
-from a function whose loop is a local variable is undefined behavior on the
-very next touch of the loop. This is documented explicitly on both
-`est::loop`'s and `future_state<T>`'s own doc comments precisely because
-it's an easy first-use mistake with no compiler or runtime defense against
-it.
+There is, deliberately, no way to hand a loop to `make_promise_future()`,
+`sleep_for()`/`sleep_until()`/`yield_execution()`, `est::mutex`,
+`est::counting_event<Mode>`, or a coroutine's own `promise_type` directly —
+every one of them resolves `est::current_loop()` fresh, at the point of
+use, instead of taking or caching a `loop&` of their own (see the next
+section for the mechanism, and each type's own doc comment for the
+cross-loop hazard this carries). This is itself the result of an
+experiment (branch `current-loop-only-experiment`) that started from an
+earlier design where every one of those also accepted an explicit `loop&`
+and cached it — see [Global Lookup Codegen](Global-Lookup-Codegen.md) for
+the codegen side of that comparison, and the "A structural hazard:
+destroying a loop with pending work" section below for a genuine
+correctness regression the change introduced and the fix that closed it.
 
-## `est::current_loop()`: opt-in, not automatic, and not `thread_local`
+**This makes loop lifetime a real precondition, now transitively through
+`current_loop()` rather than through a cached member**: a loop must outlive
+everything that ever resolved it via `current_loop()` — every
+`future_state`/`promise`/`future`/`then()`-chain, every `est::mutex`,
+every `est::counting_event<Mode>`. There's no way to check a dangling
+reference at runtime the way `est::check()` guards other preconditions in
+this codebase.
 
-A caller can still avoid threading a `loop&` through by hand, without
-reopening the global-singleton problem the section above rules out -
-`est::make_current_loop(loop&)` registers that loop as the one
+## `est::current_loop()`/`current_allocator()`: `thread_local`, opt-in, no fallback
+
+`est::make_current_loop(loop&)` registers a loop as the one
 `make_promise_future()`, `sleep_for()`/`sleep_until()`/`yield_execution()`,
-and a loop-less coroutine's own `promise_type` (all consuming
-`est::current_loop()`) fall back to, until the returned guard is
-destroyed:
+`est::mutex`, `est::counting_event<Mode>`, and a coroutine's own
+`promise_type` (all consuming `est::current_loop()`/`current_allocator()`)
+resolve, until the returned guard is destroyed:
 
 ```cpp
 // est:util.current_loop - free functions, not methods on est::loop itself
+namespace est::detail {
+struct execution_context {
+  loop* loop_ptr = nullptr;
+  std::pmr::memory_resource* resource_ptr = nullptr;
+};
+inline thread_local execution_context tls_context;
+} // namespace est::detail
+
 [[nodiscard]] auto make_current_loop(loop& loop_ref) noexcept {
-  check(!detail::loop_is_current, "est::make_current_loop(): another loop is already current...");
-  detail::loop_is_current = true;
-  platform::instance().set_current_loop_context(&loop_ref);
-  return scope_exit([]() noexcept {
-    detail::loop_is_current = false;
-    platform::instance().set_current_loop_context(nullptr);
+  check(detail::tls_context.loop_ptr == nullptr, "est::make_current_loop(): another loop is already current...");
+  detail::tls_context = {.loop_ptr = &loop_ref, .resource_ptr = loop_ref.allocator().resource()};
+  return scope_exit([&loop_ref]() noexcept {
+    loop_ref.drain_pending(); // see the hazard section below for why
+    detail::tls_context = {};
   });
 }
 
 [[nodiscard]] auto current_loop() -> loop& {
-  auto* const context = platform::instance().get_current_loop_context();
-  check(context != nullptr, "est::current_loop(): no loop is current ...");
-  return *context;
+  check(detail::tls_context.loop_ptr != nullptr, "est::current_loop(): no loop is current ...");
+  return *detail::tls_context.loop_ptr;
+}
+
+[[nodiscard]] auto current_allocator() -> std::pmr::polymorphic_allocator<std::byte> {
+  check(detail::tls_context.resource_ptr != nullptr, "est::current_allocator(): no loop is current ...");
+  return {detail::tls_context.resource_ptr};
 }
 ```
 
-A few design choices worth understanding, each driven by a real
-constraint:
+This replaced an earlier version of the mechanism that routed through
+`platform::interface`'s own virtual `get_current_loop_context()`/
+`set_current_loop_context()` methods (removed) and fell back to a
+lazily-constructed default loop when nothing was explicitly registered
+(also removed) - see
+[Global Lookup Codegen](Global-Lookup-Codegen.md#the-threadlocal-migration)
+for why, and the measured cost difference. A few design choices worth
+understanding in the current version, each driven by a real constraint:
 
-- **Not `thread_local`.** This codebase already has a plain,
-  non-`thread_local` mechanism for "which one is current" -
-  `platform`'s own `current_instance`/`instance()` - and reusing that
-  shape for the current loop costs nothing extra. `thread_local` is
-  never otherwise needed here, and the bare-metal stretch goal
-  (freestanding, no OS) is exactly the kind of target where
-  `thread_local` may have no well-defined support at all.
-- **The slot lives behind `platform::interface`'s virtual
-  `get_current_loop_context()`/`set_current_loop_context()`, not as a
-  free-standing global next to `current_instance`.** `platform::interface`
-  is a pure interface - every method pure virtual, no data members of
-  its own - so "hold a pointer and hand it back" is implemented by
-  whichever concrete backend is installed (`estext::hosted_stdcpp`
-  today), the same as `reset_loop_stall_detection()`/
-  `detect_loop_stall()` (the long-running-callback detector). Every test
-  fake in `est/tests/` deriving from `interface` provides matching
-  overrides - most are no-ops, but `loop_tests.cpp`'s
-  `fake_platform`/`jumping_platform` need working ones, since `est::loop`
-  is genuinely constructed under both.
+- **`thread_local`, not a process-global.** This codebase's ultimate
+  target is a shared-memory, no-MMU multicore machine with one loop per
+  core - a plain global would need every core to agree on (and
+  synchronize writes to) one slot, even though each core only ever
+  registers and reads its own loop. `thread_local` gives each core (or,
+  hosted, each thread) an independent slot for the price of one
+  relative-addressed load, no synchronization needed -
+  `est::platform::detail::current_instance` (`:platform`) now uses the
+  same storage strategy, for the same reason.
+- **Two separate fields (`loop_ptr`, `resource_ptr`), not just the loop
+  pointer alone.** `current_allocator()` reads `resource_ptr` directly
+  rather than going through `current_loop().allocator()`, which would
+  need a further memory read through the loop pointer to reach the same
+  value - most internal callers (`future_state<T>`'s own `allocator()`,
+  a coroutine frame's `operator new`/`operator delete`,
+  `make_promise_future()`) only ever need the allocator, not the loop
+  itself, so this is the more common path, not a rarely-used shortcut.
+- **No fallback loop.** An earlier version of `hosted_stdcpp` lazily
+  constructed a default loop and handed it out whenever nothing had been
+  explicitly registered, so a caller that never wanted to think about
+  `est::loop` at all still got a genuinely working one. Removed along
+  with the virtual `get_current_loop_context()` it depended on: on the
+  target this mechanism now designs for, there is no "hosted" convenience
+  backend and no notion of a made-up default loop for a core that forgot
+  to register its own - every core (and every hosted test/example) must
+  register one explicitly, and `current_loop()`/`current_allocator()`
+  fail their precondition immediately (aborting, in a checked build)
+  rather than silently substituting a different loop.
 - **Registration is an explicit, RAII-scoped opt-in
   (`make_current_loop()`), not automatic constructor/destructor
   registration.** Creating a loop and deciding it should be "the"
@@ -89,75 +122,116 @@ constraint:
   own tests are never meant to be "the" current loop at all, so forcing
   every one of them through the same nesting-checked slot would be the
   wrong default. `make_current_loop()` is modeled directly on
-  `platform::override_instance()`'s own shape. The nesting precondition
-  is tracked by a dedicated `detail::loop_is_current` flag in
-  `:util.current_loop`, separately from `get_current_loop_context()`'s
-  own null/non-null answer - see the next point for why that distinction
-  matters.
-- **A caller that never wants to think about `est::loop` at all still
-  gets a genuinely working one.** Rather than `current_loop()` simply
-  failing its precondition until something calls `make_current_loop()`,
-  `hosted_stdcpp`'s own `get_current_loop_context()` falls back to a loop
-  of its own, lazily constructed on first use, whenever nothing has been
-  explicitly registered - driven the same way any other loop is
-  (`est::current_loop().run_until_idle();`), without ever writing
-  `est::loop loop;` by hand. This is exactly why `hosted_stdcpp` needs to
-  name `est::loop` and so can't be one of `est`'s own partitions - see
-  [Architecture](Architecture.md)'s `estext` section for the full module
-  story, and this file's own top comment for why `:platform` itself
-  can't.
-- **`import est;` never installs a backend as a side effect.** That
-  decision belongs to a program's own entry point, not the library.
-  `examples/hello_world/main.cpp` and `examples/sleep_sort/main.cpp`
-  each construct a `hosted_stdcpp` and `override_instance()` it at the
-  top of their own `main()`; `est/tests/`'s own Catch2 binary does the
-  same once, in a small custom `main()` (`est/tests/test_main.cpp`,
-  linked against `Catch2::Catch2` rather than `Catch2::Catch2WithMain`)
-  instead of every individual test file.
+  `platform::override_instance()`'s own shape, and deliberately kept as
+  a *separate* call from it (not unified into one combined "install
+  everything" registration) - see this file's own top comment on
+  `:util.current_loop` for why: some callers (most of
+  `est/tests/platform_tests.cpp`/`timer_tests.cpp`) want to override the
+  platform with no loop involved at all, and some callers install the
+  platform once for an entire program while registering a different loop
+  per operation (`est/tests/loop_tests.cpp`) - two independent,
+  composable registrations fit both shapes; one combined one fits
+  neither as well.
 - **The registration mechanism lives in its own partition,
   `est/src/util/current_loop.cppm` (`:util.current_loop`), as free
-  functions `est::make_current_loop(loop&)`/`est::current_loop()` - not
-  methods on `est::loop` itself.** A primitive ready-queue-and-timers
-  type and an opt-in convenience for not threading a `loop&` by hand are
-  two unrelated concerns; keeping them apart means `loop.cppm` carries
-  no trace of this mechanism. The partition sits above both `:loop`
-  (needs the type) and `:platform` (needs `instance()`) in the
-  dependency DAG, same shape as `estext` one level up - ordinary, since
-  a partition of `est` itself is free to import `:loop` directly (only
-  `:platform` itself, and anything that must stay *below* `:loop`,
-  can't). `detail::loop_is_current` (the nesting flag) lives in this
-  same file, non-exported.
-
-The actual storage is a genuinely typed `est::loop*`, not an opaque
-`void*` - `:platform` names the type via an exported forward declaration
-without needing to complete it; only the concrete backend that
-implements `get_current_loop_context()` needs the complete type, to
-actually construct one. No cast needed on either side. The only call
-sites that ever write into this slot are `make_current_loop()`'s own
-guard and, for `estext::hosted_stdcpp` specifically, its own
-lazily-constructed fallback loop.
+  functions - not methods on `est::loop` itself.** A primitive
+  ready-queue-and-timers type and an opt-in convenience for not threading
+  a `loop&` by hand are two unrelated concerns; keeping them apart means
+  `loop.cppm` carries no trace of this mechanism. The partition only
+  needs `:check`, `:loop`, and `:util.scope_exit` now - it no longer
+  needs `:platform` at all, since the loop's own registration no longer
+  routes through it.
 
 A single slot with a checked precondition against nesting, not a
 push/pop stack like `platform::override_instance()`'s: two loops both
 current at once (one calling `make_current_loop()` while another's guard
-is still alive) is treated as a programming error (an `est::check()`
-failure - see `est/tests/check_tests.cpp`'s own doc comment on why that
-failure path isn't unit-tested here), not "the inner one temporarily
-shadows the outer."
+is still alive, on the same thread/core) is treated as a programming
+error (an `est::check()` failure - see `est/tests/check_tests.cpp`'s own
+doc comment on why that failure path isn't unit-tested here), not "the
+inner one temporarily shadows the outer."
 
-Every free function that takes an explicit `loop&` has a
-matching overload that pulls `est::current_loop()` instead -
-`make_promise_future<T>()`, `sleep_for()`/`sleep_until()`,
-`yield_execution()` (all `est:promise`) - and `est::mutex`/
-`est::counting_event<Mode>` each have a matching no-argument constructor.
-A coroutine returning `est::future<T>`
-can drop the `est::loop&` parameter the same way - see
-[Coroutines](Coroutines.md)'s own calling-convention section for how
-`promise_type` resolves that without ambiguity against the original,
-loop-taking convention. See [Global Lookup Codegen](Global-Lookup-Codegen.md)
-for what going through `current_loop()` actually costs, in real,
-disassembled instructions - the explicit-`loop&` path this section
-describes skips all of it.
+Every one of `make_promise_future<T>()`, `sleep_for()`/`sleep_until()`,
+`yield_execution()` (all `est:promise`), `est::mutex`'s and
+`est::counting_event<Mode>`'s constructors, and a coroutine's own
+`promise_type` (`est:future`) resolves `current_loop()` this way - there is
+no explicit-`loop&`-taking alternative left for any of them (see
+[Coroutines](Coroutines.md)'s own calling-convention section for the one
+wrinkle this leaves behind: a coroutine can still take an `est::loop&`
+*parameter*, but nothing reads it any more). See
+[Global Lookup Codegen](Global-Lookup-Codegen.md) for what going through
+`current_loop()` actually costs, in real, disassembled instructions,
+against the cached-`loop&` design this one replaced.
+
+## A structural hazard: destroying a loop with pending work
+
+Resolving `current_loop()` fresh at every point of use instead of caching
+a `loop&` member (`future_state<T>`, `est::mutex`, `est::counting_event`)
+or a `memory_resource*` (a coroutine frame's own `operator delete`, see
+[Continuation Node Mechanism](Continuation-Node-Mechanism.md)) opens a real
+gap: any of those lookups can resolve to a *different* loop than the one
+that originally created the thing being destroyed, if the current-loop
+registration changed in between. In the ordinary case that's just a
+documented precondition, not something that bites in practice - every
+existing caller keeps a single loop current for the lifetime of everything
+it creates.
+
+`est::loop` itself broke that assumption, and did so in code this
+codebase's own test suite already exercised: the "leaks nothing" family of
+tests (`est/tests/{mutex,event,loop}_tests.cpp`) deliberately destroys a
+loop while a coroutine is still suspended on it, to prove nothing leaks.
+The idiom every one of those tests (and every example) uses is
+
+```cpp
+est::loop loop;
+const auto loop_guard = est::make_current_loop(loop);
+// ... schedule work, possibly abandon some of it ...
+```
+
+C++ destroys locals in reverse declaration order, so `loop_guard` -
+declared *after* `loop`, because it needs `loop` to already exist - always
+runs its destructor *before* `loop`'s. If a still-suspended coroutine's
+frame is torn down from inside `~loop()` (via a queued resume node's
+`destroy()`, which calls the coroutine handle's own `destroy()`, which
+calls the frame's `operator delete`, which resolves `current_allocator()`
+fresh), that lookup runs *after* `loop_guard` has already cleared the
+current-loop slot. The result isn't a documented hazard someone forgot to
+avoid - it's a real, reproducible one. At the time this was found, an
+earlier version of `current_loop()` still had a fallback loop
+(hosted_stdcpp's own, since removed - see the previous section): the
+stranded lookup silently resolved to that *different* `est::loop` object,
+with its own allocator, and the frame got deallocated through the wrong
+`std::pmr::memory_resource`. Observed directly, on this branch, before the
+fix below: allocation/deallocation count mismatches in some tests, and
+outright heap corruption (`SEGFAULT`/`Subprocess aborted` under plain
+`ctest`) in others. With the fallback now gone, the same stranded lookup
+would instead fail its precondition immediately and abort - a real
+improvement (fail fast instead of silent corruption) but not a fix on its
+own: the drain below is still what keeps this from happening at all in
+the first place.
+
+**The fix**: `est::loop::drain_pending()` is a new public method - the
+same "destroy everything still queued, without running it" logic
+`~loop()` already had, factored out and made idempotent - and
+`make_current_loop()`'s returned guard now calls `loop_ref.drain_pending()`
+as the *first* thing its destructor does, before clearing the current-loop
+slot. That drains `loop_ref` (destroying any still-suspended coroutine
+frames, among everything else) while it is still the registered current
+loop, so every `current_loop()` lookup that cascades out of that drain
+resolves correctly. `~loop()` still calls `drain_pending()` itself
+unconditionally, so a loop never registered via `make_current_loop()` at
+all is unaffected - the method is a no-op the second time (or the only
+time) it runs, since by then both containers it drains are already empty.
+
+One real behavioral consequence worth calling out: work scheduled while a
+loop was current but never actually run is now destroyed the moment that
+loop stops being current, not just whenever the loop itself is eventually
+destroyed. Every caller in this codebase already runs a loop to idle
+before its guard goes out of scope, so this doesn't change any existing
+example's or test's behavior - but it is a real narrowing of what used to
+be possible (deferring a loop's remaining work to a later, separate
+`make_current_loop()` scope no longer works). See
+[Global Lookup Codegen](Global-Lookup-Codegen.md) for the rest of this
+experiment's findings.
 
 ## The ready-queue
 
@@ -233,14 +307,21 @@ primitive, `schedule_timer(detail::timer_node&, deadline)`, and
 this split exists):
 
 ```cpp
-[[nodiscard]] inline auto sleep_until(loop& loop_ref, loop::clock::time_point deadline)
-    -> future<void> {
-  auto [prom, fut] = make_promise_future<void>(loop_ref);
-  auto* node = loop_ref.allocator().template new_object<detail::sleep_resume_node>(std::move(prom));
+[[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
+  auto& loop_ref = current_loop();
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
+  auto* node = allocator.template new_object<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }
 ```
+
+`current_loop()` is still resolved here (`schedule_timer()` needs the
+loop itself), but the allocations go through `current_allocator()`
+directly rather than `loop_ref.allocator()` - the same "reach the
+allocator without a detour through the loop pointer" pattern used
+everywhere current_loop() isn't independently needed.
 
 `sleep_resume_node` holds the `promise<void>` directly rather than
 wrapping a generic closure - needed so `destroy(allocator, ran)` can
@@ -252,7 +333,7 @@ stranded-coroutine-frame hazard described in
 [Coroutines](Coroutines.md)'s `lock_resume_node`/`acquire_resume_node`
 section.
 
-`yield_execution(loop&)` gives `loop_ref` the chance to run
+`yield_execution()` gives `current_loop()` the chance to run
 whatever else is already ready before the calling coroutine resumes. It
 has no real deadline to track, so it's a direct
 `detail::yield_resume_node` handed straight to `loop_ref.enqueue_ready()`
@@ -260,9 +341,11 @@ has no real deadline to track, so it's a direct
 all:
 
 ```cpp
-[[nodiscard]] inline auto yield_execution(loop& loop_ref) -> future<void> {
-  auto [prom, fut] = make_promise_future<void>(loop_ref);
-  auto* node = loop_ref.allocator().template new_object<detail::yield_resume_node>(std::move(prom));
+[[nodiscard]] inline auto yield_execution() -> future<void> {
+  auto& loop_ref = current_loop();
+  auto allocator = current_allocator();
+  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
+  auto* node = allocator.template new_object<detail::yield_resume_node>(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }
@@ -275,7 +358,7 @@ comment for why the list is FIFO). `yield_resume_node::destroy()` completes its
 promise with an exception on abandonment rather than silently dropping
 it, for the same reason `mutex::lock_resume_node`'s own doc comment
 gives (`docs/wiki/Coroutines.md`) - a coroutine suspended via `co_await
-yield_execution(loop);` holds the only other reference to its
+yield_execution();` holds the only other reference to its
 `future_state<void>`, so silently dropping the promise would strand that
 coroutine's frame forever if the loop is destroyed first.
 

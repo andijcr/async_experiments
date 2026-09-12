@@ -95,16 +95,21 @@ of once per T" reasoning `ready_node` itself exists for.
 template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
   using decayed_fn = std::decay_t<Fn>;
   using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
-  auto downstream =
-      shared_ptr<future_state<downstream_value_type>>::make(loop_.allocator(), loop_);
+  auto allocator = current_allocator();
+  auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator);
   auto downstream_for_node = downstream; // copy: the node keeps its own reference too
   using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-  auto* node = loop_.allocator().template new_object<node_type>(std::forward<Fn>(fn),
-                                                                 std::move(downstream_for_node));
+  auto* node =
+      allocator.template new_object<node_type>(std::forward<Fn>(fn), std::move(downstream_for_node));
   set_continuation(*node);
   return future<downstream_value_type>(std::move(downstream));
 }
 ```
+
+Only `current_allocator()` is needed to build the downstream state and
+its node - `current_loop()` itself is never resolved here;
+`set_continuation()` resolves it fresh on its own, only if this
+`future_state` already turns out to be ready.
 
 Four things happen, in order:
 1. A **new `future_state<U>`** is created (`U` = `downstream_value_type`,

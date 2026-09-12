@@ -41,7 +41,7 @@ complex `.then()` chain actually cost."
 
 | Operation | Allocations | What they are |
 |---|---|---|
-| `make_promise_future<T>(loop)` | **1** | `future_state<T>` itself (no separate control block - see above) |
+| `make_promise_future<T>()` | **1** | `future_state<T>` itself (no separate control block - see above) |
 | `future<T>::then(fn)` (plain, non-flattening) | **2** | the downstream `future_state<U>`, plus the `concrete_continuation<Fn, U>` node |
 | `est::sleep_for()` / `sleep_until()` | **2** | `future_state<void>`, plus the `sleep_resume_node` node |
 | `.then(fn)` where `fn` returns a `future<V>` (flattening) | **2 up front + 1 more when it runs** | the usual 2 for the visible registration, plus 1 more, *invisible to the caller*, for `detail::flatten_forwarder<V>`'s forwarding node — see below |
@@ -79,7 +79,8 @@ avoids by registering directly on the inner future's `future_state`.
 
 ```cpp
 est::loop loop;
-auto [promise, future] = est::make_promise_future<int>(loop);   // alloc #1: FS0 = future_state<int>
+const auto loop_guard = est::make_current_loop(loop);
+auto [promise, future] = est::make_promise_future<int>();   // alloc #1: FS0 = future_state<int>
 
 auto chained = future
     .then([](int v) { return v * 2; })                          // alloc #2, #3: FS1 + Node_a

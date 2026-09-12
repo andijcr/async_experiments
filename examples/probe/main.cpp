@@ -21,6 +21,15 @@ import std;
   return est::current_loop().allocator().resource();
 }
 
+// current_allocator() - the direct thread_local read, added by the
+// current-loop-only-experiment's thread_local migration specifically so
+// call sites that only need an allocator (most of est's own internals,
+// below) don't have to dereference through the loop pointer first the way
+// probe_loop_allocator() above still does.
+[[gnu::noinline]] auto probe_current_allocator() -> void* {
+  return est::current_allocator().resource();
+}
+
 [[gnu::noinline]] auto probe_platform_instance() -> est::platform::interface* {
   return &est::platform::instance();
 }
@@ -31,15 +40,97 @@ import std;
   return std::move(fut);
 }
 
+// Added for the current-loop-only-experiment branch: probe_make_promise_future()
+// above only shows current_loop() reached *once* per call. est::mutex/
+// est::counting_event/a coroutine's own promise_type now each resolve it
+// independently, per method, instead of caching it once at construction -
+// these two probes show what that repeated resolution actually compiles to.
+
+// Uncontended fast path only - a fresh, never-locked mutex.
+[[gnu::noinline]] auto probe_mutex_lock() -> est::future<void> {
+  est::mutex m;
+  return m.lock();
+}
+
+// No queued waiter - the branch that never touches current_loop() at all,
+// for contrast with lock() above (which always does, even uncontended).
+[[gnu::noinline]] void probe_mutex_unlock_uncontended() {
+  est::mutex m;
+  m.unlock();
+}
+
+// A real coroutine (not make_promise_future() called directly). Never
+// actually suspends (no co_await), so clang's coroutine-frame elision
+// (HALO) proves the heap allocation can be skipped entirely - this probe
+// exercises promise_type's constructor (current_loop() once, to build
+// state_) but *not* its operator new/delete: with elision, there's no
+// heap frame to allocate or free in the first place.
+[[gnu::noinline]] auto probe_coroutine() -> est::future<int> {
+  co_return 42;
+}
+
+// Genuinely suspends on a not-yet-ready future, which HALO can't see
+// through (the frame's lifetime crosses the co_await, so eliding the heap
+// allocation isn't provably safe) - this is the probe that actually
+// exercises coroutine_frame_alloc()/coroutine_frame_dealloc(), each
+// resolving current_loop() independently rather than sharing one lookup.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+[[gnu::noinline]] auto probe_coroutine_suspending(est::future<int>& fut) -> est::future<int> {
+  const int value = co_await fut;
+  co_return value + 1;
+}
+
+// The registration/setup cost itself - est::make_current_loop() and
+// est::platform::override_instance(), each noinline'd so they survive as
+// real call sites instead of folding into main(). Both now write into
+// thread_local storage directly (est:util.current_loop, :platform) rather
+// than routing a loop pointer through platform::interface's own vtable
+// the way an earlier version of this mechanism did - see
+// docs/wiki/Loop-And-Timers.md and docs/wiki/Global-Lookup-Codegen.md for
+// the before/after.
+[[gnu::noinline]] auto probe_make_current_loop(est::loop& loop_ref) noexcept {
+  return est::make_current_loop(loop_ref);
+}
+
+[[gnu::noinline]] auto probe_override_instance(est::platform::interface& platform_ref) noexcept {
+  return est::platform::override_instance(platform_ref);
+}
+
 auto main() -> int {
   estext::hosted_stdcpp platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
 
   try {
-    std::println("{}", static_cast<void*>(probe_current_loop()));
-    std::println("{}", probe_loop_allocator());
-    std::println("{}", static_cast<void*>(probe_platform_instance()));
-    std::println("{}", probe_make_promise_future().get());
+    {
+      // No implicit fallback loop any more (est:util.current_loop) - every
+      // probe below that touches current_loop()/current_allocator(),
+      // directly or indirectly, needs one explicitly registered first.
+      est::loop loop;
+      const auto loop_guard = est::make_current_loop(loop);
+
+      std::println("{}", static_cast<void*>(probe_current_loop()));
+      std::println("{}", probe_loop_allocator());
+      std::println("{}", probe_current_allocator());
+      std::println("{}", static_cast<void*>(probe_platform_instance()));
+      std::println("{}", probe_make_promise_future().get());
+      probe_mutex_lock().get();
+      probe_mutex_unlock_uncontended();
+      std::println("{}", probe_coroutine().get());
+
+      auto [prom, fut] = est::make_promise_future<int>();
+      auto suspended = probe_coroutine_suspending(fut); // suspends - fut isn't ready yet
+      prom.set_value(41);
+      est::current_loop().run_until_idle(); // resumes it, frame freed
+      std::println("{}", suspended.get());
+    } // loop_guard released - loop_is_current back to false for the setup-cost probes below
+
+    est::loop mcl_loop;
+    {
+      const auto guard = probe_make_current_loop(mcl_loop);
+    }
+    {
+      const auto guard = probe_override_instance(platform_instance);
+    }
   } catch (...) {
     return EXIT_FAILURE;
   }

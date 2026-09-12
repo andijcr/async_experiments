@@ -58,7 +58,8 @@ private:
 
 TEST_CASE("co_await lock() acquires immediately when unlocked", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
@@ -79,7 +80,8 @@ TEST_CASE("co_await lock() acquires immediately when unlocked", "[mutex]") {
 
 TEST_CASE("unlock() releases the lock when nothing is waiting", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
@@ -101,8 +103,9 @@ TEST_CASE("unlock() releases the lock when nothing is waiting", "[mutex]") {
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("a second co_await lock() suspends until the first coroutine unlocks", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
-  auto [release_promise, release_future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
+  auto [release_promise, release_future] = est::make_promise_future<void>();
   std::vector<int> order;
 
   // Acquires, records itself, then stays suspended (holding the lock)
@@ -157,8 +160,9 @@ TEST_CASE("a second co_await lock() suspends until the first coroutine unlocks",
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_CASE("unlock() resumes queued waiters in FIFO order", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
-  auto [release_promise, release_future] = est::make_promise_future<void>(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
+  auto [release_promise, release_future] = est::make_promise_future<void>();
   std::vector<int> order;
 
   // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
@@ -215,7 +219,8 @@ TEST_CASE("unlock() resumes queued waiters in FIFO order", "[mutex]") {
 
 TEST_CASE("acquire() on an unlocked mutex returns an already-ready future", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
 
   auto fut = m.acquire();
   REQUIRE(fut.ready()); // fast path - completes the promise immediately
@@ -228,7 +233,8 @@ TEST_CASE("acquire() on an unlocked mutex returns an already-ready future", "[mu
 
 TEST_CASE("dropping the lock_guard unlocks the mutex", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
 
   {
     auto guard = m.acquire().get();
@@ -239,7 +245,8 @@ TEST_CASE("dropping the lock_guard unlocks the mutex", "[mutex]") {
 
 TEST_CASE("moving a lock_guard transfers ownership of the unlock", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
 
   auto first = m.acquire().get();
   {
@@ -254,7 +261,8 @@ TEST_CASE("moving a lock_guard transfers ownership of the unlock", "[mutex]") {
 
 TEST_CASE("acquire() on a locked mutex defers until the holder's guard is dropped", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
 
   auto holder = m.acquire().get();
   auto fut = m.acquire();
@@ -278,7 +286,8 @@ TEST_CASE("acquire() on a locked mutex defers until the holder's guard is droppe
 
 TEST_CASE("acquire() can be co_await'ed from inside a coroutine", "[mutex]") {
   est::loop loop;
-  est::mutex m(loop);
+  const auto loop_guard = est::make_current_loop(loop);
+  est::mutex m;
 
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto coro = [](est::loop&, est::mutex& mutex_ref) -> est::future<bool> {
@@ -301,7 +310,8 @@ TEST_CASE("destroying a mutex with a future<lock_guard> still queued on acquire(
   counting_resource resource;
   {
     est::loop loop{&resource};
-    est::mutex m(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    est::mutex m;
 
     auto holder = m.acquire().get(); // never dropped - holds the lock forever
     auto waiter_fut = m.acquire();
@@ -335,7 +345,8 @@ TEST_CASE("destroying a mutex with a coroutine co_await-ing acquire() still pend
   counting_resource resource;
   {
     est::loop loop{&resource};
-    est::mutex m(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    est::mutex m;
 
     auto holder = m.acquire().get(); // never dropped - holds the lock forever
 
@@ -364,7 +375,8 @@ TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks noth
   counting_resource resource;
   {
     est::loop loop{&resource};
-    est::mutex m(loop);
+    const auto loop_guard = est::make_current_loop(loop);
+    est::mutex m;
 
     // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
     auto holder = [](est::loop&, est::mutex& mutex_ref) -> est::future<void> {
@@ -391,7 +403,7 @@ TEST_CASE("destroying a mutex with a coroutine still queued on lock() leaks noth
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-TEST_CASE("mutex() with no loop argument uses est::current_loop()", "[mutex]") {
+TEST_CASE("mutex() default-constructs and uses est::current_loop()", "[mutex]") {
   est::loop loop;
   const auto guard = est::make_current_loop(loop);
   est::mutex m;
@@ -400,4 +412,24 @@ TEST_CASE("mutex() with no loop argument uses est::current_loop()", "[mutex]") {
   auto fut = m.lock();
   REQUIRE(fut.ready());
   REQUIRE(m.locked());
+}
+
+TEST_CASE("an unlocked mutex with no waiters can be dropped after its loop stops being current",
+          "[mutex]") {
+  // Guards mutex::~mutex() checking has_waiters() before resolving
+  // current_loop(): a mutex with nothing queued needs no loop at all to
+  // be destroyed, and must not fail current_loop()'s own precondition
+  // just because none happens to be registered any more by the time it
+  // goes out of scope.
+  est::mutex m;
+  {
+    est::loop loop;
+    const auto guard = est::make_current_loop(loop);
+    m.lock().get(); // uncontended fast path
+    m.unlock();
+  } // guard exits - no loop is current from here on
+
+  REQUIRE_FALSE(m.locked());
+  // `m` is destroyed at the end of this scope with no loop current - must
+  // not abort.
 }
