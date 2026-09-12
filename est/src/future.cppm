@@ -27,11 +27,28 @@ namespace est::detail {
 // The T-dependent half of a queued continuation, sitting on top of
 // est:loop's own type-erased detail::ready_node (see that partition's
 // doc comment on why :loop can't instead depend on :future): adds only
-// the one thing that actually needs T (invoke()), plus the plumbing
-// run() needs to call it once est::loop actually dequeues and runs this
-// node. Not nested inside future_state<T> - it's an implementation
-// detail of :future, not part of future_state's public surface, so it
-// lives here instead.
+// the one thing that actually needs T (owner_, and bind_owner() to set
+// it). Not nested inside future_state<T> - it's an implementation detail
+// of :future, not part of future_state's public surface, so it lives
+// here instead.
+//
+// Deliberately *not* the home of run() itself: an earlier version of
+// this class implemented ready_node::run() once, here, as
+// `invoke(*owner_)`, with each concrete node instead overriding a
+// second, separately virtual invoke(future_state<T>&). That bought
+// nothing - the only thing invoke() was ever called with was *owner_,
+// so state was always just this class's own owner_ read back through a
+// parameter - while costing a second, non-devirtualizable virtual call
+// (est::loop's ready_.dequeue() only ever holds a ready_node&, so
+// run()'s own dispatch can't statically know which invoke() override
+// it's about to make a *second* indirect call to) on every single
+// continuation this framework ever runs. bind_owner()/owner_ stays
+// shared here since sharing it is genuinely free - it's a plain data
+// member and a non-virtual setter, not something a second vtable slot
+// was ever paying for - but run() itself now belongs to each concrete
+// node below (concrete_continuation<Fn, U>, flatten_forwarder<T>,
+// future_resume_node<T>), which reads owner_ directly instead of
+// through a parameter. See issue #63 / docs/PLAN.md for the reasoning.
 //
 // Written *before* future_state<T> (below) in this file, but owner_'s
 // shared_ptr<future_state<T>> only actually needs future_state<T>
@@ -44,10 +61,6 @@ namespace est::detail {
 // circular completeness requirement between the two classes.
 template <class T> class continuation_node : public detail::ready_node {
 public:
-  void run() final { invoke(*owner_); }
-
-  virtual void invoke(future_state<T>& state) = 0;
-
   // Called exactly once, by future_state<T>::complete()/
   // set_continuation() right before this node is handed to
   // est::loop::enqueue_ready() - takes real shared ownership of the
@@ -62,7 +75,11 @@ public:
   // instead of destroying it (and its still-pending nodes) normally.
   void bind_owner(shared_ptr<future_state<T>> owner) { owner_ = std::move(owner); }
 
-private:
+protected:
+  // Protected, not private: every concrete node below reads this
+  // directly from its own run() override instead of through a passed-in
+  // parameter (see this class's own doc comment above for why).
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   shared_ptr<future_state<T>> owner_;
 };
 
@@ -81,7 +98,12 @@ public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
       : downstream_(std::move(downstream)) {}
 
-  void invoke(future_state<T>& state) override {
+  // Reads owner_ (continuation_node<T>) directly rather than taking a
+  // future_state<T>& parameter - see continuation_node<T>'s own doc
+  // comment on why run() lives here now instead of behind a second,
+  // separately virtual invoke().
+  void run() final {
+    auto& state = *this->owner_;
     if (state.failed()) {
       downstream_->set_exception(state.get_exception());
       return;
@@ -562,7 +584,12 @@ private:
     concrete_continuation(Fn fn, shared_ptr<future_state<U>> downstream)
         : fn_(std::move(fn)), downstream_(std::move(downstream)) {}
 
-    void invoke(future_state& state) override {
+    // Reads owner_ (continuation_node<T>) directly rather than taking a
+    // future_state<T>& parameter - see continuation_node<T>'s own doc
+    // comment on why run() lives here now instead of behind a second,
+    // separately virtual invoke().
+    void run() final {
+      auto& state = *this->owner_;
       try {
         if constexpr (detail::invocable_unwrapped<Fn, T>()) {
           if (state.failed()) {
@@ -999,16 +1026,13 @@ template <class T> class future_resume_node final : public continuation_node<T> 
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
 
-  // future_state<T>& /*unused*/: continuation_node<T>::invoke() must take
-  // one - this node doesn't need it for anything beyond satisfying that
-  // signature.
-  void invoke(future_state<T>& /*unused*/) override { handle_.resume(); }
+  void run() final { handle_.resume(); }
 
-  // Called only when invoke() never ran (the future_state this node was
+  // Called only when run() never ran (the future_state this node was
   // registered on was dropped without ever completing, per
   // ready_node::abandon()'s own doc comment, est:loop) - the awaiting
   // coroutine is still fully intact and untouched, so this is the only
-  // chance to free its frame. Never called once invoke() has run: the
+  // chance to free its frame. Never called once run() has run: the
   // coroutine either already self-destroyed or suspended again on
   // something else that now owns it, and touching handle_ then would be
   // wrong either way.

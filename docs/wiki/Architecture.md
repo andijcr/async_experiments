@@ -213,7 +213,10 @@ trio, the ready-queue's element type) and `est::detail::timer_node`
 (`fire()` + the same pair, the pending-timer list's element type) — and
 knows nothing about futures, promises, or continuations at all.
 `:future`'s `continuation_node<T>` then *inherits* `ready_node` (adding the
-one T-dependent thing it needs, `invoke(future_state<T>&)`), and
+one T-dependent thing it needs, `owner_`, a `shared_ptr<future_state<T>>`
+kept alive via `bind_owner()` — see [Continuation Node
+Mechanism](Continuation-Node-Mechanism.md) for why `run()` itself is left
+to each concrete node rather than shared here), and
 `:promise`'s `sleep_for()`/`sleep_until()` build a `sleep_resume_node`
 directly on top of `timer_node` (no generic callback-wrapping layer - it
 holds the `promise<void>` itself) to bridge a fired timer into a
