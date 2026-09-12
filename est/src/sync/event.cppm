@@ -79,14 +79,15 @@ private:
 export namespace est {
 
 // A cooperative-scheduling counting event: an awaitable generalization of
-// a counting semaphore, built the same way est::mutex is (est:sync.mutex,
-// see its own top comment for the underlying rationale) - a plain int
-// count, an est::intrusive_list<detail::ready_node> waiters_ queue, and
+// a counting semaphore - a plain int count, an
+// est::intrusive_list<detail::ready_node> waiters_ queue, and
 // detail::event_resume_node (above) completing an est::promise<void> once
-// a waiter is satisfied. wait() returns a plain future<void>, exactly
-// like mutex::lock() - already-satisfied wait() resumes immediately,
-// through future_awaiter<T>'s own already-ready fast path (est:future),
-// with no extra allocation or suspension.
+// a waiter is satisfied. est::mutex (est:sync.mutex) is built directly on
+// top of this class (a binary_event<EventResetMode::automatic> member),
+// not a separate, similarly-shaped implementation of its own. wait()
+// returns a plain future<void> - already-satisfied wait() resumes
+// immediately, through future_awaiter<T>'s own already-ready fast path
+// (est:future), with no extra allocation or suspension.
 //
 // est::binary_event<Mode> and est::one_shot_event<Mode> (both below) are
 // derived from this - not separate implementations - each one layering

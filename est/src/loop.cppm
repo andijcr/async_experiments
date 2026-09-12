@@ -93,10 +93,11 @@ public:
 // The "this node never ran/fired - complete it however abandon() does
 // that, then free it" pattern every drain-without-running call site
 // needs: loop::drain_pending() (below, for both containers it drains),
-// and every future_state<T>/mutex/counting_event<Mode> destructor that
-// drains a still-queued waiters_ list (est:future, est:sync.mutex,
-// est:sync.event) - repeating the two-line body inline at each of those
-// call sites would just be the same pair of statements copied five
+// and every future_state<T>/counting_event<Mode> destructor that drains
+// a still-queued waiters_ list (est:future, est:sync.event - est::mutex,
+// est:sync.mutex, has neither any more, having no waiters_ of its own to
+// drain) - repeating the two-line body inline at each of those call
+// sites would just be the same pair of statements copied several
 // times. Two separate, non-overloaded functions rather than one
 // overloaded on `ready_node&`/`timer_node&`: `intrusive_list<ready_node>::
 // drain(Fn)` (used by every one of the waiters_ call sites above) deduces
