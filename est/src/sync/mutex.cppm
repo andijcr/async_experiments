@@ -67,10 +67,7 @@ public:
     if (waiters_.empty()) {
       return;
     }
-    waiters_.drain([](detail::ready_node& node) {
-      node.abandon();
-      delete &node;
-    });
+    waiters_.drain(detail::abandon_ready_node);
   }
 
   [[nodiscard]] auto locked() const noexcept -> bool { return state_ != 0; }

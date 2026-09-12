@@ -3999,10 +3999,90 @@ concrete node type defines its own"), plus two stale doc-comment
 cross-references to a since-removed `future_state<T>::allocator()`
 method caught by the same review pass (`est/src/future.cppm`).
 
+**`current_allocator_new_delete<T>`'s own special members, settled by
+`clang-tidy`:** the mixin has no data, so its first cut left every
+special member implicit (rule of zero) apart from a private default
+constructor (+ `friend Derived`) guarding against unrelated construction
+- but `clang-tidy` flagged that as `cppcoreguidelines-special-member-
+functions` ("declares one, not the others") the moment a destructor was
+added explicitly to quiet a *different* check
+(`performance-trivially-destructible`, which wants an explicit
+`=default` destructor even though the fully-implicit one is already
+trivial). The two checks want contradictory things for this exact shape
+(private constructor + `friend Derived`) - genuinely, not just a matter
+of ordering: adding the destructor `performance-trivially-destructible`
+asks for immediately re-triggers `cppcoreguidelines-special-member-
+functions`, and removing it to satisfy that one re-triggers the first
+again. Settled by keeping rule-of-zero (the actually-correct state) and
+suppressing the false positive with a `NOLINTNEXTLINE` directly above
+the class - which itself needs to be the literal line before the class
+declaration, not several explanatory-comment lines above it:
+`NOLINTNEXTLINE` only suppresses the one line immediately following the
+comment, a mistake this branch's own history made once already before
+being fixed.
+
 **Verified in the pinned Docker devenv:** existing test suite passes
 unchanged (pure refactor, no new observable behavior);
 `clang-format`/`clang-tidy` clean; full suite passes under the
 `sanitize` preset (ASan+UBSan) too.
+
+### `abandon()`-then-`delete` deduplicated into `abandon_ready_node()`/`abandon_timer_node()` (done)
+
+Second code-review follow-up: every drain-without-running call site
+introduced by the `destroy()` → `abandon()` refactor above
+(`future_state<T>::~future_state()`, `mutex::~mutex()`,
+`counting_event<Mode>::~counting_event()`, and both containers
+`loop::drain_pending()` itself drains) repeated the identical two-line
+body - `node.abandon(); delete &node;` (or `delete entry.node;` for a
+`timer_node*`) - either inline or as a one-off lambda passed to
+`intrusive_list<ready_node>::drain()`. Lifted into two free functions
+living in `:loop` (`est/src/loop.cppm`), right next to `ready_node`/
+`timer_node`'s own definitions - the natural home, since they're the
+classes that define the `abandon()` contract in the first place:
+
+```cpp
+inline void abandon_ready_node(ready_node& node) noexcept {
+  node.abandon();
+  delete &node;
+}
+inline void abandon_timer_node(timer_node& node) noexcept {
+  node.abandon();
+  delete &node;
+}
+```
+
+Two separate, non-overloaded functions rather than one function
+overloaded on `ready_node&`/`timer_node&`: every `waiters_.drain(...)`
+call site passes the function directly (`waiters_.drain(detail::
+abandon_ready_node);`) rather than wrapping it in a lambda, and
+`intrusive_list<T>::drain(Fn fn)` deduces its own `Fn` template
+parameter from that argument - deduction that only works when the name
+resolves to exactly one type. An overloaded name has no single type
+until *after* overload resolution has already run, so passing an
+overloaded name straight to a deducing `Fn` parameter is ill-formed, not
+a matter of which overload a reader would expect to be picked. Since
+`timer_node`'s own abandonment never goes through `intrusive_list<T>`
+(`loop::drain_pending()`'s `pending_timers_` is a plain
+`std::pmr::vector`, not an intrusive list), only `abandon_ready_node` is
+ever passed this way in practice - `abandon_timer_node` is always called
+directly - but keeping both non-overloaded avoids the trap regardless.
+
+Considered and rejected: lifting this into `est::intrusive_list<T>`
+itself (a `drain_abandoning()` method, say). `:util.intrusive_list` is
+deliberately a generic utility with no notion of `abandon()` or
+allocator-routed deletion - coupling it to `ready_node`'s specific
+lifecycle contract would be the wrong layer for it, even though every
+current instantiation happens to be `intrusive_list<detail::ready_node>`
+in practice.
+
+No behavior change: each call site now reads `waiters_.drain(detail::
+abandon_ready_node);` (or a direct call to one of the two functions)
+instead of a hand-written lambda/pair of statements, but every code path
+still does exactly what it did before.
+
+**Verified in the pinned Docker devenv:** existing test suite passes
+unchanged (pure refactor); `clang-format`/`clang-tidy` clean; full suite
+passes under the `sanitize` preset (ASan+UBSan) too.
 
 ---
 

@@ -155,6 +155,24 @@ namespace est::detail {
 // ordinary class - its own real alignment is already known at the point
 // this template is instantiated for it, so there is no reason to
 // over-align generically instead.
+//
+// Only the default constructor is declared, and only to make it private:
+// rule-of-zero otherwise - this mixin carries no data, so an implicitly
+// generated (and trivial) copy, move, and destructor are all harmless,
+// and declaring any of them explicitly just to keep them alongside a
+// hand-written destructor would make the destructor no longer trivial
+// for no actual benefit. The private constructor + `friend Derived`
+// still does the one bit of hardening worth having: nothing but Derived
+// itself (or something Derived further friends) can construct this base
+// standalone, let alone derive from it unrelated to Derived. clang-tidy's
+// performance-trivially-destructible still wants an explicit `=default`
+// destructor here regardless - a false positive for this exact shape,
+// since adding one would immediately trip
+// cppcoreguidelines-special-member-functions right back (declaring one
+// special member but not the other four); the two checks want
+// contradictory things for this class, and rule-of-zero is the one
+// that's actually correct.
+// NOLINTNEXTLINE(performance-trivially-destructible)
 template <class Derived> class current_allocator_new_delete {
 public:
   static auto operator new(std::size_t size) -> void* {
@@ -163,6 +181,10 @@ public:
   static void operator delete(void* ptr, std::size_t size) noexcept {
     current_allocator().resource()->deallocate(ptr, size, alignof(Derived));
   }
+
+private:
+  current_allocator_new_delete() = default;
+  friend Derived;
 };
 
 } // namespace est::detail

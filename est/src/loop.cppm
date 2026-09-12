@@ -89,6 +89,31 @@ public:
   virtual void abandon() noexcept {}
 };
 
+// The "this node never ran/fired - complete it however abandon() does
+// that, then free it" pattern every drain-without-running call site
+// needs: loop::drain_pending() (below, for both containers it drains),
+// and every future_state<T>/mutex/counting_event<Mode> destructor that
+// drains a still-queued waiters_ list (est:future, est:sync.mutex,
+// est:sync.event) - repeating the two-line body inline at each of those
+// call sites would just be the same pair of statements copied five
+// times. Two separate, non-overloaded functions rather than one
+// overloaded on `ready_node&`/`timer_node&`: `intrusive_list<ready_node>::
+// drain(Fn)` (used by every one of the waiters_ call sites above) deduces
+// its own `Fn` template parameter directly from the function passed to
+// it, which only works for a name that resolves to exactly one type -
+// an overloaded name has no single type to deduce until *after*
+// overload resolution has already picked one, so passing it straight to
+// a deducing `Fn` parameter is ill-formed, not just a matter of which
+// overload a reader would expect to be picked.
+inline void abandon_ready_node(ready_node& node) noexcept {
+  node.abandon();
+  delete &node;
+}
+inline void abandon_timer_node(timer_node& node) noexcept {
+  node.abandon();
+  delete &node;
+}
+
 } // namespace est::detail
 
 export namespace est {
@@ -241,14 +266,10 @@ public:
   void drain_pending() noexcept {
     for (const auto& entry : pending_timers_) {
       timers_.cancel(entry.id);
-      entry.node->abandon();
-      delete entry.node;
+      detail::abandon_timer_node(*entry.node);
     }
     pending_timers_.clear();
-    ready_.drain([](detail::ready_node& node) {
-      node.abandon();
-      delete &node;
-    });
+    ready_.drain(detail::abandon_ready_node);
   }
 
 private:
