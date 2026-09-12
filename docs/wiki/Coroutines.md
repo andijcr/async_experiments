@@ -327,11 +327,14 @@ The lvalue path (`future.get()`) *copies* the stored value out of
 Mechanism](Continuation-Node-Mechanism.md#the-two-calling-conventions))
 can register any number of independent continuations against one
 `future_state` and let every one of them read the result safely, however
-many there are. The rvalue path (`std::move(future).get()`) *moves* it
-out instead, and a move doesn't reset `result_` — it just leaves whatever
-moved-from state `T` ends up in sitting there permanently, since nothing
-else ever touches that variant again. `await_resume()` above always takes
-this path.
+many there are — `.then()` only ever moves instead of copying when its own
+node turns out to be the *sole* surviving `shared_ptr<future_state<T>>`
+owner (issue #64; see the linked page), which by definition rules out any
+sibling continuation left to strand. The rvalue path (`std::move(future).
+get()`) *moves* it out instead, and a move doesn't reset `result_` — it
+just leaves whatever moved-from state `T` ends up in sitting there
+permanently, since nothing else ever touches that variant again.
+`await_resume()` above always takes this path.
 
 So: if `future<T>` were copyable, nothing would stop two copies each
 `co_await`ing their own handle to the same `future_state`. The first one
@@ -368,8 +371,7 @@ clever-looking fixes:
   "how many will ever exist" — a value moved out (or discarded) right
   then based on that count would break any consumer that shows up later.
   `result_` has to stay in `future_state` for as long as the
-  `future_state` itself lives, which is exactly what the always-copying
-  `.then()` path relies on.
+  `future_state` itself lives.
 - **A refcount check at each `get()` call doesn't line up with when
   consumption actually happens either.** `future_resume_node<T>` (above)
   binds its own `shared_ptr<future_state<T>>` reference before being
@@ -384,14 +386,24 @@ clever-looking fixes:
 
 The general shape of "move if you're the last owner, copy otherwise" is a
 real, useful pattern elsewhere (`Rc::try_unwrap` in Rust; copy-on-write
-strings) — it just doesn't have a sound place to hook into *this*
-specific design without changing what triggers a consumption in the first
-place. `.then()`, already always on the non-consuming path regardless of
-count, is the existing answer for "more than one independent reaction to
-one result." `future<T>::clone()` makes an explicit alias of the same
-`future_state<T>` available to an arbitrary caller too, but only for
-`T = void` or a scalar `T` - see `future<T>::clone()`'s own doc comment
-(`future.cppm`) for why every other `T` would reopen exactly this hazard.
+strings), and `.then()`'s own unwrapped dispatch *does* use exactly this
+shape (issue #64; [Continuation Node
+Mechanism](Continuation-Node-Mechanism.md#the-two-calling-conventions)) —
+but it can do so only because the check and the consumption happen
+together, synchronously, inside the same node's own `run()`, checking the
+very `shared_ptr<future_state<T>>` (`owner_`) that call is about to read
+through: nothing else can be a third party holding a reference the check
+doesn't see. `get()`/`await_resume()` can't reuse that trick for the
+reason spelled out just above — the object making the "am I the sole
+owner" decision (`future<T>::get()`) and the object guaranteed to be
+holding a reference at that exact moment (the resume node driving the
+resumption) aren't the same `shared_ptr`, so the check would almost never
+see what it's actually looking for. `.then()`'s move path sidesteps this
+by being both the checker and the consumer in one. `future<T>::clone()`
+makes an explicit alias of the same `future_state<T>` available to an
+arbitrary caller too, but only for `T = void` or a scalar `T` - see
+`future<T>::clone()`'s own doc comment (`future.cppm`) for why every
+other `T` would reopen exactly this hazard.
 
 ### Composability, concretely
 

@@ -147,6 +147,21 @@ public:
 
   explicit operator bool() const noexcept { return control_ != nullptr; }
 
+  // The number of shared_ptr<T> instances (including *this) currently
+  // sharing this control block - 0 for an empty (default-constructed or
+  // moved-from) shared_ptr, which owns nothing to count. Lets a caller
+  // that already holds the last reference to something take a cheaper
+  // path than a caller sharing it with others would - see
+  // future_state<T>::concrete_continuation<Fn, U>::run() (est:future,
+  // issue #64) for the one real use of this today: it's safe to move the
+  // stored value out, instead of copying/referencing it, exactly when
+  // `count() == 1` on the shared_ptr<future_state<T>> a continuation
+  // node holds, since nothing else can be left to observe the
+  // moved-from state afterward.
+  [[nodiscard]] auto count() const noexcept -> int {
+    return control_ != nullptr ? control_->ref_count : 0;
+  }
+
 private:
   struct control_block {
     template <class... Args>
@@ -243,6 +258,12 @@ public:
   auto operator->() const noexcept -> T* { return ptr_; }
 
   explicit operator bool() const noexcept { return ptr_ != nullptr; }
+
+  // Same contract as the primary template's own count() - see its doc
+  // comment.
+  [[nodiscard]] auto count() const noexcept -> int {
+    return ptr_ != nullptr ? ptr_->ref_count_ : 0;
+  }
 
 private:
   // ref_counted::shared_from_this() is the only caller of the

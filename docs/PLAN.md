@@ -4242,6 +4242,103 @@ the `flatten_forwarder<T>` abandonment regression test above);
 
 ---
 
+### `shared_ptr<T>::count()`, issue #64 & #71: `then()` moves instead of copying when it's the last owner
+
+Three pieces, requested and sequenced in that order: a public `count()`
+accessor on `est::shared_ptr<T>` first, then issue #64 built on top of it,
+then issue #71 - which the ref-count check in #64 makes genuinely a
+one-line addition.
+
+**`shared_ptr<T>::count()`** (`est/src/util/shared_ptr.cppm`, both the
+primary control_block-based template and the `ref_counted`-based
+intrusive specialization): returns how many `shared_ptr<T>` instances
+currently share this object's control block/ref count - 0 for an empty
+or moved-from `shared_ptr`. No new state; both specializations already
+carry the ref count `reset()`/copy already maintain, just not previously
+exposed.
+
+**Issue #64.** `future_state<T>::concrete_continuation<Fn, U>::run()`'s
+unwrapped, non-void, non-failed branch used to always call `state.get()`
+(the non-consuming `const T&` overload), even when nothing else was left
+to observe the future_state afterward. It now checks
+`this->owner_.count() == 1` first - `owner_` is this node's own
+`shared_ptr<future_state<T>>`, bound via `bind_owner()`; if the count
+comes back 1, this node is the only reference left (no live
+`future`/`promise` handle, no sibling continuation), so
+`std::move(state).get()` is used instead, turning what would otherwise
+be a copy (for an `Fn` taking `T` by value) or a harmless no-op
+distinction (for `const T&`) into an actual move. Gated on
+`std::invocable<Fn&, T&&>` at compile time (an `if constexpr`, checked
+before the runtime `count()` branch): a purely lvalue-binding callback
+like `[](auto& value) {...}` - invocable with `const T&` (which is what
+`then_callback_for`/`invocable_unwrapped` already require) but not with
+`T&&` - stays on the plain `state.get()` path unconditionally, since it
+means to observe the value in place, not receive a moved-from one.
+
+**Issue #71.** `future<T>::then(Fn&&)` split into two ref-qualified
+overloads - `&` (the original behavior, unchanged) and a new `&&`
+overload that moves this handle's own `shared_ptr<future_state<T>>` into
+a local before delegating to `future_state<T>::then()`, dropping this
+handle's reference immediately rather than leaving it held until `*this`
+goes out of scope. A member function can't mix a ref-unqualified
+overload with a ref-qualified one of the same signature (a real, "class
+member cannot be redeclared" compile error, not just an overload-
+resolution ambiguity) - hence marking the existing overload `&` rather
+than leaving it unqualified. Every existing call site is unaffected:
+lvalue calls still resolve to `&`, rvalue calls (including a plain
+temporary, already an rvalue) to `&&`, exactly as before from the
+caller's perspective. The net effect: `std::move(future).then(fn)`
+(or a temporary's `.then(fn)`) makes `owner_.count() == 1` come back true
+one reference sooner, letting issue #64's move path fire in more cases -
+e.g. a `.then()` chain where nothing else ever held onto an intermediate
+`future<T>`.
+
+**A real compile-time subtlety surfaced (and fixed) during
+verification.** `std::exchange(state_, nullptr)` doesn't compile for the
+`&&` overload's implementation - `shared_ptr<T>` has no implicit
+conversion from `nullptr_t`, so `state_ = nullptr` (what `std::exchange`
+needs to do internally) is ill-formed. Replaced with an explicit
+move-construct into a local (`auto state = std::move(state_);`) instead,
+which correctly empties `state_` via `shared_ptr`'s own move constructor.
+
+**Docs updated to match:** `docs/wiki/Continuation-Node-Mechanism.md`'s
+"The two calling conventions" code excerpt and prose (the move branch
+added to the `run()` snippet, with the `invocable<Fn&, T&&>` gate
+explained); `docs/wiki/Coroutines.md`'s "Why `future<T>` can't be
+copyable" section, which previously described `.then()`'s unwrapped
+dispatch as "always-copying" and stated outright that the general
+"move if you're the last owner, copy otherwise" pattern "doesn't have a
+sound place to hook into this specific design" - both no longer true.
+The corrected version explains why the pattern *does* work for `.then()`
+(the check and the consumption happen together, synchronously, inside
+the same node's own `run()`, on the very `shared_ptr` that call is about
+to read through) but still can't work for `get()`/`await_resume()` (the
+object making the "am I sole owner" decision and the object guaranteed
+to hold a reference at that moment - the resume node driving the
+resumption - aren't the same `shared_ptr`).
+
+**Tests added:** three `shared_ptr_tests.cpp` cases for `count()` itself
+(tracks copies/drops for both specializations; 0 for empty/moved-from);
+three `future_tests.cpp` cases using a new `copy_move_tracker` helper
+(counts copy- vs move-constructions, inheriting the running count from
+its source) - the negative case (another handle still shares the
+future_state, so the callback's by-value parameter is copy-constructed),
+issue #64's positive case (promise and future both confined to an IIFE
+and dropped before the loop drains, so the node is the sole owner by the
+time it runs), and issue #71's own isolated contribution (promise
+dropped explicitly, but the future handle deliberately kept alive
+through `run_until_idle()` - proving the `&&` overload's explicit
+release matters, not just the temporary's natural lifetime).
+
+**Verified in the pinned Docker devenv, from a from-scratch build (no
+cached BMIs, to rule out stale build state):** 179/179 tests pass (six
+new: three for `count()`, three for #64/#71); `clang-format`/`clang-tidy`
+clean; 146/146 tests pass under the `sanitize` preset (ASan+UBSan) too;
+`diff-cover` coverage gate against `main` at 100% (121/121 changed lines
+covered).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
