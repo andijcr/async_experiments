@@ -208,9 +208,9 @@ import each other in C++20 modules (or in any sane build), so one direction
 has to give.
 
 The fix: `:loop` defines its *own* minimal type-erased bases —
-`est::detail::ready_node` (a `run()` + `destroy(allocator, ran)` pair, the
-ready-queue's element type) and `est::detail::timer_node` (`fire()` +
-`destroy(allocator, ran)`, the pending-timer list's element type) — and
+`est::detail::ready_node` (a `run()` + virtual destructor + `abandon()`
+trio, the ready-queue's element type) and `est::detail::timer_node`
+(`fire()` + the same pair, the pending-timer list's element type) — and
 knows nothing about futures, promises, or continuations at all.
 `:future`'s `continuation_node<T>` then *inherits* `ready_node` (adding the
 one T-dependent thing it needs, `invoke(future_state<T>&)`), and

@@ -3796,6 +3796,92 @@ clean across every touched and new file (`est/src/util/current_loop.cppm`,
 byte-identical to `main`; full suite passes under the `sanitize` preset
 (ASan+UBSan) too; both example binaries still run correctly.
 
+### `ready_node`/`timer_node::destroy()` replaced with a plain virtual destructor + `abandon()` (done)
+
+Follow-up on "`ready_node`/`timer_node::destroy()` takes `ran` as a
+parameter; issue #50 fixed" above: `destroy(allocator, ran)` still had to
+exist as a hand-rolled virtual method purely so each concrete node could
+deallocate itself through its own most-derived type - `ready_node`/
+`timer_node`'s own doc comments called this out directly ("the whole
+reason `destroy()` is virtual instead of the caller deallocating through
+a `detail::ready_node&`"). Plain C++ already has a mechanism for exactly
+this: a class with a virtual destructor deallocates through the *dynamic*
+type's own visible `operator delete`, with the dynamic type's own correct
+size - never the static (base) one - when deleted through a base
+pointer/reference. `est::future<T>::promise_type` was already relying on
+this same idea for its own coroutine frame (`coroutine_frame_alloc()`/
+`coroutine_frame_dealloc()`, resolving `est::current_allocator()` fresh);
+this generalizes it to every `ready_node`/`timer_node` in the codebase.
+
+`ready_node`/`timer_node` themselves can't define a *shared* `operator
+new`/`operator delete` doing this, though - that would need
+`est::current_allocator()` (`est:util.current_loop`), which itself
+imports `:loop`, so `:loop` importing it back would be circular (the same
+constraint this file's own top comment on `:loop`/`:future` already
+documents, one level further down the DAG). So every concrete node type
+- `mutex::lock_resume_node`/`acquire_resume_node`, `est:promise`'s
+`sleep_resume_node`/`yield_resume_node`, `est:sync.event`'s
+`event_resume_node`, `est:future`'s `future_resume_node<T>`/
+`concrete_continuation<Fn, U>`/`flatten_forwarder<T>` - now defines its
+own pair instead, each one the same six lines:
+
+```cpp
+static auto operator new(std::size_t size) -> void* {
+  return current_allocator().resource()->allocate(size, alignof(lock_resume_node));
+}
+static void operator delete(void* ptr, std::size_t size) noexcept {
+  current_allocator().resource()->deallocate(ptr, size, alignof(lock_resume_node));
+}
+```
+
+`destroy()`'s other job - completing a held `promise<T>` with an
+exception when a node is deleted without ever having `run()`/`fire()`/
+`invoke()`d - splits out into a new `virtual void abandon() noexcept {}`
+on `ready_node`/`timer_node`, defaulted to a no-op. Every call site that
+used to pass `ran` now either calls `abandon()` first (a drain that never
+ran the node - `~future_state()`, `~mutex()`, `~counting_event()`,
+`loop::drain_pending()`) or skips straight to `delete` (`loop::
+destroy_guard()`, used by `run_one()`/`fire_ready_timers()` right after
+`run()`/`fire()` - which never counts as abandoned). This removes the
+`bool ran` parameter entirely - a node with abandonment logic
+(`lock_resume_node`/`acquire_resume_node`, `sleep_resume_node`/
+`yield_resume_node`, `event_resume_node`, `future_resume_node<T>`)
+overrides `abandon()` with just its exception-completing (or, for
+`future_resume_node<T>`, frame-freeing) logic and nothing else; a node
+without one (`concrete_continuation<Fn, U>`, `flatten_forwarder<T>`)
+simply doesn't override it, rather than taking the parameter and
+ignoring it.
+
+`future_state<T>::allocator()` (a thin `current_allocator()` wrapper) is
+now dead code - its only two callers (`then()`'s node allocation,
+`fulfill()`'s flattening node allocation) both switched to a plain `new`,
+which resolves the allocator internally - so it's removed rather than
+left unused.
+
+No behavior changes as a result: allocation and deallocation still
+resolve `est::current_allocator()` fresh at the same points as before
+(now inside each concrete node's own `operator new`/`operator delete`
+rather than pre-resolved by the caller and threaded through an explicit
+parameter), and `abandon()` runs at exactly the same points `destroy(...,
+false)` used to. `loop::drain_pending()`'s own doc comment on why it must
+run *before* `make_current_loop()`'s guard clears the current-loop slot
+now covers node deletion itself, not just the coroutine frame a node's
+`abandon()` might go on to free - both resolve `current_allocator()`
+fresh, so both need the same ordering guarantee.
+
+Docs updated everywhere `destroy(allocator, ran)`/`bool ran` was shown or
+named: `docs/wiki/Coroutines.md`, `Continuation-Node-Mechanism.md`,
+`Allocation-Patterns.md`, `Architecture.md`, `Loop-And-Timers.md`.
+
+**Verified in the pinned Docker devenv:** existing test suite passes
+unchanged (a pure refactor of already-tested abandonment/allocation
+behavior, no new observable behavior to add a test for);
+`clang-format`/`clang-tidy` clean across every touched file; full suite
+passes under the `sanitize` preset (ASan+UBSan) too, confirming every
+concrete node's `operator new`/`operator delete` pairs allocate and
+deallocate through matching sizes; both example binaries still run
+correctly.
+
 ---
 
 ## Verification for M0

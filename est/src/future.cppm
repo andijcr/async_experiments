@@ -97,12 +97,20 @@ public:
     }
   }
 
-  // bool /*ran*/ unused - see concrete_continuation<Fn, U>'s own doc
+  // No abandon() override - see concrete_continuation<Fn, U>'s own doc
   // comment (further down this file) on why dropping downstream_
   // unconditionally here is the current behavior, not a settled answer.
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator,
-               bool /*ran*/) noexcept override {
-    allocator.delete_object(this);
+
+  // Resolves est::current_allocator() fresh, same pattern
+  // detail::coroutine_frame_alloc()/coroutine_frame_dealloc() use for a
+  // coroutine frame - see ready_node's own doc comment (est:loop) for why
+  // this is what makes `delete` through a plain ready_node& correctly
+  // sized and allocator-routed for this concrete type.
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(flatten_forwarder));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(flatten_forwarder));
   }
 
 private:
@@ -250,10 +258,9 @@ namespace est {
 // moment its own ref count reached zero.
 //
 // Holds no est::loop reference of its own: every method below that needs
-// one (the destructor, set_continuation(), allocator(), then(),
-// complete()) resolves est::current_loop() (est:util.current_loop) fresh,
-// at the point of use, instead of caching a loop& member set once at
-// construction.
+// one (the destructor, set_continuation(), then(), complete()) resolves
+// est::current_loop() (est:util.current_loop) fresh, at the point of use,
+// instead of caching a loop& member set once at construction.
 //
 // KNOWN HAZARD: because the loop is looked up fresh each time rather than
 // fixed at construction, a future_state created while one loop is current
@@ -295,21 +302,24 @@ public:
   // not this future_state's - see loop.cppm). Without this, those
   // still-pending nodes are simply unreachable once this future_state
   // itself is gone - a permanent leak, not just a skipped notification.
-  // waiters_.empty() checked *before* resolving current_allocator(), not
-  // just for a wasted lookup: a future_state that completed with no
-  // continuation ever registered (or all of them already drained) can
-  // legitimately be destroyed long after whatever loop was current when
-  // it was created has stopped being current at all - current_allocator()
-  // would fail its own precondition in that case even though there is
-  // nothing here that actually needs one. Only the allocator, not the
-  // loop itself, is needed to destroy an abandoned waiter node -
-  // current_loop() is never resolved here at all.
+  // waiters_.empty() checked first, not just to skip a no-op drain: a
+  // future_state that completed with no continuation ever registered (or
+  // all of them already drained) can legitimately be destroyed long
+  // after whatever loop was current when it was created has stopped
+  // being current at all - deleting an abandoned waiter node resolves
+  // est::current_allocator() fresh, inside that node's own operator
+  // delete (ready_node's own doc comment, est:loop), which would fail
+  // its own precondition in that case even though there is nothing here
+  // that actually needs one. current_loop() itself is never resolved
+  // here at all.
   ~future_state() {
     if (waiters_.empty()) {
       return;
     }
-    auto allocator = current_allocator();
-    waiters_.drain([allocator](detail::ready_node& node) { node.destroy(allocator, false); });
+    waiters_.drain([](detail::ready_node& node) {
+      node.abandon();
+      delete &node;
+    });
   }
 
   void set_value()
@@ -460,10 +470,6 @@ public:
     }
   }
 
-  [[nodiscard]] auto allocator() const noexcept -> std::pmr::polymorphic_allocator<std::byte> {
-    return current_allocator();
-  }
-
   // Registers fn to run once ready. Two calling conventions, chosen by
   // how fn can be invoked:
   //   - fn(const T&), or fn() when T is void: "unwrapped" - called only
@@ -511,8 +517,7 @@ public:
     auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator);
     auto downstream_for_node = downstream; // copy: the node keeps its own reference too
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-    auto* node = allocator.template new_object<node_type>(std::forward<Fn>(fn),
-                                                          std::move(downstream_for_node));
+    auto* node = new node_type(std::forward<Fn>(fn), std::move(downstream_for_node));
     set_continuation(*node);
     return future<downstream_value_type>(std::move(downstream));
   }
@@ -589,19 +594,23 @@ private:
       }
     }
 
-    // `this` here is concrete_continuation<Fn, U>*, so delete_object
-    // deallocates with this type's actual size/alignment - the whole
-    // reason destroy() is virtual instead of the caller deallocating
-    // through a detail::ready_node& (see that class's own doc comment,
-    // est:loop). bool /*ran*/ unused here: downstream_ is currently just
-    // dropped on abandonment either way, unlike est::mutex's resume
-    // nodes or future_resume_node<T> below - whether a coroutine
-    // co_await-ing a `.then()`-chained future can be stranded the same
-    // way if the *upstream* future_state is dropped first is a real,
-    // separate question this class doesn't yet answer.
-    void destroy(std::pmr::polymorphic_allocator<std::byte> allocator,
-                 bool /*ran*/) noexcept override {
-      allocator.delete_object(this);
+    // No abandon() override: downstream_ is currently just dropped on
+    // abandonment either way, unlike est::mutex's resume nodes or
+    // future_resume_node<T> below - whether a coroutine co_await-ing a
+    // `.then()`-chained future can be stranded the same way if the
+    // *upstream* future_state is dropped first is a real, separate
+    // question this class doesn't yet answer.
+    //
+    // Own operator new/delete, resolving est::current_allocator() fresh -
+    // see flatten_forwarder<T>'s own doc comment (above) for why this,
+    // not a shared base implementation, is what makes `delete` through a
+    // plain ready_node& correctly sized and allocator-routed for this
+    // concrete type.
+    static auto operator new(std::size_t size) -> void* {
+      return current_allocator().resource()->allocate(size, alignof(concrete_continuation));
+    }
+    static void operator delete(void* ptr, std::size_t size) noexcept {
+      current_allocator().resource()->deallocate(ptr, size, alignof(concrete_continuation));
     }
 
   private:
@@ -634,8 +643,7 @@ private:
     // result, so the two are always the same type here.
     template <class R> void fulfill(R&& result) {
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
-        auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
-            downstream_);
+        auto* node = new detail::flatten_forwarder<U>(downstream_);
         result.state_->set_continuation(*node);
       } else {
         downstream_->set_value(std::forward<R>(result));
@@ -699,9 +707,11 @@ private:
   // future_state<T> is still busy being defined (this very member).
   // ready_node (est:loop) is already complete by this point regardless of
   // T, so keying waiters_ on it instead sidesteps that cycle entirely;
-  // complete()/the destructor above recover the real continuation_node
-  // type themselves where they actually need it (bind_owner()/destroy()).
-  // continuation_node<T> itself is untouched by this - it still declares
+  // complete() recovers the real continuation_node type itself where it
+  // actually needs it (bind_owner()) - the destructor above needs no such
+  // downcast, since abandon()/delete both work through the plain
+  // ready_node& it already has. continuation_node<T> itself is untouched
+  // by this - it still declares
   // a plain shared_ptr<future_state<T>> owner_ member, same as ever;
   // nothing here forces it to be instantiated before future_state<T>
   // completes any more, so that member now resolves fine wherever
@@ -979,12 +989,12 @@ namespace est::detail {
 // point, the compiler is free to reuse that exact frame storage for
 // whatever the coroutine's later code constructs (its next awaiter, a
 // local variable, ...), since their lifetimes don't overlap. But
-// est::loop::run_one() (est:loop) calls destroy() on this same node
-// *after* run() already returned - for a frame-embedded node, that
-// storage could already be overwritten by then, making a virtual call
-// through it undefined behavior. A separately allocated node has its own
-// real, independent lifetime, so run()-then-destroy() is exactly as safe
-// here as it already is for every other ready_node in this codebase.
+// est::loop::run_one() (est:loop) deletes this same node *after* run()
+// already returned - for a frame-embedded node, that storage could
+// already be overwritten by then, making a virtual call through it
+// undefined behavior. A separately allocated node has its own real,
+// independent lifetime, so run()-then-delete is exactly as safe here as
+// it already is for every other ready_node in this codebase.
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
@@ -994,19 +1004,27 @@ public:
   // signature.
   void invoke(future_state<T>& /*unused*/) override { handle_.resume(); }
 
-  // If invoke() never ran (the future_state this node was registered on
-  // was dropped without ever completing, so `ran` is false, per
-  // ready_node::destroy()'s own doc comment, est:loop), the awaiting
-  // coroutine is
-  // still fully intact and untouched, so this is the only chance to free
-  // its frame; if invoke() did run, the coroutine either already
-  // self-destroyed or suspended again on something else that now owns
-  // it, and touching handle_ again here would be wrong either way.
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
-    if (!ran) {
-      handle_.destroy();
-    }
-    allocator.delete_object(this);
+  // Called only when invoke() never ran (the future_state this node was
+  // registered on was dropped without ever completing, per
+  // ready_node::abandon()'s own doc comment, est:loop) - the awaiting
+  // coroutine is still fully intact and untouched, so this is the only
+  // chance to free its frame. Never called once invoke() has run: the
+  // coroutine either already self-destroyed or suspended again on
+  // something else that now owns it, and touching handle_ then would be
+  // wrong either way.
+  void abandon() noexcept override { handle_.destroy(); }
+
+  // Resolves est::current_allocator() fresh, same pattern
+  // detail::coroutine_frame_alloc()/coroutine_frame_dealloc() use for the
+  // coroutine frame this node itself resumes - see ready_node's own doc
+  // comment (est:loop) for why this is what makes `delete` through a
+  // plain ready_node& correctly sized and allocator-routed for this
+  // concrete type.
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(future_resume_node));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(future_resume_node));
   }
 
 private:
@@ -1047,7 +1065,7 @@ public:
   [[nodiscard]] auto await_ready() const noexcept -> bool { return future_.ready(); }
 
   void await_suspend(std::coroutine_handle<> handle) {
-    auto* node = future_.state_->allocator().template new_object<future_resume_node<T>>(handle);
+    auto* node = new future_resume_node<T>(handle);
     future_.state_->set_continuation(*node);
   }
 

@@ -191,7 +191,7 @@ C++ destroys locals in reverse declaration order, so `loop_guard` -
 declared *after* `loop`, because it needs `loop` to already exist - always
 runs its destructor *before* `loop`'s. If a still-suspended coroutine's
 frame is torn down from inside `~loop()` (via a queued resume node's
-`destroy()`, which calls the coroutine handle's own `destroy()`, which
+`abandon()`, which calls the coroutine handle's own `destroy()`, which
 calls the frame's `operator delete`, which resolves `current_allocator()`
 fresh), that lookup runs *after* `loop_guard` has already cleared the
 current-loop slot. The result isn't a documented hazard someone forgot to
@@ -309,27 +309,27 @@ this split exists):
 ```cpp
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
   auto& loop_ref = current_loop();
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
-  auto* node = allocator.template new_object<detail::sleep_resume_node>(std::move(prom));
+  auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
+  auto* node = new detail::sleep_resume_node(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }
 ```
 
 `current_loop()` is still resolved here (`schedule_timer()` needs the
-loop itself), but the allocations go through `current_allocator()`
-directly rather than `loop_ref.allocator()` - the same "reach the
-allocator without a detour through the loop pointer" pattern used
-everywhere current_loop() isn't independently needed.
+loop itself); the node's own allocation instead resolves
+`current_allocator()` internally, inside its own `operator new` - the
+same "reach the allocator without a detour through the loop pointer"
+pattern used everywhere current_loop() isn't independently needed.
 
 `sleep_resume_node` holds the `promise<void>` directly rather than
-wrapping a generic closure - needed so `destroy(allocator, ran)` can
-complete the promise with an exception when `ran` is false (the timer
-never fired before the loop was destroyed). A generic, type-erased
-callback would give `destroy()` no way to know it's holding a promise at
-all, and a silent drop instead would have exactly the
-stranded-coroutine-frame hazard described in
+wrapping a generic closure - needed so `abandon()` can complete the
+promise with an exception when the timer never fired before the loop was
+destroyed (`abandon()` is only ever called on that path - see
+[Continuation Node Mechanism](Continuation-Node-Mechanism.md)). A
+generic, type-erased callback would give `abandon()` no way to know it's
+holding a promise at all, and a silent drop instead would have exactly
+the stranded-coroutine-frame hazard described in
 [Coroutines](Coroutines.md)'s `lock_resume_node`/`acquire_resume_node`
 section.
 
@@ -343,9 +343,8 @@ all:
 ```cpp
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
-  auto* node = allocator.template new_object<detail::yield_resume_node>(std::move(prom));
+  auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
+  auto* node = new detail::yield_resume_node(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }
@@ -354,8 +353,8 @@ all:
 FIFO is what makes this safe: `enqueue_ready()` appends at the tail, so
 everything already queued when `yield_execution()` is called runs first
 (see [Architecture](Architecture.md) and `intrusive_list<T>`'s own doc
-comment for why the list is FIFO). `yield_resume_node::destroy()` completes its
-promise with an exception on abandonment rather than silently dropping
+comment for why the list is FIFO). `yield_resume_node::abandon()`
+completes its promise with an exception rather than silently dropping
 it, for the same reason `mutex::lock_resume_node`'s own doc comment
 gives (`docs/wiki/Coroutines.md`) - a coroutine suspended via `co_await
 yield_execution();` holds the only other reference to its
@@ -395,9 +394,8 @@ inline auto mutex::lock() -> future<void> {
     state_ = 1;
     return make_ready_future<void>();
   }
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
-  auto* node = allocator.template new_object<lock_resume_node>(std::move(prom));
+  auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
+  auto* node = new lock_resume_node(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }

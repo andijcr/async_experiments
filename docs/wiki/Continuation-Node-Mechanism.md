@@ -16,7 +16,7 @@ classDiagram
   }
   class ready_node {
     +run() void
-    +destroy(allocator, ran) void
+    +abandon() void
   }
   class continuation_node_T {
     -owner_ : shared_ptr_future_state_T
@@ -28,7 +28,6 @@ classDiagram
     -fn_ : Fn
     -downstream_ : shared_ptr_future_state_U
     +invoke(state) void
-    +destroy(allocator, ran) void
   }
   intrusive_list_node <|-- ready_node
   ready_node <|-- continuation_node_T
@@ -64,12 +63,15 @@ excerpts below for the real, fully-qualified signatures.)
   [Architecture](Architecture.md) for more on why this lives in a shared
   util partition instead of inside `est:sync.mutex`.
 - **`ready_node`** (`est:loop`) is the type-erased base the loop's
-  ready-queue actually holds. It adds exactly two things: `run()` (invoke
-  whatever this is, however it does that) and `destroy(allocator, ran)`
-  (deallocate through the *actual* derived type — see
-  [Allocation Patterns](Allocation-Patterns.md) for why this can't just be a
-  plain destructor call). `:loop` knows nothing more about what a
-  `ready_node` actually *is* — that's the whole point (see
+  ready-queue actually holds. It adds `run()` (invoke whatever this is,
+  however it does that), a virtual destructor, and `abandon()` (a hook
+  called on a node that never ran, right before it's deleted — see "Node
+  lifecycle" below). Deallocation itself is a plain `delete` through this
+  base: every concrete node type defines its own `operator new`/
+  `operator delete`, which is what makes that safe and correctly sized —
+  see [Allocation Patterns](Allocation-Patterns.md) for the full
+  mechanism. `:loop` knows nothing more about what a `ready_node` actually
+  *is* — that's the whole point (see
   [Architecture](Architecture.md#why-loop-doesnt-depend-on-future)).
 - **`continuation_node<T>`** (`est:future`) is the first T-dependent layer.
   It adds `invoke(future_state<T>&)` (still pure virtual — a concrete `Fn`
@@ -81,8 +83,8 @@ excerpts below for the real, fully-qualified signatures.)
   *inside* `future_state<T>` — one instantiation per distinct
   `(T, Fn, U)` triple a real `.then()` call site produces. It's the layer
   that finally knows the actual callback (`fn_`) and where its result goes
-  (`downstream_`, a `shared_ptr<future_state<U>>`). `invoke()` and
-  `destroy()` are implemented here, nowhere else.
+  (`downstream_`, a `shared_ptr<future_state<U>>`). `invoke()` is
+  implemented here, alongside its own `operator new`/`operator delete`.
 
 Only `run()` gets a single shared implementation at the `continuation_node<T>`
 level instead of being repeated once per `(Fn, U)` instantiation — this is a
@@ -99,8 +101,7 @@ template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
   auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator);
   auto downstream_for_node = downstream; // copy: the node keeps its own reference too
   using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-  auto* node =
-      allocator.template new_object<node_type>(std::forward<Fn>(fn), std::move(downstream_for_node));
+  auto* node = new node_type(std::forward<Fn>(fn), std::move(downstream_for_node));
   set_continuation(*node);
   return future<downstream_value_type>(std::move(downstream));
 }
@@ -149,7 +150,7 @@ sequenceDiagram
   est_loop->>est_loop: drain_ready(): ready_.dequeue()
   est_loop->>node: run() -> invoke(*owner_)
   node->>node: runs fn_, reports into downstream_
-  est_loop->>node: destroy(allocator, true) [always, via scope_exit guard]
+  est_loop->>node: delete [always, via scope_exit guard]
 ```
 
 Two possible starting states, one converging path:
@@ -175,11 +176,13 @@ means naming `shared_ptr<future_state<T>>` anywhere requires
 - while `future_state<T>` is still being defined (its own `waiters_`
 member declaration is what would be doing the forcing), a genuine
 circular dependency between the two class templates. `ready_node` is
-already complete at that point regardless of `T`, so `complete()` (and
-the destructor above) recover the real `continuation_node<T>&` with a
-`static_cast` where they actually need it - safe by construction, since
+already complete at that point regardless of `T`, so `complete()`
+recovers the real `continuation_node<T>&` with a `static_cast` where it
+actually needs it (`bind_owner()`) - safe by construction, since
 `set_continuation()` is the only thing that ever enqueues anything here,
-always a real `continuation_node&`. See `continuation_node<T>`'s own doc
+always a real `continuation_node&`. `future_state<T>`'s own destructor
+needs no such downcast: `abandon()`/`delete` both work through the plain
+`ready_node&` it already has. See `continuation_node<T>`'s own doc
 comment (`future.cppm`) for the full account.
 
 Either way, once a node reaches the loop's ready-queue it's in exactly the
@@ -188,7 +191,10 @@ holding its own `shared_ptr<future_state<T>>` back to its parent. The loop's
 `drain_ready()` eventually dequeues it, `run_one()` calls `node.run()`
 (dispatching through `continuation_node<T>::run()` to `invoke(*owner_)`),
 and — always, via a `scope_exit`-based guard, whether or not `run()`
-somehow threw — `node.destroy(allocator, true)` deallocates it.
+somehow threw — `delete` deallocates it, through this concrete node
+type's own `operator delete` (see
+[Allocation Patterns](Allocation-Patterns.md) for why every concrete node
+type needs its own).
 
 ### The `bind_owner()` subtlety
 
@@ -301,8 +307,7 @@ the outer `downstream_`:
 ```cpp
 template <class R> void fulfill(R&& result) {
   if constexpr (detail::is_future_v<std::decay_t<R>>) {
-    auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
-        downstream_);
+    auto* node = new detail::flatten_forwarder<U>(downstream_);
     result.state_->set_continuation(*node);
   } else {
     downstream_->set_value(std::forward<R>(result));
@@ -353,9 +358,11 @@ public:
     }
   }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool /*ran*/) noexcept
-      override {
-    allocator.delete_object(this);
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(flatten_forwarder));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(flatten_forwarder));
   }
 
 private:

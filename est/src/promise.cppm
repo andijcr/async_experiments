@@ -102,32 +102,40 @@ template <class T, class... Args>
 namespace est::detail {
 
 // The node behind sleep_for()/sleep_until() (below): holds a
-// promise<void> directly rather than a generic Fn, so destroy() can
-// complete that promise on abandonment (destroy() called without fire()
-// ever having run) - a type-erased Fn would give destroy() no way to
-// know it's holding a promise at all, let alone call set_exception() on
-// it. Without this, a coroutine doing `co_await sleep_for(loop, 10s);`,
-// abandoned when its loop is destroyed before the timer ever fires,
-// would leak its own frame forever - the same `ran`-guarded
-// exception-completion mutex::lock_resume_node/acquire_resume_node
-// (est:sync.mutex) and detail::yield_resume_node below also rely on, for
-// the identical reason: the awaiting coroutine holds the only other
-// reference to this promise's future_state<void> (the future<void>
-// temporary co_await awaits is spilled into the coroutine's own frame
-// across the suspension), so silently dropping the promise instead of
-// completing it would strand that frame with nothing left to free it.
+// promise<void> directly rather than a generic Fn, so abandon() can
+// complete that promise on abandonment - a type-erased Fn would give
+// abandon() no way to know it's holding a promise at all, let alone call
+// set_exception() on it. Without this, a coroutine doing `co_await
+// sleep_for(10s);`, abandoned when its loop is destroyed before the
+// timer ever fires, would leak its own frame forever - the same
+// abandon()-driven exception-completion mutex::lock_resume_node/
+// acquire_resume_node (est:sync.mutex) and detail::yield_resume_node
+// below also rely on, for the identical reason: the awaiting coroutine
+// holds the only other reference to this promise's future_state<void>
+// (the future<void> temporary co_await awaits is spilled into the
+// coroutine's own frame across the suspension), so silently dropping the
+// promise instead of completing it would strand that frame with nothing
+// left to free it.
 class sleep_resume_node final : public timer_node {
 public:
   explicit sleep_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
   void fire() override { promise_.set_value(); }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
-    if (!ran) {
-      promise_.set_exception(std::make_exception_ptr(
-          std::runtime_error("loop destroyed while sleep_for()/sleep_until() was pending")));
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept override {
+    promise_.set_exception(std::make_exception_ptr(
+        std::runtime_error("loop destroyed while sleep_for()/sleep_until() was pending")));
+  }
+
+  // Resolves est::current_allocator() fresh - see est::detail::ready_node's
+  // own doc comment (est:loop) for why every concrete node type needs its
+  // own operator new/delete like this, rather than one shared at the
+  // ready_node/timer_node base.
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(sleep_resume_node));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(sleep_resume_node));
   }
 
 private:
@@ -146,24 +154,30 @@ private:
 // the tail, so everything already queued when yield_execution() was
 // called runs first.
 //
-// run()/destroy() completing the promise with an exception on
-// abandonment (rather than silently dropping it, the "broken promise,
-// future simply never becomes ready" default every other est::promise<T>
-// in this codebase otherwise has) matters for the identical reason
-// sleep_resume_node's own doc comment (just above) and
-// mutex::lock_resume_node's own doc comment (est:sync.mutex) both give.
+// abandon() completing the promise with an exception (rather than
+// silently dropping it, the "broken promise, future simply never becomes
+// ready" default every other est::promise<T> in this codebase otherwise
+// has) matters for the identical reason sleep_resume_node's own doc
+// comment (just above) and mutex::lock_resume_node's own doc comment
+// (est:sync.mutex) both give.
 class yield_resume_node final : public ready_node {
 public:
   explicit yield_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
   void run() final { promise_.set_value(); }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
-    if (!ran) {
-      promise_.set_exception(std::make_exception_ptr(
-          std::runtime_error("loop destroyed while yield_execution() was pending")));
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept final {
+    promise_.set_exception(std::make_exception_ptr(
+        std::runtime_error("loop destroyed while yield_execution() was pending")));
+  }
+
+  // Own operator new/delete, resolving est::current_allocator() fresh -
+  // see sleep_resume_node's own doc comment (just above) for why.
+  static auto operator new(std::size_t size) -> void* {
+    return current_allocator().resource()->allocate(size, alignof(yield_resume_node));
+  }
+  static void operator delete(void* ptr, std::size_t size) noexcept {
+    current_allocator().resource()->deallocate(ptr, size, alignof(yield_resume_node));
   }
 
 private:
@@ -182,9 +196,8 @@ export namespace est {
 // itself depends on, so it cannot depend back on :future/:promise).
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
   auto& loop_ref = current_loop();
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
-  auto* node = allocator.template new_object<detail::sleep_resume_node>(std::move(prom));
+  auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
+  auto* node = new detail::sleep_resume_node(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
   return std::move(fut);
 }
@@ -210,9 +223,8 @@ export namespace est {
 // it ever checks pending_timers_.
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
-  auto* node = allocator.template new_object<detail::yield_resume_node>(std::move(prom));
+  auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
+  auto* node = new detail::yield_resume_node(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }
