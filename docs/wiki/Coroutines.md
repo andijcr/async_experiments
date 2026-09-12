@@ -180,8 +180,8 @@ allocates a small, *separately heap-allocated* resumption node
 that instead of registering the awaiter itself.
 
 That split is required, not just a style choice. `est::loop::run_one()`
-calls `node.run()` and then, via a `scope_exit` guard,
-`node.destroy(allocator_)` — *after* `run()` has already returned:
+calls `node.run()` and then, via a `scope_exit` guard, `delete`s `node` —
+*after* `run()` has already returned:
 
 ```cpp
 void run_one(detail::ready_node& node) {
@@ -189,7 +189,7 @@ void run_one(detail::ready_node& node) {
   ...
   node.run();
   ...
-} // guard fires here, calling node.destroy(allocator_)
+} // guard fires here, calling `delete &node`
 ```
 
 If `node` were embedded in the very coroutine frame that `run()`'s
@@ -197,13 +197,12 @@ If `node` were embedded in the very coroutine frame that `run()`'s
 own suspension point* would let the compiler reuse that exact frame
 storage for whatever the coroutine's later code constructs — its next
 awaiter, a local variable — since the two objects' lifetimes don't
-overlap. By the time `destroy_guard`'s destructor calls
-`node.destroy(...)`, that memory could already hold something else
-entirely, and calling a virtual function through it would be undefined
-behavior.
+overlap. By the time `destroy_guard`'s destructor runs `delete`, that
+memory could already hold something else entirely, and calling a virtual
+function (the destructor itself) through it would be undefined behavior.
 
 A separately allocated node has its own independent lifetime, entirely
-unrelated to the coroutine frame it resumes — `run()`-then-`destroy()` is
+unrelated to the coroutine frame it resumes — `run()`-then-`delete` is
 exactly as safe here as it already is for every other `ready_node` in this
 codebase (`concrete_continuation<Fn, U>`, `est:promise`'s `sleep_resume_node`/
 `yield_resume_node`). This
@@ -281,12 +280,11 @@ public:
   void run() final {
     handle_.resume();
   }
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
-    if (!ran) {
-      handle_.destroy();   // see "Abandoned coroutines are destroyed, not leaked" below
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept override {
+    handle_.destroy();   // see "Abandoned coroutines are destroyed, not leaked" below
   }
+  static auto operator new(std::size_t size) -> void*;   // resolves current_allocator()
+  static void operator delete(void* ptr, std::size_t size) noexcept;
 private:
   std::coroutine_handle<> handle_;
 };
@@ -427,8 +425,9 @@ the other side is a coroutine.
 
 ### Abandoned coroutines are destroyed, not leaked
 
-Every resumption node's `destroy()` is called two ways: after a successful
-`run()` (the normal case, described above), or by
+Every resumption node's `abandon()` is called exactly once, right before
+it's deleted, but only on one of two paths: never after a successful
+`run()` (the normal case, described above), but always from
 `future_state<T>::~future_state()`/`loop::drain_pending()` (called both by
 `~loop()` and by `make_current_loop()`'s own returned guard - see
 [Loop and Timers](Loop-And-Timers.md) for why the guard needs to call it
@@ -437,9 +436,7 @@ without ever completing/draining (the same abandoned-future scenario the
 node hierarchy already handles for `then()`'s own continuation nodes).
 Freeing only the resumption node
 itself in that second case, never the coroutine frame the handle points
-to, would permanently leak it. Each resumption node's
-`destroy()` is told whether it ever actually ran, to tell the two cases
-apart -
+to, would permanently leak it -
 
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
@@ -447,12 +444,9 @@ public:
   void run() final {
     handle_.resume();
   }
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
-    if (!ran) {
-      handle_.destroy();   // never resumed - still fully intact; this is
-                            // the only chance to free its frame
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept override {
+    handle_.destroy();   // never resumed - still fully intact; this is
+                          // the only chance to free its frame
   }
   ...
 };
@@ -460,17 +454,18 @@ public:
 
 If `run()` never happened, the coroutine is still exactly where
 `await_suspend()` left it - fully intact, suspended, never touched -
-so destroying it here is both safe and necessary. If `run()`
-*did* happen, this `destroy()` call must not touch `handle_` again: the
-coroutine either already self-destroyed (`promise_type::final_suspend()`'s
-`std::suspend_never` - `handle_` is now dangling, so even calling `.done()`
-on it would be a use-after-free) or suspended again on something else
-entirely, which now owns resuming (and eventually destroying) it. `ran` is
-what lets one `destroy()` implementation tell those two completely
-different situations apart without ever having to safely query a handle
-that might already be gone - passed in by the caller (`ready_node::
-destroy()`'s own doc comment, est:loop) rather than tracked with a private
-flag each node sets on its own `run()`, since every call site
+so destroying it in `abandon()` is both safe and necessary. If `run()`
+*did* happen, `abandon()` is never called at all, since the loop deletes
+such a node directly instead (`loop::destroy_guard()`) - which matters
+because touching `handle_` at that point would be wrong: the coroutine
+either already self-destroyed (`promise_type::final_suspend()`'s
+`std::suspend_never` - `handle_` is now dangling, so even calling
+`.done()` on it would be a use-after-free) or suspended again on
+something else entirely, which now owns resuming (and eventually
+destroying) it. Splitting this into `abandon()` (only called on the
+not-run path) rather than one `destroy()` told whether it ever ran
+(`ready_node::abandon()`'s own doc comment, est:loop) means every node's
+own logic never has to branch on that itself - the call site
 already knows statically which situation it's in.
 
 ## `est::counting_event<Mode>` becomes awaitable
@@ -512,9 +507,8 @@ can reuse it directly instead of building and immediately discarding one:
   if (try_acquire()) {
     return make_ready_future<void>();
   }
-  auto allocator = current_allocator();
-  auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
-  auto* node = allocator.template new_object<detail::event_resume_node>(std::move(prom));
+  auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
+  auto* node = new detail::event_resume_node(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }
@@ -590,7 +584,7 @@ and `est::loop`'s own destructors drain theirs — an event destroyed with
 a waiter still queued on `wait()` must not just leak it.
 
 `detail::event_resume_node` (`est::detail`, not nested inside
-`counting_event<Mode>` - its `run()`/`destroy()` never touch `Mode` or
+`counting_event<Mode>` - its `run()`/`abandon()` never touch `Mode` or
 anything else about the `counting_event` that enqueued it, so nesting it
 would only generate an identical type once per `Mode` instantiation for
 no reason) holds a `promise<void>`, not a `coroutine_handle<>` directly,
@@ -608,17 +602,14 @@ the other first - not a `shared_ptr` cycle in the strict sense (no
 object holds a `shared_ptr` back to the thing keeping it alive), but a
 practical one: both stay allocated forever.
 
-`destroy()` breaks that by actually completing the promise (with an
+`abandon()` breaks that by actually completing the promise (with an
 exception, since the true outcome is "this waiter never got a unit, and
-the event it was queued on no longer exists") before deallocating:
+the event it was queued on no longer exists") before the node is deleted:
 
 ```cpp
-void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
-  if (!ran) {
-    promise_.set_exception(std::make_exception_ptr(
-        std::runtime_error("counting_event destroyed while wait() was pending")));
-  }
-  allocator.delete_object(this);
+void abandon() noexcept final {
+  promise_.set_exception(std::make_exception_ptr(
+      std::runtime_error("counting_event destroyed while wait() was pending")));
 }
 ```
 
@@ -631,12 +622,13 @@ exception exactly like any other failure propagating across `co_await`,
 per "an exception in the awaited future propagates across `co_await`"
 above) or safely destroyed, never run, by `est::loop`'s own
 destructor-time drain - either way, the frame is no longer stranded.
-`ran` (the same parameter `est:future`'s own `future_resume_node<T>`
-reads, passed in by the caller rather than tracked with a private flag -
-`ready_node::destroy()`'s own doc comment, est:loop) is what stops this
-from double-completing an already-successfully-completed promise:
-`run()` and `destroy()` are always both called, in that order, for any
-node the loop actually processes (see [Continuation Node
+Splitting the not-run path into its own `abandon()` (`est:future`'s own
+`future_resume_node<T>` overrides the identical method - `ready_node::
+abandon()`'s own doc comment, est:loop) is what stops this from
+double-completing an already-successfully-completed promise: `abandon()`
+is only ever called on a node the loop drains *without* first calling
+`run()` on it; a node the loop does `run()` is deleted directly instead,
+no `abandon()` call at all (see [Continuation Node
 Mechanism](Continuation-Node-Mechanism.md)).
 
 `counting_event<Mode>` also takes a `max_count` (constructor argument,
@@ -674,7 +666,7 @@ into a compile error.
 
 `est::mutex` used to be its own bespoke implementation of exactly the
 pieces `counting_event<Mode>` (above) already has: an intrusive waiter
-list, a resume node, `destroy()` completing an abandoned waiter with an
+list, a resume node, `abandon()` completing an abandoned waiter with an
 exception. Issue #67 removed the duplication: `mutex` now holds a single
 `est::binary_event<EventResetMode::automatic>` member and nothing else -
 "unlocked" is exactly "one unit available," "locked" is "no unit

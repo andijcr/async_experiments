@@ -27,12 +27,13 @@ namespace est::detail {
 // The waiter node behind counting_event<Mode>::wait()'s slow path (not yet
 // signaled): queued in counting_event<Mode>::waiters_, completing an
 // est::promise<void> once set() hands it a unit. No coroutine_handle in
-// sight here, mirroring mutex::lock_resume_node exactly - wait() itself is
-// no coroutine-only primitive, so this node only ever has to know how to
-// complete a promise.
+// sight here - wait() itself is no coroutine-only primitive, so this node
+// only ever has to know how to complete a promise. est::mutex (est:sync.mutex)
+// builds its own lock() directly on top of this class via
+// est::binary_event<EventResetMode::automatic> rather than keeping a
+// resume node of its own - it never nests or duplicates this one.
 //
-// Deliberately *not* nested inside counting_event<Mode> (unlike
-// mutex::lock_resume_node inside the non-template mutex): run()/destroy()
+// Deliberately *not* nested inside counting_event<Mode>: run()/abandon()
 // only ever touch promise_, never Mode or anything else about the
 // counting_event that enqueued them, so hoisting it out here avoids an
 // identical resume_node type per Mode instantiation. Matches
@@ -40,30 +41,34 @@ namespace est::detail {
 // placement (est:loop) - counting_event<Mode>::wait() (below) is the only
 // caller either way, on both Mode values.
 //
-// destroy() completing the promise with an exception (rather than simply
+// abandon() completing the promise with an exception (rather than simply
 // deallocating the node) matters for the identical reason
-// mutex::lock_resume_node's own doc comment gives in full: a coroutine
-// suspended on the future<void> wait() returned holds that future_state
-// alive via its own frame, reachable only once this future_state itself
-// completes - silently dropping the promise instead would strand that
-// frame forever, with neither side able to free the other first.
-// Completing it here (whether from set()'s own successful hand-off, `ran`
-// true, or from ~counting_event()'s/loop::~loop()'s abandonment drain,
-// `ran` false) always drains the future_state's own pending continuation
-// onto the loop's ready queue, so the frame is never stranded either way.
-class event_resume_node final : public ready_node {
+// future_resume_node<T>'s own doc comment gives in full (est:future): a
+// coroutine suspended on the future<void> wait() returned holds that
+// future_state alive via its own frame, reachable only once this
+// future_state itself completes - silently dropping the promise instead
+// would strand that frame forever, with neither side able to free the
+// other first.
+// Completing it here (called only from ~counting_event()'s/loop::~loop()'s
+// abandonment drain, never after set()'s own successful hand-off) always
+// drains the future_state's own pending continuation onto the loop's
+// ready queue, so the frame is never stranded either way.
+class event_resume_node final : public ready_node,
+                                public current_allocator_new_delete<event_resume_node> {
 public:
   explicit event_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
 
   void run() final { promise_.set_value(); }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept final {
-    if (!ran) {
-      promise_.set_exception(std::make_exception_ptr(
-          std::runtime_error("counting_event destroyed while wait() was pending")));
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept final {
+    promise_.set_exception(std::make_exception_ptr(
+        std::runtime_error("counting_event destroyed while wait() was pending")));
   }
+
+  // operator new/delete inherited from current_allocator_new_delete<T>
+  // (est:util.current_loop) - see that class's own doc comment for why
+  // every concrete ready_node/timer_node needs its own pair rather than
+  // one shared at the ready_node base itself.
 
 private:
   promise<void> promise_;
@@ -135,24 +140,23 @@ public:
   // Destroys (without satisfying) any waiter still queued on wait() -
   // mirrors mutex::~mutex() and future_state<T>::~future_state() (both
   // drain their own pending lists the same way, for the same reason).
-  // Each waiter node's own destroy() (detail::event_resume_node, above)
+  // Each waiter node's own abandon() (detail::event_resume_node, above)
   // completes its promise with an exception first, rather than just
   // deallocating itself silently - see its own doc comment for why that
   // matters beyond just freeing the node itself.
-  // waiters_.empty() checked *before* resolving current_allocator() - a
-  // counting_event with nothing queued can legitimately be destroyed
-  // long after whatever loop was current when it was created has stopped
-  // being current at all, and current_allocator() would fail its own
-  // precondition in that case even though nothing here actually needs
-  // one. Only the allocator, not the loop itself, is needed to destroy
-  // an abandoned waiter node - current_loop() is never resolved here at
-  // all.
+  // waiters_.empty() checked first - a counting_event with nothing queued
+  // can legitimately be destroyed long after whatever loop was current
+  // when it was created has stopped being current at all, and deleting
+  // an abandoned waiter node resolves est::current_allocator() fresh,
+  // inside that node's own operator delete (est::detail::ready_node's
+  // own doc comment, est:loop), which would fail its own precondition in
+  // that case even though nothing here actually needs one. current_loop()
+  // itself is never resolved here at all.
   ~counting_event() {
     if (waiters_.empty()) {
       return;
     }
-    auto allocator = current_allocator();
-    waiters_.drain([allocator](detail::ready_node& node) { node.destroy(allocator, false); });
+    waiters_.drain(detail::abandon_ready_node);
   }
 
   [[nodiscard]] auto count() const noexcept -> int { return count_; }
@@ -272,9 +276,8 @@ public:
     if (try_acquire()) {
       return make_ready_future<void>();
     }
-    auto allocator = current_allocator();
-    auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
-    auto* node = allocator.template new_object<detail::event_resume_node>(std::move(prom));
+    auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
+    auto* node = new detail::event_resume_node(std::move(prom));
     waiters_.enqueue(*node);
     return std::move(fut);
   }

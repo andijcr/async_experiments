@@ -16,7 +16,7 @@ classDiagram
   }
   class ready_node {
     +run() void
-    +destroy(allocator, ran) void
+    +abandon() void
   }
   class continuation_node_T {
     #owner_ : shared_ptr_future_state_T
@@ -26,7 +26,6 @@ classDiagram
     -fn_ : Fn
     -downstream_ : shared_ptr_future_state_U
     +run() void
-    +destroy(allocator, ran) void
   }
   intrusive_list_node <|-- ready_node
   ready_node <|-- continuation_node_T
@@ -66,11 +65,16 @@ excerpts below for the real, fully-qualified signatures.)
   [Architecture](Architecture.md) for more on why this lives in a shared
   util partition instead of inside `est:sync.event`.
 - **`ready_node`** (`est:loop`) is the type-erased base the loop's
-  ready-queue actually holds. It adds exactly two things: `run()` (invoke
-  whatever this is, however it does that) and `destroy(allocator, ran)`
-  (deallocate through the *actual* derived type — see
-  [Allocation Patterns](Allocation-Patterns.md) for why this can't just be a
-  plain destructor call). `:loop` knows nothing more about what a
+  ready-queue actually holds. It adds `run()` (invoke whatever this is,
+  however it does that), a virtual destructor, and `abandon()` (a hook
+  called on a node that never ran, right before it's deleted — see "Node
+  lifecycle" below). Deallocation itself is a plain `delete` through this
+  base: every concrete node type has its own `operator new`/`operator
+  delete` (inherited from `detail::current_allocator_new_delete<T>`,
+  `est:util.current_loop` — see that class's own doc comment for why it
+  can't instead live on `ready_node` itself), which is what makes that
+  safe and correctly sized — see [Allocation Patterns](Allocation-Patterns.md)
+  for the full mechanism. `:loop` knows nothing more about what a
   `ready_node` actually *is* — that's the whole point (see
   [Architecture](Architecture.md#why-loop-doesnt-depend-on-future)).
 - **`continuation_node<T>`** (`est:future`) is the first T-dependent layer,
@@ -83,8 +87,8 @@ excerpts below for the real, fully-qualified signatures.)
   *inside* `future_state<T>` — one instantiation per distinct
   `(T, Fn, U)` triple a real `.then()` call site produces. It's the layer
   that finally knows the actual callback (`fn_`) and where its result goes
-  (`downstream_`, a `shared_ptr<future_state<U>>`). `run()` and `destroy()`
-  are implemented here, reading `owner_` directly from `continuation_node<T>`.
+  (`downstream_`, a `shared_ptr<future_state<U>>`). `run()` is implemented
+  here, reading `owner_` directly from `continuation_node<T>`.
 
 An earlier version of this hierarchy had `continuation_node<T>` implement
 `run()` once, for every `T`, as `invoke(*owner_)`, with each concrete node
@@ -112,8 +116,7 @@ template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
   auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator);
   auto downstream_for_node = downstream; // copy: the node keeps its own reference too
   using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-  auto* node =
-      allocator.template new_object<node_type>(std::forward<Fn>(fn), std::move(downstream_for_node));
+  auto* node = new node_type(std::forward<Fn>(fn), std::move(downstream_for_node));
   set_continuation(*node);
   return future<downstream_value_type>(std::move(downstream));
 }
@@ -162,7 +165,7 @@ sequenceDiagram
   est_loop->>est_loop: drain_ready(): ready_.dequeue()
   est_loop->>node: run()
   node->>node: reads *owner_, runs fn_, reports into downstream_
-  est_loop->>node: destroy(allocator, true) [always, via scope_exit guard]
+  est_loop->>node: delete [always, via scope_exit guard]
 ```
 
 Two possible starting states, one converging path:
@@ -188,11 +191,13 @@ means naming `shared_ptr<future_state<T>>` anywhere requires
 - while `future_state<T>` is still being defined (its own `waiters_`
 member declaration is what would be doing the forcing), a genuine
 circular dependency between the two class templates. `ready_node` is
-already complete at that point regardless of `T`, so `complete()` (and
-the destructor above) recover the real `continuation_node<T>&` with a
-`static_cast` where they actually need it - safe by construction, since
+already complete at that point regardless of `T`, so `complete()`
+recovers the real `continuation_node<T>&` with a `static_cast` where it
+actually needs it (`bind_owner()`) - safe by construction, since
 `set_continuation()` is the only thing that ever enqueues anything here,
-always a real `continuation_node&`. See `continuation_node<T>`'s own doc
+always a real `continuation_node&`. `future_state<T>`'s own destructor
+needs no such downcast: `abandon()`/`delete` both work through the plain
+`ready_node&` it already has. See `continuation_node<T>`'s own doc
 comment (`future.cppm`) for the full account.
 
 Either way, once a node reaches the loop's ready-queue it's in exactly the
@@ -202,7 +207,10 @@ holding its own `shared_ptr<future_state<T>>` back to its parent. The loop's
 (one virtual dispatch, straight into the concrete node's own `run()`,
 reading `owner_` directly — see the note in "The type hierarchy" above),
 and — always, via a `scope_exit`-based guard, whether or not `run()`
-somehow threw — `node.destroy(allocator, true)` deallocates it.
+somehow threw — `delete` deallocates it, through this concrete node
+type's own `operator delete` (see
+[Allocation Patterns](Allocation-Patterns.md) for why every concrete node
+type needs its own).
 
 ### The `bind_owner()` subtlety
 
@@ -321,8 +329,7 @@ the outer `downstream_`:
 ```cpp
 template <class R> void fulfill(R&& result) {
   if constexpr (detail::is_future_v<std::decay_t<R>>) {
-    auto* node = result.state_->allocator().template new_object<detail::flatten_forwarder<U>>(
-        downstream_);
+    auto* node = new detail::flatten_forwarder<U>(downstream_);
     result.state_->set_continuation(*node);
   } else {
     downstream_->set_value(std::forward<R>(result));
@@ -352,7 +359,9 @@ all of that: a free class template in `est::detail`, alongside
 registered directly via `set_continuation()`:
 
 ```cpp
-template <class T> class flatten_forwarder final : public continuation_node<T> {
+template <class T>
+class flatten_forwarder final : public continuation_node<T>,
+                                 public current_allocator_new_delete<flatten_forwarder<T>> {
 public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
       : downstream_(std::move(downstream)) {}
@@ -374,12 +383,9 @@ public:
     }
   }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
-    if (!ran) {
-      downstream_->set_exception(std::make_exception_ptr(
-          std::runtime_error("flattened future abandoned before its inner future completed")));
-    }
-    allocator.delete_object(this);
+  void abandon() noexcept override {
+    downstream_->set_exception(std::make_exception_ptr(
+        std::runtime_error("flattened future abandoned before its inner future completed")));
   }
 
 private:
@@ -387,8 +393,9 @@ private:
 };
 ```
 
-`destroy()` completing `downstream_` with an exception when `ran` is
-false - rather than just deallocating - matters for the same reason
+`abandon()` completing `downstream_` with an exception - rather than
+leaving it dropped, `ready_node::abandon()`'s own default no-op body -
+matters for the same reason
 `future_resume_node<T>`'s own doc comment (above) gives: a coroutine
 `co_await`-ing the outer `future<T>` this node forwards into holds
 `downstream_`'s own `future_state` alive across its own suspension, so
@@ -407,7 +414,12 @@ directly: no `Fn` member, no lambda, no `future<T>` view built via
 at the same inner value type `T` reuses the *same* `flatten_forwarder<T>`
 instantiation, instead of minting a fresh node type per `(T, Fn, U)` call
 site — fewer template instantiations overall for a codebase with many
-distinct flattening call sites sharing the same inner future type.
+distinct flattening call sites sharing the same inner future type. Neither
+`flatten_forwarder<T>` nor `concrete_continuation<Fn, U>` overrides
+`abandon()` — `downstream_` is currently just dropped on abandonment
+either way; whether a coroutine `co_await`-ing a `.then()`-chained future
+can be stranded the same way if the *upstream* future_state is dropped
+first is a real, separate question neither class yet answers.
 
 `run()` moves the inner value out — `std::move(state).get()`, not a
 copying `.get()` — since `state` is a fresh, single-owner future_state
