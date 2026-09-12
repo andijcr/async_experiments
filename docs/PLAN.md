@@ -4108,7 +4108,7 @@ handoff semantics `unlock()` needs. `mutex` is now nothing but:
 class mutex {
   ...
   [[nodiscard]] auto lock() -> future<lock_guard> {
-    if (event_.try_acquire()) {
+    if (event_.try_wait()) {
       return make_ready_future<lock_guard>(*this);
     }
     return event_.wait().then([this] { return lock_guard(*this); });
@@ -4119,7 +4119,7 @@ private:
 };
 ```
 
-`counting_event<Mode>` gained one new method for this, `try_acquire()`:
+`counting_event<Mode>` gained one new method for this, `try_wait()`:
 the synchronous half of `wait()` (the `count_ > 0` check plus the
 automatic-mode decrement), split out on its own so a caller wanting the
 fast path without a `future<void>` it would immediately discard - exactly
@@ -4139,7 +4139,7 @@ the *only* way to release a lock this class exposes at all.
 **The allocation-count tradeoff, made explicit rather than silently
 accepted.** `lock()`'s fast (uncontended) path costs exactly what it
 always did - one allocation, the returned `future_state<lock_guard>`
-itself - because it goes through `try_acquire()` directly rather than
+itself - because it goes through `try_wait()` directly rather than
 `wait()` (which would otherwise build and discard a `future<void>` just
 to build a second, different future in its place). The *contended* path
 is genuinely more expensive than the hand-written version it replaced:

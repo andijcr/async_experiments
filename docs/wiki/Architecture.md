@@ -71,7 +71,7 @@ precondition and `one_shot_event::set()`'s at-most-once enforcement.
 `:sync.mutex` depends on `:sync.event` — `est::mutex` isn't its own
 implementation any more (issue #67): it holds a single
 `est::binary_event<EventResetMode::automatic>` member and builds `lock()`
-directly on `wait()`/`try_acquire()`/`set()`, rather than re-implementing
+directly on `wait()`/`try_wait()`/`set()`, rather than re-implementing
 an intrusive waiter list, a resume node, and abandonment-completion
 handling a second time (see [Coroutines](Coroutines.md#est-mutex-lock-built-on-top-of-binary_eventautomatic)).
 `:sync.mutex` needs nothing from `:loop`/`:util.intrusive_list`/

@@ -252,11 +252,11 @@ public:
   // split out on its own for a caller (est::mutex::lock(), est:sync.mutex)
   // that wants to special-case the already-available case itself rather
   // than pay for a future_state<void> it would immediately discard. Matches
-  // std::counting_semaphore::try_acquire()'s naming/shape, generalized the
+  // std::counting_semaphore::try_wait()'s naming/shape, generalized the
   // same way wait() itself generalizes acquire() to suspend instead of
   // block. true and count() decremented (automatic) or left alone
   // (manual) if a unit was available; false, no change, otherwise.
-  [[nodiscard]] auto try_acquire() noexcept -> bool {
+  [[nodiscard]] auto try_wait() noexcept -> bool {
     if (count_ <= 0) {
       return false;
     }
@@ -274,7 +274,7 @@ public:
   // the slow path only enqueues into this event's own waiters_, not onto
   // any loop's ready-queue (that happens later, from set()).
   [[nodiscard]] auto wait() -> future<void> {
-    if (try_acquire()) {
+    if (try_wait()) {
       return make_ready_future<void>();
     }
     auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());

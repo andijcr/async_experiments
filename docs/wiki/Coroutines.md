@@ -487,13 +487,13 @@ here - `then()`, `future_awaiter<T>`, `promise_type::initial_suspend()` -
 pays a fixed allocation cost specifically so a caller never has to
 wonder whether a given `future<T>` might already be resolved, with side
 effects already applied, before it was ever inspected; a bespoke fast
-path for `wait()` alone would break that guarantee. `try_acquire()` is
+path for `wait()` alone would break that guarantee. `try_wait()` is
 the synchronous half of that fast path, split out on its own so a caller
 that doesn't want a `future<void>` at all (`est::mutex::lock()`, below)
 can reuse it directly instead of building and immediately discarding one:
 
 ```cpp
-[[nodiscard]] auto try_acquire() noexcept -> bool {
+[[nodiscard]] auto try_wait() noexcept -> bool {
   if (count_ <= 0) {
     return false;
   }
@@ -504,7 +504,7 @@ can reuse it directly instead of building and immediately discarding one:
 }
 
 [[nodiscard]] auto wait() -> future<void> {
-  if (try_acquire()) {
+  if (try_wait()) {
     return make_ready_future<void>();
   }
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
@@ -692,7 +692,7 @@ lock `lock()` returned:
 
 ```cpp
 [[nodiscard]] auto lock() -> future<lock_guard> {
-  if (event_.try_acquire()) {
+  if (event_.try_wait()) {
     return make_ready_future<lock_guard>(*this);
   }
   return event_.wait().then([this] { return lock_guard(*this); });
@@ -703,11 +703,11 @@ void unlock() noexcept { event_.set(); }
 binary_event<EventResetMode::automatic> event_;
 ```
 
-The fast (uncontended) path calls `try_acquire()` directly rather than
+The fast (uncontended) path calls `try_wait()` directly rather than
 `event_.wait()` - reusing `wait()` itself here would mean discarding the
 `future<void>` it always builds (even on its own fast path) just to
 build a second, different one (`future<lock_guard>`) in its place, an
-extra wasted allocation on every uncontended `lock()` call. `try_acquire()`
+extra wasted allocation on every uncontended `lock()` call. `try_wait()`
 being a plain, non-allocating `bool` check is exactly what avoids that;
 see the previous section for why it exists as its own method on
 `counting_event<Mode>` rather than being inlined into `wait()` alone.

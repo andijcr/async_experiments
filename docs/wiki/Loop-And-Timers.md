@@ -365,7 +365,7 @@ coroutine's frame forever if the loop is destroyed first.
 
 `est::counting_event<Mode>::wait()`'s own already-signaled fast path
 (which `est::mutex::lock()`'s own fast path builds on top of via
-`try_acquire()` - see [Coroutines](Coroutines.md)) needs an already-ready
+`try_wait()` - see [Coroutines](Coroutines.md)) needs an already-ready
 `future<T>` built from a value it already has in hand.
 `make_ready_future<T>(args...)` (`est:promise`) is that pattern factored
 out - `make_promise_future<T>()` followed by
@@ -391,7 +391,7 @@ wait()`'s fast path, for instance:
 
 ```cpp
 [[nodiscard]] auto wait() -> future<void> {
-  if (try_acquire()) {
+  if (try_wait()) {
     return make_ready_future<void>();
   }
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());

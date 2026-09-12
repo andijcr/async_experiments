@@ -62,7 +62,7 @@ public:
   // Acquires the lock, resolving once it's held - suspending the calling
   // coroutine first (if `co_await`ed) when it's already held. The fast
   // path (uncontended) consumes the available unit synchronously via
-  // try_acquire() and returns an already-ready future, with no future/
+  // try_wait() and returns an already-ready future, with no future/
   // node allocated beyond the returned future_state<lock_guard> itself -
   // matching this class's previous zero-extra-allocation fast path
   // exactly (see [Allocation Patterns](../wiki/Allocation-Patterns.md)).
@@ -142,7 +142,7 @@ private:
 };
 
 inline auto mutex::lock() -> future<lock_guard> {
-  if (event_.try_acquire()) {
+  if (event_.try_wait()) {
     return make_ready_future<lock_guard>(*this);
   }
   return event_.wait().then([this] { return lock_guard(*this); });
