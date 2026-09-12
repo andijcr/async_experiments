@@ -239,7 +239,7 @@ sequenceDiagram
     Note over state,node: (later) set_value()/set_exception() -> complete()
     state->>est_loop: enqueue_ready(node)
     est_loop->>est_loop: drain_ready(): ready_.dequeue()
-    est_loop->>node: run() -> invoke() -> handle.resume()
+    est_loop->>node: run() -> handle.resume()
     Note over coro: resumes here
   end
   coro->>awaiter: await_resume(): get() the value (or rethrow)
@@ -266,14 +266,18 @@ is what the diagram's `alt` now shows.
 `future_awaiter<T>` needs its resumption node to satisfy
 `future_state<T>::set_continuation()`'s signature —
 `detail::continuation_node<T>&` — so it gets its own tiny heap-allocated
-trampoline, `future_resume_node<T>`, that ignores the `future_state<T>&`
-it's handed and just resumes:
+trampoline, `future_resume_node<T>`, that implements `ready_node::run()`
+directly and just resumes (it has no use for `owner_`
+(`continuation_node<T>`'s own member) beyond what keeps its parent
+`future_state<T>` alive - see [Continuation Node
+Mechanism](Continuation-Node-Mechanism.md) for why `run()` lives on each
+concrete node rather than behind a shared, separately virtual `invoke()`):
 
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
   explicit future_resume_node(std::coroutine_handle<> handle) noexcept : handle_(handle) {}
-  void invoke(future_state<T>&) override {
+  void run() final {
     handle_.resume();
   }
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
@@ -284,7 +288,6 @@ public:
   }
 private:
   std::coroutine_handle<> handle_;
-  bool invoked_ = false;
 };
 ```
 
@@ -424,7 +427,7 @@ the other side is a coroutine.
 ### Abandoned coroutines are destroyed, not leaked
 
 Every resumption node's `destroy()` is called two ways: after a successful
-`run()`/`invoke()` (the normal case, described above), or by
+`run()` (the normal case, described above), or by
 `future_state<T>::~future_state()`/`loop::drain_pending()` (called both by
 `~loop()` and by `make_current_loop()`'s own returned guard - see
 [Loop and Timers](Loop-And-Timers.md) for why the guard needs to call it
@@ -440,7 +443,7 @@ apart -
 ```cpp
 template <class T> class future_resume_node final : public continuation_node<T> {
 public:
-  void invoke(future_state<T>&) override {
+  void run() final {
     handle_.resume();
   }
   void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
@@ -454,9 +457,9 @@ public:
 };
 ```
 
-If `run()`/`invoke()` never happened, the coroutine is still exactly where
+If `run()` never happened, the coroutine is still exactly where
 `await_suspend()` left it - fully intact, suspended, never touched -
-so destroying it here is both safe and necessary. If `run()`/`invoke()`
+so destroying it here is both safe and necessary. If `run()`
 *did* happen, this `destroy()` call must not touch `handle_` again: the
 coroutine either already self-destroyed (`promise_type::final_suspend()`'s
 `std::suspend_never` - `handle_` is now dangling, so even calling `.done()`
@@ -466,7 +469,7 @@ what lets one `destroy()` implementation tell those two completely
 different situations apart without ever having to safely query a handle
 that might already be gone - passed in by the caller (`ready_node::
 destroy()`'s own doc comment, est:loop) rather than tracked with a private
-flag each node sets on its own `run()`/`invoke()`, since every call site
+flag each node sets on its own `run()`, since every call site
 already knows statically which situation it's in.
 
 ## `est::mutex::lock()` becomes awaitable

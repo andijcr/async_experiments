@@ -273,9 +273,9 @@ void run_one(detail::ready_node& node) {
 
 - **`destroy_guard`** (a `scope_exit` factored into one small helper, shared
   with `fire_ready_timers()`) guarantees the node is deallocated no matter
-  how `run()` returns — even though `invoke()` already catches every
-  exception a callback could throw internally, so this is a defensive
-  guarantee, not something the happy path relies on.
+  how `run()` returns — even though a continuation node's own `run()`
+  already catches every exception a callback could throw internally, so
+  this is a defensive guarantee, not something the happy path relies on.
 - **Long-running-callback detection**: single-threaded means one slow
   continuation blocks everything else the loop owns — timers, other ready
   work, all of it — with nothing able to preempt it. Measuring and

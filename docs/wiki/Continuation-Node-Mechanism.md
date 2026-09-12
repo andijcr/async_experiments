@@ -19,15 +19,13 @@ classDiagram
     +destroy(allocator, ran) void
   }
   class continuation_node_T {
-    -owner_ : shared_ptr_future_state_T
-    +run() void
-    +invoke(state) void
+    #owner_ : shared_ptr_future_state_T
     +bind_owner(owner) void
   }
   class concrete_continuation_Fn_U {
     -fn_ : Fn
     -downstream_ : shared_ptr_future_state_U
-    +invoke(state) void
+    +run() void
     +destroy(allocator, ran) void
   }
   intrusive_list_node <|-- ready_node
@@ -71,23 +69,34 @@ excerpts below for the real, fully-qualified signatures.)
   plain destructor call). `:loop` knows nothing more about what a
   `ready_node` actually *is* — that's the whole point (see
   [Architecture](Architecture.md#why-loop-doesnt-depend-on-future)).
-- **`continuation_node<T>`** (`est:future`) is the first T-dependent layer.
-  It adds `invoke(future_state<T>&)` (still pure virtual — a concrete `Fn`
-  hasn't entered the picture yet) and implements `run()` *once*, for every
-  `T`, by forwarding to `invoke(*owner_)`. It also owns `bind_owner()` and
-  the `owner_` member — the mechanism that keeps a queued node's
-  `future_state<T>` alive; see "The `bind_owner()` subtlety" below.
+- **`continuation_node<T>`** (`est:future`) is the first T-dependent layer,
+  and a thin one: it adds only `owner_` (a `shared_ptr<future_state<T>>`,
+  `protected`) and `bind_owner()` to set it — the mechanism that keeps a
+  queued node's `future_state<T>` alive; see "The `bind_owner()` subtlety"
+  below. It does *not* implement `run()` — that's each concrete node's own
+  job now (see the note below on why).
 - **`concrete_continuation<Fn, U>`** is a private nested class template
   *inside* `future_state<T>` — one instantiation per distinct
   `(T, Fn, U)` triple a real `.then()` call site produces. It's the layer
   that finally knows the actual callback (`fn_`) and where its result goes
-  (`downstream_`, a `shared_ptr<future_state<U>>`). `invoke()` and
-  `destroy()` are implemented here, nowhere else.
+  (`downstream_`, a `shared_ptr<future_state<U>>`). `run()` and `destroy()`
+  are implemented here, reading `owner_` directly from `continuation_node<T>`.
 
-Only `run()` gets a single shared implementation at the `continuation_node<T>`
-level instead of being repeated once per `(Fn, U)` instantiation — this is a
-deliberate compile-time-cost optimization, the same "compiled once instead
-of once per T" reasoning `ready_node` itself exists for.
+An earlier version of this hierarchy had `continuation_node<T>` implement
+`run()` once, for every `T`, as `invoke(*owner_)`, with each concrete node
+instead overriding a second, separately virtual `invoke(future_state<T>&)`.
+That bought nothing: the only thing `invoke()` was ever called with was
+`*owner_`, so `state` was always just `owner_` read back through a
+parameter. It did cost something, though — a second, non-devirtualizable
+virtual call (`est::loop`'s ready-queue only ever holds a `ready_node&`, so
+`run()`'s own dispatch can't statically know which `invoke()` override it's
+about to make a *second* indirect call to) on every single continuation
+this framework ever runs. `bind_owner()`/`owner_` stay shared at the
+`continuation_node<T>` level regardless — sharing them costs nothing, since
+they're a plain data member and a non-virtual setter, not something a
+second vtable slot was ever paying for — but `run()` itself now belongs to
+each concrete node, which reads `owner_` directly instead of through a
+parameter. (Issue #63; see `docs/PLAN.md` for the full writeup.)
 
 ## What `then()` actually builds
 
@@ -147,8 +156,8 @@ sequenceDiagram
   parent->>est_loop: enqueue_ready(node)
   Note over node: node now holds a real shared_ptr<br/>keeping `parent` alive
   est_loop->>est_loop: drain_ready(): ready_.dequeue()
-  est_loop->>node: run() -> invoke(*owner_)
-  node->>node: runs fn_, reports into downstream_
+  est_loop->>node: run()
+  node->>node: reads *owner_, runs fn_, reports into downstream_
   est_loop->>node: destroy(allocator, true) [always, via scope_exit guard]
 ```
 
@@ -186,7 +195,8 @@ Either way, once a node reaches the loop's ready-queue it's in exactly the
 same state: owned by the queue (an intrusive link, no `shared_ptr`) *and*
 holding its own `shared_ptr<future_state<T>>` back to its parent. The loop's
 `drain_ready()` eventually dequeues it, `run_one()` calls `node.run()`
-(dispatching through `continuation_node<T>::run()` to `invoke(*owner_)`),
+(one virtual dispatch, straight into the concrete node's own `run()`,
+reading `owner_` directly — see the note in "The type hierarchy" above),
 and — always, via a `scope_exit`-based guard, whether or not `run()`
 somehow threw — `node.destroy(allocator, true)` deallocates it.
 
@@ -219,11 +229,13 @@ continuation still sitting in the loop's ready-queue, even if every other
 
 ## The two calling conventions
 
-`invoke()`'s real body — the part `concrete_continuation<Fn, U>` actually
-implements — dispatches on how `Fn` can be called, checked in this order:
+`run()`'s real body — the part `concrete_continuation<Fn, U>` actually
+implements — reads `owner_` (`continuation_node<T>`'s own member) and then
+dispatches on how `Fn` can be called, checked in this order:
 
 ```cpp
-void invoke(future_state& state) override {
+void run() final {
+  auto& state = *this->owner_;
   try {
     if constexpr (detail::invocable_unwrapped<Fn, T>()) {
       if (state.failed()) {                        // "unwrapped", auto-propagate
@@ -262,9 +274,13 @@ when unwrapped genuinely isn't viable: `Fn` explicitly typed to take
 `future<T>&` isn't invocable with a plain `const T&`, so it still falls
 through to wrapped.
 
+(`invoke_and_fulfill()`/`fulfill()`, called from both branches above, are
+`concrete_continuation<Fn, U>`'s own private helpers — see "Flattening is
+not a special case" below for `fulfill()`.)
+
 `then_callback_for<Fn, T>` (the concept constraining `then()`'s template
 parameter) checks in the identical order, and for a sharper reason than
-just matching `invoke()`'s own precedence:
+just matching `run()`'s own precedence:
 
 ```cpp
 template <class Fn, class T>
@@ -283,11 +299,11 @@ overload-resolution failure the way "no viable candidate" is, so it isn't
 SFINAE-friendly; instantiating that check at all is a hard compile error,
 constraint or no constraint. Checking `invocable_unwrapped<Fn, T>()`
 first means an `Fn` for which it's satisfied never triggers the wrapped
-check at all — the same short-circuiting that decides `invoke()`'s own
+check at all — the same short-circuiting that decides `run()`'s own
 dispatch order is what makes this ordering *necessary* here, not just
 consistent. An `Fn` matching neither shape still fails right at the
 `then()` call site with a "constraints not satisfied" diagnostic, not
-deep inside `invoke()`'s own
+deep inside `run()`'s own
 instantiation.
 
 ## Flattening is not a special case
@@ -337,7 +353,8 @@ public:
   explicit flatten_forwarder(shared_ptr<future_state<T>> downstream)
       : downstream_(std::move(downstream)) {}
 
-  void invoke(future_state<T>& state) override {
+  void run() final {
+    auto& state = *this->owner_;
     if (state.failed()) {
       downstream_->set_exception(state.get_exception());
       return;
@@ -366,15 +383,14 @@ private:
 The forwarding logic this node needs is fixed — it never varies by
 closure, only by `T` — so `flatten_forwarder<T>` bakes that one shape in
 directly: no `Fn` member, no lambda, no `future<T>` view built via
-`shared_from_this()` (it operates on the `future_state<T>&` `invoke()`
-already receives, which already exposes `failed()`/`get_exception()`/`get()`
-publicly). Every flattening `.then()` at the same inner value type `T`
-reuses the *same* `flatten_forwarder<T>` instantiation, instead of
-minting a fresh node type per `(T, Fn, U)` call site — fewer template
-instantiations overall for a codebase with many distinct flattening call
-sites sharing the same inner future type.
+`shared_from_this()` (it operates on `*owner_`, which already exposes
+`failed()`/`get_exception()`/`get()` publicly). Every flattening `.then()`
+at the same inner value type `T` reuses the *same* `flatten_forwarder<T>`
+instantiation, instead of minting a fresh node type per `(T, Fn, U)` call
+site — fewer template instantiations overall for a codebase with many
+distinct flattening call sites sharing the same inner future type.
 
-`invoke()` moves the inner value out — `std::move(state).get()`, not a
+`run()` moves the inner value out — `std::move(state).get()`, not a
 copying `.get()` — since `state` is a fresh, single-owner future_state
 (`fn`'s own return value, not a stored one). That move matters beyond
 speed: a `future<std::unique_ptr<T>>` returned from a `then()` callback
