@@ -458,6 +458,30 @@ TEST_CASE("make_promise_future<T>() with no loop argument uses est::current_loop
   REQUIRE(future.get() == 42);
 }
 
+TEST_CASE("make_ready_future<T>(args...) returns an already-ready future constructed from args",
+          "[loop]") {
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  auto future = est::make_ready_future<int>(42);
+  REQUIRE(future.ready());
+  REQUIRE(future.get() == 42);
+}
+
+TEST_CASE("make_ready_future<T>(args...) forwards every argument to T's constructor", "[loop]") {
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  auto future = est::make_ready_future<std::string>(std::size_t{3}, 'x');
+  REQUIRE(future.ready());
+  REQUIRE(future.get() == "xxx");
+}
+
+TEST_CASE("make_ready_future<void>() returns an already-ready future<void>", "[loop]") {
+  est::loop loop;
+  const auto guard = est::make_current_loop(loop);
+  auto future = est::make_ready_future<void>();
+  REQUIRE(future.ready());
+}
+
 TEST_CASE("sleep_for()/sleep_until()/yield_execution() with no loop argument use "
           "est::current_loop()",
           "[loop]") {

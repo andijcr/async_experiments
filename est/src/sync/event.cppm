@@ -246,19 +246,18 @@ public:
   // resuming immediately (no suspension, no allocation - see
   // future_awaiter<T>::await_ready(), est:future) if it already is. Only
   // current_allocator() is needed here, never current_loop() itself - the
-  // fast path completes the promise inline, and the slow path only
-  // enqueues into this event's own waiters_, not onto any loop's
-  // ready-queue (that happens later, from set()).
+  // fast path completes the promise inline (make_ready_future()), and
+  // the slow path only enqueues into this event's own waiters_, not onto
+  // any loop's ready-queue (that happens later, from set()).
   [[nodiscard]] auto wait() -> future<void> {
-    auto allocator = current_allocator();
-    auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
     if (count_ > 0) {
       if constexpr (Mode == EventResetMode::automatic) {
         --count_;
       }
-      prom.set_value();
-      return std::move(fut);
+      return make_ready_future<void>();
     }
+    auto allocator = current_allocator();
+    auto [prom, fut] = detail::make_promise_future_impl<void>(allocator);
     auto* node = allocator.template new_object<detail::event_resume_node>(std::move(prom));
     waiters_.enqueue(*node);
     return std::move(fut);
