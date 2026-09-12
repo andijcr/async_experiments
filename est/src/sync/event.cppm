@@ -242,6 +242,25 @@ public:
   // out.
   void reset() noexcept { count_ = 0; }
 
+  // Attempts to consume one unit synchronously, without ever constructing
+  // a future or enqueuing a waiter - the non-awaiting half of wait(),
+  // split out on its own for a caller (est::mutex::lock(), est:sync.mutex)
+  // that wants to special-case the already-available case itself rather
+  // than pay for a future_state<void> it would immediately discard. Matches
+  // std::counting_semaphore::try_acquire()'s naming/shape, generalized the
+  // same way wait() itself generalizes acquire() to suspend instead of
+  // block. true and count() decremented (automatic) or left alone
+  // (manual) if a unit was available; false, no change, otherwise.
+  [[nodiscard]] auto try_acquire() noexcept -> bool {
+    if (count_ <= 0) {
+      return false;
+    }
+    if constexpr (Mode == EventResetMode::automatic) {
+      --count_;
+    }
+    return true;
+  }
+
   // Suspends the calling coroutine until the count is greater than zero,
   // resuming immediately (no suspension, no allocation - see
   // future_awaiter<T>::await_ready(), est:future) if it already is. Only
@@ -250,10 +269,7 @@ public:
   // the slow path only enqueues into this event's own waiters_, not onto
   // any loop's ready-queue (that happens later, from set()).
   [[nodiscard]] auto wait() -> future<void> {
-    if (count_ > 0) {
-      if constexpr (Mode == EventResetMode::automatic) {
-        --count_;
-      }
+    if (try_acquire()) {
       return make_ready_future<void>();
     }
     auto allocator = current_allocator();

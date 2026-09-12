@@ -577,6 +577,54 @@ TEST_CASE("flattening a chained then() frees every node involved, no leak", "[fu
   REQUIRE(resource.allocations == 5);
 }
 
+TEST_CASE("dropping an abandoned inner future_state completes the flattened future, no leak",
+          "[future]") {
+  // Guards flatten_forwarder<T>::destroy(): if the inner future_state a
+  // flattening then() registered a flatten_forwarder<T> on is dropped
+  // without ever completing, the outer (flattened) future it forwards
+  // into must still be completed (with an exception), not silently
+  // left to strand a coroutine suspended awaiting it - the identical
+  // hazard concrete_continuation<Fn, U>::destroy() (this file's own
+  // "a throwing continuation's node and downstream future are freed"
+  // test, and every resume node in this codebase) already guards
+  // against, one layer over. Originally undiscovered until
+  // est::mutex::lock()'s own then()-based slow path (issue #67,
+  // docs/PLAN.md's "Issue #66 & #67" entry) turned this from a
+  // documented-but-unexercised gap into a real, test-caught leak.
+  counting_resource resource;
+  {
+    est::loop loop{&resource};
+    const auto loop_guard = est::make_current_loop(loop);
+    auto inner_pair = std::optional(est::make_promise_future<int>());
+    auto [outer_promise, outer_future] = est::make_promise_future<int>();
+
+    auto chained =
+        outer_future.then([&inner_pair](int /*value*/) { return std::move(inner_pair->second); });
+    outer_promise.set_value(1);
+    loop.run_until_idle(); // then()'s callback runs, returns the still-pending inner future -
+                           // fulfill() registers a flatten_forwarder<int> on its future_state
+
+    // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+    auto coro = [](est::loop&, est::future<int>& fut) -> est::future<int> {
+      const int value = co_await fut;
+      co_return value;
+    };
+    auto result = coro(loop, chained);
+    loop.run_until_idle(); // coro suspends awaiting `chained` - still not ready
+
+    inner_pair.reset();    // drops the inner promise and future - the inner
+                           // future_state is destroyed while flatten_forwarder
+                           // is still registered on it, never having run
+    loop.run_until_idle(); // drains the now-completed `chained`, resuming (and
+                           // finishing) the suspended coroutine
+
+    REQUIRE(result.failed());
+    REQUIRE_THROWS_AS(result.get(), std::runtime_error);
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
+
 // est::future<T> itself is a coroutine's return type - no separate
 // task<T> wrapper - via future<T>::promise_type. Every coroutine below is
 // a plain lambda still taking est::loop& as its first parameter, exactly

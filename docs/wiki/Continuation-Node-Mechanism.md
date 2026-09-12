@@ -35,7 +35,9 @@ classDiagram
 
 - `intrusive_list_node` (real name `est::intrusive_list_node`) lives in
   `est:util.intrusive_list` — a genuinely generic utility shared by
-  `est::mutex`, `est::future_state<T>`, and `est::loop` alike (see
+  `est::counting_event<Mode>` (which `est::mutex` now builds `lock()` on
+  top of directly, rather than keeping a waiter list of its own - issue
+  #67), `est::future_state<T>`, and `est::loop` alike (see
   [Architecture](Architecture.md)).
 - `ready_node` (real name `est::detail::ready_node`) lives in `est:loop`.
 - `continuation_node_T` (real name `est::detail::continuation_node<T>`)
@@ -50,7 +52,9 @@ excerpts below for the real, fully-qualified signatures.)
 
 - **`intrusive_list_node`** (`est:util.intrusive_list`) is nothing but an
   intrusive `next` pointer. It's the root of *three* independent intrusive
-  lists in this codebase: `est::mutex`'s own waiter list, and (via
+  lists in this codebase: `est::counting_event<Mode>`'s own waiter list
+  (`est::mutex`'s `lock()` is built directly on top of it, not a separate
+  waiter list of its own), and (via
   `ready_node`) both `future_state<T>`'s
   "not yet ready" queue and `est::loop`'s "ready to run" queue. Reusing one
   link field across all of them is safe because a node is only ever a
@@ -60,7 +64,7 @@ excerpts below for the real, fully-qualified signatures.)
   is what each of the three actually stores its nodes in - see
   [Allocation Patterns](Allocation-Patterns.md) and
   [Architecture](Architecture.md) for more on why this lives in a shared
-  util partition instead of inside `est:sync.mutex`.
+  util partition instead of inside `est:sync.event`.
 - **`ready_node`** (`est:loop`) is the type-erased base the loop's
   ready-queue actually holds. It adds exactly two things: `run()` (invoke
   whatever this is, however it does that) and `destroy(allocator, ran)`
@@ -370,8 +374,11 @@ public:
     }
   }
 
-  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool /*ran*/) noexcept
-      override {
+  void destroy(std::pmr::polymorphic_allocator<std::byte> allocator, bool ran) noexcept override {
+    if (!ran) {
+      downstream_->set_exception(std::make_exception_ptr(
+          std::runtime_error("flattened future abandoned before its inner future completed")));
+    }
     allocator.delete_object(this);
   }
 
@@ -379,6 +386,18 @@ private:
   shared_ptr<future_state<T>> downstream_;
 };
 ```
+
+`destroy()` completing `downstream_` with an exception when `ran` is
+false - rather than just deallocating - matters for the same reason
+`future_resume_node<T>`'s own doc comment (above) gives: a coroutine
+`co_await`-ing the outer `future<T>` this node forwards into holds
+`downstream_`'s own `future_state` alive across its own suspension, so
+dropping just this node's reference to it without completing it would
+strand that coroutine's frame with nothing left to free it. (Originally
+left unhandled - "not a settled answer" - until `est::mutex::lock()`'s
+own `.then()`-based slow path, `est/src/sync/mutex.cppm`, turned the gap
+from theoretical into a real, test-caught leak; see `docs/PLAN.md`'s
+"Issue #66 & #67" entry.)
 
 The forwarding logic this node needs is fixed — it never varies by
 closure, only by `T` — so `flatten_forwarder<T>` bakes that one shape in
