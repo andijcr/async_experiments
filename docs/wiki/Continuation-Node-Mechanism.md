@@ -662,3 +662,54 @@ exactly the bug an earlier version of this function had, caught by the
 "resolves synchronously when every future is already ready" test
 (`est/tests/when_all_tests.cpp`) failing outright once `then_fast()`
 replaced `then()` here.
+
+## `est::when_any()`: the same shape, with no counter at all
+
+`est::when_any(future<Ts>&... futures) -> future<void>` (`est/src/when_any.cppm`)
+resolves the moment *any one* of `futures` is accounted for - completed
+or abandoned, succeeded or failed. Same ownership contract as
+`est::when_all()` (each `future<T>&` stays the caller's, `when_any()`
+only ever registers continuations on it), same two-stage
+`then_fast()` chain per input for the identical pair of reasons
+(`when_any_track()`, below, mirrors `when_all_track()` line for line
+apart from what its second stage does), and the identical
+"`event.wait()` last" ordering, for the identical reason:
+
+```cpp
+template <class T>
+void when_any_track(future<T>& input, shared_ptr<one_shot_event<EventResetMode::manual>> event) {
+  input.then_fast([](future<T>&) {}).then_fast([event = std::move(event)](future<void>&) {
+    event->set();
+  });
+}
+```
+
+The one real difference: `when_all_state` needs a `remaining` counter
+alongside its event, decremented by every input, because *every one* of
+them has to be accounted for before the shared event can fire.
+`when_any()` has no such bookkeeping at all - firing on the *first*
+input to finish means each `when_any_track()` call can share nothing
+but the `one_shot_event` itself, calling `set()` directly with no
+counter to check first. That's safe unmodified: `one_shot_event<Mode>::set()`
+already tolerates being called redundantly by as many races as reach it
+(its own doc comment, `est:sync.event`, calls out exactly this shape -
+"two unrelated cancellation sources racing to fire the same one-shot
+signal" - as the reason it doesn't require callers to coordinate first)
+without so much as a shared counter to serialize them, single-threaded
+or not: every input but the first to finish calls `set()` on an
+already-signaled event, and `has_been_set_`'s own check turns that into
+a no-op before it ever reaches `binary_event<Mode>::set()` underneath.
+
+No cancellation follows from any of this: the inputs that didn't win
+keep running to completion in the background, same as any other
+future nothing is left watching, exactly the same accepted constraint
+`est::when_all()`'s own doc comment already states (this codebase has no
+cancellation mechanism at all) - `est::when_any()` doesn't reopen that
+question, just inherits it.
+
+An empty call has nothing that could ever complete it - "any one of
+zero" isn't vacuously true the way `est::when_all()`'s own empty case
+is, so `when_any(future<Ts>&...)` `static_assert`s `sizeof...(Ts) > 0`
+at compile time, and the `std::span<future<T>>` overload - whose size
+isn't visible to the compiler - `check()`s the same precondition at
+runtime instead.

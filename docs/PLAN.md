@@ -4857,6 +4857,79 @@ lines as before).
 
 ---
 
+### Issue #54, part two: `est::when_any()`
+
+The follow-up `est::when_all()` itself deferred: same ownership
+contract (each `future<T>&` stays the caller's own; `when_any()` never
+consumes, moves, or reads a value/exception out of any input itself),
+and built the same way from the start this time - `then_fast()` at both
+tracking stages, a `one_shot_event<EventResetMode::manual>` for the
+completion signal, and `event.wait()` called last, after every input is
+registered - all three of which `est::when_all()` only reached after a
+PR review round and a bug of its own; see that entry, above, and
+`docs/wiki/Continuation-Node-Mechanism.md`'s "`est::when_any()`: the
+same shape, with no counter at all" for why each one still applies here
+unchanged. `est::when_any()` resolves the moment *any one* of its inputs
+is accounted for - completed or abandoned, succeeded or failed - and
+never fails or cancels the inputs that didn't win, which simply keep
+running to completion in the background (this codebase has no
+cancellation mechanism at all, the same accepted constraint
+`est::when_all()`'s own doc comment already states).
+
+**Simpler than `when_all` in one real way: no counter.** `when_all_state`
+needs a `remaining` count because *every* input has to be accounted for
+before its event can fire. `when_any_track()` shares nothing but the
+`one_shot_event` itself and calls `set()` unconditionally - safe
+unmodified, since `one_shot_event<Mode>::set()` already tolerates being
+called redundantly by as many races as reach it (its own doc comment
+calls out exactly this shape: independent cancellation sources racing to
+fire the same one-shot signal, with no coordination required). No
+`when_any_state` wrapper struct exists at all - `shared_ptr<one_shot_event
+<EventResetMode::manual>>` is the entire shared state.
+
+**Empty case handled the opposite way from `when_all`.** "Any one of
+zero" has nothing that could ever complete it - not vacuously true the
+way `when_all`'s own empty case is - so the fixed-arity overload
+`static_assert`s `sizeof...(Ts) > 0` at compile time (a pack's size is
+always known then), and the `std::span<future<T>>` overload `check()`s
+the same precondition at runtime instead, since a span's size isn't
+visible to the compiler. Matches this codebase's own established
+"no practical way to unit-test a `check()` failure without process-
+isolation tooling" precedent (`est/tests/check_tests.cpp`) - not
+exercised by a test, same as every other `check()` call site in this
+codebase.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new `:when_any`
+node and edges in `docs/wiki/Architecture.md`'s dependency graph
+(notably no edge to `:promise` - unlike `when_all`, `when_any` has no
+empty-case `make_ready_future()` call, so it never needs `:promise` at
+all); the full mechanism written up in
+`docs/wiki/Continuation-Node-Mechanism.md`, alongside `est::when_all()`'s
+own entry.
+
+**Tests added** (`est/tests/when_any_tests.cpp`): resolves once any one
+input is ready, not before; resolves synchronously when at least one
+input is already ready at call time (guards the identical `event.wait()`
+-ordering correctness `when_all()` needed, verified correct from the
+start here rather than caught after the fact); resolves on a failed
+input the same as a succeeded one; resolves when one input is abandoned
+while another stays genuinely pending (mirrors `when_all()`'s own
+abandonment regression test); does not consume the caller's futures;
+works across heterogeneous types including `future<void>`; the
+`std::span` overload's own any-one-ready case; two leak tests (freed on
+the happy path - including the redundant `set()` from whichever input
+loses - and freed even when the winning input is abandoned rather than
+completed).
+
+**Verified in the pinned Docker devenv:** 203/203 tests pass (9 new);
+`clang-format`/`clang-tidy` clean; 170/170 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 97% (140/143 changed lines covered - the same
+`counting_resource::do_is_equal()` boilerplate pattern as every other
+test file that defines one).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

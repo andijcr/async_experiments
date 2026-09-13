@@ -22,6 +22,7 @@ graph BT
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
   when_all[":when_all<br/>when_all(), detail::when_all_state"]
+  when_any[":when_any<br/>when_any()"]
 
   check --> platform
   event --> check
@@ -58,6 +59,11 @@ graph BT
   when_all --> event
   when_all --> shared_ptr
   when_all --> current_loop
+  when_any --> check
+  when_any --> future
+  when_any --> event
+  when_any --> shared_ptr
+  when_any --> current_loop
 ```
 
 The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
