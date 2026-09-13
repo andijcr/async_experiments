@@ -45,7 +45,24 @@ public:
     if (ctrl_->cancelled) {
       return;
     }
-    fn_();
+    try {
+      fn_();
+    } catch (...) {
+      // fn_ has no downstream future to route an exception into (unlike
+      // future_state<T>'s own continuations, concrete_continuation<Fn, U>::
+      // run(), est:future) - fn_ returns void, not a future<T>. Letting it
+      // escape here would unwind loop::fire_ready_timers()/run_impl()
+      // entirely, abandoning every other unrelated pending timer and
+      // ready-work item on the same loop over one periodic callback's own
+      // bug - and silently kill this chain forever with no diagnostic.
+      // Reported the same way loop::run_one()'s own long-running-callback
+      // stall is (platform::printdbg() - a loud diagnostic that doesn't
+      // stop the loop), then treated as one skipped period: the chain
+      // still reschedules below, so a transient failure doesn't
+      // permanently kill an otherwise-healthy periodic job.
+      platform::printdbg(
+          "est::schedule_periodic: fn() threw an exception - period skipped, chain continues");
+    }
     if (ctrl_->cancelled) { // fn_ itself may have just cancelled
       return;
     }

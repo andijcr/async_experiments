@@ -5225,6 +5225,55 @@ this file's own existing unreachable-catch pattern, and a couple of
 `REQUIRE(...)` line-attribution artifacts in the new test files
 themselves).
 
+#### Follow-up code review: two real findings, both fixed
+
+A `/code-review` pass over this PR's diff (single-pass, no subagent
+fan-out available) found two genuine issues, both independently verified
+against the actual code before fixing:
+
+**`periodic_timer_node::fire()` had no exception handling around `fn_()`,
+unlike every other user-callback path in this codebase** -
+`concrete_continuation<Fn, U>::run()` (`est:future`) wraps its own `fn_(...)`
+call in `try`/`catch (...)`, routing any exception into
+`downstream_->set_exception()`. `fire()` had nothing comparable: a
+throwing `schedule_periodic()` callback would propagate straight out of
+`loop::fire_ready_timers()`/`run_impl()`, unwinding the *entire* loop over
+one periodic callback's own bug - abandoning every other unrelated
+pending timer and ready-work item mid-drain, and silently killing the
+periodic chain forever with no diagnostic. No test exercised a throwing
+callback. Fixed by wrapping `fn_()` in `try`/`catch (...)`, reporting via
+`platform::printdbg()` (the same "loud diagnostic, don't stop the loop"
+tool `loop::run_one()`'s own long-running-callback stall detection
+already uses) and letting the chain still reschedule - `fn_` returns
+`void`, not a `future<T>`, so there's no downstream to route the
+exception into the way `.then()` continuations do; treating one bad
+period as skipped rather than fatal is the closer match to what
+"periodic" implies. New test: `fn()` throwing on one period is skipped,
+doesn't escape `run_until_idle()`, and the chain still reaches (and
+honors) a later cancelling call.
+
+**`est::jitter` discarded half the entropy `get_random_seed()` computed,
+for nothing.** `hosted_stdcpp::get_random_seed()` combines *two*
+`std::random_device` draws into its 64-bit return value
+(`(dev() << 32) | dev()`), but `jitter`'s constructor fed that straight
+into `static_cast<std::minstd_rand::result_type>(seed)` - a 32-bit type,
+so the cast silently truncated to the low 32 bits, meaning the *entire
+first* `random_device` draw was computed and then thrown away unused.
+Not a crash, but a real waste (a `std::random_device` draw can be slow -
+some implementations gather real hardware entropy per call - and a
+future bare-metal backend's entropy source may be scarcer still) and a
+broken contract (a 64-bit seed getter whose only caller only ever
+benefited from half of it). Fixed with an XOR-fold (`seed ^ (seed >> 32)`)
+before the narrowing cast, in `jitter`'s own constructor - both halves
+now contribute, and `get_random_seed()`'s 64-bit contract stays honest
+for any future caller that might want more than 32 bits directly, with
+no change needed on the `hosted_stdcpp` side at all.
+
+**Re-verified in the pinned Docker devenv after both fixes:** 226/226
+tests pass (1 new); `clang-format`/`clang-tidy` clean; 193/193 tests pass
+under the `sanitize` preset too; `diff-cover` coverage gate against `main`
+at 93% (both fixed source files still at 100%).
+
 ---
 
 ## Verification for M0

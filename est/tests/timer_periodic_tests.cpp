@@ -92,6 +92,35 @@ TEST_CASE("schedule_periodic() calls fn() once per period until cancelled from w
   REQUIRE(calls == 3);
 }
 
+TEST_CASE("schedule_periodic() survives fn() throwing - the period is skipped, the chain "
+          "still reschedules",
+          "[timer_periodic]") {
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto guard = est::platform::override_instance(fake);
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  int calls = 0;
+  std::optional<est::periodic_timer_handle> handle;
+  handle = est::schedule_periodic(1s, [&] {
+    ++calls;
+    if (calls == 2) {
+      throw std::runtime_error("transient failure");
+    }
+    if (calls == 3) {
+      handle->cancel();
+    }
+  });
+
+  // Must not throw out of run_until_idle() itself, and must still reach
+  // the third, cancelling call - proving the second period's exception
+  // was contained to that one period, not left to unwind the loop or
+  // kill the chain.
+  REQUIRE_NOTHROW(loop.run_until_idle());
+  REQUIRE(calls == 3);
+}
+
 TEST_CASE("schedule_periodic()'s jittered delay stays within [interval - max_jitter, interval + "
           "max_jitter]",
           "[timer_periodic]") {

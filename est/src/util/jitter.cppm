@@ -28,7 +28,7 @@ public:
   // legitimate, if pointless, way to say "no jitter": every draw is then
   // exactly zero.
   explicit jitter(duration max_jitter) noexcept
-      : engine_(static_cast<std::minstd_rand::result_type>(platform::instance().get_random_seed())),
+      : engine_(seed_from(platform::instance().get_random_seed())),
         dist_(-clamp(max_jitter).count(), clamp(max_jitter).count()) {
     check(max_jitter >= duration::zero(), "est::jitter: max_jitter must be non-negative");
   }
@@ -39,6 +39,14 @@ public:
 
 private:
   static auto clamp(duration d) noexcept -> duration { return std::max(d, duration::zero()); }
+
+  // XOR-folds get_random_seed()'s full 64 bits down to minstd_rand's own
+  // 32-bit seed, rather than a plain truncating cast that would silently
+  // discard the upper half - on hosted_stdcpp specifically, the entire
+  // first of its two std::random_device draws - for nothing.
+  static auto seed_from(std::uint64_t seed) noexcept -> std::minstd_rand::result_type {
+    return static_cast<std::minstd_rand::result_type>(seed ^ (seed >> 32));
+  }
 
   std::minstd_rand engine_;
   std::uniform_int_distribution<duration::rep> dist_;
