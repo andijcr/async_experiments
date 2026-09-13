@@ -61,7 +61,12 @@ TEST_CASE("when_all() resolves only once every future is ready, not before", "[w
   REQUIRE(combined.ready());
 }
 
-TEST_CASE("when_all() resolves immediately when every future is already ready", "[when_all]") {
+TEST_CASE("when_all() resolves synchronously when every future is already ready", "[when_all]") {
+  // when_all_track()'s two then_fast() stages each run inline, on this
+  // call stack, when the future they're registered on is already ready -
+  // so when every input is already ready at call time, when_all() itself
+  // resolves the returned future synchronously, before it even returns,
+  // with no run_until_idle() needed at all.
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   auto [first_promise, first_future] = est::make_promise_future<int>();
@@ -70,8 +75,6 @@ TEST_CASE("when_all() resolves immediately when every future is already ready", 
   second_promise.set_value("hello");
 
   auto combined = est::when_all(first_future, second_future);
-  REQUIRE_FALSE(combined.ready()); // then()'s own continuation still defers to the loop
-  loop.run_until_idle();
   REQUIRE(combined.ready());
 }
 
@@ -100,7 +103,7 @@ TEST_CASE("when_all() counts a failed future the same as a succeeded one", "[whe
 
 TEST_CASE("when_all() still resolves when one input is abandoned while the loop keeps running",
           "[when_all]") {
-  // Guards when_all_track()'s two-stage then() chain (est/src/when_all.cppm):
+  // Guards when_all_track()'s two-stage then_fast() chain (est/src/when_all.cppm):
   // a hook registered directly on an input future is silently never
   // invoked if that future's own future_state is abandoned (destroyed
   // while still pending) rather than completed -
@@ -150,8 +153,8 @@ TEST_CASE("when_all() works across heterogeneous types, including future<void>",
 
 TEST_CASE("when_all() does not consume the caller's futures", "[when_all]") {
   // The input futures stay owned by the caller throughout - when_all()
-  // only ever registers a then() continuation on each, never moving or
-  // otherwise taking ownership of any of them.
+  // only ever registers a then_fast() continuation on each, never moving
+  // or otherwise taking ownership of any of them.
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   auto [promise, future] = est::make_promise_future<int>();

@@ -4798,6 +4798,63 @@ are `when_all_tests.cpp`'s own `counting_resource::do_is_equal()`, copied
 boilerplate never exercised by any of these tests, same as in every
 other test file that defines one).
 
+**Follow-up from PR review: `then_fast()` + `one_shot_event`, and a
+third bug this surfaced.** Two review comments on PR #89, after
+`then_fast()` (issue #65) landed on `main` from a parallel PR opened
+after this one: `when_all_track()` should use `then_fast()` at both
+stages instead of `then()`, and `when_all_state` should hold a
+`one_shot_event<EventResetMode::manual>` instead of a raw
+`promise<void>`.
+
+*`then_fast()` at both stages.* `when_all_track()`'s two callbacks - a
+no-op and a two-line decrement - are exactly the "caller specifically
+knows `fn` is cheap" case `then_fast()`'s own doc comment describes, the
+same one `counting_event<Mode>::wait()`'s own already-signaled fast path
+already relies on. Swapping both `then()` calls for `then_fast()` lets
+an already-ready input's entire two-stage chain resolve synchronously,
+with no loop round trip, instead of always deferring.
+
+*`one_shot_event<manual>` instead of `promise<void>`.* `event.wait()`
+now produces the `future<void>` `when_all()` hands back directly, with
+no separate `make_promise_future()` call; Mode = manual matches the
+"one broadcast, however many observers" shape `when_all_state`'s
+completion signal actually has.
+
+*Bug three, caught by this pass's own rewritten test, not review.*
+Naively building `when_all_state` and calling `event.wait()` immediately
+- before registering any `when_all_track()` calls - defeated the entire
+point of switching to `then_fast()`: `wait()`'s own already-signaled
+fast path (`try_wait()`) can only take effect if the event is *already*
+`set()` at the moment `wait()` is called, but calling `wait()` first
+means every `when_all()` call registers a waiter against a still-
+unsignaled event unconditionally - even one where every input was
+already ready and resolved synchronously moments later, inside the very
+`then_fast()` calls that same event's own `set()` needed to see coming
+first. The rewritten "resolves synchronously when every future is
+already ready" test (previously "resolves immediately", tolerant of a
+`run_until_idle()` round trip) caught this immediately: `combined.ready()`
+came back false right after `when_all()` returned, even with both inputs
+already resolved. Fixed by reordering `when_all()`/`when_all(std::span<...>)`
+themselves: build `when_all_state`, register every `when_all_track()`
+call, *then* call `state->event.wait()` last - by which point `set()`
+has already fired if every input turned out to be ready, letting
+`wait()`'s own fast path resolve the whole call synchronously end to
+end. `detail::when_all_setup()` shrank to just the "build the state, or
+an empty one for `count == 0`" half of what it used to do, since the
+future-returning half can no longer safely live there.
+
+Wiki (`docs/wiki/Continuation-Node-Mechanism.md`, `docs/wiki/Architecture.md`)
+and the module's own doc comments (`est/src/when_all.cppm`) rewritten to
+match: `then()` → `then_fast()` throughout, the `one_shot_event`-based
+state, the new `:sync.event` dependency edge, and a dedicated writeup of
+why `event.wait()` has to be called last.
+
+**Re-verified in the pinned Docker devenv after the follow-up:**
+194/194 tests pass; `clang-format`/`clang-tidy` clean; 161/161 tests pass
+under the `sanitize` preset too; `diff-cover` coverage gate against
+`main` at 98% (170/173 changed lines covered - the same 3 boilerplate
+lines as before).
+
 ---
 
 ## Verification for M0

@@ -542,13 +542,17 @@ has the same story from that page's own angle (total allocation counts per
 `est::when_all(future<Ts>&... futures) -> future<void>` (`est/src/when_all.cppm`,
 issue #54) resolves once every one of `futures` is *accounted for* -
 completed or abandoned, succeeded or failed - each input stays owned by
-the caller (`when_all()` only ever registers `.then()` continuations on
-it, never moves or consumes it), which inspects `failed()`/`get()` on
+the caller (`when_all()` only ever registers `then_fast()` continuations
+on it, never moves or consumes it), which inspects `failed()`/`get()` on
 whichever of them it cares about afterward. Internally, it's a small
-counting barrier: a shared `detail::when_all_state{promise<void> result;
-int remaining;}`, and one tracking chain per input
+counting barrier: a shared `detail::when_all_state{one_shot_event<manual>
+event; int remaining;}`, and one tracking chain per input
 (`detail::when_all_track<T>()`) that decrements `remaining` and calls
-`result.set_value()` the moment it reaches zero.
+`event.set()` the moment it reaches zero. `event.wait()` (`:sync.event`)
+is what produces the `future<void>` `when_all()` hands back to its own
+caller - Mode = manual matches the "one broadcast, however many observers"
+shape this state has, whether that's the caller's own further `.then()`s
+or a `clone()`d handle to the same returned future.
 
 That tracking chain has two independent correctness traps, both found
 the same way - a test written specifically to exercise the failure mode,
@@ -563,7 +567,7 @@ v) {...}` lambda. `then_callback_for<T>`'s own dispatch
 check too, since a template parameter binds to `const T&` just as
 readily as to `future<T>&`. Landing in unwrapped mode is exactly wrong
 here: unwrapped mode auto-propagates a failure straight to the
-`.then()`-returned future *without ever calling `fn`* (see "The two
+`then_fast()`-returned future *without ever calling `fn`* (see "The two
 calling conventions" above) - so a generic hook would silently never
 decrement `remaining` for a failed input, hanging `when_all()`'s
 returned future forever the first time any one constituent failed. The
@@ -590,13 +594,13 @@ never run for an abandoned input, hanging `when_all()`'s returned future
 forever exactly the same way trap one did, just triggered by a different
 precondition.
 
-The fix is a two-stage `.then()` chain, not a single hook:
+The fix is a two-stage `then_fast()` chain, not a single hook:
 
 ```cpp
 template <class T> void when_all_track(future<T>& input, shared_ptr<when_all_state> state) {
-  input.then([](future<T>&) {}).then([state = std::move(state)](future<void>&) {
+  input.then_fast([](future<T>&) {}).then_fast([state = std::move(state)](future<void>&) {
     if (--state->remaining == 0) {
-      state->result.set_value();
+      state->event.set();
     }
   });
 }
@@ -614,14 +618,47 @@ living in that second stage - also typed on a concrete `future<void>&`,
 for the identical trap-one reason - therefore always runs exactly once
 per input, whether that input was completed or abandoned.
 
+`then_fast()`, not `then()`, at both stages: `when_all_track()`'s two
+callbacks - a no-op and a two-line decrement - are exactly the "caller
+specifically knows `fn` is cheap" scenario `then_fast()`'s own doc
+comment ("`then_fast()`: running inline instead of deferring", above)
+describes, the same one `counting_event<Mode>::wait()`'s own
+already-signaled fast path already relies on. For an `input` that's
+already ready at registration time, this lets an entire
+`when_all_track()` call resolve synchronously and immediately, right
+there - no loop round trip at all - rather than paying for one even
+when there's nothing left to actually wait for.
+
 One `when_all_track<T>()` instantiation is built per distinct `T` in the
 input list (or the single `T` of a `std::span<future<T>>`, for the
 range-based overload), each copying the same `shared_ptr<when_all_state>`
 into its own second-stage closure - the node that copy ends up living in
 is what keeps `when_all_state` alive until every one of them has run.
-`detail::when_all_setup()` builds the shared `promise<void>`/`future<void>`
-pair and the `when_all_state` itself once, shared by both overloads
-(which differ only in how they arrive at the input count and how they
-iterate their inputs) - a `count == 0` call resolves the returned future
-immediately without allocating a `when_all_state` at all, since there's
-nothing left to track.
+`detail::when_all_setup()` builds the `when_all_state` itself (empty,
+via a default-constructed `shared_ptr`, for `count == 0` - the two
+`when_all()` overloads special-case that themselves rather than ever
+dereferencing it), shared by both overloads, which differ only in how
+they arrive at the input count and how they iterate their inputs.
+
+**Ordering matters: `event.wait()` is called last, not alongside
+building `state`.** Building `when_all_state`, registering every
+`when_all_track()` call, and *then* calling
+`state->event.wait()` - in that order - is not a stylistic choice.
+`one_shot_event<Mode>::wait()` (`:sync.event`) has its own
+already-signaled fast path (`try_wait()`): called on an event that's
+already been `set()`, it returns an already-`ready()`
+`make_ready_future<void>()` synchronously, with no waiter node or loop
+round trip at all - symmetric with `then_fast()`'s own already-ready
+fast path. When every input turns out to already be ready,
+`when_all_track()`'s `then_fast()` chains resolve synchronously and
+`state->event.set()` fires *before `when_all()` ever calls `wait()`* -
+so `wait()`'s own fast path is exactly what lets the whole call resolve
+synchronously end to end. Calling `wait()` first (building the returned
+future before any input is tracked) would register a waiter against a
+still-unsignaled event unconditionally, forcing even an
+all-already-ready `when_all()` call through the same deferred,
+loop-enqueued path a genuinely-pending input would have needed anyway -
+exactly the bug an earlier version of this function had, caught by the
+"resolves synchronously when every future is already ready" test
+(`est/tests/when_all_tests.cpp`) failing outright once `then_fast()`
+replaced `then()` here.

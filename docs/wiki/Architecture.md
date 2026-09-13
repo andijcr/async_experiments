@@ -55,6 +55,7 @@ graph BT
   promise --> current_loop
   when_all --> future
   when_all --> promise
+  when_all --> event
   when_all --> shared_ptr
   when_all --> current_loop
 ```
@@ -87,15 +88,18 @@ now reached only through `:sync.event`. It still depends on `:future`/
 
 `:when_all` sits at the bottom of the DAG, alongside `:sync.mutex` -
 nothing else in this codebase depends on it. It needs `:future`/`:promise`
-for the `future<T>&`/`promise<void>` pair its one combinator,
-`est::when_all()`, is built from, `:util.shared_ptr` for the
-allocator-first `detail::when_all_state` control block a call shares
-across every constituent future's completion hook, and
+for the `future<T>&`/`future<void>` its one combinator, `est::when_all()`,
+works with; `:sync.event` for `est::one_shot_event<EventResetMode::manual>`,
+`detail::when_all_state`'s own completion signal (`wait()` is what
+produces the `future<void>` `when_all()` hands back to its caller, in
+place of a separate `make_promise_future()` call); `:util.shared_ptr` for
+the allocator-first `detail::when_all_state` control block a call shares
+across every constituent future's completion hook; and
 `:util.current_loop` for `current_allocator()` to build that control
 block against. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md#estwhen_all-forcing-wrapped-mode-and-surviving-abandonment)
-for why each input needs a two-stage `.then()` chain, each stage typed
-on a concrete `future<T>&`/`future<void>&` rather than a generic `auto&`
-parameter.
+for why each input needs a two-stage `then_fast()` chain, each stage
+typed on a concrete `future<T>&`/`future<void>&` rather than a generic
+`auto&` parameter.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
