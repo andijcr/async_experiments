@@ -102,7 +102,7 @@ constructs one, and `platform::override_instance()`s it
 | Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`) | `est/src/platform/platform.cppm` |
 | `hosted_stdcpp` (the one concrete `platform::interface` - a separate module, `estext`, not part of `est`) | `estext/src/hosted_stdcpp.cppm` |
 | `est::check()` | `est/src/check.cppm` |
-| `est::shared_ptr<T>`, `est::ref_counted` | `est/src/util/shared_ptr.cppm` |
+| `est::shared_ptr<T>`, `est::ref_counted`, `detail::shared_ptr_common<Derived, Pointer, T>`, `detail::shared_ptr_control_block<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
 | `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
 | `est::mutex`, `mutex::lock_guard` (built on `est::binary_event<EventResetMode::automatic>`) | `est/src/sync/mutex.cppm` |
