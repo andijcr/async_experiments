@@ -22,6 +22,8 @@ add_executable(est_tests
   event_tests.cpp
   timer_tests.cpp
   loop_tests.cpp
+  jitter_tests.cpp
+  timer_periodic_tests.cpp
   future_tests.cpp
   scope_exit_tests.cpp
   shared_ptr_tests.cpp

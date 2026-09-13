@@ -5108,6 +5108,125 @@ test file that defines one).
 
 ---
 
+### Issue #73: `est::schedule_periodic()` - a periodic timer, plus `est::jitter`
+
+Requested directly, with two concrete pieces named up front: "build #73,
+create a util jitter that performs uniform distribution jitter. Add on
+platform a `get_random_seed()` method." `est::timer_queue`/`est::loop`
+had no repeating-timer concept at all going in - `loop::fire_ready_timers()`
+unconditionally deletes every `timer_node` right after `fire()` returns,
+the same one-shot contract every existing node type in this codebase
+already relies on (`sleep_resume_node`, `promise_resume_node<T>`).
+
+**`platform::interface::get_random_seed() -> std::uint64_t`** (new pure
+virtual, `est/src/platform/platform.cppm`) - "where does randomness come
+from" answered the same way `now()`/`assert_failure()` already are: a
+platform decision, not something `est` itself sources directly.
+`hosted_stdcpp` (`estext`) answers via `std::random_device`, falling back
+to `now()`'s own bit pattern if that throws (mirroring the same
+try/catch-and-fall-back shape its own `assert_failure()`/`vprintdbg()`
+already use for their own fallible `std::` calls). Every existing
+`platform::interface` implementation - the four test fakes
+(`platform_tests.cpp`, `timer_tests.cpp`, `loop_tests.cpp`'s two) plus
+`hosted_stdcpp` itself - needed a new override; the fakes all return a
+fixed constant, keeping any test that indirectly exercises `est::jitter`
+reproducible rather than flaky. `platform_tests.cpp` gained a fifth
+dispatch test (`get_random_seed()` retargets through
+`override_instance()`, matching its existing `sleep_until()`/`printdbg()`
+tests' own shape).
+
+**`est::jitter`** (`est/src/util/jitter.cppm`, `:util.jitter`) - a small,
+self-seeding uniform-jitter generator: `std::minstd_rand` (a single-word-
+state 32-bit Lehmer/Park-Miller LCG, not `std::mt19937`'s much larger
+state - plenty of quality for spreading out wakeups, no reason for this
+codebase's eventual bare-metal target to carry more) plus a
+`std::uniform_int_distribution` over `[-max_jitter, +max_jitter]`. Seeds
+itself once, at construction, from `platform::instance().get_random_seed()`
+- the one place in this codebase that needs actual randomness. Not
+cryptographically secure, nor does it need to be: jitter only has to
+differ from the last draw, never resist prediction. `max_jitter` must be
+non-negative (`est::check()`-enforced, matching `counting_event`'s own
+`max_count > 0` precondition shape - checked after being used to build
+the distribution's bounds, via a small `clamp()` helper, so a negative
+value can't itself feed `std::uniform_int_distribution` invalid bounds
+before the check has a chance to fire).
+
+**`est::schedule_periodic(interval, fn, max_jitter = {})`**
+(`est/src/timer_periodic.cppm`, `:timer.periodic`) - built entirely as
+sugar on top of `loop::schedule_timer()`, the same way `sleep_for()`/
+`yield_execution()` are (`est:promise`), with zero changes to `loop.cppm`
+itself. Since a `timer_node` can't survive its own firing,
+`detail::periodic_timer_node<Fn>::fire()` hands off to a **fresh** node
+for the next period before returning, moving `fn_`/`jitter_` forward into
+it so the same callable and the same PRNG state (not a freshly-reseeded
+one) carry across the whole chain - only the node's own allocation is new
+each period, consistent with every other node type in this codebase being
+a one-shot, freshly-allocated object. Cancellation is one small shared
+`detail::periodic_timer_control{bool cancelled}` (`est::shared_ptr`,
+referenced by every node in the chain and by the `periodic_timer_handle`
+returned to the caller) - plain, not atomic, since this is entirely
+loop-thread-side state, the same single-threaded assumption as everywhere
+else in `est`. `fire()` checks it twice: once before calling `fn_()` (so
+an already-scheduled-but-not-yet-fired node stops cleanly once
+cancelled), once after (so `fn_` cancelling itself, mid-call, actually
+prevents that same call from rescheduling one more time).
+
+**`interval` must be positive and `max_jitter` strictly less than
+`interval`, both checked** - not merely `<=`: a jittered delay of exactly
+zero risks the rescheduled node landing in the very timer batch that's
+still firing (`loop::fire_ready_timers()` evaluates "now" once per batch,
+so a same-instant reschedule would be picked up and re-fired before that
+batch ever returns control to `loop`'s own outer loop) - jitter perturbs
+a period, it doesn't get to invert or collapse one.
+
+**`std::move()` removed on every `est::jitter` handoff, per `clang-tidy`:**
+the first draft moved `jitter_`/`jit` into each successive node
+(mirroring how `fn_`/`ctrl_` are actually moved) - `performance-move-
+const-arg` correctly flagged this as pointless: `est::jitter` is
+trivially copyable (two small integers' worth of state), so a move costs
+exactly what a copy does. Fixed by passing it by value/copy at every call
+site instead, with a comment explaining why - this is the one place in
+the node's construction that *isn't* a move, deliberately.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table (`est::jitter`,
+`est::schedule_periodic()`/`periodic_timer_handle`/`detail::
+periodic_timer_node<Fn>`, and `get_random_seed()` added to the platform
+seam's own row); a new `:util.jitter`/`:timer.periodic` pair of nodes and
+edges in `docs/wiki/Architecture.md`'s dependency graph, plus a paragraph
+on why `:timer.periodic` depends on `:util.current_loop`/`:util.jitter`/
+`:util.shared_ptr` but deliberately not `:future`/`:promise` (nothing
+about `schedule_periodic()` is awaited); a full new "Periodic timers"
+section in `docs/wiki/Loop-And-Timers.md`, placed right after the
+existing `schedule_timer()`/`future<void>` bridge section it builds on.
+
+**Tests added:** `est/tests/jitter_tests.cpp` (draws stay within
+`[-max_jitter, +max_jitter]`; a zero `max_jitter` always draws zero; many
+draws produce more than a couple of distinct values - not a fixed value
+or a two-value alternation). `est/tests/timer_periodic_tests.cpp`, driven
+by the same fake-clock `platform::interface` pattern `loop_tests.cpp`
+established: fires once per period until self-cancelled from inside the
+callback; each jittered delay stays within `[interval - max_jitter,
+interval + max_jitter]`; `cancel()` called from outside stops the chain
+before its next scheduled firing (via `loop.stop()` to break out of the
+first `run_until_idle()`, since a periodic chain that never self-cancels
+would otherwise never go idle on its own); the node chain and control
+block are freed, not leaked, across several periods; a still-pending node
+is abandoned, not leaked, when the loop is destroyed before ever firing.
+
+**Verified in the pinned Docker devenv:** 225/225 tests pass (18 new);
+`clang-format`/`clang-tidy` clean (the `performance-move-const-arg`
+finding above, fixed before this line); 192/192 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 91% (181/199 changed lines covered - both new source files at
+100%; the misses are unused fake-platform boilerplate overrides in test
+files that don't exercise `est::jitter`, an unreachable
+`std::random_device`-throws fallback branch in `hosted_stdcpp` matching
+this file's own existing unreachable-catch pattern, and a couple of
+`REQUIRE(...)` line-attribution artifacts in the new test files
+themselves).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

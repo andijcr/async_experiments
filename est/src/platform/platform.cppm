@@ -85,6 +85,16 @@ public:
   // for real wall-clock seconds (est/tests/loop_tests.cpp).
   virtual void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept = 0;
 
+  // Returns a fresh, best-effort-random seed value for anything in est
+  // that needs one (est::jitter, :util.jitter, the only caller today) -
+  // "where does randomness come from" is a platform decision the same way
+  // now()/assert_failure() are: hosted_stdcpp answers via
+  // std::random_device (estext), a future bare-metal backend from
+  // whatever hardware entropy source it has. Not required to be
+  // cryptographically secure, or even high-quality - jitter only needs to
+  // differ from the last draw, never to resist prediction.
+  [[nodiscard]] virtual auto get_random_seed() const noexcept -> std::uint64_t = 0;
+
   // Reports a failed est::check() and terminates - the platform's answer
   // to "what actually happens when a check fails," same reasoning as
   // now() being the answer to "what time is it": a bare-metal backend,

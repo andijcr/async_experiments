@@ -99,9 +99,10 @@ constructs one, and `platform::override_instance()`s it
 
 | Concept | File |
 |---|---|
-| Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`) | `est/src/platform/platform.cppm` |
+| Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`, `get_random_seed()`) | `est/src/platform/platform.cppm` |
 | `hosted_stdcpp` (the one concrete `platform::interface` - a separate module, `estext`, not part of `est`) | `estext/src/hosted_stdcpp.cppm` |
 | `est::check()` | `est/src/check.cppm` |
+| `est::jitter` | `est/src/util/jitter.cppm` |
 | `est::shared_ptr<T>`, `est::ref_counted`, `detail::shared_ptr_common<Derived, Pointer, T>`, `detail::shared_ptr_control_block<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
 | `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
@@ -109,6 +110,7 @@ constructs one, and `platform::override_instance()`s it
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node`, `detail::abandoned_exception` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
+| `est::schedule_periodic()`, `est::periodic_timer_handle`, `detail::periodic_timer_node<Fn>` | `est/src/timer_periodic.cppm` |
 | `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `sleep_for()`/`sleep_until()`, `detail::promise_resume_node<T>` | `est/src/promise.cppm` |
 | `est::when_all()` (fixed-arity and `std::span` overloads), `detail::when_all_state` | `est/src/when_all.cppm` |

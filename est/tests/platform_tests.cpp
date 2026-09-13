@@ -21,6 +21,12 @@ public:
     last_sleep_until = deadline;
   }
 
+  // A fixed, distinguishable value, same spirit as epoch above - a test
+  // can confirm override_instance() retargets this too.
+  [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override {
+    return random_seed;
+  }
+
   [[noreturn]] void assert_failure(std::string_view /*message*/,
                                    std::source_location /*location*/) const noexcept override {
     std::abort();
@@ -49,6 +55,7 @@ public:
   detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
 
   static constexpr std::chrono::steady_clock::time_point epoch{};
+  static constexpr std::uint64_t random_seed = 0xC0FFEE;
   mutable std::optional<std::chrono::steady_clock::time_point> last_sleep_until;
   mutable std::optional<std::string> last_vprintdbg_message;
 };
@@ -74,6 +81,12 @@ TEST_CASE("sleep_until() dispatches through the currently overridden instance", 
   const auto deadline = stub_platform::epoch + 5s;
   est::platform::instance().sleep_until(deadline);
   REQUIRE(stub.last_sleep_until == deadline);
+}
+
+TEST_CASE("get_random_seed() dispatches through the currently overridden instance", "[platform]") {
+  stub_platform stub;
+  const auto guard = est::platform::override_instance(stub);
+  REQUIRE(est::platform::instance().get_random_seed() == stub_platform::random_seed);
 }
 
 TEST_CASE("printdbg() dispatches through the currently overridden instance", "[platform]") {
