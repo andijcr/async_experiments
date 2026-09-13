@@ -176,7 +176,7 @@ own any more, see "`est::mutex`: `lock()` built on top of
 stays a coroutine-frame subobject (fine, since nothing reaches back into
 it after its own `co_await` expression ends), but `await_suspend()`
 allocates a small, *separately heap-allocated* resumption node
-(`future_resume_node<T>`, `detail::promise_resume_node`, ...) and registers
+(`future_resume_node<T>`, `detail::promise_resume_node<T>`, ...) and registers
 that instead of registering the awaiter itself.
 
 That split is required, not just a style choice. `est::loop::run_one()`
@@ -205,7 +205,7 @@ A separately allocated node has its own independent lifetime, entirely
 unrelated to the coroutine frame it resumes — `run()`-then-`delete` is
 exactly as safe here as it already is for every other `ready_node` in this
 codebase (`concrete_continuation<Fn, U>`, `est:promise`'s `sleep_resume_node`/
-`promise_resume_node`, the latter shared with `est:sync.event`). This
+`promise_resume_node<T>`, the latter shared with `est:sync.event`). This
 is also why `final_suspend()` safely uses plain `std::suspend_never` (the
 coroutine frame self-destructs immediately on completion): nothing that
 ever resumes the coroutine lives inside the frame being destroyed.
@@ -508,8 +508,7 @@ can reuse it directly instead of building and immediately discarding one:
     return make_ready_future<void>();
   }
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::promise_resume_node(
-      std::move(prom), "counting_event destroyed while wait() was pending");
+  auto* node = new detail::promise_resume_node<void>(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }
@@ -534,7 +533,7 @@ since `await_suspend()` never runs when `await_ready()` already returns
 `future_state<void>` control block itself, from
 `make_ready_future<void>()` - `wait()` builds one unconditionally, fast
 path or not, since it has no way to hand back a `future<void>` without
-one. A contended `wait()` additionally allocates the `promise_resume_node`
+one. A contended `wait()` additionally allocates the `promise_resume_node<void>`
 queued in `waiters_`.
 
 `wait()` is also no longer awaitable-*only*: since it returns a plain
@@ -578,26 +577,25 @@ auto set(int n = 1) -> int {
 Waiters resume in `est::intrusive_list`'s documented FIFO order — the
 first-queued waiter is the first one handed a unit once one's available.
 
-### `detail::promise_resume_node`: completing on abandonment, not just dropping
+### `detail::promise_resume_node<T>`: completing on abandonment, not just dropping
 
 `~counting_event()` drains `waiters_` the same way `future_state<T>`'s
 and `est::loop`'s own destructors drain theirs — an event destroyed with
 a waiter still queued on `wait()` must not just leak it.
 
-`detail::promise_resume_node` (`est::detail`, defined in `est:promise`
+`detail::promise_resume_node<T>` (`est::detail`, defined in `est:promise`
 rather than nested inside `counting_event<Mode>` - its `run()`/
 `abandon()` never touch `Mode` or anything else about the
 `counting_event` that enqueued it, so nesting it would only generate an
 identical type once per `Mode` instantiation for no reason; it's the same
-node `yield_execution()` uses, below - issue #77 collapsed what used to
-be two byte-identical types, one per call site, into this one shared
-class, differing only in the fixed message each passes to its own
-constructor) holds a `promise<void>`, not a `coroutine_handle<>`
-directly, so naively deallocating an abandoned node (matching the
-"broken promise, the future simply never becomes ready" contract every
-other dropped `est::promise<T>` in this codebase otherwise has by
-default) would reopen a real leak: a coroutine doing
-`co_await event.wait();` holds the resulting `future<void>` as a
+node `yield_execution()` uses, below, always as `promise_resume_node<void>`
+- issue #77 collapsed what used to be two byte-identical types, one per
+call site, into this one shared, templated class) holds a `promise<T>`,
+not a `coroutine_handle<>` directly, so naively deallocating an
+abandoned node (matching the "broken promise, the future simply never
+becomes ready" contract every other dropped `est::promise<T>` in this
+codebase otherwise has by default) would reopen a real leak: a coroutine
+doing `co_await event.wait();` holds the resulting `future<void>` as a
 temporary spilled into its own frame across the suspension - the *only*
 other reference to that `future_state<void>`, besides the node in
 `counting_event<Mode>::waiters_`. Drop the node's promise silently, and
@@ -608,15 +606,17 @@ first - not a `shared_ptr` cycle in the strict sense (no object holds a
 `shared_ptr` back to the thing keeping it alive), but a practical one:
 both stay allocated forever.
 
-`abandon()` breaks that by actually completing the promise (with an
-exception built from the fixed message supplied at construction, since
-the true outcome is "this waiter never got a unit, and the event it was
-queued on no longer exists") before the node is deleted:
+`abandon()` breaks that by actually completing the promise, with
+`detail::abandoned_exception` (`est:loop` - the one shared, message-less
+exception type every `abandon()` override in this codebase that needs to
+complete something, rather than just deallocate, throws; nothing here
+ever inspects `what()` to tell one abandonment apart from another, so
+there was nothing for a per-call-site message to actually communicate),
+before the node is deleted:
 
 ```cpp
 void abandon() noexcept final {
-  promise_.set_exception(
-      std::make_exception_ptr(std::runtime_error(std::string(abandoned_message_))));
+  promise_.set_exception(std::make_exception_ptr(abandoned_exception()));
 }
 ```
 
@@ -725,7 +725,7 @@ pays for any `T`.
 
 The slow (contended) path is where the simplification actually costs
 something: `event_.wait().then(...)` allocates `event_.wait()`'s own
-`future_state<void>` + `promise_resume_node` (exactly what the old,
+`future_state<void>` + `promise_resume_node<void>` (exactly what the old,
 hand-written `acquire_resume_node` also needed), *plus* `.then()`'s own
 downstream `future_state<lock_guard>` + `concrete_continuation<Fn,
 lock_guard>` node (see [Continuation Node

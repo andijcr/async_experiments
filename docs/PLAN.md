@@ -4278,13 +4278,13 @@ serves every caller instead of minting an identical type per caller (or,
 now, per `Mode` instantiation).
 
 `yield_execution()` and `counting_event<Mode>::wait()`'s slow path both
-now construct a `detail::promise_resume_node` directly, each supplying
-its own message ("loop destroyed while yield_execution() was pending",
+constructed a `detail::promise_resume_node` directly, each supplying its
+own message ("loop destroyed while yield_execution() was pending",
 "counting_event destroyed while wait() was pending" - the same two
 messages the two deleted classes already used, unchanged). `mutex::lock()`
-inherits this transparently, through `event_.wait()`.
+inherited this transparently, through `event_.wait()`.
 
-One thing this refactor surfaced: a `promise_resume_node::abandon()`
+This first pass surfaced one thing: a `promise_resume_node::abandon()`
 built from a `std::string_view` member (rather than a string literal
 baked directly into the `std::runtime_error(...)` call, as
 `sleep_resume_node::abandon()` still does) trips `clang-tidy`'s
@@ -4297,24 +4297,64 @@ pre-existing `NOLINT` (`est/src/future.cppm`) already documents for an
 unrelated noexcept function in this codebase - not a new class of risk,
 just a different function taking the same accepted trade.
 
-No behavior change: `run()`/`abandon()` do exactly what the two deleted
-classes' own copies did, just once instead of twice. Docs updated to
-match throughout - `docs/wiki/Coroutines.md` (the `event_resume_node`
-section renamed and rewritten to describe the shared type, cross-
+**Revised during PR review** (before merge - the PR stayed open for
+this): the per-call-site message was never actually load-bearing.
+Nothing anywhere in this codebase inspects `what()` to tell one
+abandonment apart from another - a completed promise's exception is only
+ever observed as "this failed," never matched against particular text -
+so three-plus call sites each hand-rolling their own `std::runtime_error`
+literal (`sleep_resume_node`, `promise_resume_node`,
+`flatten_forwarder<T>`, `concrete_continuation<Fn, U>`) was needless
+duplication one level up from the one issue #77 had already removed.
+Introduced `est::detail::abandoned_exception` (`est/src/loop.cppm`, next
+to `ready_node`/`timer_node` - the lowest-level module every one of these
+call sites' own modules transitively imports, so no new dependency edge
+either): a fixed, message-less `std::runtime_error` subclass, default-
+constructible, that every one of those four `abandon()` overrides now
+throws instead of building its own literal. This also made the earlier
+`NOLINTNEXTLINE(bugprone-exception-escape)` unnecessary: with the
+message gone, `abandoned_exception()`'s own constructor passes a plain
+string literal straight to `std::runtime_error`, the same shape
+`sleep_resume_node::abandon()` always used and clang-tidy never flagged -
+removed along with the `std::string_view abandoned_message_` member it
+was suppressing a false positive for.
+
+`promise_resume_node` also picked up a template parameter,
+`promise_resume_node<T>`, matching `est:future`'s own
+`future_resume_node<T>`/`concrete_continuation<Fn, U>` convention - both
+of its current instantiations are `promise_resume_node<void>`
+(`run()`'s `promise_.set_value()` call, with no argument, only compiles
+against `promise<T>` for `T = void` in the first place, so nothing else
+could instantiate this class regardless), but there's nothing left in
+`run()`/`abandon()` that's actually void-specific once the message is
+gone either.
+
+No behavior change beyond the exception's own (now generic) `what()`
+text: `run()`/`abandon()` do exactly what the four call sites' own
+copies did, just through one shared type instead of four (or, for
+`promise_resume_node<T>`, two) separate ones. Docs updated to match
+throughout - `docs/wiki/Coroutines.md` (the `event_resume_node` section
+renamed and rewritten to describe the shared, templated type, cross-
 referenced from `yield_execution()`'s own section instead of duplicating
 the explanation), `docs/wiki/Loop-And-Timers.md`,
-`docs/wiki/Allocation-Patterns.md`, `docs/wiki/Home.md` (source-location
-table entry moved from `event.cppm` to `promise.cppm`), plus stale
-references in `est/tests/loop_tests.cpp` and `est/tests/mutex_tests.cpp`
-comments.
+`docs/wiki/Allocation-Patterns.md`, `docs/wiki/Continuation-Node-Mechanism.md`
+(a pre-existing, unrelated staleness caught while touching the same
+`flatten_forwarder<T>::abandon()` code sample - the surrounding prose
+still claimed neither `flatten_forwarder<T>` nor `concrete_continuation<Fn,
+U>` overrode `abandon()` at all, contradicted by its own code block right
+above it), `docs/wiki/Home.md` (source-location table: `promise_resume_node<T>`
+moved from `event.cppm` to `promise.cppm`, `abandoned_exception` added
+against `loop.cppm`), plus stale references in `est/tests/loop_tests.cpp`
+and `est/tests/mutex_tests.cpp` comments.
 
 **Verified in the pinned Docker devenv:** 173/173 tests pass under both
 the `default` and `ci` presets (pure refactor - no new test needed,
-existing coverage of both call sites already exercises `run()`/
-`abandon()` on the shared node the same way it did on the two separate
-ones); `clang-format`/`clang-tidy` clean; 140/140 tests pass under the
+existing coverage of every call site already exercises `run()`/
+`abandon()` on the shared types the same way it did on the separate
+ones); `clang-format`/`clang-tidy` clean (zero `NOLINT` needed for this
+code, unlike the pre-review version); 140/140 tests pass under the
 `sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
-`main` at 100% (7/7 changed lines covered).
+`main` at 100% (11/11 changed lines covered).
 
 ---
 

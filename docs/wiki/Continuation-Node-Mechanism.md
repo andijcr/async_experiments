@@ -384,8 +384,7 @@ public:
   }
 
   void abandon() noexcept override {
-    downstream_->set_exception(std::make_exception_ptr(
-        std::runtime_error("flattened future abandoned before its inner future completed")));
+    downstream_->set_exception(std::make_exception_ptr(abandoned_exception()));
   }
 
 private:
@@ -393,9 +392,12 @@ private:
 };
 ```
 
-`abandon()` completing `downstream_` with an exception - rather than
-leaving it dropped, `ready_node::abandon()`'s own default no-op body -
-matters for the same reason
+`abandon()` completing `downstream_` with `detail::abandoned_exception`
+(`est:loop` - the one shared, message-less exception type every
+`abandon()` override in this codebase that needs to actually complete
+something throws, rather than one hand-rolled `std::runtime_error`
+literal per call site) - rather than leaving it dropped, `ready_node::
+abandon()`'s own default no-op body - matters for the same reason
 `future_resume_node<T>`'s own doc comment (above) gives: a coroutine
 `co_await`-ing the outer `future<T>` this node forwards into holds
 `downstream_`'s own `future_state` alive across its own suspension, so
@@ -414,12 +416,11 @@ directly: no `Fn` member, no lambda, no `future<T>` view built via
 at the same inner value type `T` reuses the *same* `flatten_forwarder<T>`
 instantiation, instead of minting a fresh node type per `(T, Fn, U)` call
 site — fewer template instantiations overall for a codebase with many
-distinct flattening call sites sharing the same inner future type. Neither
-`flatten_forwarder<T>` nor `concrete_continuation<Fn, U>` overrides
-`abandon()` — `downstream_` is currently just dropped on abandonment
-either way; whether a coroutine `co_await`-ing a `.then()`-chained future
-can be stranded the same way if the *upstream* future_state is dropped
-first is a real, separate question neither class yet answers.
+distinct flattening call sites sharing the same inner future type.
+`concrete_continuation<Fn, U>` overrides `abandon()` the identical way,
+completing its own `downstream_` with the same `detail::abandoned_exception`
+instead of leaving it dropped - the same "Issue #66 & #67" fix covers
+both classes at once, since both carry the identical hazard.
 
 `run()` moves the inner value out — `std::move(state).get()`, not a
 copying `.get()` — since `state` is a fresh, single-owner future_state

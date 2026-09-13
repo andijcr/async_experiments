@@ -131,10 +131,12 @@ public:
   // into holds downstream_'s own future_state alive across its own
   // suspension, so dropping just this node's reference to it - without
   // completing it - would strand that coroutine's frame with nothing left
-  // to free it.
+  // to free it. abandoned_exception (est:loop, this same namespace) -
+  // shared with every other abandon() override in this codebase that
+  // needs to actually complete something, rather than one hand-rolled
+  // literal per call site.
   void abandon() noexcept override {
-    downstream_->set_exception(std::make_exception_ptr(
-        std::runtime_error("flattened future abandoned before its inner future completed")));
+    downstream_->set_exception(std::make_exception_ptr(abandoned_exception()));
   }
 
   // operator new/delete inherited from current_allocator_new_delete<T>
@@ -638,7 +640,7 @@ private:
     // at teardown) before ever completing. downstream_ must still be
     // completed here, not silently dropped, for the identical reason
     // every other resume node in this codebase (future_resume_node<T>,
-    // further down this file; detail::promise_resume_node, est:promise)
+    // further down this file; detail::promise_resume_node<T>, est:promise)
     // already completes an abandoned promise instead of just dropping
     // it: a coroutine co_await-ing the future<U> this then() call
     // returned holds that same future_state<U> alive across its own
@@ -651,10 +653,12 @@ private:
     // test-caught leak - a coroutine co_await-ing mutex_ref.lock() left
     // permanently stranded when the mutex (and its underlying
     // future_state<void>) were torn down before that lock() ever
-    // resolved.
+    // resolved. detail::abandoned_exception (est:loop) - shared with
+    // every other abandon() override in this codebase that needs to
+    // actually complete something, rather than one hand-rolled literal
+    // per call site.
     void abandon() noexcept override {
-      downstream_->set_exception(std::make_exception_ptr(
-          std::runtime_error("then() abandoned before its upstream future completed")));
+      downstream_->set_exception(std::make_exception_ptr(detail::abandoned_exception()));
     }
 
     // operator new/delete inherited from current_allocator_new_delete<T>
@@ -1031,7 +1035,7 @@ namespace est::detail {
 // awaited future is already resolved by the time co_await evaluates it).
 // Separately heap-allocated via an allocator (like every other ready_node
 // this codebase queues - concrete_continuation<Fn, U>,
-// est:promise's sleep_resume_node/promise_resume_node), *not* embedded
+// est:promise's sleep_resume_node/promise_resume_node<T>), *not* embedded
 // inside the coroutine frame it resumes: an awaiter object embedded in a
 // coroutine's own frame only lives for the duration of *its own*
 // co_await expression - once run() resumes the coroutine past that

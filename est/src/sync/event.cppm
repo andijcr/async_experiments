@@ -23,7 +23,7 @@ enum class EventResetMode : std::uint8_t { automatic, manual };
 // A cooperative-scheduling counting event: an awaitable generalization of
 // a counting semaphore - a plain int count, an
 // est::intrusive_list<detail::ready_node> waiters_ queue, and
-// detail::promise_resume_node (est:promise - shared with
+// detail::promise_resume_node<void> (est:promise - shared with
 // yield_execution(), see its own doc comment for why one type serves
 // both) completing an est::promise<void> once a waiter is satisfied.
 // est::mutex (est:sync.mutex) is built directly on top of this class (a
@@ -85,10 +85,10 @@ public:
   // Destroys (without satisfying) any waiter still queued on wait() -
   // mirrors mutex::~mutex() and future_state<T>::~future_state() (both
   // drain their own pending lists the same way, for the same reason).
-  // Each waiter node's own abandon() (detail::promise_resume_node,
-  // est:promise) completes its promise with an exception first, rather than just
-  // deallocating itself silently - see its own doc comment for why that
-  // matters beyond just freeing the node itself.
+  // Each waiter node's own abandon() (detail::promise_resume_node<void>,
+  // est:promise) completes its promise with an exception first, rather
+  // than just deallocating itself silently - see its own doc comment for
+  // why that matters beyond just freeing the node itself.
   // waiters_.empty() checked first - a counting_event with nothing queued
   // can legitimately be destroyed long after whatever loop was current
   // when it was created has stopped being current at all, and deleting
@@ -142,8 +142,8 @@ public:
   //
   // Deferred through est::loop::enqueue_ready() rather than completed
   // directly here, for the identical reason mutex::unlock() defers
-  // (see its own doc comment): detail::promise_resume_node::run() only ever
-  // calls promise_.set_value(), never runs arbitrary downstream coroutine
+  // (see its own doc comment): detail::promise_resume_node<void>::run()
+  // only ever calls promise_.set_value(), never runs arbitrary downstream coroutine
   // code inline on this call stack, so nothing about set() itself needs
   // to bound recursion - deferring anyway keeps this consistent with
   // every other completion path in this codebase: never invoke a
@@ -222,8 +222,7 @@ public:
       return make_ready_future<void>();
     }
     auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-    auto* node = new detail::promise_resume_node(
-        std::move(prom), "counting_event destroyed while wait() was pending");
+    auto* node = new detail::promise_resume_node<void>(std::move(prom));
     waiters_.enqueue(*node);
     return std::move(fut);
   }

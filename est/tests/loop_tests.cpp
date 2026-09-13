@@ -364,17 +364,17 @@ TEST_CASE("a loop dropped with ready work and pending timers still queued frees 
 TEST_CASE("destroying a loop with a coroutine co_await-ing yield_execution() still pending "
           "leaks nothing",
           "[loop]") {
-  // Same hazard as est:sync.event's detail::promise_resume_node (est/tests/mutex_tests.cpp,
+  // Same hazard as est:sync.event's detail::promise_resume_node<T> (est/tests/mutex_tests.cpp,
   // "destroying a mutex with a coroutine co_await-ing lock() still
   // pending leaks nothing") - a coroutine suspended via co_await holds
   // its own reference to yield_execution()'s future_state<void> (the
   // future<void> temporary co_await awaits is spilled into the
   // coroutine's own frame across the suspension), so dropping only
-  // detail::promise_resume_node's own reference (via ~loop()'s drain of
+  // detail::promise_resume_node<T>'s own reference (via ~loop()'s drain of
   // ready_) would leave that future_state - and the coroutine frame
   // keeping it alive - with nowhere left to go, unless abandon() actually
   // completes the promise instead of silently dropping it. See
-  // detail::promise_resume_node's own doc comment (est/src/promise.cppm)
+  // detail::promise_resume_node<T>'s own doc comment (est/src/promise.cppm)
   // for the full reasoning.
   counting_resource resource;
   {

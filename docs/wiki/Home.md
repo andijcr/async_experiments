@@ -107,7 +107,7 @@ constructs one, and `platform::override_instance()`s it
 | `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
 | `est::mutex`, `mutex::lock_guard` (built on `est::binary_event<EventResetMode::automatic>`) | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
-| `est::loop`, `ready_node`, `timer_node` | `est/src/loop.cppm` |
+| `est::loop`, `ready_node`, `timer_node`, `detail::abandoned_exception` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
-| `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `sleep_for()`/`sleep_until()`, `detail::promise_resume_node` | `est/src/promise.cppm` |
+| `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `sleep_for()`/`sleep_until()`, `detail::promise_resume_node<T>` | `est/src/promise.cppm` |
