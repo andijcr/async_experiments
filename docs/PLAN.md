@@ -5274,6 +5274,55 @@ tests pass (1 new); `clang-format`/`clang-tidy` clean; 193/193 tests pass
 under the `sanitize` preset too; `diff-cover` coverage gate against `main`
 at 93% (both fixed source files still at 100%).
 
+#### Follow-up: fixed-rate scheduling, and `Fn` constrained to `std::invocable<Fn&>`
+
+Requested directly, two changes: "Periodic timer should measure time
+before calling the function. Fn should be std::invocable."
+
+**Fixed-delay, not fixed-rate - a real drift bug.**
+`periodic_timer_node::fire()`'s first cut computed the next deadline from
+`platform::instance().now()` called *after* `fn_()` returned, not before
+- so a slow or variable-latency `fn_()` would push every later period
+further out by however long that call took, compounding period over
+period (classic fixed-delay scheduling, like a naive `setTimeout()`
+chain, not the fixed-rate `setInterval()`-style cadence a "periodic
+timer" implies). Fixed by capturing `platform::instance().now()` into a
+local (`period_start`) at the very top of `fire()`, before `fn_()` runs,
+and scheduling the next node at `period_start + interval_ + offset`
+instead of a post-call `now()` read. The very first period
+(`schedule_periodic()` itself) was already correct by construction -
+nothing has called `fn()` yet at that point - so only `fire()`'s own
+rescheduling needed the fix. New test
+(`est/tests/timer_periodic_tests.cpp`): `fn()` itself advances the fake
+clock by 400ms (simulating a slow callback) each call, interval 1s -
+asserts consecutive call *start* times are exactly `interval` apart, not
+`interval + 400ms`; this test fails under the old code and passes under
+the fix, making it a genuine regression guard rather than a
+restatement of the implementation.
+
+**`Fn` constrained to `std::invocable<Fn&>`**, on both
+`detail::periodic_timer_node<Fn>` and `schedule_periodic()` themselves -
+matching `est::scope_exit`'s own established pattern
+(`est:util.scope_exit`) of constraining a stored-and-later-invoked `Fn`
+at the type, not only at whatever function happens to construct it, so a
+caller passing something non-callable gets a constraint-failure
+diagnostic pointing at the actual mismatch instead of a template-
+instantiation error buried inside `fire()`'s body. `std::invocable<Fn&>`,
+not plain `std::invocable<Fn>`: `fn_` is invoked repeatedly, as a named
+(non-const lvalue) member, once per period - the same distinction
+`future.cppm`'s own `invocable_unwrapped<Fn, T>()`/`then_callback_for<Fn,
+T>` already draw between a callable invoked once (`Fn`, `scope_exit`'s own
+shape) and one stored and invoked more than once (`Fn&`).
+
+**Re-verified in the pinned Docker devenv:** 227/227 tests pass (1 new);
+`clang-format`/`clang-tidy` clean (one `cppcoreguidelines-pro-bounds-
+avoid-unchecked-container-access` finding on the new test's own
+`std::vector::operator[]` calls, fixed by switching to `.at()` - matching
+`when_all_tests.cpp`/`when_any_tests.cpp`/`when_any_succeeds_tests.cpp`'s
+own existing convention); 194/194 tests pass under the `sanitize` preset
+too; `diff-cover` coverage gate against `main` at 93%
+(`timer_periodic.cppm` still 100%).
+
 ---
 
 ## Verification for M0

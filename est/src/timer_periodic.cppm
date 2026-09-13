@@ -27,7 +27,18 @@ struct periodic_timer_control {
 // returns - the same one-shot contract every other timer_node in this
 // codebase relies on - so a self-rescheduling timer has to hand off to a
 // successor instead of surviving its own firing.
+//
+// Fn constrained the same way est::scope_exit constrains its own stored
+// Fn (est:util.scope_exit) - at the type, not just at schedule_periodic()
+// below - so a bad Fn fails with a constraint diagnostic pointing at the
+// actual mismatch, not a template-instantiation error buried inside
+// fire()'s own body. std::invocable<Fn&>, not plain std::invocable<Fn>:
+// fn_ is invoked repeatedly, as a named (non-const lvalue) member, once
+// per period - matching future.cppm's own Fn&-based invocable checks for
+// a callable stored and invoked more than once, rather than scope_exit's
+// own plain Fn (invoked exactly once, from a destructor).
 template <class Fn>
+  requires std::invocable<Fn&>
 class periodic_timer_node final : public timer_node,
                                   public current_allocator_new_delete<periodic_timer_node<Fn>> {
 public:
@@ -45,6 +56,13 @@ public:
     if (ctrl_->cancelled) {
       return;
     }
+    // Measured *before* fn_() runs, not after: the next deadline is
+    // anchored to when this period started, not to whenever fn_()
+    // happened to finish - fixed-rate scheduling (like setInterval()),
+    // not fixed-delay. Without this, a slow or variable-latency fn_()
+    // would make the chain's real cadence drift away from `interval` by
+    // however long each call took, compounding period over period.
+    const auto period_start = platform::instance().now();
     try {
       fn_();
     } catch (...) {
@@ -73,7 +91,7 @@ public:
                                      // already documents
     const auto offset = jitter_();
     auto* next = new periodic_timer_node(std::move(fn_), interval_, jitter_, ctrl_);
-    loop_ref.schedule_timer(*next, platform::instance().now() + interval_ + offset);
+    loop_ref.schedule_timer(*next, period_start + interval_ + offset);
   }
 
   // No abandon() override: a periodic chain dying alongside its loop (or
@@ -111,18 +129,26 @@ private:
 // in [-max_jitter, +max_jitter] each period (est::jitter, :util.jitter) -
 // spreading out otherwise-lockstep wakeups (several independent periodic
 // sources sharing one loop) instead of always firing at exactly the same
-// phase relative to each other. `interval` must be positive and
-// `max_jitter` must be strictly less than `interval` (both checked):
-// jitter perturbs a period, it never gets to invert or collapse one - a
-// jittered delay of exactly zero would risk the rescheduled node landing
-// in the very timer batch that's still firing (est::loop::fire_ready_timers(),
-// est:loop, evaluates "now" once per batch), refiring before returning to
-// est::loop's own outer loop.
+// phase relative to each other. Fixed-rate, not fixed-delay: each
+// period's deadline is measured from when the *previous* one started,
+// not from when fn() returned, so a slow or variable-latency fn()
+// doesn't drift the chain's average cadence away from `interval` - see
+// detail::periodic_timer_node<Fn>::fire()'s own doc comment. `interval`
+// must be positive and `max_jitter` must be strictly less than `interval`
+// (both checked): jitter perturbs a period, it never gets to invert or
+// collapse one - a jittered delay of exactly zero would risk the
+// rescheduled node landing in the very timer batch that's still firing
+// (est::loop::fire_ready_timers(), est:loop, evaluates "now" once per
+// batch), refiring before returning to est::loop's own outer loop.
 //
 // Against est::current_loop() - no explicit loop& overload, matching
 // every other timer-driven entry point in this codebase (sleep_for(),
 // yield_execution()).
+//
+// Fn must be std::invocable<Fn&> - see detail::periodic_timer_node<Fn>'s
+// own doc comment for why Fn&, not plain Fn.
 template <class Fn>
+  requires std::invocable<Fn&>
 [[nodiscard]] auto
 schedule_periodic(loop::clock::duration interval, Fn fn, loop::clock::duration max_jitter = {})
     -> periodic_timer_handle {

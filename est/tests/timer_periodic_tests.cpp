@@ -92,6 +92,42 @@ TEST_CASE("schedule_periodic() calls fn() once per period until cancelled from w
   REQUIRE(calls == 3);
 }
 
+TEST_CASE("schedule_periodic() is fixed-rate: a slow fn() doesn't drift later deadlines",
+          "[timer_periodic]") {
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto guard = est::platform::override_instance(fake);
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  constexpr auto interval = 1s;
+  constexpr auto slow_work = 400ms; // < interval, so it never pushes a
+                                    // period past the next one entirely
+
+  std::vector<std::chrono::steady_clock::time_point> call_times;
+  int calls = 0;
+  std::optional<est::periodic_timer_handle> handle;
+  handle = est::schedule_periodic(interval, [&] {
+    call_times.push_back(fake.current);
+    fake.current += slow_work; // simulate fn() itself taking real time
+    ++calls;
+    if (calls == 3) {
+      handle->cancel();
+    }
+  });
+
+  loop.run_until_idle();
+  REQUIRE(calls == 3);
+  REQUIRE(call_times.size() == 3);
+
+  // Each period's own start is exactly `interval` after the previous
+  // one's - not interval + slow_work, which fixed-delay scheduling
+  // (measuring the next deadline from when fn() *returned*, not from
+  // when this period started) would have produced instead.
+  REQUIRE(call_times.at(1) - call_times.at(0) == interval);
+  REQUIRE(call_times.at(2) - call_times.at(1) == interval);
+}
+
 TEST_CASE("schedule_periodic() survives fn() throwing - the period is skipped, the chain "
           "still reschedules",
           "[timer_periodic]") {

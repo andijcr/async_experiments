@@ -468,24 +468,56 @@ ready-queue `drain_ready()` will pick up on the loop's next iteration.
 `est::schedule_periodic(interval, fn, max_jitter = {})` (`est:timer.periodic`)
 calls `fn()` repeatedly, once every `interval` (plus a fresh, uniformly
 distributed jitter offset each period - `est::jitter`, `:util.jitter`,
-below). Built entirely on `schedule_timer()` above, with no change to
-`loop.cppm` itself: `loop::fire_ready_timers()` unconditionally deletes
-every `timer_node` right after `fire()` returns - the same one-shot
-contract `sleep_resume_node` already relies on - so a periodic timer can't
-reuse itself in place. Instead, `detail::periodic_timer_node<Fn>::fire()`
-hands off to a **fresh** node for the next period before returning:
+below). `Fn` must satisfy `std::invocable<Fn&>` (checked at the type, on
+both `schedule_periodic()` and `detail::periodic_timer_node<Fn>` itself -
+the same place `est::scope_exit`, `est:util.scope_exit`, constrains its
+own stored `Fn`) - `Fn&`, not plain `Fn`, since `fn_` is invoked
+repeatedly as a named member, not just once. Built entirely on
+`schedule_timer()` above, with no change to `loop.cppm` itself:
+`loop::fire_ready_timers()` unconditionally deletes every `timer_node`
+right after `fire()` returns - the same one-shot contract
+`sleep_resume_node` already relies on - so a periodic timer can't reuse
+itself in place. Instead, `detail::periodic_timer_node<Fn>::fire()` hands
+off to a **fresh** node for the next period before returning:
 
 ```cpp
 void fire() override {
   if (ctrl_->cancelled) { return; }
-  fn_();
+  const auto period_start = platform::instance().now(); // before fn_(), not after
+  try {
+    fn_();
+  } catch (...) {
+    platform::printdbg("...");   // loud, but doesn't stop the loop or the chain
+  }
   if (ctrl_->cancelled) { return; }   // fn_ itself may have just cancelled
   auto& loop_ref = current_loop();    // resolved fresh, same as every other node
   const auto offset = jitter_();
   auto* next = new periodic_timer_node(std::move(fn_), interval_, jitter_, ctrl_);
-  loop_ref.schedule_timer(*next, platform::instance().now() + interval_ + offset);
+  loop_ref.schedule_timer(*next, period_start + interval_ + offset);
 }
 ```
+
+**Fixed-rate, not fixed-delay.** `period_start` is captured *before*
+`fn_()` runs, and the next deadline is computed from it, not from a
+`now()` read taken after `fn_()` returns - so a slow or variable-latency
+`fn_()` doesn't push every later period further out by however long that
+call happened to take (the classic fixed-delay drift a naive
+`setTimeout()`-chain has). This is what a "periodic timer" means in
+practice: a `setInterval()`-style fixed cadence, anchored to when each
+period *started*, not to how long the previous one's work took.
+
+**A throwing `fn_()` is caught, not left to propagate.** `fn_` has no
+downstream `future<T>` to route an exception into the way `.then()`
+continuations do (`concrete_continuation<Fn, U>::run()`,
+[Continuation Node Mechanism](Continuation-Node-Mechanism.md)) - it
+returns `void`. Left uncaught, an exception would unwind
+`loop::fire_ready_timers()`/`run_impl()` entirely, abandoning every other
+unrelated pending timer and ready-work item on the same loop over one
+callback's own bug, and silently killing the chain forever. Caught and
+reported via `platform::printdbg()` instead (the same "loud diagnostic,
+keep going" tool `loop::run_one()`'s own long-running-callback stall
+detection already uses) - the period is skipped, the chain still
+reschedules.
 
 `fn_`/`jitter_` are moved/copied forward into each successive node rather
 than re-created, so the same jitter PRNG state (and the same callable)
