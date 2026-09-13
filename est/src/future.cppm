@@ -390,14 +390,38 @@ public:
   }
 
   // Registers a continuation node (already allocated, via its own
-  // operator new) to run once ready. If already ready, hands it straight
-  // to est::loop's
-  // ready-queue instead of queueing it locally - either way, this
-  // future_state never invokes a continuation itself; est::loop always
-  // does, on its own drain pass, never inline on this call stack.
-  void set_continuation(continuation_node& node) {
+  // operator new) to run once ready. If not yet ready, just enqueues it
+  // into waiters_ for complete() to drain later - unaffected by
+  // run_inline_if_ready below, since there's nothing to run yet on this
+  // path.
+  //
+  // If already ready, the default (run_inline_if_ready = false) hands
+  // the node straight to est::loop's ready-queue instead of invoking it
+  // here - this future_state never invokes a continuation itself in that
+  // case; est::loop always does, on its own drain pass, never inline on
+  // this call stack. That default is the same "never invoke a
+  // continuation synchronously from within another's own call stack"
+  // invariant this codebase applies everywhere else (mutex::unlock(),
+  // counting_event<Mode>::set(), ...), so a chain of then() calls of any
+  // length always resolves through est::loop's own iterative drain,
+  // never by direct recursion on the call stack.
+  //
+  // run_inline_if_ready = true (then_fast(), below) opts a single node
+  // out of that: run() executes right here instead, then the node is
+  // deleted immediately - the same "run, then delete" idiom est::loop's
+  // own run_one()/destroy_guard() use on its own drain pass (est:loop),
+  // just performed here directly since those two helpers are private to
+  // est::loop. A caller reaching for this accepts the same
+  // recursion-depth responsibility a coroutine's already-ready co_await
+  // always had - see then_fast()'s own doc comment. Issue #65.
+  void set_continuation(continuation_node& node, bool run_inline_if_ready = false) {
     if (ready()) {
       node.bind_owner(this->shared_from_this());
+      if (run_inline_if_ready) {
+        node.run();
+        delete &node;
+        return;
+      }
       current_loop().enqueue_ready(node);
       return;
     }
@@ -557,6 +581,47 @@ public:
   // held until the handle itself goes out of scope. Issue #64 (the move)
   // / #71 (the && overload).
   template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
+    return then_impl(std::forward<Fn>(fn), /*run_inline_if_ready=*/false);
+  }
+
+  // then_fast(): identical to then() above (same wrapped/unwrapped
+  // dispatch, monadic flatten, and move optimization) except a
+  // continuation registered on an *already-ready* future_state runs
+  // immediately, on the caller's own call stack, instead of always being
+  // deferred through est::loop's ready-queue - the same "don't wait for
+  // something that isn't being waited for" fast path
+  // future_awaiter<T>::await_ready() (below) already gives co_await,
+  // extended to then()'s non-coroutine callers. Issue #65: the two were
+  // "subtly different" before this existed - an already-ready future
+  // resumes a co_await inline, but a then() on one always deferred.
+  //
+  // An opt-in method, not then()'s own new default: then() must stay
+  // safe for a chain of any length (deferring every completion through
+  // the loop turns unbounded chain length into an iterative drain
+  // instead of direct recursion on the call stack - see
+  // set_continuation()'s own doc comment above). then_fast() is for a
+  // caller that specifically knows fn is cheap and wants the
+  // already-signaled case (say, counting_event<Mode>::wait()'s own
+  // already-signaled fast path) to resolve without an extra loop round
+  // trip, accepting the same recursion-depth responsibility a
+  // coroutine's already-ready co_await always had.
+  //
+  // Only the direct registration below opts in - a then_fast() callback
+  // that itself returns a future<U> still flattens via the ordinary,
+  // always-deferred fulfill()/flatten_forwarder<U> path (below): keeping
+  // "fast" from also having to thread through the monadic-flatten case
+  // keeps this addition to a single call site's behavior, not a second
+  // property every future-returning path in this class has to carry.
+  template <detail::then_callback_for<T> Fn> auto then_fast(Fn&& fn) {
+    return then_impl(std::forward<Fn>(fn), /*run_inline_if_ready=*/true);
+  }
+
+private:
+  // Shared implementation behind then()/then_fast() above - identical in
+  // every way except whether a continuation registered on an
+  // already-ready future_state runs inline or defers through est::loop;
+  // see set_continuation()'s own run_inline_if_ready parameter.
+  template <class Fn> auto then_impl(Fn&& fn, bool run_inline_if_ready) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
     auto allocator = current_allocator();
@@ -564,11 +629,10 @@ public:
     auto downstream_for_node = downstream; // copy: the node keeps its own reference too
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
     auto* node = new node_type(std::forward<Fn>(fn), std::move(downstream_for_node));
-    set_continuation(*node);
+    set_continuation(*node, run_inline_if_ready);
     return future<downstream_value_type>(std::move(downstream));
   }
 
-private:
   // Fn's raw (pre-flatten) result type, dispatching wrapped-vs-unwrapped
   // exactly as then() itself does above. A plain (non-consteval-required,
   // never actually called - only ever named inside decltype()) function
@@ -970,6 +1034,29 @@ public:
   template <class Fn> auto then(Fn&& fn) && {
     auto state = std::move(state_);
     return state->then(std::forward<Fn>(fn));
+  }
+
+  // Forwards to future_state<T>::then_fast() (see its own doc comment) -
+  // the same lvalue/rvalue-qualified split as then() above, for API
+  // shape consistency, but *not* for the same payoff: issue #64/#71's
+  // move optimization (concrete_continuation<Fn, U>::run()'s own
+  // `owner_.count() == 1` check) can never actually fire through this
+  // overload the way it does for then(). then_fast() runs the
+  // continuation synchronously, inside this very function call - the
+  // `state` local right below is still alive (it's this call's own
+  // stack frame) at the moment run() checks owner_.count(), contributing
+  // a reference on top of owner_'s own, so the count this checks is at
+  // least 2, never 1. then()'s version of this optimization only reaches
+  // 1 because its run() happens *later*, via est::loop's drain, by which
+  // point a temporary exactly like this one has already gone out of
+  // scope. Kept anyway so a caller that no longer needs *this can still
+  // say so, same as with then() - it just isn't what makes the
+  // difference here.
+  template <class Fn> auto then_fast(Fn&& fn) & { return state_->then_fast(std::forward<Fn>(fn)); }
+
+  template <class Fn> auto then_fast(Fn&& fn) && {
+    auto state = std::move(state_);
+    return state->then_fast(std::forward<Fn>(fn));
   }
 
   // Suspends the calling coroutine until *this becomes ready, resuming

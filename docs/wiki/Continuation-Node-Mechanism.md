@@ -125,7 +125,11 @@ template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
 Only `current_allocator()` is needed to build the downstream state and
 its node - `current_loop()` itself is never resolved here;
 `set_continuation()` resolves it fresh on its own, only if this
-`future_state` already turns out to be ready.
+`future_state` already turns out to be ready. (This is `then()`'s own
+shape specifically - `then_fast()`, its sibling, shares every step above
+through one private `then_impl()`; see "`then_fast()`: running inline
+instead of deferring" below for the one thing that differs between the
+two.)
 
 Four things happen, in order:
 1. A **new `future_state<U>`** is created (`U` = `downstream_value_type`,
@@ -177,8 +181,10 @@ Two possible starting states, one converging path:
   for each node, calls `bind_owner()` before handing it to
   `loop.enqueue_ready()`.
 - **Parent already ready.** `set_continuation()`'s `if (ready())` branch
-  takes the same `bind_owner()` + `enqueue_ready()` step immediately,
-  skipping `waiters_` entirely.
+  takes the same `bind_owner()` step immediately, skipping `waiters_`
+  entirely - then either `enqueue_ready()`s the node (the default) or, if
+  the caller opted in via `then_fast()`, runs it right here instead - see
+  "`then_fast()`: running inline instead of deferring" below.
 
 `waiters_`'s own declared element type is actually `detail::ready_node`
 (`est:loop`), not `continuation_node<T>` as the diagram above simplifies
@@ -331,6 +337,88 @@ consistent. An `Fn` matching neither shape still fails right at the
 `then()` call site with a "constraints not satisfied" diagnostic, not
 deep inside `run()`'s own
 instantiation.
+
+## `then_fast()`: running inline instead of deferring
+
+Issue #65: `co_await` on an already-ready `future<T>` resumes inline
+(`future_awaiter<T>::await_ready()`, [Coroutines](Coroutines.md)), but
+`then()` registered on an already-ready `future_state<T>` always deferred
+through `est::loop`'s ready-queue regardless - a "subtly different"
+asymmetry between the two ways of consuming a future. `then_fast()` is
+the opt-in fix: an identical sibling of `then()` (same wrapped/unwrapped
+dispatch, same monadic flatten, same move optimization above) except a
+continuation registered on an already-ready `future_state<T>` runs
+immediately instead of deferring:
+
+```cpp
+void set_continuation(continuation_node& node, bool run_inline_if_ready = false) {
+  if (ready()) {
+    node.bind_owner(this->shared_from_this());
+    if (run_inline_if_ready) {
+      node.run();
+      delete &node;
+      return;
+    }
+    current_loop().enqueue_ready(node);
+    return;
+  }
+  waiters_.enqueue(node);
+}
+```
+
+`then()`/`then_fast()` share one private `then_impl(fn, run_inline_if_ready)`
+- identical in every way (node allocation, downstream `future_state`,
+registration) except which value they pass through to
+`set_continuation()` above. `run_inline_if_ready = true` reuses the exact
+"run, then delete" idiom `est::loop`'s own `run_one()`/`destroy_guard()`
+use on its own drain pass ([Loop and Timers](Loop-And-Timers.md)) - just
+performed directly here, since those two helpers are private to
+`est::loop`.
+
+**Why an opt-in method, not `then()`'s own new default.** `then()` must
+stay safe for a chain of any length: deferring every completion through
+`est::loop` turns unbounded chain length into an iterative drain instead
+of direct recursion on the call stack (`set_continuation()`'s own doc
+comment, `future.cppm`) - the same "never invoke a continuation
+synchronously from within another's own call stack" invariant this
+codebase applies everywhere else (`mutex::unlock()`,
+`counting_event<Mode>::set()`, ...). `then_fast()` is for a caller that
+specifically knows `fn` is cheap and wants the already-signaled case
+(say, `counting_event<Mode>::wait()`'s own already-signaled fast path,
+[Coroutines](Coroutines.md)) to resolve without an extra loop round trip,
+accepting the same recursion-depth responsibility a coroutine's
+already-ready `co_await` always had.
+
+`run_inline_if_ready` only ever matters on the already-ready branch: a
+`then_fast()` call registered on a *not-yet-ready* `future_state<T>` just
+enqueues into `waiters_`, identically to `then()` - there's nothing to
+run inline yet, and no flag is stored on the node for `complete()` to
+consult later. Whether a given `then_fast()` call actually runs inline
+or not is decided once, at registration time, by whether the future was
+already ready then - not by anything remembered afterward.
+
+**The flatten case is deliberately excluded.** A `then_fast()` callback
+that itself returns a `future<V>` still flattens through the ordinary,
+always-deferred `fulfill()`/`flatten_forwarder<V>` path below - "fast"
+doesn't thread through monadic flattening. This keeps the addition to a
+single call site's behavior (the direct registration in `then_impl()`)
+rather than a second property every future-returning path in this class
+has to carry.
+
+**A real cost: `then_fast()`'s own `&&` overload can't get the move
+optimization above.** `concrete_continuation<Fn, U>::run()`'s
+`owner_.count() == 1` check only ever reaches 1 for `then()` because
+`run()` happens *later*, once `est::loop` drains it - by which point
+whatever temporaries were on the registering call's own stack (including
+`future<T>::then(Fn&&) &&`'s own `state` local) have already unwound.
+`then_fast()`'s `run()` happens synchronously, inside that same call -
+its `state` local is still alive, holding a reference, at the exact
+moment `run()` checks `owner_.count()`. That reference plus `owner_`
+itself already puts the count at 2, never 1, no matter how carefully a
+caller manages every other handle. `future<T>::then_fast(Fn&&) &&` still
+exists, for API-shape symmetry with `then()` and because releasing a
+handle early is never harmful - it just isn't what makes the difference
+here the way it does for `then()`.
 
 ## Flattening is not a special case
 
