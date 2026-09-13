@@ -4455,6 +4455,109 @@ covered).
 
 ---
 
+### Issue #54: `est::when_all()` - waiting on more than one future at once
+
+Scoped down from the issue's full proposal (`when_all` + `when_any`,
+each in a fixed-arity and a range-based form) after discussing it: this
+pass covers only `when_all`, both arities; `when_any` is left for a
+follow-up issue, since it has its own open question (what happens to the
+futures that haven't completed yet, with no cancellation mechanism to
+stop them) worth deciding separately rather than folded into this one.
+
+**Failure semantics, resolved.** The issue's own "open questions"
+section asked whether `when_all` should fail fast (`Promise.all`-style)
+or wait for every input regardless (`Promise.allSettled`-style).
+Resolved here as neither, exactly: the input futures are owned by the
+caller (passed as `future<T>&`, never consumed), `when_all()` waits for
+every one of them to complete - success or failure, no fail-fast - and
+then simply resolves; it never fails itself, and never reads a value or
+an exception out of any input. The caller checks `failed()`/`get()` on
+whichever inputs it cares about afterward, exactly as if it had awaited
+each one individually. This sidesteps the "what does the combined result
+look like when one of N heterogeneous types failed" question entirely -
+there's no combined value or exception to construct in the first place,
+just a `future<void>` signaling "everyone's done now."
+
+**Shape:** a new partition, `est::when_all()` (`est/src/when_all.cppm`,
+`:when_all` - sits at the bottom of the DAG next to `:sync.mutex`,
+depending on `:future`/`:promise`/`:util.shared_ptr`/`:util.current_loop`
+and nothing else depends on it). Two overloads:
+- `when_all(future<Ts>&... futures) -> future<void>` - fixed arity,
+  heterogeneous. An empty pack resolves immediately.
+- `when_all(std::span<future<T>> futures) -> future<void>` - a
+  dynamically-sized, homogeneous run instead of a fixed argument list.
+  An empty span resolves immediately. Template argument deduction can't
+  see through a container's implicit conversion to `std::span`, so a
+  caller passing, say, a `std::vector<future<T>>` needs to spell out
+  `std::span(the_vector)` at the call site.
+
+**Mechanism:** a small counting barrier. `detail::when_all_state` holds
+a `promise<void> result` and an `int remaining`, allocated once via
+`shared_ptr<when_all_state>::make(current_allocator(), ...)` and shared
+(via `est::shared_ptr`, not `std::shared_ptr` - allocator-first, per
+`CLAUDE.md`) across one `.then()` registration per input future. Each
+registration decrements `remaining`; whichever one brings it to zero
+calls `result.set_value()`.
+
+**A real correctness bug caught during verification, not just
+clean-room design.** The obvious per-future hook shape - a single
+generic `[](auto& completed) {...}` lambda, reused for every `T` in the
+pack - silently breaks `when_all()` for any T where a constituent future
+fails. `then_callback_for<T>`'s own dispatch (`invocable_unwrapped<Fn,
+T>()`, `docs/wiki/Continuation-Node-Mechanism.md`) checks unwrapped mode
+first, and a generic lambda satisfies that check too - a template
+parameter binds to `const T&` exactly as readily as to `future<T>&` - so
+`then()` picks unwrapped mode, which auto-propagates a failure straight
+to the (here, discarded) `.then()`-returned future *without ever calling
+the lambda at all*. A failed input would simply never decrement
+`remaining`, and `when_all()`'s returned future would hang forever the
+first time any one constituent failed - caught by the "counts a failed
+future the same as a succeeded one" test below, not by inspection. Fixed
+by `detail::when_all_hook<T>()`, a small factory returning a lambda
+explicitly typed on `future<T>&` (not a generic parameter) - a
+`future<T>&` parameter can't bind a `const T&` argument, so
+`invocable_unwrapped` is false regardless of `T` (`T = void` included,
+where the zero-argument unwrapped check fails for the identical reason:
+this lambda always takes exactly one argument), forcing wrapped mode -
+always invoked, success or failure - unconditionally. Full writeup in
+`docs/wiki/Continuation-Node-Mechanism.md`'s new "`est::when_all()`:
+forcing wrapped mode on purpose" section.
+
+**Nothing new needed for abandonment-safety.** A `when_all()` call whose
+loop tears down before every input completes relies entirely on
+`concrete_continuation<Fn, U>`'s existing `abandon()` override (Issue
+#66 & #67, above) - each abandoned hook's own destructor still runs,
+dropping its `shared_ptr<when_all_state>` reference normally, so the
+shared state and every hook free cleanly with no special-casing in
+`when_all.cppm` itself. Verified directly by a dedicated leak test
+(below), not just assumed.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new `:when_all`
+node and edges in `docs/wiki/Architecture.md`'s dependency graph, plus a
+short paragraph on why it sits where it does; the wrapped-mode-forcing
+mechanism above written up in full in
+`docs/wiki/Continuation-Node-Mechanism.md`.
+
+**Tests added** (`est/tests/when_all_tests.cpp`): empty pack resolves
+immediately; resolves only once every input is ready, not before;
+resolves immediately when every input is already ready; counts a failed
+future the same as a succeeded one (the test that caught the
+wrapped-mode bug above); works across heterogeneous types including
+`future<void>`; does not consume the caller's futures; the `std::span`
+overload's own ready-timing and empty-range cases; two leak tests
+(shared state and hooks freed on the happy path, and freed even when
+every input is abandoned before completing).
+
+**Verified in the pinned Docker devenv:** 189/189 tests pass (10 new);
+`clang-format`/`clang-tidy` clean; 156/156 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 98% (173/176 changed lines covered - the 3 uncovered lines are
+`when_all_tests.cpp`'s own `counting_resource::do_is_equal()`, copied
+boilerplate never exercised by any of these tests, same as in every
+other test file that defines one).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

@@ -22,3 +22,4 @@ export import :loop;
 export import :util.current_loop;
 export import :future;
 export import :promise;
+export import :when_all;
