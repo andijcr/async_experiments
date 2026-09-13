@@ -11,9 +11,11 @@ export namespace est {
 // target - into est's cooperative event system
 // (est::binary_event<EventResetMode::manual>, est:sync.event). `source`
 // is the *only* atomic anywhere in this framework an external writer
-// ever touches: it stores through it at its own pace, and poll() below
-// (loop-thread only) is the one and only place this class ever reads it.
-// Between poll() calls, nothing here is shared/concurrently touched: the
+// ever touches: it stores through it at its own pace, and the
+// constructor (once, for the initial value) plus poll() below
+// (loop-thread only, every time after) are the only places this class
+// ever reads it. Between poll() calls, nothing here is shared/concurrently
+// touched: the
 // cached last-seen value and the internal binary_event live entirely on
 // the loop thread, the same single-threaded assumption as everywhere
 // else in est - this class exists to be the one deliberate seam where
@@ -49,12 +51,13 @@ public:
   explicit external_event(std::atomic<T>& source) noexcept
       : source_(&source), last_seen_(source.load(std::memory_order_relaxed)) {}
 
-  // Loop-thread only; never suspends. The *only* read of source_ anywhere
-  // in this class. memory_order_acquire pairs with the external writer's
-  // own release store (or stronger) - a caller writing `source` from
-  // another thread should use at least memory_order_release there for
-  // this to actually synchronize-with the read here, not just happen to
-  // observe the new value on a given platform.
+  // Loop-thread only; never suspends. The only read of source_ after
+  // construction (see the constructor's own relaxed load for the initial
+  // value). memory_order_acquire pairs with the external writer's own
+  // release store (or stronger) - a caller writing `source` from another
+  // thread should use at least memory_order_release there for this to
+  // actually synchronize-with the read here, not just happen to observe
+  // the new value on a given platform.
   void poll() noexcept {
     T current = source_->load(std::memory_order_acquire);
     if (current != last_seen_) {
