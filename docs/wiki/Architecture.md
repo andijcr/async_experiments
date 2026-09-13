@@ -22,6 +22,7 @@ graph BT
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
   when_all[":when_all<br/>when_all(), detail::when_all_state"]
+  when_any_succeeds[":when_any_succeeds<br/>when_any_succeeds(), detail::when_any_succeeds_state"]
 
   check --> platform
   event --> check
@@ -58,6 +59,10 @@ graph BT
   when_all --> event
   when_all --> shared_ptr
   when_all --> current_loop
+  when_any_succeeds --> future
+  when_any_succeeds --> promise
+  when_any_succeeds --> shared_ptr
+  when_any_succeeds --> current_loop
 ```
 
 The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
@@ -100,6 +105,21 @@ block against. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md#
 for why each input needs a two-stage `then_fast()` chain, each stage
 typed on a concrete `future<T>&`/`future<void>&` rather than a generic
 `auto&` parameter.
+
+`:when_any_succeeds` sits at the same bottom layer, independent of
+`:when_all` (neither imports the other - they share a design pattern,
+not code). It needs `:future`/`:promise` for the `future<T>&`/`future<bool>`
+its one combinator, `est::when_any_succeeds()`, works with -
+`:promise` specifically for `make_promise_future<bool>()`, since a
+`bool`-carrying result can't be produced by an event the way
+`est::when_all()`'s own `future<void>` result can; `:util.shared_ptr`
+for the allocator-first `detail::when_any_succeeds_state` control block
+a call shares across every constituent future's completion hook; and
+`:util.current_loop` for `current_allocator()` to build that control
+block against. No `:sync.event` edge, unlike `:when_all`/`:when_any` -
+see [Continuation Node Mechanism](Continuation-Node-Mechanism.md#estwhen_any_succeeds-when-a-result-has-to-carry-a-value)
+for the full mechanism and why a plain `promise<bool>` fits better here
+than an event does.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
