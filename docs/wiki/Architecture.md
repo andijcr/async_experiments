@@ -92,9 +92,10 @@ for the `future<T>&`/`promise<void>` pair its one combinator,
 allocator-first `detail::when_all_state` control block a call shares
 across every constituent future's completion hook, and
 `:util.current_loop` for `current_allocator()` to build that control
-block against. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md#estwhen_all-forcing-wrapped-mode-on-purpose)
-for why its per-future hook has to be typed on `future<T>&` specifically
-rather than a generic `auto&` parameter.
+block against. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md#estwhen_all-forcing-wrapped-mode-and-surviving-abandonment)
+for why each input needs a two-stage `.then()` chain, each stage typed
+on a concrete `future<T>&`/`future<void>&` rather than a generic `auto&`
+parameter.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`

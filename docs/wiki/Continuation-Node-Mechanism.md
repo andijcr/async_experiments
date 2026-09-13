@@ -447,58 +447,91 @@ couldn't be flattened through a copying path at all, since
 has the same story from that page's own angle (total allocation counts per
 `then()` shape).
 
-## `est::when_all()`: forcing wrapped mode on purpose
+## `est::when_all()`: forcing wrapped mode, and surviving abandonment
 
 `est::when_all(future<Ts>&... futures) -> future<void>` (`est/src/when_all.cppm`,
-issue #54) resolves once every one of `futures` is ready, success or
-failure - each input stays owned by the caller (`when_all()` only ever
-registers a `.then()` continuation on it, never moves or consumes it),
-which inspects `failed()`/`get()` on whichever of them it cares about
-afterward. Internally, it's a small counting barrier: a shared
-`detail::when_all_state{promise<void> result; int remaining;}`, and one
-`.then()` registration per input that decrements `remaining` and calls
+issue #54) resolves once every one of `futures` is *accounted for* -
+completed or abandoned, succeeded or failed - each input stays owned by
+the caller (`when_all()` only ever registers `.then()` continuations on
+it, never moves or consumes it), which inspects `failed()`/`get()` on
+whichever of them it cares about afterward. Internally, it's a small
+counting barrier: a shared `detail::when_all_state{promise<void> result;
+int remaining;}`, and one tracking chain per input
+(`detail::when_all_track<T>()`) that decrements `remaining` and calls
 `result.set_value()` the moment it reaches zero.
 
-The one thing that registration *cannot* be is a generic `[](auto& v)
-{...}` lambda, even though that would otherwise be the natural shape for
-"run this the same way regardless of `T`." `then_callback_for<T>`'s own
-dispatch (`invocable_unwrapped<Fn, T>()`, above) checks unwrapped mode
-first - `std::invocable<Fn&, const T&>` - and a generic lambda satisfies
-that check too, since a template parameter binds to `const T&` just as
+That tracking chain has two independent correctness traps, both found
+the same way - a test written specifically to exercise the failure mode,
+not by inspection - and both fixed in the shape `when_all_track<T>()`
+ended up with:
+
+**Trap one: a generic hook silently skips failed inputs.** The obvious
+shape for "run this the same way regardless of `T`" is a generic `[](auto&
+v) {...}` lambda. `then_callback_for<T>`'s own dispatch
+(`invocable_unwrapped<Fn, T>()`, above) checks unwrapped mode first -
+`std::invocable<Fn&, const T&>` - and a generic lambda satisfies that
+check too, since a template parameter binds to `const T&` just as
 readily as to `future<T>&`. Landing in unwrapped mode is exactly wrong
 here: unwrapped mode auto-propagates a failure straight to the
 `.then()`-returned future *without ever calling `fn`* (see "The two
 calling conventions" above) - so a generic hook would silently never
-decrement `remaining` for a failed input, and `when_all()`'s returned
-future would simply hang forever the first time any one constituent
-failed.
-
-The fix is `detail::when_all_hook<T>()`, a small factory that returns a
-lambda explicitly typed on `future<T>&`:
-
-```cpp
-template <class T> auto when_all_hook(shared_ptr<when_all_state> state) {
-  return [state = std::move(state)](future<T>& /*completed*/) {
-    if (--state->remaining == 0) {
-      state->result.set_value();
-    }
-  };
-}
-```
-
+decrement `remaining` for a failed input, hanging `when_all()`'s
+returned future forever the first time any one constituent failed. The
+fix: type the hook explicitly on `future<T>&`, never a generic parameter.
 A `future<T>&` parameter cannot bind a `const T&` argument - they're
 unrelated types - so `invocable_unwrapped<Fn, T>()` is false regardless
 of `T` (including `T = void`, where the zero-argument unwrapped check
-fails for the same reason: this lambda always takes exactly one
-argument). Wrapped mode - `std::invocable<Fn&, future<T>&>` - is the only
-one left, and it runs unconditionally, success or failure, which is
-exactly the completion signal `when_all()` needs. One `when_all_hook<T>()`
-instantiation is built per distinct `T` in the input list (or the single
-`T` of a `std::span<future<T>>`, for the range-based overload), each
-capturing its own copy of the same `shared_ptr<when_all_state>` - the
-node that copy ends up living in, per that future's own `.then()` call,
-is what keeps `when_all_state` alive until every one of them has run
-(or been abandoned - `concrete_continuation<Fn, U>`'s own `abandon()`
-override, discussed above, means a `when_all()` call whose loop tears
-down before every input completes still frees its shared state and every
-hook cleanly, rather than leaking).
+fails for the identical reason: such a hook always takes exactly one
+argument), forcing wrapped mode - `std::invocable<Fn&, future<T>&>`,
+which runs unconditionally, success or failure.
+
+**Trap two: a correctly-typed hook still skips *abandoned* inputs.**
+Even once forced into wrapped mode, a hook registered *directly* on
+`input` is never invoked if `input`'s own `future_state` is *abandoned*
+(destroyed while still pending) rather than actually completed - a
+concrete, plausible way to trigger this: a helper function starts some
+async producer, calls `when_all()` on the future it hands back, and
+returns, letting its own local promise/future pair for that input go out
+of scope once nothing local needs them any more. `concrete_continuation<Fn,
+U>`'s own `abandon()` override (discussed above) unconditionally
+completes *its own* downstream with an exception - it never invokes
+`fn_` at all. A counting hook living directly in `fn_` would therefore
+never run for an abandoned input, hanging `when_all()`'s returned future
+forever exactly the same way trap one did, just triggered by a different
+precondition.
+
+The fix is a two-stage `.then()` chain, not a single hook:
+
+```cpp
+template <class T> void when_all_track(future<T>& input, shared_ptr<when_all_state> state) {
+  input.then([](future<T>&) {}).then([state = std::move(state)](future<void>&) {
+    if (--state->remaining == 0) {
+      state->result.set_value();
+    }
+  });
+}
+```
+
+The first stage is a pure no-op, typed on `future<T>&` for the same
+wrapped-mode reason as trap one - its only job is to produce a
+`future<void>` that reliably completes whenever `input` does, *whichever
+way that happens*. That's the key property `abandon()`'s own
+exception-completion has: `downstream_->set_exception(...)` goes through
+`future_state<T>::complete()` exactly the same way a normal
+`set_value()`/`set_exception()` call does, which drains and wakes up
+*second-stage* waiters identically either way. The real counting logic,
+living in that second stage - also typed on a concrete `future<void>&`,
+for the identical trap-one reason - therefore always runs exactly once
+per input, whether that input was completed or abandoned.
+
+One `when_all_track<T>()` instantiation is built per distinct `T` in the
+input list (or the single `T` of a `std::span<future<T>>`, for the
+range-based overload), each copying the same `shared_ptr<when_all_state>`
+into its own second-stage closure - the node that copy ends up living in
+is what keeps `when_all_state` alive until every one of them has run.
+`detail::when_all_setup()` builds the shared `promise<void>`/`future<void>`
+pair and the `when_all_state` itself once, shared by both overloads
+(which differ only in how they arrive at the input count and how they
+iterate their inputs) - a `count == 0` call resolves the returned future
+immediately without allocating a `when_all_state` at all, since there's
+nothing left to track.

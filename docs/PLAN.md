@@ -4493,66 +4493,95 @@ and nothing else depends on it). Two overloads:
 
 **Mechanism:** a small counting barrier. `detail::when_all_state` holds
 a `promise<void> result` and an `int remaining`, allocated once via
-`shared_ptr<when_all_state>::make(current_allocator(), ...)` and shared
-(via `est::shared_ptr`, not `std::shared_ptr` - allocator-first, per
-`CLAUDE.md`) across one `.then()` registration per input future. Each
-registration decrements `remaining`; whichever one brings it to zero
-calls `result.set_value()`.
+`detail::when_all_setup()` (shared by both overloads) using
+`shared_ptr<when_all_state>::make(current_allocator(), ...)` - `est::shared_ptr`,
+not `std::shared_ptr` - allocator-first, per `CLAUDE.md`. A `count == 0`
+call resolves the returned future immediately, skipping the allocation
+entirely. Each input gets one `detail::when_all_track<T>()` registration,
+which decrements `remaining`; whichever one brings it to zero calls
+`result.set_value()`.
 
-**A real correctness bug caught during verification, not just
-clean-room design.** The obvious per-future hook shape - a single
-generic `[](auto& completed) {...}` lambda, reused for every `T` in the
-pack - silently breaks `when_all()` for any T where a constituent future
-fails. `then_callback_for<T>`'s own dispatch (`invocable_unwrapped<Fn,
-T>()`, `docs/wiki/Continuation-Node-Mechanism.md`) checks unwrapped mode
-first, and a generic lambda satisfies that check too - a template
-parameter binds to `const T&` exactly as readily as to `future<T>&` - so
-`then()` picks unwrapped mode, which auto-propagates a failure straight
-to the (here, discarded) `.then()`-returned future *without ever calling
-the lambda at all*. A failed input would simply never decrement
-`remaining`, and `when_all()`'s returned future would hang forever the
-first time any one constituent failed - caught by the "counts a failed
-future the same as a succeeded one" test below, not by inspection. Fixed
-by `detail::when_all_hook<T>()`, a small factory returning a lambda
-explicitly typed on `future<T>&` (not a generic parameter) - a
-`future<T>&` parameter can't bind a `const T&` argument, so
-`invocable_unwrapped` is false regardless of `T` (`T = void` included,
-where the zero-argument unwrapped check fails for the identical reason:
-this lambda always takes exactly one argument), forcing wrapped mode -
-always invoked, success or failure - unconditionally. Full writeup in
-`docs/wiki/Continuation-Node-Mechanism.md`'s new "`est::when_all()`:
-forcing wrapped mode on purpose" section.
+**Two real correctness bugs caught during verification, not just
+clean-room design** - both found by a test written specifically to
+exercise the failure mode, not by inspection.
 
-**Nothing new needed for abandonment-safety.** A `when_all()` call whose
-loop tears down before every input completes relies entirely on
-`concrete_continuation<Fn, U>`'s existing `abandon()` override (Issue
-#66 & #67, above) - each abandoned hook's own destructor still runs,
-dropping its `shared_ptr<when_all_state>` reference normally, so the
-shared state and every hook free cleanly with no special-casing in
-`when_all.cppm` itself. Verified directly by a dedicated leak test
-(below), not just assumed.
+*Bug one, caught by this pass's own tests before ever opening the PR.*
+The obvious per-future hook shape - a single generic `[](auto& completed)
+{...}` lambda, reused for every `T` in the pack - silently breaks
+`when_all()` for any `T` where a constituent future fails.
+`then_callback_for<T>`'s own dispatch (`invocable_unwrapped<Fn, T>()`,
+`docs/wiki/Continuation-Node-Mechanism.md`) checks unwrapped mode first,
+and a generic lambda satisfies that check too - a template parameter
+binds to `const T&` exactly as readily as to `future<T>&` - so `then()`
+picks unwrapped mode, which auto-propagates a failure straight to the
+(here, discarded) `.then()`-returned future *without ever calling the
+lambda at all*. A failed input would simply never decrement `remaining`,
+hanging `when_all()`'s returned future forever the first time any one
+constituent failed - caught by the "counts a failed future the same as a
+succeeded one" test below. Fixed by typing the hook explicitly on
+`future<T>&` (not a generic parameter) - a `future<T>&` parameter can't
+bind a `const T&` argument, so `invocable_unwrapped` is false regardless
+of `T` (`T = void` included, where the zero-argument unwrapped check
+fails for the identical reason: such a hook always takes exactly one
+argument), forcing wrapped mode - always invoked, success or failure -
+unconditionally.
+
+*Bug two, caught by a code review pass after the PR was already open.*
+Even with bug one fixed, a *correctly-typed* hook registered *directly*
+on an input future is still never invoked if that future's own
+`future_state` is *abandoned* (destroyed while still pending) rather
+than actually completed - a concrete, plausible trigger: a helper
+function starts some async producer, calls `when_all()` on the future it
+hands back, and returns, letting its own local promise/future pair for
+that one input go out of scope once nothing local needs them any more.
+`concrete_continuation<Fn, U>`'s own `abandon()` override (Issue #66 &
+#67, above) unconditionally completes *its own* downstream with an
+exception - it never invokes `fn_` at all - so a counting hook living
+directly in `fn_` would simply never run for that input, hanging
+`when_all()`'s returned future forever exactly like bug one, just from a
+different precondition (previously described here, incorrectly, as
+"nothing new needed for abandonment-safety" - that was verified only for
+memory-safety, i.e. no leak on full teardown, never for whether the
+returned future actually resolves when just one input is abandoned while
+the loop and every other input keep going). Fixed by replacing the
+single per-input hook with a two-stage `.then()` chain
+(`detail::when_all_track<T>()`): a no-op first stage, typed on
+`future<T>&` for the identical bug-one reason, whose only job is to
+produce a `future<void>` that reliably completes whenever the input does
+- *whichever way that happens*, since `abandon()`'s own
+exception-completion goes through `future_state<T>::complete()` exactly
+the same way a normal completion does, waking up second-stage waiters
+identically either way. The real counting logic lives in that second
+stage instead, also typed on a concrete `future<void>&`, and so always
+runs exactly once per input, completed or abandoned.
+
+Full writeup of both traps and the two-stage fix in
+`docs/wiki/Continuation-Node-Mechanism.md`'s "`est::when_all()`: forcing
+wrapped mode, and surviving abandonment" section.
 
 **Docs:** `docs/wiki/Home.md`'s source-location table; a new `:when_all`
 node and edges in `docs/wiki/Architecture.md`'s dependency graph, plus a
-short paragraph on why it sits where it does; the wrapped-mode-forcing
-mechanism above written up in full in
+short paragraph on why it sits where it does; both traps and the
+two-stage fix written up in full in
 `docs/wiki/Continuation-Node-Mechanism.md`.
 
 **Tests added** (`est/tests/when_all_tests.cpp`): empty pack resolves
 immediately; resolves only once every input is ready, not before;
 resolves immediately when every input is already ready; counts a failed
-future the same as a succeeded one (the test that caught the
-wrapped-mode bug above); works across heterogeneous types including
-`future<void>`; does not consume the caller's futures; the `std::span`
-overload's own ready-timing and empty-range cases; two leak tests
-(shared state and hooks freed on the happy path, and freed even when
-every input is abandoned before completing).
+future the same as a succeeded one (caught bug one above); still
+resolves when one input is abandoned while the loop keeps running
+(caught bug two above, added after the code-review pass that found it);
+works across heterogeneous types including `future<void>`; does not
+consume the caller's futures; the `std::span` overload's own
+ready-timing and empty-range cases; two leak tests (shared state and
+hooks freed on the happy path, and freed even when every input is
+abandoned before completing).
 
-**Verified in the pinned Docker devenv:** 189/189 tests pass (10 new);
-`clang-format`/`clang-tidy` clean; 156/156 tests pass under the
+**Verified in the pinned Docker devenv:** 190/190 tests pass (11 new);
+`clang-format`/`clang-tidy` clean; 157/157 tests pass under the
 `sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
-`main` at 98% (173/176 changed lines covered - the 3 uncovered lines are
-`when_all_tests.cpp`'s own `counting_resource::do_is_equal()`, copied
+`main` at 98% (changed lines covered - the handful of uncovered lines
+are `when_all_tests.cpp`'s own `counting_resource::do_is_equal()`, copied
 boilerplate never exercised by any of these tests, same as in every
 other test file that defines one).
 

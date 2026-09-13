@@ -98,6 +98,38 @@ TEST_CASE("when_all() counts a failed future the same as a succeeded one", "[whe
   REQUIRE_THROWS_AS(second_future.get(), std::runtime_error);
 }
 
+TEST_CASE("when_all() still resolves when one input is abandoned while the loop keeps running",
+          "[when_all]") {
+  // Guards when_all_track()'s two-stage then() chain (est/src/when_all.cppm):
+  // a hook registered directly on an input future is silently never
+  // invoked if that future's own future_state is abandoned (destroyed
+  // while still pending) rather than completed -
+  // concrete_continuation<Fn, U>::abandon() (est:future) unconditionally
+  // completes only its own downstream, never `fn_`. A real, plausible
+  // shape for this: a helper that kicks off async work and returns a
+  // combined future, letting its own local promise/future pair for one
+  // of the inputs go out of scope once nothing local needs it any more -
+  // modeled here by the IIFE below, which does exactly that for
+  // first_promise/first_future while second_future is still very much
+  // alive and later completes normally.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [second_promise, second_future] = est::make_promise_future<int>();
+
+  auto combined = [&] {
+    auto [first_promise, first_future] = est::make_promise_future<int>();
+    // first_promise and first_future are both destroyed here, without
+    // either ever completing - abandoning first_future's own
+    // future_state while when_all()'s own tracking chain is still
+    // registered on it.
+    return est::when_all(first_future, second_future);
+  }();
+
+  second_promise.set_value(2);
+  loop.run_until_idle();
+  REQUIRE(combined.ready());
+}
+
 TEST_CASE("when_all() works across heterogeneous types, including future<void>", "[when_all]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
