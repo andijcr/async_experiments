@@ -5325,6 +5325,54 @@ too; `diff-cover` coverage gate against `main` at 93%
 
 ---
 
+### Issue #47's pooling alternative, measured: `std::pmr::unsynchronized_pool_resource`
+
+Follow-up to issue #47's own alternative (3) - "a dedicated small-object
+pool for `future_resume_node<T>`... doesn't remove the allocation count,
+only its cost." Rather than write one, tried the cheapest possible version
+first: since every allocation in this codebase already flows through the
+loop's own `std::pmr::polymorphic_allocator<std::byte>`
+(`docs/wiki/Allocation-Patterns.md`), a caller can swap in
+`std::pmr::unsynchronized_pool_resource` (the single-threaded variant,
+matching `est::loop`'s own no-atomics constraint) as the backing resource
+with zero framework changes at all - `est::loop loop{&pool};` instead of
+`est::loop loop;`.
+
+**Measured, not just argued.** A throwaway benchmark (`examples/probe/`,
+temporarily rewritten, not committed) drove 200,000 iterations of a mixed
+workload - one genuinely-suspending `co_await` plus one `.then()` chain
+per iteration, 1.4 million allocate/deallocate pairs total - under a
+Release+LTO build, timing the same workload against `new_delete_resource()`
+directly versus `unsynchronized_pool_resource` wrapping it. Result: ~50-52ms
+pooled versus ~56-58ms unpooled, a consistent ~9-10% improvement, confirmed
+with the run order swapped (pooled-then-baseline as well as
+baseline-then-pooled) to rule out warm-up bias rather than a genuine
+resource-level effect. Allocation *counts* were identical in every run,
+confirming the win is purely `malloc`/`free` cost, not a change in how
+many allocations happen.
+
+**Conclusion matches issue #47's own recommendation.** A real, repeatable
+win, but a modest one - this codebase's own allocations are already cheap
+enough that a generic pool resource captures most of the available gain
+without writing a bespoke freelist sized to one specific node type (issue
+#47's alternative (2), the invasive embedded-resume-node redesign, remains
+unnecessary on this evidence).
+
+**Landed:** `docs/wiki/Allocation-Patterns.md` gained a "Pooling: measured,
+not just theoretical" section with the full numbers and the opt-in
+snippet; `examples/hello_world/main.cpp` now constructs its `est::loop`
+against a `std::pmr::unsynchronized_pool_resource` as a worked example of
+the opt-in pattern (not because `hello_world` itself needs it - it's the
+first place a reader looks for "how do I set this up"). A comment
+recording this finding was also added to issue #47 itself.
+
+**Re-verified in the pinned Docker devenv:** `clang-format`/`clang-tidy`
+clean; `ci` preset build + 227/227 tests pass (no test-visible behavior
+changed - `hello_world` isn't part of the test suite, run manually to
+confirm it still prints `est::future value: 42`).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
