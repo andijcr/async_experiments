@@ -4857,6 +4857,93 @@ lines as before).
 
 ---
 
+### `shared_ptr<T>`'s two specializations deduplicated via a CRTP base (done)
+
+A framework-wide sweep for repeated logic turned up one clear candidate:
+`est::shared_ptr<T>`'s primary template (a `T` boxed inside a heap-allocated
+control block) and its `est::ref_counted`-based partial specialization
+(`T` carries its own ref count and allocator directly, no wrapping struct)
+duplicated the same ~90 lines of copy/move/`swap()`/`reset()`/`get()`/
+`operator*`/`operator->`/`operator bool`/`count()` almost verbatim - the
+only real difference between the two is *how* to reach the ref count and
+the pointee from the one thing each specialization actually stores
+differently (a `control_block*` vs. a `T*`), and what "destroy" means for
+each.
+
+Factored that shared machinery into one CRTP base,
+`detail::shared_ptr_common<Derived, Pointer, T>` (`est/src/util/shared_ptr.cppm`),
+storing the single `Pointer` and implementing every one of those members in
+terms of three static accessors it calls on `Derived`: `element_of(ptr)`,
+`ref_count_of(ptr)`, `destroy(ptr)`. Each `shared_ptr<T>` specialization now
+only defines `make()` (which differs in allocation shape - one allocation
+combining ref count + allocator + `T` for the primary template, vs. `T`
+allocated directly for the `ref_counted` case) and those three tiny
+accessors, then inherits the base for everything else; copy/move/the
+destructor are left fully implicit on both specializations (neither adds
+a member of its own beyond `base`), so they just forward straight to
+`shared_ptr_common`'s own. `shared_ptr_control_block<T>` (the primary
+template's boxed-`T` struct: allocator + ref count + `T`) moved out of
+being a private nested type of `shared_ptr<T>` into a free struct in
+`namespace est::detail`, since a class's base-specifier list (needed here,
+for `Pointer = shared_ptr_control_block<T>*`) is evaluated before the
+class body opens and can't name a type nested inside that same class.
+
+**`bugprone-crtp-constructor-accessibility`, caught by `clang-tidy`:**
+the base's first cut left its default/copy/move/pointer-adopting
+constructors implicitly public - which `clang-tidy` correctly flagged as
+letting the mixin be constructed or inherited from outside its one
+intended pairing with `shared_ptr<T>`. Fixed the same way this codebase's
+own pre-existing `current_allocator_new_delete<Derived>` mixin (see the
+entry above) already settled the identical shape: every constructor moved
+`private`, plus `friend Derived;` so only the one intended derived
+specialization can reach them.
+
+**A real `std::uses_allocator` regression, caught by the build, not by
+`shared_ptr_tests.cpp`:** `shared_ptr_control_block<T>`'s first draft
+carried its own `using allocator_type = std::pmr::polymorphic_allocator<std::byte>;`
+member - copied out of habit from the class it replaced, but a member the
+*original* nested `control_block` never actually had (it only ever saw
+`allocator_type` via its enclosing class's scope). That one extra typedef
+is exactly what `std::uses_allocator` construction keys off of:
+`polymorphic_allocator::new_object<T>()`'s internal `construct()` checks
+whether `T` itself declares a convertible `allocator_type` and, if so,
+silently appends a *second*, trailing allocator argument on top of
+whatever was already passed explicitly. `shared_ptr_control_block<T>`'s
+constructor already takes the allocator as its first parameter by design
+(it's stored, then read back by `destroy()`), so the extra trailing one
+broke every call site with more than a bare no-arg `T` - caught only when
+`est/src/when_all.cppm` (`detail::when_all_state`, merged separately while
+this refactor was in progress) failed to compile with a constructor-
+overload-resolution error, not by any existing test. Fixed by removing the
+stray `allocator_type` member and spelling out
+`std::pmr::polymorphic_allocator<std::byte>` directly in the constructor
+parameter and the stored member's type instead.
+
+Three weaker duplication candidates surfaced by the same sweep were left
+alone as not worth the abstraction: `detail::ready_node`/`timer_node`'s
+parallel `abandon_*`/`destroy()` shape (already intentionally distinct
+naming, not accidental duplication); `future_state<T>::set_value(const
+U&)`/`set_value(U&&)` (an idiomatic copy/move pair, not repetition); and
+`sleep_until()`/`yield_execution()`'s shared "build a node, register it,
+return its future" shape (too few call sites to earn a shared helper).
+
+Docs updated: `docs/wiki/Home.md`'s source-location table (added
+`detail::shared_ptr_common`/`detail::shared_ptr_control_block<T>` next to
+`est::shared_ptr<T>`/`est::ref_counted`). `Architecture.md` and
+`Allocation-Patterns.md` needed no changes - both already describe
+`shared_ptr<T>`'s externally observable allocation behavior, which this
+refactor doesn't change, rather than its old internal nested-`control_block`
+layout.
+
+**Verified in the pinned Docker devenv:** 194/194 tests pass;
+`clang-format`/`clang-tidy` clean (zero user-code findings); full suite
+passes under the `sanitize` preset (ASan+UBSan) too, at 161/161; `diff-cover`
+coverage gate against `main` at 98.1% (51/52 changed lines covered - the
+one miss is the primary template's own class-declaration line, not
+executable code).
+
+---
+
 ### Issue #54, part two: `est::when_any()`
 
 The follow-up `est::when_all()` itself deferred: same ownership
