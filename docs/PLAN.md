@@ -4668,6 +4668,195 @@ original stacked base already merged) at 100%
 
 ---
 
+### Issue #54: `est::when_all()` - waiting on more than one future at once
+
+Scoped down from the issue's full proposal (`when_all` + `when_any`,
+each in a fixed-arity and a range-based form) after discussing it: this
+pass covers only `when_all`, both arities; `when_any` is left for a
+follow-up issue, since it has its own open question (what happens to the
+futures that haven't completed yet, with no cancellation mechanism to
+stop them) worth deciding separately rather than folded into this one.
+
+**Failure semantics, resolved.** The issue's own "open questions"
+section asked whether `when_all` should fail fast (`Promise.all`-style)
+or wait for every input regardless (`Promise.allSettled`-style).
+Resolved here as neither, exactly: the input futures are owned by the
+caller (passed as `future<T>&`, never consumed), `when_all()` waits for
+every one of them to complete - success or failure, no fail-fast - and
+then simply resolves; it never fails itself, and never reads a value or
+an exception out of any input. The caller checks `failed()`/`get()` on
+whichever inputs it cares about afterward, exactly as if it had awaited
+each one individually. This sidesteps the "what does the combined result
+look like when one of N heterogeneous types failed" question entirely -
+there's no combined value or exception to construct in the first place,
+just a `future<void>` signaling "everyone's done now."
+
+**Shape:** a new partition, `est::when_all()` (`est/src/when_all.cppm`,
+`:when_all` - sits at the bottom of the DAG next to `:sync.mutex`,
+depending on `:future`/`:promise`/`:util.shared_ptr`/`:util.current_loop`
+and nothing else depends on it). Two overloads:
+- `when_all(future<Ts>&... futures) -> future<void>` - fixed arity,
+  heterogeneous. An empty pack resolves immediately.
+- `when_all(std::span<future<T>> futures) -> future<void>` - a
+  dynamically-sized, homogeneous run instead of a fixed argument list.
+  An empty span resolves immediately. Template argument deduction can't
+  see through a container's implicit conversion to `std::span`, so a
+  caller passing, say, a `std::vector<future<T>>` needs to spell out
+  `std::span(the_vector)` at the call site.
+
+**Mechanism:** a small counting barrier. `detail::when_all_state` holds
+a `promise<void> result` and an `int remaining`, allocated once via
+`detail::when_all_setup()` (shared by both overloads) using
+`shared_ptr<when_all_state>::make(current_allocator(), ...)` - `est::shared_ptr`,
+not `std::shared_ptr` - allocator-first, per `CLAUDE.md`. A `count == 0`
+call resolves the returned future immediately, skipping the allocation
+entirely. Each input gets one `detail::when_all_track<T>()` registration,
+which decrements `remaining`; whichever one brings it to zero calls
+`result.set_value()`.
+
+**Two real correctness bugs caught during verification, not just
+clean-room design** - both found by a test written specifically to
+exercise the failure mode, not by inspection.
+
+*Bug one, caught by this pass's own tests before ever opening the PR.*
+The obvious per-future hook shape - a single generic `[](auto& completed)
+{...}` lambda, reused for every `T` in the pack - silently breaks
+`when_all()` for any `T` where a constituent future fails.
+`then_callback_for<T>`'s own dispatch (`invocable_unwrapped<Fn, T>()`,
+`docs/wiki/Continuation-Node-Mechanism.md`) checks unwrapped mode first,
+and a generic lambda satisfies that check too - a template parameter
+binds to `const T&` exactly as readily as to `future<T>&` - so `then()`
+picks unwrapped mode, which auto-propagates a failure straight to the
+(here, discarded) `.then()`-returned future *without ever calling the
+lambda at all*. A failed input would simply never decrement `remaining`,
+hanging `when_all()`'s returned future forever the first time any one
+constituent failed - caught by the "counts a failed future the same as a
+succeeded one" test below. Fixed by typing the hook explicitly on
+`future<T>&` (not a generic parameter) - a `future<T>&` parameter can't
+bind a `const T&` argument, so `invocable_unwrapped` is false regardless
+of `T` (`T = void` included, where the zero-argument unwrapped check
+fails for the identical reason: such a hook always takes exactly one
+argument), forcing wrapped mode - always invoked, success or failure -
+unconditionally.
+
+*Bug two, caught by a code review pass after the PR was already open.*
+Even with bug one fixed, a *correctly-typed* hook registered *directly*
+on an input future is still never invoked if that future's own
+`future_state` is *abandoned* (destroyed while still pending) rather
+than actually completed - a concrete, plausible trigger: a helper
+function starts some async producer, calls `when_all()` on the future it
+hands back, and returns, letting its own local promise/future pair for
+that one input go out of scope once nothing local needs them any more.
+`concrete_continuation<Fn, U>`'s own `abandon()` override (Issue #66 &
+#67, above) unconditionally completes *its own* downstream with an
+exception - it never invokes `fn_` at all - so a counting hook living
+directly in `fn_` would simply never run for that input, hanging
+`when_all()`'s returned future forever exactly like bug one, just from a
+different precondition (previously described here, incorrectly, as
+"nothing new needed for abandonment-safety" - that was verified only for
+memory-safety, i.e. no leak on full teardown, never for whether the
+returned future actually resolves when just one input is abandoned while
+the loop and every other input keep going). Fixed by replacing the
+single per-input hook with a two-stage `.then()` chain
+(`detail::when_all_track<T>()`): a no-op first stage, typed on
+`future<T>&` for the identical bug-one reason, whose only job is to
+produce a `future<void>` that reliably completes whenever the input does
+- *whichever way that happens*, since `abandon()`'s own
+exception-completion goes through `future_state<T>::complete()` exactly
+the same way a normal completion does, waking up second-stage waiters
+identically either way. The real counting logic lives in that second
+stage instead, also typed on a concrete `future<void>&`, and so always
+runs exactly once per input, completed or abandoned.
+
+Full writeup of both traps and the two-stage fix in
+`docs/wiki/Continuation-Node-Mechanism.md`'s "`est::when_all()`: forcing
+wrapped mode, and surviving abandonment" section.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new `:when_all`
+node and edges in `docs/wiki/Architecture.md`'s dependency graph, plus a
+short paragraph on why it sits where it does; both traps and the
+two-stage fix written up in full in
+`docs/wiki/Continuation-Node-Mechanism.md`.
+
+**Tests added** (`est/tests/when_all_tests.cpp`): empty pack resolves
+immediately; resolves only once every input is ready, not before;
+resolves immediately when every input is already ready; counts a failed
+future the same as a succeeded one (caught bug one above); still
+resolves when one input is abandoned while the loop keeps running
+(caught bug two above, added after the code-review pass that found it);
+works across heterogeneous types including `future<void>`; does not
+consume the caller's futures; the `std::span` overload's own
+ready-timing and empty-range cases; two leak tests (shared state and
+hooks freed on the happy path, and freed even when every input is
+abandoned before completing).
+
+**Verified in the pinned Docker devenv:** 190/190 tests pass (11 new);
+`clang-format`/`clang-tidy` clean; 157/157 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 98% (changed lines covered - the handful of uncovered lines
+are `when_all_tests.cpp`'s own `counting_resource::do_is_equal()`, copied
+boilerplate never exercised by any of these tests, same as in every
+other test file that defines one).
+
+**Follow-up from PR review: `then_fast()` + `one_shot_event`, and a
+third bug this surfaced.** Two review comments on PR #89, after
+`then_fast()` (issue #65) landed on `main` from a parallel PR opened
+after this one: `when_all_track()` should use `then_fast()` at both
+stages instead of `then()`, and `when_all_state` should hold a
+`one_shot_event<EventResetMode::manual>` instead of a raw
+`promise<void>`.
+
+*`then_fast()` at both stages.* `when_all_track()`'s two callbacks - a
+no-op and a two-line decrement - are exactly the "caller specifically
+knows `fn` is cheap" case `then_fast()`'s own doc comment describes, the
+same one `counting_event<Mode>::wait()`'s own already-signaled fast path
+already relies on. Swapping both `then()` calls for `then_fast()` lets
+an already-ready input's entire two-stage chain resolve synchronously,
+with no loop round trip, instead of always deferring.
+
+*`one_shot_event<manual>` instead of `promise<void>`.* `event.wait()`
+now produces the `future<void>` `when_all()` hands back directly, with
+no separate `make_promise_future()` call; Mode = manual matches the
+"one broadcast, however many observers" shape `when_all_state`'s
+completion signal actually has.
+
+*Bug three, caught by this pass's own rewritten test, not review.*
+Naively building `when_all_state` and calling `event.wait()` immediately
+- before registering any `when_all_track()` calls - defeated the entire
+point of switching to `then_fast()`: `wait()`'s own already-signaled
+fast path (`try_wait()`) can only take effect if the event is *already*
+`set()` at the moment `wait()` is called, but calling `wait()` first
+means every `when_all()` call registers a waiter against a still-
+unsignaled event unconditionally - even one where every input was
+already ready and resolved synchronously moments later, inside the very
+`then_fast()` calls that same event's own `set()` needed to see coming
+first. The rewritten "resolves synchronously when every future is
+already ready" test (previously "resolves immediately", tolerant of a
+`run_until_idle()` round trip) caught this immediately: `combined.ready()`
+came back false right after `when_all()` returned, even with both inputs
+already resolved. Fixed by reordering `when_all()`/`when_all(std::span<...>)`
+themselves: build `when_all_state`, register every `when_all_track()`
+call, *then* call `state->event.wait()` last - by which point `set()`
+has already fired if every input turned out to be ready, letting
+`wait()`'s own fast path resolve the whole call synchronously end to
+end. `detail::when_all_setup()` shrank to just the "build the state, or
+an empty one for `count == 0`" half of what it used to do, since the
+future-returning half can no longer safely live there.
+
+Wiki (`docs/wiki/Continuation-Node-Mechanism.md`, `docs/wiki/Architecture.md`)
+and the module's own doc comments (`est/src/when_all.cppm`) rewritten to
+match: `then()` → `then_fast()` throughout, the `one_shot_event`-based
+state, the new `:sync.event` dependency edge, and a dedicated writeup of
+why `event.wait()` has to be called last.
+
+**Re-verified in the pinned Docker devenv after the follow-up:**
+194/194 tests pass; `clang-format`/`clang-tidy` clean; 161/161 tests pass
+under the `sanitize` preset too; `diff-cover` coverage gate against
+`main` at 98% (170/173 changed lines covered - the same 3 boilerplate
+lines as before).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

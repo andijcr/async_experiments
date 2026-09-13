@@ -21,6 +21,7 @@ graph BT
   current_loop[":util.current_loop<br/>make_current_loop(loop&amp;), current_loop()"]
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
+  when_all[":when_all<br/>when_all(), detail::when_all_state"]
 
   check --> platform
   event --> check
@@ -52,6 +53,11 @@ graph BT
   promise --> platform
   promise --> shared_ptr
   promise --> current_loop
+  when_all --> future
+  when_all --> promise
+  when_all --> event
+  when_all --> shared_ptr
+  when_all --> current_loop
 ```
 
 The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
@@ -79,6 +85,21 @@ handling a second time (see [Coroutines](Coroutines.md#est-mutex-lock-built-on-t
 now reached only through `:sync.event`. It still depends on `:future`/
 `:promise` directly, for `future<lock_guard>`/`make_ready_future<lock_guard>`
 (`lock()`'s own return type and fast path) and `.then()` (the slow path).
+
+`:when_all` sits at the bottom of the DAG, alongside `:sync.mutex` -
+nothing else in this codebase depends on it. It needs `:future`/`:promise`
+for the `future<T>&`/`future<void>` its one combinator, `est::when_all()`,
+works with; `:sync.event` for `est::one_shot_event<EventResetMode::manual>`,
+`detail::when_all_state`'s own completion signal (`wait()` is what
+produces the `future<void>` `when_all()` hands back to its caller, in
+place of a separate `make_promise_future()` call); `:util.shared_ptr` for
+the allocator-first `detail::when_all_state` control block a call shares
+across every constituent future's completion hook; and
+`:util.current_loop` for `current_allocator()` to build that control
+block against. See [Continuation Node Mechanism](Continuation-Node-Mechanism.md#estwhen_all-forcing-wrapped-mode-and-surviving-abandonment)
+for why each input needs a two-stage `then_fast()` chain, each stage
+typed on a concrete `future<T>&`/`future<void>&` rather than a generic
+`auto&` parameter.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
