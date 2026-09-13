@@ -4480,11 +4480,13 @@ future. Two designs were sketched before picking one:
   identical `&`/`&&`-qualified split `then()` already has (issue #64/#71).
 
 **Mechanically:** `set_continuation()`'s already-ready branch, on
-`run_inline_if_ready`, calls `node.run()` then `delete &node` right
-there instead of `current_loop().enqueue_ready(node)` - the same "run,
-then delete" idiom `est::loop`'s own `run_one()`/`destroy_guard()` use on
-its own drain pass, just performed directly since those two helpers are
-private to `est::loop`. The not-yet-ready branch (`waiters_.enqueue()`)
+`run_inline_if_ready`, runs `node.run()` and lets it be deleted right
+there (originally a bare `delete &node;`; later replaced with a local
+`unique_ptr<continuation_node>` - see the follow-up entry below) instead
+of `current_loop().enqueue_ready(node)` - the same "run, then delete"
+idiom `est::loop`'s own `run_one()`/`destroy_guard()` use on its own
+drain pass, just performed directly since those two helpers are private
+to `est::loop`. The not-yet-ready branch (`waiters_.enqueue()`)
 is completely untouched: nothing is stored on the node itself, so
 whether a given `then_fast()` call ends up running inline or deferred is
 decided once, at registration time, by whether the future was already
@@ -4577,6 +4579,83 @@ which this codebase currently does.
 `clang-format`/`clang-tidy` clean; 150/150 tests pass under the
 `sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
 `main` at 100% (73/73 changed lines covered).
+
+### `std::unique_ptr` replacing hand-written node-guard `new`/`delete` (done)
+
+A follow-up design question, not tied to a numbered issue: now that every
+concrete `ready_node`/`timer_node` already has its own `operator new`/
+`operator delete` (`detail::current_allocator_new_delete<T>`,
+est:util.current_loop), could the remaining hand-written `new`/`delete`
+call sites - `loop::destroy_guard()` (a `scope_exit`-wrapped `delete`),
+`detail::abandon_ready_node()`/`abandon_timer_node()`
+(`node.abandon(); delete &node;`), and `future_state<T>::set_continuation()`'s
+new `then_fast()` inline branch (`node.run(); delete &node;`, added just
+above) - be replaced with `std::unique_ptr` instead, and at what cost?
+
+**Checked the assembly cost empirically before touching any code**, the
+same way `docs/wiki/Global-Lookup-Codegen.md` already validates a
+different codegen claim in this codebase: compiled a minimal
+reproduction of the actual shape (a `ready_node`-style virtual base with
+a virtual destructor and a derived type with a custom `operator new`/
+`delete`) at `-O2` with the pinned clang, comparing a bare
+`delete &node;` through the base reference against
+`std::unique_ptr<ready_node>`'s destructor doing the same, and a bare
+`new concrete()` against `std::make_unique<concrete>()` followed by
+`.release()`. Both pairs produced byte-for-byte identical assembly.
+`delete` through a base reference with a virtual destructor already
+tail-calls into the vtable's deleting-destructor slot - exactly what
+`unique_ptr<ready_node>`'s own destructor compiles down to - and
+`make_unique<T>` still resolves to `T`'s own custom `operator new` (name
+lookup finds it before the global one), so there's nothing to devirtualize
+or deoptimize either way: every call site that actually deletes a node
+here has already type-erased it down to `ready_node&`/`timer_node&` by
+the time it gets there (out of `intrusive_list<ready_node>` or
+`pending_timers_`, both deliberately non-owning, type-erased
+containers), so `unique_ptr` carries exactly the same missing static-type
+information a raw pointer does - there's no call site where switching
+would let the compiler skip the vtable indirection that isn't already
+skipping it today.
+
+**Changed anyway, for the style win alone** (fewer naked `delete`
+expressions, no assembly cost either way):
+
+- `loop::destroy_guard()` (`est/src/loop.cppm`): now returns
+  `std::unique_ptr<Node>(&node)` directly instead of a
+  `scope_exit`-wrapped lambda. No call-site changes needed at all -
+  `run_one()`/`fire_ready_timers()` still use `node`/`*node` directly,
+  never through `guard`; the guard only ever existed for its destructor's
+  side effect, so its exact type was never part of either caller's own
+  contract.
+- `detail::abandon_ready_node()`/`abandon_timer_node()`
+  (`est/src/loop.cppm`): construct a local `const std::unique_ptr<...>`
+  first, then call `abandon()` through it - ownership transfers before
+  `abandon()` runs, but the implicit deletion still only happens once the
+  function returns, preserving the exact `abandon()`-before-`delete`
+  ordering the old two-statement body had.
+- `future_state<T>::set_continuation()`'s inline branch
+  (`est/src/future.cppm`, `then_fast()`'s own mechanism, added just
+  above): same pattern - a local `unique_ptr<continuation_node>` owns
+  `node` before `run()` is called through it.
+
+Docs updated to match: `docs/wiki/Coroutines.md` (the `run_one()` code
+excerpt and surrounding prose, which quoted the old `scope_exit`-based
+`destroy_guard` and a literal `delete &node`),
+`docs/wiki/Continuation-Node-Mechanism.md` (the `set_continuation()` code
+excerpt in the `then_fast()` section), `docs/wiki/Loop-And-Timers.md`
+(`destroy_guard`'s own one-line description), and the doc comments on
+`ready_node`/`timer_node` themselves (no longer claiming deletion is
+"through a plain `delete`" specifically, since it's now spelled two
+different ways depending on the call site - the actual safety argument,
+resolving through the dynamic type's own vtable slot regardless of which
+spelling triggers it, is unchanged and still the point being made).
+
+**Verified in the pinned Docker devenv:** 183/183 tests pass;
+`clang-format`/`clang-tidy` clean; 150/150 tests pass under the
+`sanitize` preset (ASan+UBSan, the most relevant check here - it would
+have caught a double-free or use-after-free from a botched ownership
+handoff immediately) too; `diff-cover` coverage gate against
+`claude/then-fast-continuation` (this branch's own stacked base) at 100%
+(7/7 changed lines covered).
 
 ---
 

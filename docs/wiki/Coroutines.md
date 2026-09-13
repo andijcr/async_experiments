@@ -180,16 +180,16 @@ allocates a small, *separately heap-allocated* resumption node
 that instead of registering the awaiter itself.
 
 That split is required, not just a style choice. `est::loop::run_one()`
-calls `node.run()` and then, via a `scope_exit` guard, `delete`s `node` —
-*after* `run()` has already returned:
+calls `node.run()` and then, via a `unique_ptr<detail::ready_node>` guard,
+deletes `node` — *after* `run()` has already returned:
 
 ```cpp
 void run_one(detail::ready_node& node) {
-  const auto guard = destroy_guard(node);
+  const auto guard = destroy_guard(node); // std::unique_ptr<detail::ready_node>(&node)
   ...
   node.run();
   ...
-} // guard fires here, calling `delete &node`
+} // guard's destructor fires here, deleting node through the dynamic type's own vtable slot
 ```
 
 If `node` were embedded in the very coroutine frame that `run()`'s
@@ -197,12 +197,12 @@ If `node` were embedded in the very coroutine frame that `run()`'s
 own suspension point* would let the compiler reuse that exact frame
 storage for whatever the coroutine's later code constructs — its next
 awaiter, a local variable — since the two objects' lifetimes don't
-overlap. By the time `destroy_guard`'s destructor runs `delete`, that
-memory could already hold something else entirely, and calling a virtual
-function (the destructor itself) through it would be undefined behavior.
+overlap. By the time `guard`'s destructor deletes it, that memory could
+already hold something else entirely, and calling a virtual function
+(the destructor itself) through it would be undefined behavior.
 
 A separately allocated node has its own independent lifetime, entirely
-unrelated to the coroutine frame it resumes — `run()`-then-`delete` is
+unrelated to the coroutine frame it resumes — `run()`-then-delete is
 exactly as safe here as it already is for every other `ready_node` in this
 codebase (`concrete_continuation<Fn, U>`, `est:promise`'s `sleep_resume_node`/
 `promise_resume_node<T>`, the latter shared with `est:sync.event`). This

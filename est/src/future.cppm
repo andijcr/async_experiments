@@ -419,16 +419,20 @@ public:
   // out of that: run() executes right here instead, then the node is
   // deleted immediately - the same "run, then delete" idiom est::loop's
   // own run_one()/destroy_guard() use on its own drain pass (est:loop),
-  // just performed here directly since those two helpers are private to
-  // est::loop. A caller reaching for this accepts the same
-  // recursion-depth responsibility a coroutine's already-ready co_await
-  // always had - see then_fast()'s own doc comment. Issue #65.
+  // just performed here directly (via a local unique_ptr<continuation_node>
+  // rather than a bare `delete`, purely a style choice - a virtual
+  // destructor already makes deleting through this base reference safe
+  // either way, see ready_node's own doc comment, est:loop) since those
+  // two helpers are private to est::loop. A caller reaching for this
+  // accepts the same recursion-depth responsibility a coroutine's
+  // already-ready co_await always had - see then_fast()'s own doc
+  // comment. Issue #65.
   void set_continuation(continuation_node& node, bool run_inline_if_ready = false) {
     if (ready()) {
       node.bind_owner(this->shared_from_this());
       if (run_inline_if_ready) {
-        node.run();
-        delete &node;
+        const std::unique_ptr<continuation_node> owned(&node);
+        owned->run();
         return;
       }
       current_loop().enqueue_ready(node);

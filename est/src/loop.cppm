@@ -25,23 +25,25 @@ namespace est::detail {
 // ready to run - a fulfilled future_state<T>'s continuation, or a
 // resumed coroutine handle (future_resume_node<T>, est:future).
 //
-// Destroyed through a plain `delete` on this base pointer/reference
-// (loop::destroy_guard(), drain_pending() below) - safe despite the
-// virtual destructor being the only thing this base declares, because
-// every concrete node type also has its own `operator new`/`operator
-// delete` (usually inherited from detail::current_allocator_new_delete<T>,
-// est:util.current_loop - resolving est::current_allocator(), the same
-// pattern detail::coroutine_frame_alloc()/coroutine_frame_dealloc()
-// use for a coroutine frame, est:future): a class with a virtual
-// destructor always deallocates through the dynamic type's own visible
+// Destroyed on this base pointer/reference - a bare `delete`
+// (abandon_ready_node() below) or a `std::unique_ptr<ready_node>`'s own
+// implicit deletion (loop::destroy_guard() below) alike - safe despite
+// the virtual destructor being the only thing this base declares,
+// because every concrete node type also has its own `operator new`/
+// `operator delete` (usually inherited from
+// detail::current_allocator_new_delete<T>, est:util.current_loop -
+// resolving est::current_allocator(), the same pattern
+// detail::coroutine_frame_alloc()/coroutine_frame_dealloc() use for a
+// coroutine frame, est:future): a class with a virtual destructor
+// always deallocates through the dynamic type's own visible
 // deallocation function, with the dynamic type's own correct size,
-// never the static (base) one - `delete` through a base pointer is
-// exactly what a virtual destructor exists to make safe. This base
-// itself cannot inherit that same mixin, nor define an equivalent
-// default directly: either would need est::current_allocator()
-// (est:util.current_loop), which itself imports :loop, so :loop
-// importing it back would be circular (see this file's own top comment
-// on the same constraint for est::future).
+// never the static (base) one - deleting through a base pointer, however
+// that deletion is spelled, is exactly what a virtual destructor exists
+// to make safe. This base itself cannot inherit that same mixin, nor
+// define an equivalent default directly: either would need
+// est::current_allocator() (est:util.current_loop), which itself
+// imports :loop, so :loop importing it back would be circular (see this
+// file's own top comment on the same constraint for est::future).
 // The exception every abandon() override that needs to actually complete
 // something (rather than just deallocate) throws/wraps: ready_node::
 // abandon()'s own doc comment below lists them - est:future's
@@ -88,8 +90,8 @@ public:
 // nothing needs to walk them in deadline order beyond what timer_queue's
 // min-heap already provides.
 //
-// Destroyed through a plain `delete`, same as ready_node above and for
-// the identical reason - see that class's own doc comment.
+// Destroyed the same way ready_node above is, and for the identical
+// reason - see that class's own doc comment.
 class timer_node {
 public:
   timer_node() = default;
@@ -123,13 +125,26 @@ public:
 // overload resolution has already picked one, so passing it straight to
 // a deducing `Fn` parameter is ill-formed, not just a matter of which
 // overload a reader would expect to be picked.
+//
+// `owned` takes ownership of `node` before abandon() ever runs, not
+// after: constructing a `unique_ptr` doesn't itself call anything on the
+// object it holds, so `owned->abandon()` still runs first, with the
+// implicit deletion happening only once this function returns - the
+// same ordering the old, hand-written `node.abandon(); delete &node;`
+// pair had. `unique_ptr<ready_node>`/`unique_ptr<timer_node>`, not the
+// concrete node's own type: exactly like a bare `delete` through this
+// base reference already relied on (ready_node's own doc comment,
+// above), deletion resolves through the dynamic type's own vtable slot
+// either way - a virtual destructor is precisely what makes owning (and
+// deleting) a polymorphic object through its base type safe, whichever
+// of the two spellings does the deleting.
 inline void abandon_ready_node(ready_node& node) noexcept {
-  node.abandon();
-  delete &node;
+  const std::unique_ptr<ready_node> owned(&node);
+  owned->abandon();
 }
 inline void abandon_timer_node(timer_node& node) noexcept {
-  node.abandon();
-  delete &node;
+  const std::unique_ptr<timer_node> owned(&node);
+  owned->abandon();
 }
 
 } // namespace est::detail
@@ -339,15 +354,21 @@ private:
   // fire_ready_timers() need. Never calls abandon(): both callers
   // construct this guard immediately before unconditionally calling
   // run()/fire() on the same node, so it never counts as abandoned.
-  // Returned by value as a genuine prvalue (never bound to a named
-  // variable and then moved) so this compiles despite scope_exit's
-  // deleted move constructor - the same guaranteed-copy-elision pattern
-  // est::platform::override_instance() relies on. Defined ahead of
-  // run_one()/fire_ready_timers() below: a deduced (auto) return type
-  // must be resolved from the function's own body before any earlier
-  // caller in the class can use it.
+  // A plain `std::unique_ptr<Node>`, not a scope_exit-wrapped lambda
+  // (an earlier version of this method): deletion through a
+  // `unique_ptr<Node>` where `Node` is `ready_node`/`timer_node` (the
+  // base type, not whatever concrete node this actually is) resolves
+  // through the dynamic type's own vtable slot exactly like a bare
+  // `delete` through the same reference already did - the virtual
+  // destructor both spellings rely on doesn't care which one triggers
+  // it - so this costs nothing at the call site (`node` is still used
+  // directly by both callers below, never through `guard` itself) while
+  // dropping one more hand-written `delete` expression from this file.
+  // Defined ahead of run_one()/fire_ready_timers() below: a deduced
+  // (auto) return type must be resolved from the function's own body
+  // before any earlier caller in the class can use it.
   template <class Node> [[nodiscard]] auto destroy_guard(Node& node) noexcept {
-    return scope_exit([&node]() noexcept { delete &node; });
+    return std::unique_ptr<Node>(&node);
   }
 
   // Runs one ready continuation, checking it against
