@@ -662,3 +662,156 @@ exactly the bug an earlier version of this function had, caught by the
 "resolves synchronously when every future is already ready" test
 (`est/tests/when_all_tests.cpp`) failing outright once `then_fast()`
 replaced `then()` here.
+
+## `est::when_any()`: the same shape, with no counter at all
+
+`est::when_any(future<Ts>&... futures) -> future<void>` (`est/src/when_any.cppm`)
+resolves the moment *any one* of `futures` is accounted for - completed
+or abandoned, succeeded or failed. Same ownership contract as
+`est::when_all()` (each `future<T>&` stays the caller's, `when_any()`
+only ever registers continuations on it), same two-stage
+`then_fast()` chain per input for the identical pair of reasons
+(`when_any_track()`, below, mirrors `when_all_track()` line for line
+apart from what its second stage does), and the identical
+"`event.wait()` last" ordering, for the identical reason:
+
+```cpp
+template <class T>
+void when_any_track(future<T>& input, shared_ptr<one_shot_event<EventResetMode::manual>> event) {
+  input.then_fast([](future<T>&) {}).then_fast([event = std::move(event)](future<void>&) {
+    event->set();
+  });
+}
+```
+
+The one real difference: `when_all_state` needs a `remaining` counter
+alongside its event, decremented by every input, because *every one* of
+them has to be accounted for before the shared event can fire.
+`when_any()` has no such bookkeeping at all - firing on the *first*
+input to finish means each `when_any_track()` call can share nothing
+but the `one_shot_event` itself, calling `set()` directly with no
+counter to check first. That's safe unmodified: `one_shot_event<Mode>::set()`
+already tolerates being called redundantly by as many races as reach it
+(its own doc comment, `est:sync.event`, calls out exactly this shape -
+"two unrelated cancellation sources racing to fire the same one-shot
+signal" - as the reason it doesn't require callers to coordinate first)
+without so much as a shared counter to serialize them, single-threaded
+or not: every input but the first to finish calls `set()` on an
+already-signaled event, and `has_been_set_`'s own check turns that into
+a no-op before it ever reaches `binary_event<Mode>::set()` underneath.
+
+No cancellation follows from any of this: the inputs that didn't win
+keep running to completion in the background, same as any other
+future nothing is left watching, exactly the same accepted constraint
+`est::when_all()`'s own doc comment already states (this codebase has no
+cancellation mechanism at all) - `est::when_any()` doesn't reopen that
+question, just inherits it.
+
+An empty call has nothing that could ever complete it - "any one of
+zero" isn't vacuously true the way `est::when_all()`'s own empty case
+is, so `when_any(future<Ts>&...)` `static_assert`s `sizeof...(Ts) > 0`
+at compile time, and the `std::span<future<T>>` overload - whose size
+isn't visible to the compiler - `check()`s the same precondition at
+runtime instead.
+
+## `est::when_any_succeeds()`: when a result has to carry a value
+
+`est::when_any_succeeds(future<Ts>&... futures) -> future<bool>`
+(`est/src/when_any_succeeds.cppm`) resolves `true` the moment *any one*
+of `futures` succeeds, or `false` once *every one* of them has failed
+(or been abandoned) without any succeeding. Same ownership contract as
+`est::when_all()` (each `future<T>&` stays the caller's, never consumed
+or moved), and the same two-stage `then_fast()` chain per input for the
+same abandonment-safety reason `when_all_track()` needs one (above) - a
+hook registered directly on `input`, even one correctly typed to force
+wrapped mode, is still skipped entirely if `input`'s own `future_state`
+is abandoned rather than completed, since `concrete_continuation<Fn,
+U>::abandon()` only ever completes its own downstream, never `fn_`.
+
+The one real difference from `when_all_track()`/a hypothetical
+"when_any_track()": this combinator's own first stage isn't a pure
+no-op, because `when_any_succeeds()` needs to know **which way** each
+`input` finished, not just *that* it did:
+
+```cpp
+struct when_any_succeeds_state {
+  promise<bool> result;
+  int remaining;
+  bool done = false;
+};
+
+template <class T>
+void when_any_succeeds_track(future<T>& input, shared_ptr<when_any_succeeds_state> state) {
+  input
+      .then_fast([](future<T>& in) {
+        if (in.failed()) {
+          std::rethrow_exception(in.get_exception());
+        }
+      })
+      .then_fast([state = std::move(state)](future<void>& completed) {
+        if (state->done) {
+          return;
+        }
+        if (completed.failed()) {
+          if (--state->remaining == 0) {
+            state->done = true;
+            state->result.set_value(false);
+          }
+        } else {
+          state->done = true;
+          state->result.set_value(true);
+        }
+      });
+}
+```
+
+The first stage's callback rethrows `input`'s own stored exception when
+`input` failed. That's not a new mechanism - it's the exact same
+callback-exception routing `concrete_continuation<Fn, U>::run()`'s own
+`try`/`catch` already does for a callback that throws on its own (see
+"What `then()` actually builds", above): the rethrow lands in that
+`catch`, and `downstream_->set_exception(std::current_exception())`
+completes *this stage's own* `future<void>` with the same exception
+`input` failed with. `input` succeeding leaves the callback returning
+normally, completing this stage's `future<void>` the ordinary way; `input`
+being *abandoned* instead of completed lands here identically without
+any code of this class's own - `abandon()` (above) always completes its
+own downstream with an exception, whether or not the callback above
+ever even ran. The second stage, then, only ever has to ask "did this
+stage fail" - a plain `completed.failed()` - to learn "did `input` fail
+to produce anything," never needing to tell an ordinary failure and an
+abandonment apart.
+
+**`done` guards against completing `result` twice.** Two different
+things can complete `result`: the first success, immediately, however
+early that happens; or the last unaccounted-for failure, once
+`remaining` reaches zero. Both can't be allowed to fire - a second
+`set_value()` call on an already-completed `future_state` is a checked
+precondition violation elsewhere in this codebase - so every hook checks
+`done` first and does nothing at all if it's already set. Single-threaded
+and loop-driven, this is a plain flag, not anything atomic: hooks run
+one at a time, never interleaved, so "check `done`, then maybe set it
+and complete `result`" can't race with itself the way it might need to
+under real concurrency.
+
+**No `event.wait()`-ordering subtlety here, unlike `when_all`/`when_any`.**
+`when_any_succeeds()` builds its `promise<bool>`/`future<bool>` pair
+once, up front, with an ordinary `make_promise_future<bool>()` - not
+through an `est::one_shot_event`'s own `wait()`, which is what made
+*when* `when_all()`/`when_any()` called `wait()` relative to registering
+their inputs matter (their own doc comments, above and below). A plain
+`future<bool>` has no equivalent "already-signaled fast path" to
+accidentally miss: it's ready exactly when its underlying `future_state`
+says so, checked fresh every time, regardless of when the promise/future
+pair was created relative to whichever hook eventually calls
+`set_value()` on it. `est::one_shot_event` isn't used here at all, in
+fact - it has no way to carry a `bool` payload, only to signal that
+*something* happened - so a plain `promise<bool>` is what fits a
+value-carrying result, the same way `est::when_all()`'s own `future<void>`
+result was exactly what let it use an event instead.
+
+An empty pack resolves to `false` immediately: "does at least one of
+these succeed" has a well-defined answer even with nothing to check -
+there is nothing that could have succeeded, the same reasoning that
+makes `est::when_all()`'s own empty case vacuously `true` for "has
+everything completed."

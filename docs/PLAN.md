@@ -4944,6 +4944,170 @@ executable code).
 
 ---
 
+### Issue #54, part two: `est::when_any()`
+
+The follow-up `est::when_all()` itself deferred: same ownership
+contract (each `future<T>&` stays the caller's own; `when_any()` never
+consumes, moves, or reads a value/exception out of any input itself),
+and built the same way from the start this time - `then_fast()` at both
+tracking stages, a `one_shot_event<EventResetMode::manual>` for the
+completion signal, and `event.wait()` called last, after every input is
+registered - all three of which `est::when_all()` only reached after a
+PR review round and a bug of its own; see that entry, above, and
+`docs/wiki/Continuation-Node-Mechanism.md`'s "`est::when_any()`: the
+same shape, with no counter at all" for why each one still applies here
+unchanged. `est::when_any()` resolves the moment *any one* of its inputs
+is accounted for - completed or abandoned, succeeded or failed - and
+never fails or cancels the inputs that didn't win, which simply keep
+running to completion in the background (this codebase has no
+cancellation mechanism at all, the same accepted constraint
+`est::when_all()`'s own doc comment already states).
+
+**Simpler than `when_all` in one real way: no counter.** `when_all_state`
+needs a `remaining` count because *every* input has to be accounted for
+before its event can fire. `when_any_track()` shares nothing but the
+`one_shot_event` itself and calls `set()` unconditionally - safe
+unmodified, since `one_shot_event<Mode>::set()` already tolerates being
+called redundantly by as many races as reach it (its own doc comment
+calls out exactly this shape: independent cancellation sources racing to
+fire the same one-shot signal, with no coordination required). No
+`when_any_state` wrapper struct exists at all - `shared_ptr<one_shot_event
+<EventResetMode::manual>>` is the entire shared state.
+
+**Empty case handled the opposite way from `when_all`.** "Any one of
+zero" has nothing that could ever complete it - not vacuously true the
+way `when_all`'s own empty case is - so the fixed-arity overload
+`static_assert`s `sizeof...(Ts) > 0` at compile time (a pack's size is
+always known then), and the `std::span<future<T>>` overload `check()`s
+the same precondition at runtime instead, since a span's size isn't
+visible to the compiler. Matches this codebase's own established
+"no practical way to unit-test a `check()` failure without process-
+isolation tooling" precedent (`est/tests/check_tests.cpp`) - not
+exercised by a test, same as every other `check()` call site in this
+codebase.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new `:when_any`
+node and edges in `docs/wiki/Architecture.md`'s dependency graph
+(notably no edge to `:promise` - unlike `when_all`, `when_any` has no
+empty-case `make_ready_future()` call, so it never needs `:promise` at
+all); the full mechanism written up in
+`docs/wiki/Continuation-Node-Mechanism.md`, alongside `est::when_all()`'s
+own entry.
+
+**Tests added** (`est/tests/when_any_tests.cpp`): resolves once any one
+input is ready, not before; resolves synchronously when at least one
+input is already ready at call time (guards the identical `event.wait()`
+-ordering correctness `when_all()` needed, verified correct from the
+start here rather than caught after the fact); resolves on a failed
+input the same as a succeeded one; resolves when one input is abandoned
+while another stays genuinely pending (mirrors `when_all()`'s own
+abandonment regression test); does not consume the caller's futures;
+works across heterogeneous types including `future<void>`; the
+`std::span` overload's own any-one-ready case; two leak tests (freed on
+the happy path - including the redundant `set()` from whichever input
+loses - and freed even when the winning input is abandoned rather than
+completed).
+
+**Verified in the pinned Docker devenv:** 203/203 tests pass (9 new);
+`clang-format`/`clang-tidy` clean; 170/170 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 97% (140/143 changed lines covered - the same
+`counting_resource::do_is_equal()` boilerplate pattern as every other
+test file that defines one).
+
+---
+
+### `est::when_any_succeeds()`: a race with a value-carrying result
+
+Requested directly: "a `when_any_succeeds` that waits for a
+non-exception future" among its inputs, "returns `future<bool>`, false
+when none finished successfully" - with the same ownership contract
+(`future<T>&`, caller-owned) and the same overall shape (two overloads,
+a two-stage `then_fast()` chain per input) `est::when_all()` had already
+settled on. `est::when_any_succeeds(future<Ts>&... futures) -> future<bool>`
+(`est/src/when_any_succeeds.cppm`) resolves `true` the moment *any one*
+input succeeds, or `false` once *every one* has failed (or been
+abandoned) without any succeeding - a race for the first success, with a
+"nobody won" fallback that can only fire once nothing is left that could
+still win.
+
+**The tracking chain's first stage isn't a no-op here, unlike
+`when_all_track()`'s own.** `when_any_succeeds()` needs to know *which
+way* each input finished, not just *that* it did, so
+`when_any_succeeds_track()`'s first `then_fast()` stage rethrows the
+input's own stored exception when it failed - reusing
+`concrete_continuation<Fn, U>::run()`'s existing callback-exception
+routing (est:future) to translate "input failed" into "this stage's own
+`future_state` fails, with the same exception," with no new mechanism
+needed. Input succeeding, or being abandoned instead of completed
+(`abandon()` always fails its own downstream regardless of whether the
+callback ever ran), both land on the second stage's `completed.failed()`
+check without it ever needing to tell the two apart - abandonment isn't
+a success, and that's the only distinction that matters from here on.
+
+**A `done` flag, not just a counter, guards the result.** Two different
+paths can complete `result`: the first success (immediately, however
+early), or the last unaccounted-for failure once `remaining` reaches
+zero - and only one of those two may ever actually call `set_value()`,
+on pain of a checked precondition violation (completing an
+already-completed `future_state` twice). Every hook checks `done` first
+and does nothing if it's already set; single-threaded and loop-driven,
+this needs no atomics, since hooks never interleave with each other.
+Missed on the first pass and caught by `diff-cover`, not a test failure:
+the `done`-is-already-set early return had no test exercising it at all
+until "ignores a later completion once it has already resolved" was
+added specifically to cover it - not just for the coverage number, but
+because an untested guard against a real crash (a second `set_value()`
+call) is exactly the kind of code most worth a dedicated test.
+
+**No event, unlike `when_all`/`when_any` - and no ordering subtlety to
+get wrong as a result.** `est::one_shot_event` can only ever signal that
+*something* happened, never carry a value - so a `bool`-valued result
+needs a plain `promise<bool>`/`future<bool>` pair (`make_promise_future
+<bool>()`, built once, up front) instead. That sidesteps `when_all()`'s
+own "`event.wait()` must be called last" hazard entirely (see its own
+entry, above): a plain `future`'s readiness is checked fresh against its
+`future_state` every time, with no "already-signaled fast path" of its
+own to accidentally register a waiter against too early - unlike
+`one_shot_event::wait()`, timing relative to registering inputs simply
+doesn't matter here.
+
+**Empty case resolves `false`, the opposite of `when_all`'s vacuous
+`true`, for the same underlying reason.** "Does at least one of these
+succeed" is false over an empty set - there's nothing that could have
+succeeded - the mirror image of "has everything completed" being
+vacuously true over the same empty set.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new
+`:when_any_succeeds` node and edges in `docs/wiki/Architecture.md`'s
+dependency graph (no `:sync.event` edge, unlike `:when_all` - explained
+above); the full mechanism written up in
+`docs/wiki/Continuation-Node-Mechanism.md`, alongside `est::when_all()`'s
+own entry.
+
+**Tests added** (`est/tests/when_any_succeeds_tests.cpp`): resolves true
+as soon as one input succeeds; does not resolve while one input has
+failed but another is still pending; resolves false only once every
+input has failed; resolves true even when it wins after some inputs
+already failed; resolves synchronously when one input already succeeded
+at call time; an empty pack resolves false immediately; ignores a later
+completion once already resolved (the `done`-flag test above); treats an
+abandoned input the same as a failed one, not a success; does not
+consume the caller's futures; the `std::span` overload's own any-one-
+succeeds case and empty-range case; two leak tests (freed on the happy
+path - including a redundant completion from whichever input loses -
+and freed even when the winning input is abandoned rather than
+completed).
+
+**Verified in the pinned Docker devenv:** 207/207 tests pass (11 new);
+`clang-format`/`clang-tidy` clean; 174/174 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 98% (196/199 changed lines covered - the same
+`counting_resource::do_is_equal()` boilerplate pattern as every other
+test file that defines one).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
