@@ -4453,6 +4453,131 @@ clean; 146/146 tests pass under the `sanitize` preset (ASan+UBSan) too;
 `diff-cover` coverage gate against `main` at 100% (121/121 changed lines
 covered).
 
+### Issue #65: `then_fast()` - an opt-in fast path matching `co_await`'s (done)
+
+`co_await` on an already-ready `future<T>` resumes inline
+(`future_awaiter<T>::await_ready()`, `est:future`), but `.then()`
+registered on an already-ready `future_state<T>` always deferred through
+`est::loop`'s ready-queue regardless - a "subtly different," not
+obviously intentional, asymmetry between the two ways of consuming a
+future. Two designs were sketched before picking one:
+
+- **A separate `fast_future<T>` type**, distinct from `future<T>`, whose
+  own `.then()`/`co_await` always run inline when ready, with a
+  one-directional `fast_future<T> -> future<T>` conversion for widening
+  back to the safe default. More self-documenting (a value's type alone
+  says whether its continuations can run inline), but real cost: reusing
+  `future<T>`'s own `get()`/`clone()`/`promise_type` and, especially,
+  `future_awaiter<T>` (currently built around a `future<T>&`, not a
+  `future_state<T>&`/`shared_ptr` directly) would need a real refactor of
+  already-carefully-commented, already-tested code, not just a new class
+  bolted on alongside it.
+- **An opt-in flag on the existing registration path** - chosen. No new
+  type; `future_state<T>::set_continuation()` gains a
+  `bool run_inline_if_ready = false` parameter, and `then()`
+  grows a sibling, `then_fast()`, that passes `true` through one shared
+  private `then_impl()`. `future<T>::then_fast()` forwards to it with the
+  identical `&`/`&&`-qualified split `then()` already has (issue #64/#71).
+
+**Mechanically:** `set_continuation()`'s already-ready branch, on
+`run_inline_if_ready`, calls `node.run()` then `delete &node` right
+there instead of `current_loop().enqueue_ready(node)` - the same "run,
+then delete" idiom `est::loop`'s own `run_one()`/`destroy_guard()` use on
+its own drain pass, just performed directly since those two helpers are
+private to `est::loop`. The not-yet-ready branch (`waiters_.enqueue()`)
+is completely untouched: nothing is stored on the node itself, so
+whether a given `then_fast()` call ends up running inline or deferred is
+decided once, at registration time, by whether the future was already
+ready then - a `then_fast()` call on a not-yet-ready future_state defers
+exactly like `then()` always has, since there's nothing to run inline
+yet. `then()`'s own default stays unconditionally deferred - it must
+remain safe for a chain of any length (deferring every completion
+through `est::loop` turns unbounded chain length into an iterative drain
+instead of direct recursion on the call stack), the same invariant this
+codebase already applies to `mutex::unlock()`/`counting_event<Mode>::set()`.
+`then_fast()` is the explicit, per-call opt-in for a caller who knows
+their own callback is cheap and specifically wants the loop round-trip
+skipped, accepting the same recursion-depth trade a coroutine's
+already-ready `co_await` always implicitly did. The monadic-flatten path
+(`fulfill()`/`flatten_forwarder<U>`) deliberately keeps deferring
+regardless of `then_fast()` - "fast" doesn't thread through flattening,
+keeping the change to one call site's behavior rather than a second
+property every future-returning path has to carry.
+
+**A real, non-obvious cost surfaced while writing the tests: `then_fast()`'s
+own `&&` overload can't actually get issue #64's move optimization.**
+`concrete_continuation<Fn, U>::run()`'s `owner_.count() == 1` check only
+ever reaches 1 for `then()` because `run()` happens *later*, once
+`est::loop` drains it - by which point whatever temporaries were on the
+registering call's own stack (including `future<T>::then(Fn&&) &&`'s own
+`state` local) have already unwound. `then_fast()`'s `run()` happens
+synchronously, *inside* that same call - its own `state` local is still
+alive, holding a reference, at the exact moment `run()` checks
+`owner_.count()`; that reference plus `owner_` itself already puts the
+count at 2, never 1, regardless of how carefully a caller manages every
+other handle. Confirmed by literally reproducing issue #64's own
+sole-owner test shape with `then_fast()` instead of `then()`: it copies,
+not moves - the opposite of `then()`'s own outcome under the identical
+shape. `future<T>::then_fast(Fn&&) &&` is kept anyway, for API-shape
+symmetry with `then()` and because releasing a handle early is never
+harmful - it just isn't what makes the difference here the way it does
+for `then()`. Documented as such at both the `&&` overload's own doc
+comment and the regression test that demonstrates it
+(`future_tests.cpp`, *"then_fast()'s inline run() defeats the sole-owner
+move optimization then() relies on"*).
+
+**Docs updated to match:** `docs/wiki/Continuation-Node-Mechanism.md`
+(a new "`then_fast()`: running inline instead of deferring" section, plus
+a cross-reference from "What `then()` actually builds" and an updated
+"Parent already ready" bullet under "Node lifecycle"),
+`docs/wiki/Coroutines.md` (the `await_ready()` passage that used to argue
+"the two aren't inconsistent" now points to `then_fast()` as the actual
+resolution, plus a note on `counting_event<Mode>::wait()`'s own
+already-signaled fast path).
+
+**Tests added (`future_tests.cpp`):** `then_fast()` running inline on an
+already-ready future with no `run_until_idle()` needed; deferring
+identically to `then()` when registered before `set_value()`;
+propagating a stored exception inline; and the sole-owner/move-defeated
+case above.
+
+**A related hardening, caught while auditing whether `then_fast()`'s new
+inline `node.run()` call could let an exception surface somewhere more
+surprising than before.** Every `run()`/`fire()` in the codebase either
+holds no throwing user code at all (`promise_resume_node<T>::run()`,
+`sleep_resume_node::fire()` - plain `set_value()`), delegates to
+compiler-generated coroutine unwind semantics that already redirect an
+exception to `unhandled_exception()` before it ever reaches the caller
+(`future_resume_node<T>::run()`), or - the one node that runs arbitrary
+caller-supplied code - wraps that call in a catch-all
+(`concrete_continuation<Fn, U>::run()`, `future.cppm`). `check()`/
+`assert_failure()` failures were already ruled out as a throw path
+regardless: `platform::interface::assert_failure()` is declared
+`noexcept`, so a failing precondition terminates the process rather than
+unwinding through anything.
+
+One real asymmetry surfaced, though: `flatten_forwarder<T>::run()`'s
+`state.failed()` branch was an early `return` *ahead of* its own `try`,
+unlike `concrete_continuation<Fn, U>`'s identical branch, which was
+always inside its own `try`. Nothing on that path currently throws
+(`get_exception()` is `noexcept`, `set_exception()` itself doesn't throw
+short of `bad_alloc` or a `check()`-triggered terminate), so this wasn't
+a live bug - but it meant an exception there would have escaped `run()`
+uncaught instead of being routed into `downstream_`'s own
+`set_exception()`, the one thing every other node with user-facing
+failure handling already guarantees. Fixed by folding the `failed()`
+check into the existing `try`, matching `concrete_continuation<Fn, U>`'s
+shape exactly - no behavior change under any currently-throwing path,
+just removing the one place structurally relying on nothing ever
+throwing there. No new test: forcing this specific branch to throw would
+need mocking allocation failure or a `check()` violation, neither of
+which this codebase currently does.
+
+**Verified in the pinned Docker devenv:** 183/183 tests pass (four new);
+`clang-format`/`clang-tidy` clean; 150/150 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 100% (73/73 changed lines covered).
+
 ---
 
 ## Verification for M0

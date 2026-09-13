@@ -251,6 +251,97 @@ TEST_CASE("then() registered on an already-ready future still defers to the loop
   REQUIRE(chained.get() == 9);
 }
 
+TEST_CASE("then_fast() registered on an already-ready future runs immediately, no loop drain "
+          "needed",
+          "[future]") {
+  // Issue #65: unlike then() above, then_fast() runs its callback right
+  // here - before run_until_idle() is ever called - when the future was
+  // already ready at registration time.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_value(9);
+
+  bool invoked = false;
+  auto chained = future.then_fast([&](est::future<int>& state) {
+    invoked = true;
+    return state.get();
+  });
+  REQUIRE(invoked);         // ran inline, synchronously, inside then_fast() itself
+  REQUIRE(chained.ready()); // downstream is already complete too, no drain needed
+  REQUIRE(chained.get() == 9);
+}
+
+TEST_CASE("then_fast() registered before set_value defers exactly like then()", "[future]") {
+  // The not-yet-ready path is untouched by then_fast(): there's nothing
+  // to run inline until set_value()/set_exception() actually completes
+  // this future_state, so a not-yet-ready then_fast() enqueues into
+  // waiters_ and defers through the loop precisely like then() does.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  bool invoked = false;
+  auto chained = future.then_fast([&](est::future<int>& state) {
+    invoked = true;
+    return state.get();
+  });
+  REQUIRE_FALSE(invoked);
+
+  promise.set_value(7);
+  REQUIRE_FALSE(invoked); // still deferred - est::loop hasn't drained yet
+  loop.run_until_idle();
+  REQUIRE(invoked);
+  REQUIRE(chained.get() == 7);
+}
+
+TEST_CASE("then_fast() propagates a stored exception exactly like then()", "[future]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+
+  auto chained = future.then_fast([](int value) { return value * 2; });
+  REQUIRE(chained.ready()); // ran inline - auto-propagate-on-failure, fn_ not called
+  REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
+}
+
+TEST_CASE("then_fast()'s inline run() defeats the sole-owner move optimization then() relies on",
+          "[future]") {
+  // Deliberately the opposite outcome from "then() moves the stored
+  // value out when the continuation node is the sole owner of
+  // future_state" (issue #64) - even reproducing that test's exact
+  // shape (promise/future both confined to, and destroyed at the end
+  // of, an immediately-invoked lambda) still copies here, never moves,
+  // because then_fast()'s run() executes synchronously, inside
+  // future<T>::then_fast(Fn&&) &&'s own call frame - its local `state`
+  // (what used to be future's state_) is still alive and holding a
+  // reference for the whole call, so concrete_continuation<Fn, U>::run()'s
+  // own `owner_.count() == 1` check can never see just 1: at minimum,
+  // that local plus owner_ itself are both alive at once. then()'s own
+  // version of this test only reaches count() == 1 because run() there
+  // happens *after* run_until_idle() - by which point this same lambda's
+  // locals have already unwound. then_fast()'s whole point (skipping
+  // that deferral) is exactly what puts this optimization out of reach.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  int observed_copies = -1;
+  int observed_moves = -1;
+  auto chained = [&] {
+    auto [promise, future] = est::make_promise_future<copy_move_tracker>();
+    promise.set_value(copy_move_tracker{});
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    return std::move(future).then_fast([&](copy_move_tracker value) {
+      observed_copies = value.copies;
+      observed_moves = value.moves;
+    });
+  }();
+
+  REQUIRE(chained.ready()); // ran inline - no run_until_idle() needed
+  REQUIRE(observed_copies == 1);
+  REQUIRE(observed_moves == 1); // the one move already done: set_value(tracker&&) into result_
+}
+
 TEST_CASE("then() observes a stored exception via get()", "[future]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);

@@ -251,17 +251,24 @@ awaiting coroutine's body immediately, right there on whatever call stack
 reached that `co_await`, for the identical reasoning `initial_suspend()`
 (above) uses: paying for a `future_resume_node<T>` allocation and a full
 ready-queue round trip purely to resume something that was never
-actually going to wait for anything isn't worth it. Note that `.then()`
-registered on an already-ready future still defers through `est::loop`
-rather than running inline (`future_tests.cpp`, *"then() registered on
-an already-ready future still defers to the loop"*) - the two aren't
-inconsistent: a `.then()` callback runs arbitrary caller code that could
-itself do anything, while `co_await` on an already-ready future is
-resuming a frame that was already going to run next regardless.
-`future_state<T>::set_continuation()` (called from `await_suspend()`)
-still handles the "not yet ready" case exactly as before - this only
-changes whether that call, and the node it needs, happens at all, which
-is what the diagram's `alt` now shows.
+actually going to wait for anything isn't worth it. `.then()` registered
+on an already-ready future used to always defer through `est::loop`
+rather than running inline regardless of what a caller wanted - issue
+#65 flagged this as a "subtly different," not obviously intentional,
+asymmetry between the two ways of consuming a future. `then_fast()`
+(`future_state<T>`'s own doc comment, `future.cppm`; see [Continuation
+Node Mechanism](Continuation-Node-Mechanism.md) for the full mechanism)
+is the resolution: `then()` keeps deferring by default - a `.then()`
+callback runs arbitrary caller code, and `then()` must stay safe for a
+chain of any length, which deferring through `est::loop`'s own iterative
+drain guarantees regardless of chain length - while `then_fast()` is the
+explicit opt-in for a caller who specifically wants the same "resume
+right here" behavior `co_await` already gets for free, and knows its own
+callback is cheap enough to accept the recursion-depth trade that comes
+with it. `future_state<T>::set_continuation()` (called from
+`await_suspend()`) still handles the "not yet ready" case exactly as
+before - this only changes whether that call, and the node it needs,
+happens at all, which is what the diagram's `alt` now shows.
 
 `future_awaiter<T>` needs its resumption node to satisfy
 `future_state<T>::set_continuation()`'s signature —
@@ -551,7 +558,12 @@ queued in `waiters_`.
 `wait()` is also no longer awaitable-*only*: since it returns a plain
 `future<void>`, it can be used from ordinary, non-coroutine code too
 (polled via `ready()`/`get()`, or chained with `then()`), not just via
-`co_await`.
+`co_await`. `event.wait().then_fast(fn)` gets the uncontended case the
+identical "resume right here, no loop round trip" treatment
+`co_await event.wait()` already does (`then_fast()` - [Continuation Node
+Mechanism](Continuation-Node-Mechanism.md)); plain `then()` still defers
+even here, since it has no way to know a given `fn` is cheap enough to
+run inline.
 
 `set(n)` hands available units directly to queued waiters (via
 `loop.enqueue_ready()`, never completing their promises inline here — the
