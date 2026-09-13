@@ -4541,10 +4541,42 @@ identically to `then()` when registered before `set_value()`;
 propagating a stored exception inline; and the sole-owner/move-defeated
 case above.
 
+**A related hardening, caught while auditing whether `then_fast()`'s new
+inline `node.run()` call could let an exception surface somewhere more
+surprising than before.** Every `run()`/`fire()` in the codebase either
+holds no throwing user code at all (`promise_resume_node<T>::run()`,
+`sleep_resume_node::fire()` - plain `set_value()`), delegates to
+compiler-generated coroutine unwind semantics that already redirect an
+exception to `unhandled_exception()` before it ever reaches the caller
+(`future_resume_node<T>::run()`), or - the one node that runs arbitrary
+caller-supplied code - wraps that call in a catch-all
+(`concrete_continuation<Fn, U>::run()`, `future.cppm`). `check()`/
+`assert_failure()` failures were already ruled out as a throw path
+regardless: `platform::interface::assert_failure()` is declared
+`noexcept`, so a failing precondition terminates the process rather than
+unwinding through anything.
+
+One real asymmetry surfaced, though: `flatten_forwarder<T>::run()`'s
+`state.failed()` branch was an early `return` *ahead of* its own `try`,
+unlike `concrete_continuation<Fn, U>`'s identical branch, which was
+always inside its own `try`. Nothing on that path currently throws
+(`get_exception()` is `noexcept`, `set_exception()` itself doesn't throw
+short of `bad_alloc` or a `check()`-triggered terminate), so this wasn't
+a live bug - but it meant an exception there would have escaped `run()`
+uncaught instead of being routed into `downstream_`'s own
+`set_exception()`, the one thing every other node with user-facing
+failure handling already guarantees. Fixed by folding the `failed()`
+check into the existing `try`, matching `concrete_continuation<Fn, U>`'s
+shape exactly - no behavior change under any currently-throwing path,
+just removing the one place structurally relying on nothing ever
+throwing there. No new test: forcing this specific branch to throw would
+need mocking allocation failure or a `check()` violation, neither of
+which this codebase currently does.
+
 **Verified in the pinned Docker devenv:** 183/183 tests pass (four new);
 `clang-format`/`clang-tidy` clean; 150/150 tests pass under the
 `sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
-`main` at 100% (74/74 changed lines covered).
+`main` at 100% (73/73 changed lines covered).
 
 ---
 

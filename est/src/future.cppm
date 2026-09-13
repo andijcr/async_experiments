@@ -104,14 +104,23 @@ public:
   // future_state<T>& parameter - see continuation_node<T>'s own doc
   // comment on why run() lives here now instead of behind a second,
   // separately virtual invoke().
+  //
+  // The state.failed() branch lives inside the same try as the success
+  // path, not before it (an earlier version of this method had it as an
+  // early return ahead of the try, unlike concrete_continuation<Fn, U>'s
+  // own identical branch, which was always inside its try) - nothing on
+  // this path currently throws (get_exception() is noexcept, and
+  // set_exception() itself doesn't throw short of bad_alloc or a
+  // check()-triggered assert_failure(), which is noexcept and terminates
+  // rather than unwinds), but there's no reason for this method to be
+  // the one place in this codebase that assumes so structurally, when
+  // catching it costs nothing.
   void run() final {
     auto& state = *this->owner_;
-    if (state.failed()) {
-      downstream_->set_exception(state.get_exception());
-      return;
-    }
     try {
-      if constexpr (std::is_void_v<T>) {
+      if (state.failed()) {
+        downstream_->set_exception(state.get_exception());
+      } else if constexpr (std::is_void_v<T>) {
         downstream_->set_value();
       } else {
         downstream_->set_value(std::move(state).get());
