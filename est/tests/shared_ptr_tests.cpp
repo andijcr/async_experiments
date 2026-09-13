@@ -193,3 +193,39 @@ TEST_CASE("a default-constructed shared_ptr is empty", "[shared_ptr]") {
   REQUIRE_FALSE(ptr);
   REQUIRE(ptr.get() == nullptr);
 }
+
+TEST_CASE("count() tracks copies and drops for a non-ref_counted T", "[shared_ptr]") {
+  auto first = est::shared_ptr<int>::make(std::pmr::get_default_resource(), 1);
+  REQUIRE(first.count() == 1);
+  {
+    auto second = first; // NOLINT(performance-unnecessary-copy-initialization)
+    REQUIRE(first.count() == 2);
+    REQUIRE(second.count() == 2);
+  }
+  REQUIRE(first.count() == 1);
+}
+
+TEST_CASE("count() is 0 for an empty or moved-from shared_ptr", "[shared_ptr]") {
+  est::shared_ptr<int> empty;
+  REQUIRE(empty.count() == 0);
+
+  auto first = est::shared_ptr<int>::make(std::pmr::get_default_resource(), 1);
+  auto second = std::move(first);
+  REQUIRE(first.count() == 0); // NOLINT(bugprone-use-after-move)
+  REQUIRE(second.count() == 1);
+}
+
+TEST_CASE("count() tracks copies and drops for a ref_counted T too", "[shared_ptr]") {
+  auto first = est::shared_ptr<self_aware>::make(std::pmr::get_default_resource(), 1);
+  REQUIRE(first.count() == 1);
+  {
+    auto second = first; // NOLINT(performance-unnecessary-copy-initialization)
+    REQUIRE(first.count() == 2);
+    REQUIRE(second.count() == 2);
+  }
+  REQUIRE(first.count() == 1);
+
+  auto self = first->shared_from_this();
+  REQUIRE(first.count() == 2);
+  REQUIRE(self.count() == 2);
+}

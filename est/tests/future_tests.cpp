@@ -37,6 +37,27 @@ private:
   }
 };
 
+// Counts how many times a value was copy- vs move-constructed since the
+// original (each copy/move inherits the running counts from the source
+// and adds one more of its own kind) - lets a test observe which path
+// concrete_continuation<Fn, U>::run()'s own `count() == 1` check (issue
+// #64) actually took, by inspecting the value a by-value callback
+// parameter received: the parameter binding itself is the copy or move
+// being counted.
+struct copy_move_tracker {
+  int copies = 0;
+  int moves = 0;
+
+  copy_move_tracker() = default;
+  copy_move_tracker(const copy_move_tracker& other) noexcept
+      : copies(other.copies + 1), moves(other.moves) {}
+  copy_move_tracker(copy_move_tracker&& other) noexcept
+      : copies(other.copies), moves(other.moves + 1) {}
+  auto operator=(const copy_move_tracker&) -> copy_move_tracker& = default;
+  auto operator=(copy_move_tracker&&) -> copy_move_tracker& = default;
+  ~copy_move_tracker() = default;
+};
+
 } // namespace
 
 // Every test below declares its own est::loop, then registers it as
@@ -87,6 +108,103 @@ TEST_CASE("an unwrapped then() receives a reference into the stored value, not a
 
   REQUIRE(first_address != nullptr);
   REQUIRE(first_address == second_address);
+}
+
+TEST_CASE("then() copies the stored value when another handle still shares the future_state",
+          "[future]") {
+  // The negative case for the next two tests: `promise`/`future` both
+  // stay alive through run_until_idle() below, so the future_state's
+  // ref count is at least 3 (promise's own state_, future's own state_,
+  // the node's owner_) by the time run() checks it - concrete_continuation
+  // <Fn, U>::run()'s own `count() == 1` optimization (issue #64) must not
+  // fire, and the callback's by-value parameter must be copy-, not
+  // move-, constructed from the stored value.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<copy_move_tracker>();
+  promise.set_value(copy_move_tracker{});
+
+  int observed_copies = -1;
+  int observed_moves = -1;
+  // By-value on purpose, not an oversight: the parameter binding itself is
+  // what's under test (see copy_move_tracker's own doc comment) - a
+  // const& parameter would never let a move happen at all.
+  // NOLINTNEXTLINE(performance-unnecessary-value-param)
+  auto chained = future.then([&](copy_move_tracker value) {
+    observed_copies = value.copies;
+    observed_moves = value.moves;
+  });
+  loop.run_until_idle();
+
+  REQUIRE(observed_copies == 1);
+  REQUIRE(observed_moves == 1); // the one move already done: set_value(tracker&&) into result_
+}
+
+TEST_CASE("then() moves the stored value out when the continuation node is the sole owner "
+          "of future_state",
+          "[future]") {
+  // Issue #64. `promise`/`future` are both confined to the immediately-
+  // invoked lambda below and destroyed before run_until_idle() runs -
+  // set_value() happens before then() is called, so the node already
+  // holds its own owner_ shared_ptr (via set_continuation()'s
+  // already-ready branch) by the time the lambda returns, leaving the
+  // node as the future_state's sole owner once promise/future go out of
+  // scope. count() == 1 at run() time, so the callback's by-value
+  // parameter must be move-, not copy-, constructed.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  int observed_copies = -1;
+  int observed_moves = -1;
+  auto chained = [&] {
+    auto [promise, future] = est::make_promise_future<copy_move_tracker>();
+    promise.set_value(copy_move_tracker{});
+    // By-value on purpose - see the first copy_move_tracker test's own
+    // NOLINTNEXTLINE comment.
+    // NOLINTNEXTLINE(performance-unnecessary-value-param)
+    return std::move(future).then([&](copy_move_tracker value) {
+      observed_copies = value.copies;
+      observed_moves = value.moves;
+    });
+  }();
+  loop.run_until_idle();
+
+  REQUIRE(observed_copies == 0);
+  REQUIRE(observed_moves == 2); // set_value(tracker&&) into result_, then moved into the callback
+}
+
+TEST_CASE("std::move(future).then() releases this handle's own reference immediately", "[future]") {
+  // Isolates issue #71's own contribution from issue #64's: `promise` is
+  // explicitly dropped first (moved into, and destroyed alongside, a
+  // nested scope) so it can't keep the future_state's ref count above 1
+  // on its own - then `future` is std::move()-then()'d but deliberately
+  // kept in scope (unlike the previous test) through run_until_idle().
+  // Without future<T>::then(Fn&&) && releasing `future`'s own state_
+  // immediately, `future` staying in scope would keep the future_state's
+  // ref count at 2 for the whole loop drain, and the callback would
+  // observe a copy, not a move, despite the caller having written
+  // std::move(future).
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<copy_move_tracker>();
+  promise.set_value(copy_move_tracker{});
+  {
+    auto discard = std::move(promise);
+  } // NOLINT(bugprone-use-after-move)
+
+  int observed_copies = -1;
+  int observed_moves = -1;
+  // By-value on purpose - see the first copy_move_tracker test's own
+  // NOLINTNEXTLINE comment.
+  // NOLINTNEXTLINE(performance-unnecessary-value-param)
+  auto chained = std::move(future).then([&](copy_move_tracker value) {
+    observed_copies = value.copies;
+    observed_moves = value.moves;
+  });
+  loop.run_until_idle();
+
+  REQUIRE(observed_copies == 0);
+  REQUIRE(observed_moves == 2);
 }
 
 TEST_CASE("set_exception then get() rethrows", "[future]") {

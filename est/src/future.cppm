@@ -539,6 +539,21 @@ public:
   // its node - current_loop() itself is never resolved here;
   // set_continuation() below resolves it fresh on its own, only if this
   // future_state already turns out to be ready.
+  //
+  // Unwrapped mode's non-void, non-failed case has one more branch on
+  // top of this, for an Fn also invocable with T&& (by value, by
+  // const T&, or by T&&/auto&& itself - excludes a purely lvalue-bound
+  // callback like `[](auto& value)`, which stays on the plain reference
+  // path unconditionally): `concrete_continuation<Fn, U>::run()` (below)
+  // moves the stored value out, instead of just reading a reference into
+  // it, when its own `shared_ptr<future_state<T>>::count() == 1` -
+  // nothing else can be left holding this future_state at that point, so
+  // there's nothing left to strand with a moved-from value.
+  // `future<T>::then(Fn&&) &&` (the rvalue-qualified overload) exists
+  // specifically to make that count come back 1 more often, by releasing
+  // the calling handle's own reference immediately instead of leaving it
+  // held until the handle itself goes out of scope. Issue #64 (the move)
+  // / #71 (the && overload).
   template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
@@ -612,6 +627,32 @@ private:
             downstream_->set_exception(state.get_exception());
           } else if constexpr (std::is_void_v<T>) {
             invoke_and_fulfill();
+          } else if constexpr (std::invocable<Fn&, T&&>) {
+            // Only reachable when Fn also accepts an rvalue T (by value,
+            // by const T&, or by T&&/auto&& itself) - a generic callback
+            // that only binds an lvalue (e.g. `[](auto& value)`, which
+            // invocable_unwrapped<Fn, T>() above already confirmed is
+            // callable with `const T&`) is std::invocable<Fn&, const T&>
+            // but *not* std::invocable<Fn&, T&&>, so it stays on the
+            // state.get() path in the else branch below unconditionally -
+            // moving from `state` would silently hand it a dangling
+            // reference otherwise, since it means to observe the value in
+            // place, not take a copy of it.
+            if (this->owner_.count() == 1) {
+              // this->owner_ is the only shared_ptr<future_state<T>> left
+              // (issue #64): no other future<T>/promise<T> handle, and no
+              // sibling continuation registered alongside this one, can
+              // still be holding `state` - this node is the sole reason it
+              // survived this long, and it's about to run() exactly once,
+              // right here. Safe, then, to move the stored value out
+              // instead of just reading a reference into it - harmless for
+              // an Fn taking `const T&` (a const reference binds to an
+              // rvalue exactly like an lvalue) and turns a copy into a
+              // move for an Fn taking T by value.
+              invoke_and_fulfill(std::move(state).get());
+            } else {
+              invoke_and_fulfill(state.get());
+            }
           } else {
             invoke_and_fulfill(state.get());
           }
@@ -904,8 +945,28 @@ public:
   }
 
   // Forwards to future_state<T>::then() (see its own doc comment) - the
-  // node allocation and registration live there now, not here.
-  template <class Fn> auto then(Fn&& fn) { return state_->then(std::forward<Fn>(fn)); }
+  // node allocation and registration live there now, not here. Lvalue-
+  // qualified so it can coexist with the rvalue-qualified overload right
+  // below (a member function can't mix a ref-unqualified and a ref-
+  // qualified overload of the same signature - a real lvalue future<T>
+  // handle is the only caller that needs this one; an rvalue always binds
+  // the other overload instead).
+  template <class Fn> auto then(Fn&& fn) & { return state_->then(std::forward<Fn>(fn)); }
+
+  // Same, for a caller that no longer needs *this once the continuation
+  // is registered (`std::move(future).then(fn)`; a plain temporary -
+  // `future_returning_call().then(fn)` - already reaches this overload
+  // too, since a prvalue is an rvalue). Releases this handle's own
+  // reference to the future_state immediately, rather than leaving it
+  // held until *this goes out of scope: every reference this handle
+  // would otherwise keep alive past this call is one more reason
+  // `concrete_continuation<Fn, U>::run()`'s own `count() == 1` check
+  // (issue #64, `future_state<T>::then()`'s own doc comment) could come
+  // back false. Issue #71.
+  template <class Fn> auto then(Fn&& fn) && {
+    auto state = std::move(state_);
+    return state->then(std::forward<Fn>(fn));
+  }
 
   // Suspends the calling coroutine until *this becomes ready, resuming
   // with its value (or rethrowing its exception) - the primitive that

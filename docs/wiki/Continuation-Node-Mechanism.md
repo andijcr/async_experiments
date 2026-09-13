@@ -254,8 +254,14 @@ void run() final {
         downstream_->set_exception(state.get_exception());
       } else if constexpr (std::is_void_v<T>) {
         invoke_and_fulfill();                        // "unwrapped", T = void
+      } else if constexpr (std::invocable<Fn&, T&&>) {
+        if (this->owner_.count() == 1) {
+          invoke_and_fulfill(std::move(state).get()); // "unwrapped", sole owner: move
+        } else {
+          invoke_and_fulfill(state.get());            // "unwrapped", shared: copy/reference
+        }
       } else {
-        invoke_and_fulfill(state.get());              // "unwrapped", T != void
+        invoke_and_fulfill(state.get());              // "unwrapped", Fn can't take T&&
       }
     } else {
       future<T> view(state.shared_from_this());   // "wrapped"
@@ -272,7 +278,15 @@ void run() final {
   `Fn` is skipped entirely and the exception is forwarded straight into
   `downstream_` via `get_exception()` — a plain pointer copy, not a
   throw/catch round-trip, since `failed()` already established there's an
-  exception waiting.
+  exception waiting. When `Fn` also accepts `T&&` (by value, by `const T&`,
+  or by `T&&`/`auto&&` itself — excludes a purely lvalue-bound callback like
+  `[](auto& value)`) and this node is the sole `shared_ptr<future_state<T>>`
+  owner (`owner_.count() == 1` — no sibling continuation, no live
+  `future`/`promise` handle left), `run()` moves the stored value out
+  instead of reading a reference into it (issue #64). `future<T>::then(Fn&&)
+  &&` exists to make that count come back 1 more often, by dropping the
+  caller's own reference before delegating to `future_state<T>::then()`
+  (issue #71) — see `future.cppm`.
 - **Wrapped** (`Fn` invocable with `future<T>&`): always called, success or
   failure, with a *fresh* `future<T>` view built via `shared_from_this()` —
   never a stored one, since a continuation only ever runs once. `Fn`
