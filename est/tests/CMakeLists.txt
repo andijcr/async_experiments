@@ -26,6 +26,7 @@ add_executable(est_tests
   scope_exit_tests.cpp
   shared_ptr_tests.cpp
   when_all_tests.cpp
+  when_any_tests.cpp
   when_any_succeeds_tests.cpp
 )
 # Catch2::Catch2, not Catch2::Catch2WithMain: test_main.cpp supplies its

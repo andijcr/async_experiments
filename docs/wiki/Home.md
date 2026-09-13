@@ -112,4 +112,5 @@ constructs one, and `platform::override_instance()`s it
 | `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `sleep_for()`/`sleep_until()`, `detail::promise_resume_node<T>` | `est/src/promise.cppm` |
 | `est::when_all()` (fixed-arity and `std::span` overloads), `detail::when_all_state` | `est/src/when_all.cppm` |
+| `est::when_any()` (fixed-arity and `std::span` overloads) | `est/src/when_any.cppm` |
 | `est::when_any_succeeds()` (fixed-arity and `std::span` overloads), `detail::when_any_succeeds_state` | `est/src/when_any_succeeds.cppm` |

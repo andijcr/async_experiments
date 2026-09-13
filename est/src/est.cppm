@@ -23,4 +23,5 @@ export import :util.current_loop;
 export import :future;
 export import :promise;
 export import :when_all;
+export import :when_any;
 export import :when_any_succeeds;

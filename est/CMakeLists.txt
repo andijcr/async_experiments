@@ -20,6 +20,7 @@ target_sources(est
       src/future.cppm
       src/promise.cppm
       src/when_all.cppm
+      src/when_any.cppm
       src/when_any_succeeds.cppm
 )
 
