@@ -191,9 +191,39 @@ chain flows through the one loop's allocator, this single counter catches a
 leak anywhere in an arbitrarily deep or flattened chain, not just at the
 top level.
 
-The same property is what would let a real caller plug in an arena or pool
+The same property is what lets a real caller plug in an arena or pool
 `memory_resource` for a whole `est::loop` and have every `future_state`,
 every continuation node, and every timer node in every chain built against
 it serviced from that one resource — nothing in the design routes any of
 this through the global default resource unless a caller explicitly asks for
 that as the loop's own allocator.
+
+## Pooling: measured, not just theoretical
+
+[Issue #47](https://github.com/andijcr/async_experiments/issues/47) raised
+pooling `future_resume_node<T>` specifically as a way to cut per-`co_await`
+allocation cost without touching `est::future`'s design. Since every
+allocation already goes through the loop's own `memory_resource`, the
+cheapest way to try that is to not write a pool at all: just hand
+`est::loop` a `std::pmr::unsynchronized_pool_resource` (the
+`unsynchronized_` variant, not `synchronized_` - matches `est::loop`'s own
+single-threaded, no-atomics constraint, see
+[Architecture](Architecture.md#design-philosophy)) instead of the default
+`new_delete_resource()`, with zero changes anywhere in `est` itself:
+
+```cpp
+std::pmr::unsynchronized_pool_resource pool;
+est::loop loop{&pool};
+```
+
+Measured on a Release+LTO build (200,000 iterations mixing a genuinely-
+suspending `co_await` with a `.then()` chain per iteration, 1.4 million
+allocate/deallocate pairs total, identical allocation counts confirmed under
+both resources): `unsynchronized_pool_resource` ran the workload in ~50-52ms
+against ~56-58ms for `new_delete_resource()` directly - a consistent
+~9-10% improvement, holding up with the run order swapped to rule out
+warm-up bias. A real win, but a modest one: it confirms this codebase's own
+allocations are already cheap enough that a generic pool resource captures
+most of the available gain, without needing a bespoke freelist sized to one
+specific node type (issue #47's own escalation path if this hadn't been
+enough).
