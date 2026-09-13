@@ -331,20 +331,23 @@ destroyed (`abandon()` is only ever called on that path - see
 generic, type-erased callback would give `abandon()` no way to know it's
 holding a promise at all, and a silent drop instead would have exactly
 the stranded-coroutine-frame hazard described in
-[Coroutines](Coroutines.md)'s `event_resume_node` section.
+[Coroutines](Coroutines.md)'s `promise_resume_node<T>` section.
 
 `yield_execution()` gives `current_loop()` the chance to run
 whatever else is already ready before the calling coroutine resumes. It
 has no real deadline to track, so it's a direct
-`detail::yield_resume_node` handed straight to `loop_ref.enqueue_ready()`
-- a plain `ready_node` holding a `promise<void>`, no timer machinery at
-all:
+`detail::promise_resume_node<void>` handed straight to
+`loop_ref.enqueue_ready()` - a plain `ready_node` holding a `promise<void>`,
+no timer machinery at all, and the same shared node type
+`counting_event<Mode>::wait()`'s own slow path uses below (issue #77
+collapsed what used to be two separate, byte-identical node types into
+this one):
 
 ```cpp
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::yield_resume_node(std::move(prom));
+  auto* node = new detail::promise_resume_node<void>(std::move(prom));
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }
@@ -353,11 +356,11 @@ all:
 FIFO is what makes this safe: `enqueue_ready()` appends at the tail, so
 everything already queued when `yield_execution()` is called runs first
 (see [Architecture](Architecture.md) and `intrusive_list<T>`'s own doc
-comment for why the list is FIFO). `yield_resume_node::abandon()`
-completes its promise with an exception rather than silently dropping
-it, for the same reason `detail::event_resume_node`'s own doc comment
-gives (`docs/wiki/Coroutines.md`) - a coroutine suspended via `co_await
-yield_execution();` holds the only other reference to its
+comment for why the list is FIFO). `promise_resume_node<T>::abandon()`
+completes its promise with `detail::abandoned_exception` (`est:loop`)
+rather than silently dropping it, for the same reason its own doc
+comment gives (`docs/wiki/Coroutines.md`) - a coroutine suspended via
+`co_await yield_execution();` holds the only other reference to its
 `future_state<void>`, so silently dropping the promise would strand that
 coroutine's frame forever if the loop is destroyed first.
 
@@ -395,7 +398,7 @@ wait()`'s fast path, for instance:
     return make_ready_future<void>();
   }
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::event_resume_node(std::move(prom));
+  auto* node = new detail::promise_resume_node<void>(std::move(prom));
   waiters_.enqueue(*node);
   return std::move(fut);
 }

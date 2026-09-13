@@ -318,9 +318,9 @@ TEST_CASE("destroying a mutex with a coroutine co_await-ing lock() still pending
   // spilled into the coroutine's own frame across the suspension) - so
   // dropping *just* that continuation's own reference leaves the
   // future_state (and the coroutine frame keeping it alive) with nowhere
-  // left to go, unless destroy() actually completes the promise (with an
+  // left to go, unless abandon() actually completes the promise (with an
   // exception, here) instead of silently dropping it - see
-  // detail::event_resume_node's own doc comment (est/src/sync/event.cppm)
+  // detail::promise_resume_node<T>'s own doc comment (est/src/promise.cppm)
   // for the full reasoning est::mutex now inherits by building on
   // est::binary_event. Without that fix, this test leaks the waiting
   // coroutine's entire frame.

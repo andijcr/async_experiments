@@ -42,6 +42,22 @@ namespace est::detail {
 // (est:util.current_loop), which itself imports :loop, so :loop
 // importing it back would be circular (see this file's own top comment
 // on the same constraint for est::future).
+// The exception every abandon() override that needs to actually complete
+// something (rather than just deallocate) throws/wraps: ready_node::
+// abandon()'s own doc comment below lists them - est:future's
+// flatten_forwarder<T>/concrete_continuation<Fn, U>, est:promise's
+// sleep_resume_node/promise_resume_node<T>. One shared, message-less type
+// instead of each call site hand-rolling its own std::runtime_error(a
+// slightly different literal) - nothing anywhere in this codebase ever
+// inspects what() to tell one abandonment apart from another (the
+// completed promise/future's own exception_ptr is only ever observed as
+// "this failed," never matched against particular text), so the message
+// never carried information a caller could act on in the first place.
+class abandoned_exception : public std::runtime_error {
+public:
+  abandoned_exception() : std::runtime_error("est: abandoned") {}
+};
+
 class ready_node : public intrusive_list_node {
 public:
   ready_node() = default;
@@ -58,10 +74,10 @@ public:
   // did run (loop::destroy_guard() below deletes those directly, no
   // abandon() call). Default is a no-op; a node whose completion needs
   // to differ on this abandoned path - est:future's future_resume_node<T>/
-  // concrete_continuation<Fn, U>/flatten_forwarder<T>, est:sync.event's
-  // event_resume_node, est:promise's sleep_resume_node/yield_resume_node -
-  // overrides it instead of every call site branching on a `ran` flag
-  // itself.
+  // concrete_continuation<Fn, U>/flatten_forwarder<T>, est:promise's
+  // sleep_resume_node/promise_resume_node<T> (the latter shared with
+  // est:sync.event) - overrides it instead of every call site branching
+  // on a `ran` flag itself.
   virtual void abandon() noexcept {}
 };
 

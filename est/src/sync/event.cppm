@@ -20,74 +20,18 @@ export namespace est {
 // multi-unit count rather than a plain boolean.
 enum class EventResetMode : std::uint8_t { automatic, manual };
 
-} // namespace est
-
-namespace est::detail {
-
-// The waiter node behind counting_event<Mode>::wait()'s slow path (not yet
-// signaled): queued in counting_event<Mode>::waiters_, completing an
-// est::promise<void> once set() hands it a unit. No coroutine_handle in
-// sight here - wait() itself is no coroutine-only primitive, so this node
-// only ever has to know how to complete a promise. est::mutex (est:sync.mutex)
-// builds its own lock() directly on top of this class via
-// est::binary_event<EventResetMode::automatic> rather than keeping a
-// resume node of its own - it never nests or duplicates this one.
-//
-// Deliberately *not* nested inside counting_event<Mode>: run()/abandon()
-// only ever touch promise_, never Mode or anything else about the
-// counting_event that enqueued them, so hoisting it out here avoids an
-// identical resume_node type per Mode instantiation. Matches
-// est::detail::ready_node/timer_node's own "type-erased, internal-only"
-// placement (est:loop) - counting_event<Mode>::wait() (below) is the only
-// caller either way, on both Mode values.
-//
-// abandon() completing the promise with an exception (rather than simply
-// deallocating the node) matters for the identical reason
-// future_resume_node<T>'s own doc comment gives in full (est:future): a
-// coroutine suspended on the future<void> wait() returned holds that
-// future_state alive via its own frame, reachable only once this
-// future_state itself completes - silently dropping the promise instead
-// would strand that frame forever, with neither side able to free the
-// other first.
-// Completing it here (called only from ~counting_event()'s/loop::~loop()'s
-// abandonment drain, never after set()'s own successful hand-off) always
-// drains the future_state's own pending continuation onto the loop's
-// ready queue, so the frame is never stranded either way.
-class event_resume_node final : public ready_node,
-                                public current_allocator_new_delete<event_resume_node> {
-public:
-  explicit event_resume_node(promise<void> prom) noexcept : promise_(std::move(prom)) {}
-
-  void run() final { promise_.set_value(); }
-
-  void abandon() noexcept final {
-    promise_.set_exception(std::make_exception_ptr(
-        std::runtime_error("counting_event destroyed while wait() was pending")));
-  }
-
-  // operator new/delete inherited from current_allocator_new_delete<T>
-  // (est:util.current_loop) - see that class's own doc comment for why
-  // every concrete ready_node/timer_node needs its own pair rather than
-  // one shared at the ready_node base itself.
-
-private:
-  promise<void> promise_;
-};
-
-} // namespace est::detail
-
-export namespace est {
-
 // A cooperative-scheduling counting event: an awaitable generalization of
 // a counting semaphore - a plain int count, an
 // est::intrusive_list<detail::ready_node> waiters_ queue, and
-// detail::event_resume_node (above) completing an est::promise<void> once
-// a waiter is satisfied. est::mutex (est:sync.mutex) is built directly on
-// top of this class (a binary_event<EventResetMode::automatic> member),
-// not a separate, similarly-shaped implementation of its own. wait()
-// returns a plain future<void> - already-satisfied wait() resumes
-// immediately, through future_awaiter<T>'s own already-ready fast path
-// (est:future), with no extra allocation or suspension.
+// detail::promise_resume_node<void> (est:promise - shared with
+// yield_execution(), see its own doc comment for why one type serves
+// both) completing an est::promise<void> once a waiter is satisfied.
+// est::mutex (est:sync.mutex) is built directly on top of this class (a
+// binary_event<EventResetMode::automatic> member), not a separate,
+// similarly-shaped implementation of its own. wait() returns a plain
+// future<void> - already-satisfied wait() resumes immediately, through
+// future_awaiter<T>'s own already-ready fast path (est:future), with no
+// extra allocation or suspension.
 //
 // est::binary_event<Mode> and est::one_shot_event<Mode> (both below) are
 // derived from this - not separate implementations - each one layering
@@ -141,10 +85,10 @@ public:
   // Destroys (without satisfying) any waiter still queued on wait() -
   // mirrors mutex::~mutex() and future_state<T>::~future_state() (both
   // drain their own pending lists the same way, for the same reason).
-  // Each waiter node's own abandon() (detail::event_resume_node, above)
-  // completes its promise with an exception first, rather than just
-  // deallocating itself silently - see its own doc comment for why that
-  // matters beyond just freeing the node itself.
+  // Each waiter node's own abandon() (detail::promise_resume_node<void>,
+  // est:promise) completes its promise with an exception first, rather
+  // than just deallocating itself silently - see its own doc comment for
+  // why that matters beyond just freeing the node itself.
   // waiters_.empty() checked first - a counting_event with nothing queued
   // can legitimately be destroyed long after whatever loop was current
   // when it was created has stopped being current at all, and deleting
@@ -198,8 +142,8 @@ public:
   //
   // Deferred through est::loop::enqueue_ready() rather than completed
   // directly here, for the identical reason mutex::unlock() defers
-  // (see its own doc comment): detail::event_resume_node::run() only ever
-  // calls promise_.set_value(), never runs arbitrary downstream coroutine
+  // (see its own doc comment): detail::promise_resume_node<void>::run()
+  // only ever calls promise_.set_value(), never runs arbitrary downstream coroutine
   // code inline on this call stack, so nothing about set() itself needs
   // to bound recursion - deferring anyway keeps this consistent with
   // every other completion path in this codebase: never invoke a
@@ -278,7 +222,7 @@ public:
       return make_ready_future<void>();
     }
     auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-    auto* node = new detail::event_resume_node(std::move(prom));
+    auto* node = new detail::promise_resume_node<void>(std::move(prom));
     waiters_.enqueue(*node);
     return std::move(fut);
   }
