@@ -20,6 +20,8 @@ target_sources(est
       src/future.cppm
       src/promise.cppm
       src/when_all.cppm
+      src/when_any.cppm
+      src/when_any_succeeds.cppm
 )
 
 target_compile_features(est PUBLIC cxx_std_23)
