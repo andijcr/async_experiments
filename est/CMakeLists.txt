@@ -15,6 +15,7 @@ target_sources(est
       src/util/jitter.cppm
       src/sync/mutex.cppm
       src/sync/event.cppm
+      src/sync/external_event.cppm
       src/timer.cppm
       src/loop.cppm
       src/util/current_loop.cppm

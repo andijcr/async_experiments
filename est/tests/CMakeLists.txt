@@ -20,6 +20,7 @@ add_executable(est_tests
   intrusive_list_tests.cpp
   mutex_tests.cpp
   event_tests.cpp
+  external_event_tests.cpp
   timer_tests.cpp
   loop_tests.cpp
   jitter_tests.cpp

@@ -5325,6 +5325,107 @@ too; `diff-cover` coverage gate against `main` at 93%
 
 ---
 
+### Issue #74: `est::external_event<T>` - bridging an externally-written value
+
+The other half of issue #73's own periodic-timer work, as specced out in
+[#74's own planning comment](https://github.com/andijcr/async_experiments/issues/74#issuecomment-5652953980)
+before #73 landed: "Implement `external_event::set/poll`, use periodic
+timer to poll... bridging external events with events." `est::
+external_event<T>` (`est/src/sync/external_event.cppm`,
+`:sync.external_event`) wraps a caller-owned `std::atomic<T>&` - written
+from another thread, an ISR, or (eventually) a hardware register - and
+bridges it into the existing `est::binary_event<EventResetMode::manual>`
+(`est:sync.event`) machinery: `poll()` (loop-thread only, never suspends)
+is the *one* place this class ever reads the atomic, and the *only*
+genuinely cross-thread state anywhere in this codebase - the deliberate
+exception to `est`'s single-threaded/no-atomics rule (`CLAUDE.md`), not
+an accidental one.
+
+**Shape settled largely as spec'd**, with one naming change: the spec's
+own `acknowledge()` became plain `reset()` instead, matching every other
+`EventResetMode::manual` primitive's own naming
+(`counting_event<manual>::reset()`, `binary_event<manual>::reset()`)
+rather than inventing a new name for the identical "clear the signal,
+ready for the next one" operation. Level-triggered, not edge-triggered:
+`poll()` calls `event_.set()` (idempotent, stays signaled until
+`reset()`) rather than trying to fire once per distinct value, so a
+`wait()` called after several changes already happened still resolves
+immediately via `binary_event`'s own already-signaled fast path,
+observing the *latest* value through `value()` - a change before
+`reset()` folds into whatever `reset()` next observes rather than being
+lost or double-counted, and a change after `reset()` sets the event
+again.
+
+**`T` constrained twice**: `std::equality_comparable<T>` (a `requires`
+clause - `poll()` needs `!=` to detect a change) and
+`std::atomic<T>::is_always_lock_free` (a `static_assert` - `poll()` is
+meant to be callable from a context as constrained as a periodic timer
+callback, eventually an ISR, so it must never silently block on a
+fallback lock the way a non-lock-free `std::atomic<T>` could).
+
+**Deliberately not started/owned by this class** - a caller wires
+`poll()` into `est::schedule_periodic()` (issue #73, above) explicitly,
+rather than `external_event<T>` starting a periodic timer of its own:
+lets one periodic timer's callback drive several sources' `poll()` calls
+at once, or drive `poll()` from something other than a timer entirely,
+and keeps this class trivially unit-testable without any real second
+thread - a test just assigns directly to the `std::atomic<T>` it
+constructs the bridge over, single-threaded, matching every other test
+in this codebase.
+
+**Two `clang-tidy` findings, both fixed by a cleaner design rather than a
+suppression:**
+- `cppcoreguidelines-avoid-const-or-ref-data-members` on the first
+  draft's `std::atomic<T>& source_` member. Fixed by storing
+  `std::atomic<T>*` instead - `event_` (a `binary_event<Mode>`) already
+  makes this class non-copyable/non-movable regardless, inheriting
+  `counting_event<Mode>`'s own deleted special members, so the pointer
+  costs nothing functionally and sidesteps the guideline cleanly (the
+  constructor still takes `std::atomic<T>&`, only the stored
+  representation changed).
+- `cppcoreguidelines-avoid-capturing-lambda-coroutines` on the new
+  integration test's own `[&]() -> future<void> { ... }()` - a genuine
+  use-after-free hazard, not a false positive: an immediately-invoked
+  capturing lambda coroutine's closure object (holding the captures) is
+  a temporary that dies at the end of the full-expression, while the
+  coroutine frame it produced can outlive it. Fixed by switching to a
+  captureless lambda taking its dependencies as parameters instead
+  (copied straight into the coroutine frame, not the closure) - the same
+  pattern `est/tests/event_tests.cpp`'s own `waiter` lambda already
+  established, `NOLINTBEGIN`/`NOLINTEND`-wrapped for the companion
+  `cppcoreguidelines-avoid-reference-coroutine-parameters` finding that
+  shape itself triggers.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new
+`:sync.external_event` node and edges in `docs/wiki/Architecture.md`'s
+dependency graph, plus a paragraph on why it depends on `:sync.event`/
+`:future` but not `:platform` (unlike `:util.jitter`, it never calls
+`platform::instance()` itself); a full new "Bridging external writers"
+section in `docs/wiki/Loop-And-Timers.md`, placed right after `est::
+jitter`'s own section.
+
+**Tests added** (`est/tests/external_event_tests.cpp`): `poll()` with no
+change is a no-op; `poll()` after a change resolves a queued `wait()`;
+`wait()` called after an already-observed change resolves synchronously
+(the `binary_event` fast path); multiple concurrent waiters all resolve
+off one `poll()`; a second change before `reset()` is folded into
+`value()` without double-firing; `reset()` re-arms for the next change;
+both `std::atomic<bool>` (flag-style) and `std::atomic<int>` (value-style)
+as `T`; and a full integration test bridging into a real
+`schedule_periodic()` poll loop end to end, matching the issue's own
+motivating shape.
+
+**Verified in the pinned Docker devenv:** 235/235 tests pass (8 new);
+`clang-format`/`clang-tidy` clean (both findings above, fixed before this
+line); 202/202 tests pass under the `sanitize` preset (ASan+UBSan) too;
+`diff-cover` coverage gate against `main` at 98% (`external_event.cppm`
+itself at 100%; the one miss is an unexercised fake-platform
+`assert_failure()` override in the new integration test, the same
+boilerplate-never-called pattern every other fake platform in this
+codebase's test suite already has).
+
+---
+
 ### Issue #47's pooling alternative, measured: `std::pmr::unsynchronized_pool_resource`
 
 Follow-up to issue #47's own alternative (3) - "a dedicated small-object
