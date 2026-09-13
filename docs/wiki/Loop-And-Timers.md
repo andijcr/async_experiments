@@ -631,6 +631,133 @@ any real second thread: a test just assigns directly to the
 `std::atomic<T>` it constructs the bridge over, single-threaded, matching
 every other test in this codebase (`est/tests/external_event_tests.cpp`).
 
+## A stream instead of a value: `est::spsc_ring<T>` (`:sync.spsc_ring`)
+
+`est::external_event<T>` above is level-triggered on a single value - a
+write between two `poll()` calls that gets overwritten again before the
+next one is silently lost, the right tradeoff for a sensor reading or a
+status flag. `est::spsc_ring<T>` (issue #96) answers the other half:
+every value pushed reaches the consumer exactly once, in order, or is
+rejected outright (never silently dropped) - for a stream of discrete
+items (log records, incoming frames, queued commands) where losing one
+isn't acceptable.
+
+```cpp
+template <class T>
+  requires std::is_trivially_copyable_v<T> && std::default_initializable<T>
+class spsc_ring {
+public:
+  explicit spsc_ring(std::size_t capacity, allocator_type allocator = {});
+
+  [[nodiscard]] auto try_push(T value) noexcept -> bool;      // external-context only
+  [[nodiscard]] auto try_pop() noexcept -> std::optional<T>;  // loop-context only
+};
+```
+
+Exactly one producer (external context) ever calls `try_push()`, exactly
+one consumer (loop context) ever calls `try_pop()` - the same "the atomic
+is the one deliberate FFI boundary, everything else stays single-
+threaded" shape `external_event<T>` already established for one value,
+generalized to a bounded stream.
+
+**`capacity() + 1` slots, not `capacity()`** - the classic ring-buffer
+trick for telling full apart from empty using nothing but the two
+indices already needed anyway, no separate atomic count or generation
+bit:
+
+```cpp
+[[nodiscard]] auto try_push(T value) noexcept -> bool {
+  const auto write_index = write_index_.load(std::memory_order_relaxed);
+  const auto next_write = advance(write_index);
+  if (next_write == read_index_.load(std::memory_order_acquire)) {
+    return false; // full
+  }
+  buffer_[write_index] = value;
+  write_index_.store(next_write, std::memory_order_release);
+  return true;
+}
+```
+
+`write_index_` is read with `memory_order_relaxed` here for the same
+reason `external_event<T>::poll()` needs no ordering at all to read its
+own `last_seen_`: `write_index_` is written *only* by `try_push()`
+itself, so this call's own prior write is already visible to its own
+later read via plain program order - no cross-thread synchronization
+needed for a value nothing else ever writes.
+
+**Two atomics, two producer/consumer roles, two acquire/release
+pairings** - more involved than `external_event<T>`'s single atomic, so
+spelled out explicitly rather than left implicit:
+
+- `try_push()`'s `read_index_.load(acquire)` pairs with `try_pop()`'s own
+  `read_index_.store(release)` (below) - not because `try_push()` reads
+  *through* `read_index_`, but so "the ring is full" reflects every slot
+  `try_pop()` has actually finished reading, never a stale view that
+  would reject a push the consumer already made room for.
+- `try_push()`'s `write_index_.store(release)` pairs with `try_pop()`'s
+  own `write_index_.load(acquire)` - this is the pairing that actually
+  publishes the value: the release store doesn't just make the new index
+  visible, it makes everything sequenced before it (the plain,
+  unsynchronized write into `buffer_[write_index]` just above) visible to
+  whichever `try_pop()` call's acquire load first observes the new index.
+
+```cpp
+[[nodiscard]] auto try_pop() noexcept -> std::optional<T> {
+  const auto read_index = read_index_.load(std::memory_order_relaxed);
+  if (read_index == write_index_.load(std::memory_order_acquire)) {
+    return std::nullopt; // empty
+  }
+  T value = buffer_[read_index];
+  read_index_.store(advance(read_index), std::memory_order_release);
+  return value;
+}
+```
+
+The two functions are exact mirror images: `try_pop()`'s own
+`read_index_.load(relaxed)` needs no ordering for the identical reason
+`try_push()`'s `write_index_.load(relaxed)` doesn't (only `try_pop()`
+itself ever writes `read_index_`), and its `write_index_.load(acquire)`/
+`read_index_.store(release)` pair with `try_push()`'s own release/acquire
+the same way, just with producer and consumer swapped.
+
+**`T` constrained to trivially copyable and default-constructible** -
+deliberately narrow, matching `external_event<T>`'s own "lock-free-
+adjacent" spirit (there, `std::atomic<T>::is_always_lock_free`) applied
+here to a whole slot instead: a plain, POD-like type moves between the
+caller and `buffer_` with an ordinary assignment, with no placement-new/
+manual-destroy bookkeeping anywhere and no possibility of either throwing
+- which is also what keeps `try_push()`/`try_pop()` honestly `noexcept`
+(a bounds-checked `.at()` into `buffer_` would reintroduce exactly the
+exception this class's own `noexcept` promises never happens, for an
+index that's provably always in range by construction - see the
+`NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)`
+comments at each access in `est/src/sync/spsc_ring.cppm` for why the
+unchecked form is correct here, not merely faster).
+
+**Composition with `external_event<T>`/`schedule_periodic()`, not
+inheritance or reuse** - the ring buffer and the periodic timer solve
+different problems and neither is built in terms of the other; a caller
+wires them together explicitly, the same way `external_event<T>::poll()`
+above is wired into `schedule_periodic()`:
+
+```cpp
+est::spsc_ring<int> queue(64);                  // written by another thread/ISR
+auto handle = est::schedule_periodic(10ms, [&queue] {
+  while (const auto item = queue.try_pop()) {
+    // ... handle *item ...
+  }
+});
+```
+
+The simplest drain strategy - unconditionally draining to empty every
+period, shown above - always pays the drain-loop cost even when nothing
+was pushed since the last period. A caller with a genuinely idle-most-
+of-the-time queue could instead layer `est::external_event<std::size_t>`
+over a monotonic write-counter bumped alongside every successful
+`try_push()`, only draining when that counter actually moved - a real
+optimization for that shape, but not something `spsc_ring<T>` itself
+needs to know about either way.
+
 ## `run()` vs. `run_until_idle()`, and `stop()`
 
 Both currently do exactly the same thing — drain ready work, sleep until the

@@ -21,6 +21,7 @@ add_executable(est_tests
   mutex_tests.cpp
   event_tests.cpp
   external_event_tests.cpp
+  spsc_ring_tests.cpp
   timer_tests.cpp
   loop_tests.cpp
   jitter_tests.cpp

@@ -107,6 +107,7 @@ constructs one, and `platform::override_instance()`s it
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
 | `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
 | `est::external_event<T>` | `est/src/sync/external_event.cppm` |
+| `est::spsc_ring<T>` | `est/src/sync/spsc_ring.cppm` |
 | `est::mutex`, `mutex::lock_guard` (built on `est::binary_event<EventResetMode::automatic>`) | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop`, `ready_node`, `timer_node`, `detail::abandoned_exception` | `est/src/loop.cppm` |

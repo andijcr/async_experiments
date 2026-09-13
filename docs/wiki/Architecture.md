@@ -16,6 +16,7 @@ graph BT
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
   event[":sync.event<br/>counting_event&lt;Mode&gt;, binary_event&lt;Mode&gt;, one_shot_event&lt;Mode&gt;"]
   external_event[":sync.external_event<br/>external_event&lt;T&gt;"]
+  spsc_ring[":sync.spsc_ring<br/>spsc_ring&lt;T&gt;"]
   mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
@@ -37,6 +38,7 @@ graph BT
   event --> current_loop
   external_event --> future
   external_event --> event
+  spsc_ring --> check
   mutex --> future
   mutex --> promise
   mutex --> event
@@ -119,6 +121,17 @@ doesn't make the name visible to a third partition merely importing
 `external_event<T>` never calls `platform::instance()` itself - the
 `std::atomic<T>&` it bridges is entirely caller-supplied, with no
 platform hook of its own needed anywhere.
+
+`:sync.spsc_ring` depends only on `:check` (a positive-`capacity`
+precondition) - genuinely standalone among the `:sync.*` family: no
+`:platform` (nothing about its own algorithm needs the clock or a random
+seed), no `:future`/`:promise`/`:loop` (unlike `:sync.event`/
+`:sync.external_event`, `try_push()`/`try_pop()` are plain, synchronous
+functions - nothing here is awaited, and nothing here defers through a
+loop's own ready-queue). A caller composes it with `est::external_event<T>`/
+`est::schedule_periodic()` itself, at the call site, rather than either
+partition depending on the other - see `docs/wiki/Loop-And-Timers.md`'s
+own "Bridging external writers" section for that composition.
 
 `:sync.mutex` depends on `:sync.event` — `est::mutex` isn't its own
 implementation any more (issue #67): it holds a single

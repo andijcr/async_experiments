@@ -19,6 +19,7 @@ export import :util.jitter;
 export import :sync.mutex;
 export import :sync.event;
 export import :sync.external_event;
+export import :sync.spsc_ring;
 export import :timer;
 export import :loop;
 export import :util.current_loop;

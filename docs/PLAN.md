@@ -5474,6 +5474,117 @@ confirm it still prints `est::future value: 42`).
 
 ---
 
+### Issue #96: `est::spsc_ring<T>` - a lock-free bounded queue, composing with `external_event<T>`/`schedule_periodic()`
+
+Requested as the natural follow-up to issue #74's own `external_event<T>`:
+"a fixed size circular queue (at runtime) written by the external context
+and read in the loop context, no mutex." Spec'd out first as its own
+issue (#96) before any code, settling the open questions the issue itself
+raised, then implemented largely as spec'd.
+
+**Why this isn't `external_event<T>` generalized.** `external_event<T>`
+is level-triggered on a single value - writes between two `poll()` calls
+collapse into one, the right tradeoff for a sensor reading, wrong for a
+stream where every value matters (log records, incoming frames, queued
+commands). `est::spsc_ring<T>` (`est/src/sync/spsc_ring.cppm`,
+`:sync.spsc_ring`) delivers every successfully pushed value exactly once,
+in order, or rejects it outright while full - never silently drops one.
+The two solve different problems and neither is built in terms of the
+other; see the "composition, not reuse" section of the design comment
+below.
+
+**Open questions from #96, settled:**
+- **Full/empty disambiguation** → `capacity() + 1` slots, the classic
+  trick: full is `advance(write_index) == read_index`, empty is
+  `write_index == read_index`, needing no separate atomic count or
+  generation bit alongside the two indices already required.
+- **Overwrite-on-full vs. reject-on-full** → reject (`try_push()` returns
+  `false`, leaves the value unconsumed) - the safer default for the
+  motivating "this data actually matters" examples; an "overwrite oldest"
+  policy for a metrics/telemetry use case is left as a real but
+  unimplemented future option, not guessed at.
+- **`T`'s constraints** → `std::is_trivially_copyable_v<T> &&
+  std::default_initializable<T>` (a `requires` clause) - a plain,
+  POD-like slot type moved with an ordinary assignment, no placement-new/
+  manual-destroy bookkeeping anywhere, matching `external_event<T>`'s own
+  "lock-free-adjacent" spirit applied to a whole slot instead of one
+  value.
+- **Where it lives** → its own partition, `est/src/sync/spsc_ring.cppm`
+  (`:sync.spsc_ring`), alongside `mutex.cppm`/`event.cppm`/
+  `external_event.cppm` rather than folded into any of them - genuinely
+  standalone in the dependency graph (depends only on `:check`, not even
+  `:platform`: nothing in its own algorithm needs a clock or a random
+  seed).
+- **Memory ordering** → given its own full writeup in
+  `docs/wiki/Loop-And-Timers.md`'s new "A stream instead of a value"
+  section, as the issue itself asked for: two atomics (`write_index_`,
+  `read_index_`), each written by exactly one side, each side's own
+  `relaxed` self-read paired against the other side's `acquire`/`release`
+  cross-read - `try_push()`'s `write_index_.store(release)` is what
+  actually publishes the pushed value (everything sequenced before it,
+  including the plain unsynchronized write into `buffer_`), paired with
+  `try_pop()`'s own `write_index_.load(acquire)`; the reverse pairing on
+  `read_index_` publishes a freed slot back to the producer the same way.
+- **Testing** → the same single-threaded-simulation approach
+  `external_event_tests.cpp` established generalizes cleanly: `try_push()`
+  called directly from the test body, no real second thread needed to
+  exercise the logic correctly.
+
+**A real tension between two `clang-tidy` checks, resolved by keeping the
+unchecked access.** The first draft used `buffer_.at(index)` (bounds-
+checked) to satisfy `cppcoreguidelines-pro-bounds-avoid-unchecked-
+container-access` - which immediately tripped `bugprone-exception-escape`
+instead, since `.at()` can throw and both `try_push()`/`try_pop()` are
+(deliberately - see the design comment) `noexcept`. Unlike the earlier
+`current_allocator_new_delete<Derived>` case where two checks wanted
+contradictory things for an equally-valid shape, this one has an actual
+answer: `write_index`/`read_index` are provably always `< buffer_.size()`
+by construction (`advance()` itself never returns otherwise), so a
+bounds check can only ever pass silently or - if the invariant were ever
+violated by a bug - throw straight through a `noexcept` function into
+`std::terminate()`, strictly worse than the plain access, not safer, for
+a case that cannot occur. Reverted to `buffer_[index]`, each site keeping
+a `NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)`
+plus a comment stating the invariant, rather than silently suppressing
+without explanation.
+
+**`bugprone-unchecked-optional-access` on the tests, not the source** -
+`clang-tidy` doesn't recognize `REQUIRE(popped.has_value())` immediately
+before `popped.value()` as a narrowing guard the way a plain `if` would
+be. Rather than `NOLINT`-ing every call site, rewritten to compare the
+`std::optional<T>` `try_pop()` returns directly against a value or
+`std::nullopt` (`ring.try_pop() == 42`, `ring.try_pop() == std::nullopt`)
+- `std::optional`'s own `operator==` is well-defined either way it's
+engaged, so this sidesteps the question entirely instead of working
+around the checker, and reads more directly besides.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new
+`:sync.spsc_ring` node and edge in `docs/wiki/Architecture.md`'s
+dependency graph, with a paragraph on why it depends on nothing but
+`:check`; a full new "A stream instead of a value" section in
+`docs/wiki/Loop-And-Timers.md`, right after `external_event<T>`'s own,
+including the composition example and the `.at()`-vs-`noexcept` tension
+above.
+
+**Tests added** (`est/tests/spsc_ring_tests.cpp`): empty ring `try_pop()`
+returns `nullopt`; a single push/pop round-trips a value; FIFO order
+across several pushes then pops; `try_push()` rejects once full without
+overwriting; a full ring accepts again once drained; interleaved push/pop
+across many more cycles than `buffer_.size()` stays correct (the classic
+place a mod-arithmetic bug in `advance()` would show up); `capacity()`
+reflects the constructor argument, not `buffer_.size()`; a trivially
+copyable struct works as `T`, not just `int`; and a full integration test
+draining a pre-filled ring through a real `schedule_periodic()` poll
+loop, matching the composition example above end to end.
+
+**Verified in the pinned Docker devenv:** 244/244 tests pass (9 new);
+`clang-format`/`clang-tidy` clean (both tensions above, resolved before
+this line); 211/211 tests pass under the `sanitize` preset (ASan+UBSan)
+too; `diff-cover` coverage gate against `main` at 98%
+(`spsc_ring.cppm` itself at 100%).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
