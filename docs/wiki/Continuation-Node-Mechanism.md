@@ -370,12 +370,12 @@ void set_continuation(continuation_node& node, bool run_inline_if_ready = false)
 - identical in every way (node allocation, downstream `future_state`,
 registration) except which value they pass through to
 `set_continuation()` above. `run_inline_if_ready = true` reuses the exact
-"run, then delete" idiom `est::loop`'s own `run_one()`/`destroy_guard()`
-use on its own drain pass ([Loop and Timers](Loop-And-Timers.md)) - just
-performed directly here (via a local `unique_ptr`, not a bare `delete` -
-a virtual destructor makes deleting through this base reference safe
-either way, see `ready_node`'s own doc comment, `est:loop`), since those
-two helpers are private to `est::loop`.
+"run, then delete" idiom `est::loop`'s own `run_one()` uses on its own
+drain pass ([Loop and Timers](Loop-And-Timers.md)) - just performed
+directly here (via a local `unique_ptr`, not a bare `delete` - a virtual
+destructor makes deleting through this base reference safe either way,
+see `ready_node`'s own doc comment, `est:loop`), since `run_one()` itself
+is private to `est::loop`.
 
 **Why an opt-in method, not `then()`'s own new default.** `then()` must
 stay safe for a chain of any length: deferring every completion through

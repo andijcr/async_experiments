@@ -265,19 +265,24 @@ arbitrarily deep, purely synchronous chain resolves inside one
 
 ```cpp
 void run_one(detail::ready_node& node) {
-  const auto guard = destroy_guard(node);          // always destroy, however this exits
+  const std::unique_ptr<detail::ready_node> guard(&node); // always destroy, however this exits
   platform::instance().reset_loop_stall_detection();
   node.run();
   platform::instance().detect_loop_stall(long_running_threshold);
 }
 ```
 
-- **`destroy_guard`** (a `std::unique_ptr<Node>` factored into one small
-  helper, shared with `fire_ready_timers()`) guarantees the node is
+- **`guard`** (a plain `std::unique_ptr<detail::ready_node>`, holding the
+  same reference `node` names - `fire_ready_timers()` below has the
+  identical one-liner for `detail::timer_node`) guarantees the node is
   deallocated no matter how `run()` returns — even though a continuation
   node's own `run()` already catches every exception a callback could
   throw internally, so this is a defensive guarantee, not something the
-  happy path relies on.
+  happy path relies on. Not factored into a shared helper (an earlier
+  version of this code had one, `destroy_guard<Node>()`): once its body
+  shrank to exactly `unique_ptr<Node>(&node)`, the template stopped
+  earning its keep over writing the same one line at each of the two
+  call sites.
 - **Long-running-callback detection**: single-threaded means one slow
   continuation blocks everything else the loop owns — timers, other ready
   work, all of it — with nothing able to preempt it. Measuring and

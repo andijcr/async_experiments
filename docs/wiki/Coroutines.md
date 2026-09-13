@@ -185,7 +185,7 @@ deletes `node` — *after* `run()` has already returned:
 
 ```cpp
 void run_one(detail::ready_node& node) {
-  const auto guard = destroy_guard(node); // std::unique_ptr<detail::ready_node>(&node)
+  const std::unique_ptr<detail::ready_node> guard(&node);
   ...
   node.run();
   ...
@@ -475,7 +475,7 @@ If `run()` never happened, the coroutine is still exactly where
 `await_suspend()` left it - fully intact, suspended, never touched -
 so destroying it in `abandon()` is both safe and necessary. If `run()`
 *did* happen, `abandon()` is never called at all, since the loop deletes
-such a node directly instead (`loop::destroy_guard()`) - which matters
+such a node directly instead (`loop::run_one()`'s own guard) - which matters
 because touching `handle_` at that point would be wrong: the coroutine
 either already self-destroyed (`promise_type::final_suspend()`'s
 `std::suspend_never` - `handle_` is now dangling, so even calling

@@ -130,7 +130,7 @@ owner (`bind_owner()` — see
    drain loop picks up next (the ready-queue is checked fresh every
    iteration, so a continuation completing another continuation cascades
    within one `run_until_idle()` call, not one per link).
-3. After `Node_a.run()` returns, its `destroy_guard` deallocates it —
+3. After `Node_a.run()` returns, `run_one()`'s own guard deallocates it —
    `Node_a` is gone, and with it the last strong reference `FS0` might have
    needed beyond the caller's own `promise`/`future` handles (if those were
    already dropped, `FS0` is destroyed here too).

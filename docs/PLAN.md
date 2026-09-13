@@ -4619,13 +4619,6 @@ skipping it today.
 **Changed anyway, for the style win alone** (fewer naked `delete`
 expressions, no assembly cost either way):
 
-- `loop::destroy_guard()` (`est/src/loop.cppm`): now returns
-  `std::unique_ptr<Node>(&node)` directly instead of a
-  `scope_exit`-wrapped lambda. No call-site changes needed at all -
-  `run_one()`/`fire_ready_timers()` still use `node`/`*node` directly,
-  never through `guard`; the guard only ever existed for its destructor's
-  side effect, so its exact type was never part of either caller's own
-  contract.
 - `detail::abandon_ready_node()`/`abandon_timer_node()`
   (`est/src/loop.cppm`): construct a local `const std::unique_ptr<...>`
   first, then call `abandon()` through it - ownership transfers before
@@ -4636,14 +4629,29 @@ expressions, no assembly cost either way):
   (`est/src/future.cppm`, `then_fast()`'s own mechanism, added just
   above): same pattern - a local `unique_ptr<continuation_node>` owns
   `node` before `run()` is called through it.
+- `loop::destroy_guard()` (`est/src/loop.cppm`): first changed to return
+  `std::unique_ptr<Node>(&node)` directly instead of a
+  `scope_exit`-wrapped lambda, then removed outright once that body
+  shrank to exactly that one line - a template wrapping a single-line
+  `unique_ptr<Node>(&node)` construction stopped earning its keep over
+  just writing it inline at both of its two call sites
+  (`run_one()`/`fire_ready_timers()`), which is what each now does
+  directly instead of naming a shared helper for it. One further
+  consequence surfaced by `clang-tidy`, not anticipated going in:
+  `run_one()` no longer touches any member of `*this` at all once the
+  call to `destroy_guard()` (a non-static member, needing an implicit
+  `this` just to be called) is gone -
+  `readability-convert-member-functions-to-static` caught it immediately,
+  fixed by marking `run_one()` `static`.
 
 Docs updated to match: `docs/wiki/Coroutines.md` (the `run_one()` code
 excerpt and surrounding prose, which quoted the old `scope_exit`-based
 `destroy_guard` and a literal `delete &node`),
 `docs/wiki/Continuation-Node-Mechanism.md` (the `set_continuation()` code
 excerpt in the `then_fast()` section), `docs/wiki/Loop-And-Timers.md`
-(`destroy_guard`'s own one-line description), and the doc comments on
-`ready_node`/`timer_node` themselves (no longer claiming deletion is
+(`destroy_guard`'s own description, now describing `run_one()`'s inline
+guard directly), `docs/wiki/Allocation-Patterns.md`, and the doc comments
+on `ready_node`/`timer_node` themselves (no longer claiming deletion is
 "through a plain `delete`" specifically, since it's now spelled two
 different ways depending on the call site - the actual safety argument,
 resolving through the dynamic type's own vtable slot regardless of which
@@ -4654,8 +4662,9 @@ spelling triggers it, is unchanged and still the point being made).
 `sanitize` preset (ASan+UBSan, the most relevant check here - it would
 have caught a double-free or use-after-free from a botched ownership
 handoff immediately) too; `diff-cover` coverage gate against
-`claude/then-fast-continuation` (this branch's own stacked base) at 100%
-(7/7 changed lines covered).
+`origin/main` (this PR having since been retargeted there directly, its
+original stacked base already merged) at 100%
+(9/9 changed lines covered).
 
 ---
 

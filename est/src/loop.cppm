@@ -26,8 +26,8 @@ namespace est::detail {
 // resumed coroutine handle (future_resume_node<T>, est:future).
 //
 // Destroyed on this base pointer/reference - a bare `delete`
-// (abandon_ready_node() below) or a `std::unique_ptr<ready_node>`'s own
-// implicit deletion (loop::destroy_guard() below) alike - safe despite
+// (abandon_ready_node() below) or a local `std::unique_ptr<ready_node>`'s
+// own implicit deletion (loop::run_one() below) alike - safe despite
 // the virtual destructor being the only thing this base declares,
 // because every concrete node type also has its own `operator new`/
 // `operator delete` (usually inherited from
@@ -73,7 +73,7 @@ public:
 
   // Called exactly once, immediately before a node that never ran is
   // deleted (loop::drain_pending() below) - never called on a node that
-  // did run (loop::destroy_guard() below deletes those directly, no
+  // did run (loop::run_one() below deletes those directly, no
   // abandon() call). Default is a no-op; a node whose completion needs
   // to differ on this abandoned path - est:future's future_resume_node<T>/
   // concrete_continuation<Fn, U>/flatten_forwarder<T>, est:promise's
@@ -349,28 +349,6 @@ private:
     }
   }
 
-  // Returns a guard that deletes `node` when it goes out of scope - the
-  // "always destroy after running/firing" pattern both run_one() and
-  // fire_ready_timers() need. Never calls abandon(): both callers
-  // construct this guard immediately before unconditionally calling
-  // run()/fire() on the same node, so it never counts as abandoned.
-  // A plain `std::unique_ptr<Node>`, not a scope_exit-wrapped lambda
-  // (an earlier version of this method): deletion through a
-  // `unique_ptr<Node>` where `Node` is `ready_node`/`timer_node` (the
-  // base type, not whatever concrete node this actually is) resolves
-  // through the dynamic type's own vtable slot exactly like a bare
-  // `delete` through the same reference already did - the virtual
-  // destructor both spellings rely on doesn't care which one triggers
-  // it - so this costs nothing at the call site (`node` is still used
-  // directly by both callers below, never through `guard` itself) while
-  // dropping one more hand-written `delete` expression from this file.
-  // Defined ahead of run_one()/fire_ready_timers() below: a deduced
-  // (auto) return type must be resolved from the function's own body
-  // before any earlier caller in the class can use it.
-  template <class Node> [[nodiscard]] auto destroy_guard(Node& node) noexcept {
-    return std::unique_ptr<Node>(&node);
-  }
-
   // Runs one ready continuation, checking it against
   // long_running_threshold. Single-threaded means one slow continuation
   // blocks everything else this loop owns, with nothing to preempt it,
@@ -386,8 +364,31 @@ private:
   // installed platform decides *how* to provide it. A future backend
   // could watch for a stall on its own background thread instead of only
   // checking synchronously here, without this call site changing at all.
-  void run_one(detail::ready_node& node) {
-    const auto guard = destroy_guard(node);
+  // `guard` exists purely for its destructor's side effect - `node`
+  // itself is what run() is actually called on below, never `guard` -
+  // guaranteeing the node is deleted no matter how this function
+  // returns, even though run() itself already catches every exception a
+  // callback could throw internally (this is a defensive guarantee, not
+  // something the happy path relies on). Deletion through
+  // `unique_ptr<detail::ready_node>` (the base type, not whatever
+  // concrete node this actually is) resolves through the dynamic type's
+  // own vtable slot, exactly like a bare `delete` through the same
+  // reference would - a virtual destructor makes that safe regardless of
+  // which spelling triggers it. Used inline here and in
+  // fire_ready_timers() below rather than through a shared helper: once
+  // this shrank to exactly `unique_ptr<Node>(&node)`, a template wrapping
+  // it stopped earning its keep over writing the same one line twice.
+  //
+  // static: touches no member of *this any more - long_running_threshold
+  // (below) is itself a static member, and everything else here is
+  // either the node parameter or est::platform::instance() - now that
+  // destroy_guard() (a non-static member, needing an implicit `this` to
+  // call at all) is gone from this body, nothing left requires an
+  // instance. drain_ready() below still calls this the same way either
+  // way (`run_one(*node)`, implicitly `this->run_one(*node)` for a
+  // static member too).
+  static void run_one(detail::ready_node& node) {
+    const std::unique_ptr<detail::ready_node> guard(&node);
     platform::instance().reset_loop_stall_detection();
     node.run();
     platform::instance().detect_loop_stall(long_running_threshold);
@@ -400,7 +401,7 @@ private:
       check(it != pending_timers_.end(), "loop: fired timer id missing from pending_timers_");
       auto* node = it->node;
       pending_timers_.erase(it);
-      const auto guard = destroy_guard(*node);
+      const std::unique_ptr<detail::timer_node> guard(node);
       node->fire();
     }
   }
