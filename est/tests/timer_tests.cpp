@@ -21,6 +21,10 @@ public:
   // implementation that actually advances a fake clock instead.
   void sleep_until(std::chrono::steady_clock::time_point /*deadline*/) const noexcept override {}
 
+  // A fixed, deterministic value: nothing in these tests exercises
+  // est::jitter.
+  [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 42; }
+
   [[noreturn]] void assert_failure(std::string_view /*message*/,
                                    std::source_location /*location*/) const noexcept override {
     std::abort();

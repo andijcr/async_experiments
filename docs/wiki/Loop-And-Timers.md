@@ -463,6 +463,100 @@ node just does `prom.set_value()`, which in turn triggers `future_state<
 void>::complete()`, which enqueues *its* continuations onto the same
 ready-queue `drain_ready()` will pick up on the loop's next iteration.
 
+## Periodic timers: `schedule_periodic()`
+
+`est::schedule_periodic(interval, fn, max_jitter = {})` (`est:timer.periodic`)
+calls `fn()` repeatedly, once every `interval` (plus a fresh, uniformly
+distributed jitter offset each period - `est::jitter`, `:util.jitter`,
+below). `Fn` must satisfy `std::invocable<Fn&>` (checked at the type, on
+both `schedule_periodic()` and `detail::periodic_timer_node<Fn>` itself -
+the same place `est::scope_exit`, `est:util.scope_exit`, constrains its
+own stored `Fn`) - `Fn&`, not plain `Fn`, since `fn_` is invoked
+repeatedly as a named member, not just once. Built entirely on
+`schedule_timer()` above, with no change to `loop.cppm` itself:
+`loop::fire_ready_timers()` unconditionally deletes every `timer_node`
+right after `fire()` returns - the same one-shot contract
+`sleep_resume_node` already relies on - so a periodic timer can't reuse
+itself in place. Instead, `detail::periodic_timer_node<Fn>::fire()` hands
+off to a **fresh** node for the next period before returning:
+
+```cpp
+void fire() override {
+  if (ctrl_->cancelled) { return; }
+  const auto period_start = platform::instance().now(); // before fn_(), not after
+  try {
+    fn_();
+  } catch (...) {
+    platform::printdbg("...");   // loud, but doesn't stop the loop or the chain
+  }
+  if (ctrl_->cancelled) { return; }   // fn_ itself may have just cancelled
+  auto& loop_ref = current_loop();    // resolved fresh, same as every other node
+  const auto offset = jitter_();
+  auto* next = new periodic_timer_node(std::move(fn_), interval_, jitter_, ctrl_);
+  loop_ref.schedule_timer(*next, period_start + interval_ + offset);
+}
+```
+
+**Fixed-rate, not fixed-delay.** `period_start` is captured *before*
+`fn_()` runs, and the next deadline is computed from it, not from a
+`now()` read taken after `fn_()` returns - so a slow or variable-latency
+`fn_()` doesn't push every later period further out by however long that
+call happened to take (the classic fixed-delay drift a naive
+`setTimeout()`-chain has). This is what a "periodic timer" means in
+practice: a `setInterval()`-style fixed cadence, anchored to when each
+period *started*, not to how long the previous one's work took.
+
+**A throwing `fn_()` is caught, not left to propagate.** `fn_` has no
+downstream `future<T>` to route an exception into the way `.then()`
+continuations do (`concrete_continuation<Fn, U>::run()`,
+[Continuation Node Mechanism](Continuation-Node-Mechanism.md)) - it
+returns `void`. Left uncaught, an exception would unwind
+`loop::fire_ready_timers()`/`run_impl()` entirely, abandoning every other
+unrelated pending timer and ready-work item on the same loop over one
+callback's own bug, and silently killing the chain forever. Caught and
+reported via `platform::printdbg()` instead (the same "loud diagnostic,
+keep going" tool `loop::run_one()`'s own long-running-callback stall
+detection already uses) - the period is skipped, the chain still
+reschedules.
+
+`fn_`/`jitter_` are moved/copied forward into each successive node rather
+than re-created, so the same jitter PRNG state (and the same callable)
+carries across the whole chain - only the node's own allocation is fresh
+each period, the same way every other node type in this codebase is a
+one-shot, freshly-allocated object rather than something reused in place.
+
+**Cancellation** is a small shared `detail::periodic_timer_control{bool
+cancelled}`, referenced by every node in the chain (`est::shared_ptr`) and
+by the `periodic_timer_handle` `schedule_periodic()` returns to the
+caller. `handle.cancel()` (or `fn_` itself calling it) just flips the
+flag - checked at the top of `fire()` (stops even an already-scheduled
+but not-yet-fired node from calling `fn_()`) and again after `fn_()`
+returns (stops `fn_` from being able to reschedule itself one last time
+after cancelling). Not atomic: this is loop-thread-side state, the same
+single-threaded assumption as everywhere else in `est`.
+
+`interval` must be positive and `max_jitter` strictly less than `interval`
+(both `est::check()`-enforced): a jittered delay of exactly zero risks the
+rescheduled node landing in the very timer batch that's still firing
+(`fire_ready_timers()` evaluates "now" once per batch, so a same-instant
+reschedule would be picked up and re-fired before that batch ever returns
+to `loop`'s own outer `for (;;)`), and jitter is meant to perturb a
+period, not invert or collapse it.
+
+### `est::jitter` (`:util.jitter`)
+
+A small, self-seeding uniform-jitter generator - `std::minstd_rand` (a
+single-word-state 32-bit LCG, not `std::mt19937`'s much larger state) plus
+a `std::uniform_int_distribution` over `[-max_jitter, +max_jitter]`.
+Seeded once, at construction, from `platform::instance().get_random_seed()`
+(`:platform`) - the one place in this codebase that needs actual
+randomness, and the one new platform hook this feature added (`hosted_stdcpp`
+answers it via `std::random_device`, falling back to `now()`'s own bit
+pattern if that throws; a future bare-metal backend would answer from
+whatever hardware entropy source it has). Not cryptographically secure,
+nor does it need to be - jitter only has to differ from the last draw,
+never resist prediction.
+
 ## `run()` vs. `run_until_idle()`, and `stop()`
 
 Both currently do exactly the same thing — drain ready work, sleep until the

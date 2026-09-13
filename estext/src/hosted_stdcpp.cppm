@@ -24,6 +24,22 @@ public:
     std::this_thread::sleep_until(deadline);
   }
 
+  // std::random_device itself can throw (implementation-defined, if no
+  // entropy source is available) - caught the same way assert_failure()/
+  // vprintdbg() below already guard their own fallible std:: calls,
+  // falling back to now()'s own bit pattern (never truly random, but at
+  // least not identical across process runs) rather than letting this
+  // noexcept method terminate the program over something only ever used
+  // for jitter.
+  [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override {
+    try {
+      std::random_device dev;
+      return (static_cast<std::uint64_t>(dev()) << 32) | dev();
+    } catch (...) {
+      return static_cast<std::uint64_t>(now().time_since_epoch().count());
+    }
+  }
+
   // std::vprint_unicode(), not std::println(): this is the type-erased
   // half of the split printdbg()/interface::vprintdbg() (platform.cppm's
   // own doc comments) exists for - fmt/args already arrive pre-erased via

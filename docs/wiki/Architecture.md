@@ -19,6 +19,8 @@ graph BT
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
   current_loop[":util.current_loop<br/>make_current_loop(loop&amp;), current_loop()"]
+  jitter[":util.jitter<br/>jitter"]
+  timer_periodic[":timer.periodic<br/>schedule_periodic(), periodic_timer_handle"]
   future[":future<br/>future_state&lt;T&gt;, future&lt;T&gt;, continuation_node&lt;T&gt;, promise_type"]
   promise[":promise<br/>promise&lt;T&gt;, make_promise_future, sleep_for/sleep_until"]
   when_all[":when_all<br/>when_all(), detail::when_all_state"]
@@ -45,6 +47,14 @@ graph BT
   current_loop --> loop
   current_loop --> platform
   current_loop --> scope_exit
+  jitter --> check
+  jitter --> platform
+  timer_periodic --> check
+  timer_periodic --> loop
+  timer_periodic --> platform
+  timer_periodic --> current_loop
+  timer_periodic --> jitter
+  timer_periodic --> shared_ptr
   future --> check
   future --> loop
   future --> intrusive_list
@@ -84,6 +94,18 @@ than a coroutine of its own, the same "producer without `co_await`"
 pattern `sleep_until()` (`:promise`) already uses; on `:util.intrusive_list`
 for its own waiter queue; and on `:check` directly for `set(n)`'s `n > 0`
 precondition and `one_shot_event::set()`'s at-most-once enforcement.
+
+`:util.jitter` depends only on `:platform` (for
+`platform::instance().get_random_seed()`, the one hook it needs) and
+`:check` (a non-negative `max_jitter` precondition) — nothing else in
+`est` needs randomness, so this is the one partition that does.
+`:timer.periodic` sits just above `:util.current_loop` (needing
+`current_loop()`/`current_allocator()` the same way `sleep_for()`/
+`yield_execution()` do), pulling in `:util.jitter` for its own jittered
+re-scheduling and `:util.shared_ptr` for the small cancellation control
+block shared across a periodic chain's nodes — deliberately *not*
+`:future`/`:promise`: nothing about `schedule_periodic()` is awaited, so
+it has no reason to depend on either.
 
 `:sync.mutex` depends on `:sync.event` — `est::mutex` isn't its own
 implementation any more (issue #67): it holds a single

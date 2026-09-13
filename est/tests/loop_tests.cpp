@@ -47,6 +47,11 @@ public:
     current = std::max(current, deadline);
   }
 
+  // A fixed, deterministic value: nothing in these tests exercises
+  // est::jitter, and a fixed seed keeps anything that indirectly does
+  // reproducible rather than flaky.
+  [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 42; }
+
   [[noreturn]] void assert_failure(std::string_view /*message*/,
                                    std::source_location /*location*/) const noexcept override {
     std::abort();
@@ -87,6 +92,10 @@ public:
   void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
     current = std::max(current, deadline);
   }
+
+  // A fixed, deterministic value - see fake_platform's own identical
+  // override, above, for why.
+  [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 42; }
 
   [[noreturn]] void assert_failure(std::string_view /*message*/,
                                    std::source_location /*location*/) const noexcept override {
