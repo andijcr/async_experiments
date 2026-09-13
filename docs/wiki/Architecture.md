@@ -15,6 +15,7 @@ graph BT
   shared_ptr[":util.shared_ptr<br/>shared_ptr&lt;T&gt;, ref_counted"]
   intrusive_list[":util.intrusive_list<br/>intrusive_list_node, intrusive_list&lt;T&gt;"]
   event[":sync.event<br/>counting_event&lt;Mode&gt;, binary_event&lt;Mode&gt;, one_shot_event&lt;Mode&gt;"]
+  external_event[":sync.external_event<br/>external_event&lt;T&gt;"]
   mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
   loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
@@ -34,6 +35,8 @@ graph BT
   event --> future
   event --> promise
   event --> current_loop
+  external_event --> future
+  external_event --> event
   mutex --> future
   mutex --> promise
   mutex --> event
@@ -106,6 +109,16 @@ re-scheduling and `:util.shared_ptr` for the small cancellation control
 block shared across a periodic chain's nodes — deliberately *not*
 `:future`/`:promise`: nothing about `schedule_periodic()` is awaited, so
 it has no reason to depend on either.
+
+`:sync.external_event` depends only on `:sync.event` (its internal
+`est::binary_event<EventResetMode::manual>`) and `:future` (to spell out
+`wait()`'s own `future<void>` return type in its own file - `:sync.event`
+imports `:future` too, but as a plain, non-exported `import`, which
+doesn't make the name visible to a third partition merely importing
+`:sync.event`). Notably *not* `:platform`: unlike `:util.jitter`,
+`external_event<T>` never calls `platform::instance()` itself - the
+`std::atomic<T>&` it bridges is entirely caller-supplied, with no
+platform hook of its own needed anywhere.
 
 `:sync.mutex` depends on `:sync.event` — `est::mutex` isn't its own
 implementation any more (issue #67): it holds a single

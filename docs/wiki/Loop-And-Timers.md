@@ -557,6 +557,80 @@ whatever hardware entropy source it has). Not cryptographically secure,
 nor does it need to be - jitter only has to differ from the last draw,
 never resist prediction.
 
+## Bridging external writers: `est::external_event<T>` (`:sync.external_event`)
+
+`est::schedule_periodic()` above answers "run this periodically"; issue
+#74 asked for the other half - "wake up when something *outside* this
+loop's own call stack changes." `est::external_event<T>` bridges a value
+written from another thread, an ISR, or (on a future bare-metal target) a
+hardware register into `est`'s existing cooperative event system
+(`est::binary_event<EventResetMode::manual>`, above) - the *one*
+deliberate exception to this codebase's single-threaded/no-atomics rule
+(`CLAUDE.md`): the `std::atomic<T>&` it wraps is the FFI boundary itself,
+never touched anywhere in this class except inside `poll()`.
+
+```cpp
+template <class T>
+  requires std::equality_comparable<T>
+class external_event {
+public:
+  explicit external_event(std::atomic<T>& source) noexcept;
+
+  void poll() noexcept;                       // loop-thread only, never suspends
+  [[nodiscard]] auto wait() -> future<void>;   // delegates to the internal binary_event
+  void reset() noexcept;                       // re-arms for the next change
+  [[nodiscard]] auto value() const noexcept -> T;
+
+private:
+  std::atomic<T>* source_;
+  T last_seen_;
+  binary_event<EventResetMode::manual> event_;
+};
+```
+
+`T` must be lock-free (`static_assert(std::atomic<T>::is_always_lock_free)`)
+- `poll()` is meant to be callable from a context as constrained as a
+periodic timer callback (eventually: an ISR), so it must never silently
+block on a fallback lock the way a non-lock-free `std::atomic<T>` could.
+`poll()` is the *only* place this class ever reads `source_`: it loads
+with `memory_order_acquire` (pairing with the external writer's own
+`memory_order_release` store or stronger) and, if the value changed since
+the last poll, updates `last_seen_` and calls `event_.set()`. Everything
+else - the cached `last_seen_`, the internal `binary_event` - lives
+entirely on the loop thread, same single-threaded assumption as
+everywhere else in `est`.
+
+**Level-triggered, with an explicit `reset()` step, not edge-triggered
+per change.** `poll()` calling `event_.set()` (idempotent, stays signaled
+until `reset()`) rather than something that fires once per distinct value
+means a consumer that calls `wait()` after several changes have already
+happened still resolves immediately via `binary_event`'s own
+already-signaled fast path, observing the *latest* value via `value()` -
+it was never meant to replay every intermediate one. A change that
+happens before the consumer calls `reset()` is folded into the value
+`reset()` will next observe, not lost or double-counted; a change *after*
+`reset()` sets the event again. This mirrors every other `EventResetMode::
+manual` primitive in this codebase (`counting_event<manual>`,
+`binary_event<manual>`) rather than inventing new semantics.
+
+**Deliberately not started/owned by this class** - a caller wires
+`poll()` into `schedule_periodic()` explicitly, rather than
+`external_event<T>` starting a periodic timer of its own:
+
+```cpp
+std::atomic<int> reading{0};             // written by another thread/ISR
+est::external_event<int> bridge{reading};
+auto handle = est::schedule_periodic(50ms, [&bridge] { bridge.poll(); });
+// ... co_await bridge.wait(); use bridge.value(); bridge.reset();
+```
+
+This lets one periodic timer's callback drive several sources' `poll()`
+calls at once, or drive `poll()` from something other than a timer
+entirely, and keeps `external_event<T>` trivially unit-testable without
+any real second thread: a test just assigns directly to the
+`std::atomic<T>` it constructs the bridge over, single-threaded, matching
+every other test in this codebase (`est/tests/external_event_tests.cpp`).
+
 ## `run()` vs. `run_until_idle()`, and `stop()`
 
 Both currently do exactly the same thing — drain ready work, sleep until the
