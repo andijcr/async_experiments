@@ -13,15 +13,22 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(Catch2)
 
 add_executable(larson_scanner_tests
+  test_main.cpp
   larson_scanner_tests.cpp
+  larson_scanner_app_tests.cpp
 )
-# Catch2::Catch2WithMain, not the bare Catch2::Catch2 est/tests/ and
-# examples/spreadsheet/tests/ use: larson_scanner.cppm has no est::
-# dependency at all, so there's no platform::interface to install
-# before any TEST_CASE runs.
+# Catch2::Catch2, not Catch2::Catch2WithMain: test_main.cpp supplies its
+# own main(), installing a platform::interface before any TEST_CASE runs
+# - needed for larson_scanner_app_tests.cpp's cases, which drive a real
+# est::loop (larson_scanner_tests.cpp's own pure-logic cases don't need
+# it, but having one installed doesn't affect them either), matching
+# examples/spreadsheet/tests/CMakeLists.txt's identical reasoning.
 target_link_libraries(larson_scanner_tests PRIVATE
+  est::est
+  estext::estext
   larson_scanner::larson_scanner
-  Catch2::Catch2WithMain
+  larson_scanner::larson_scanner_app
+  Catch2::Catch2
 )
 est_set_warnings(larson_scanner_tests)
 est_enable_coverage(larson_scanner_tests)

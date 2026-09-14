@@ -1,6 +1,7 @@
 import est;
 import estext;
 import larson_scanner;
+import larson_scanner_app;
 import std;
 
 // EXIT_SUCCESS/EXIT_FAILURE and std::setvbuf()'s _IOLBF are macros/
@@ -9,39 +10,13 @@ import std;
 #include <cstdio>
 #include <cstdlib>
 
-namespace {
-
-// Drains every command currently queued in *commands and applies each
-// to *buffer, stopping *loop_ptr on a quit command. Suspends between
-// batches on new_commands->wait() - woken only when the poll-only
-// periodic timer (main() below) has actually observed
-// command_count move, never on a fixed schedule of its own. Named
-// function with pointer parameters, not a capturing lambda coroutine -
-// same reasoning examples/spreadsheet/main.cpp's own run_server() gives
-// for its own coroutine (a reference or capture copied into a
-// coroutine frame can still dangle if the referent doesn't outlive the
-// frame; a pointer parameter says nothing implicit about that either
-// way, matching cppcoreguidelines-avoid-reference-coroutine-parameters/
-// -avoid-capturing-lambda-coroutines).
-auto drain_commands(est::spsc_ring<larson_scanner::command>* commands,
-                    est::external_event<std::size_t>* new_commands,
-                    larson_scanner::led_buffer* buffer,
-                    est::loop* loop_ptr) -> est::future<void> {
-  for (;;) {
-    co_await new_commands->wait();
-    new_commands->reset();
-    while (const auto cmd = commands->try_pop()) {
-      if (cmd->kind == larson_scanner::CommandKind::quit) {
-        loop_ptr->stop();
-        co_return;
-      }
-      larson_scanner::apply(*buffer, *cmd);
-    }
-  }
-}
-
-} // namespace
-
+// main() itself is now the entire "I/O" half of this program: everything
+// est::-shaped (the loop, the timers, the command queue/event handoff)
+// lives in larson_scanner_app::app (src/larson_scanner_app.cppm) instead -
+// this file only turns command-line/stdin I/O into calls against that
+// class's own plain, blocking interface (push_command()/loop(), no
+// future<T> in either), and turns the led_buffer it hands back via the
+// render callback into the actual printed UTF8/ANSI text.
 auto main() -> int {
   // A concrete platform::interface isn't installed automatically just
   // by `import est;` - this program's own decision to make, same as
@@ -55,69 +30,37 @@ auto main() -> int {
   // examples/spreadsheet/main.cpp gives for the identical call.
   std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
-  using namespace std::chrono_literals;
-
-  // Everything that can actually throw (spsc_ring<T>'s/led_buffer's own
-  // allocations, schedule_periodic()'s precondition checks, std::jthread
-  // construction, loop.run() itself) lives inside this one try block -
-  // nothing throwing is reachable from main() outside it.
+  // Everything that can actually throw (larson_scanner::app's own
+  // allocations, std::jthread construction, app::loop() itself) lives
+  // inside this one try block - nothing throwing is reachable from
+  // main() outside it.
   try {
-    est::loop loop;
-    const auto loop_guard = est::make_current_loop(loop);
-
-    larson_scanner::led_buffer buffer(40, 20.0F, 0.01F);
+    larson_scanner::app scanner_app(larson_scanner::app_config{},
+                                    [](const larson_scanner::led_buffer& buffer) {
+                                      std::println("{}", larson_scanner::render(buffer));
+                                    });
 
     // The controller: a real std::jthread genuinely blocks on
-    // std::getline() (fine here - it's not the one thread est::loop
-    // runs on), pushes each parsed command into commands, and bumps
-    // command_count once per push so new_commands (an
-    // est::external_event<std::size_t> bridging that counter) can wake
-    // drain_commands() above - est::spsc_ring<T>'s own
-    // "composition, not reuse" story (docs/wiki/Loop-And-Timers.md),
-    // for real. Capacity 16 - comfortably more than a human can type
-    // ahead of a drain.
-    est::spsc_ring<larson_scanner::command> commands(16);
-    std::atomic<std::size_t> command_count{0};
-    est::external_event<std::size_t> new_commands{command_count};
-
-    std::jthread input_thread([&commands, &command_count] {
-      std::size_t pushed = 0;
+    // std::getline() (fine here - it's not the one thread app::loop()
+    // runs on) and hands each parsed command straight to
+    // scanner_app.push_command() - est::spsc_ring<T>/
+    // est::external_event<T>'s own "composition, not reuse" story
+    // (docs/wiki/Loop-And-Timers.md), now entirely app's own concern
+    // rather than this file's.
+    std::jthread input_thread([&scanner_app] {
       std::string line;
       while (std::getline(std::cin, line)) {
         if (const auto cmd = larson_scanner::parse_command(line)) {
-          while (!commands.try_push(larson_scanner::command{*cmd})) {
-            std::this_thread::yield(); // ring momentarily full - back off and retry
-          }
-          command_count.store(++pushed, std::memory_order_release);
+          scanner_app.push_command(*cmd);
         }
         // an unparseable line is silently dropped - never crash on bad input
       }
       // EOF (or a read error) also shuts the app down cleanly, via the
       // same quit command a literal "quit" line produces.
-      while (
-          !commands.try_push(larson_scanner::command{.kind = larson_scanner::CommandKind::quit})) {
-        std::this_thread::yield();
-      }
-      command_count.store(++pushed, std::memory_order_release);
+      scanner_app.push_command({.kind = larson_scanner::CommandKind::quit});
     });
 
-    // The physics tick's own scheduling stays a regular fixed-interval
-    // timer - tick_interval is reused as both schedule_periodic()'s own
-    // interval and the dt argument led_buffer::tick() receives each
-    // time, rather than led_buffer::tick() assuming any particular
-    // cadence on its own (see its own doc comment in
-    // larson_scanner.cppm for why that split matters).
-    constexpr auto tick_interval = 20ms;
-    auto tick_handle = est::schedule_periodic(
-        tick_interval, [&buffer, tick_interval] { buffer.tick(tick_interval); });
-    auto render_handle = est::schedule_periodic(
-        33ms, [&buffer] { std::println("{}", larson_scanner::render(buffer)); });
-    // poll() only - an O(1) load+compare, never touches commands itself;
-    // the actual drain happens in drain_commands() above, once woken.
-    auto poll_handle = est::schedule_periodic(20ms, [&new_commands] { new_commands.poll(); });
-
-    auto commands_task = drain_commands(&commands, &new_commands, &buffer, &loop);
-    loop.run();
+    scanner_app.loop(); // blocks until input_thread pushes a quit command
   } catch (...) {
     return EXIT_FAILURE;
   }
