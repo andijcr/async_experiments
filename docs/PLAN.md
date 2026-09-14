@@ -5530,7 +5530,7 @@ below.
   `external_event_tests.cpp` established generalizes cleanly: `try_push()`
   called directly from the test body, no real second thread needed to
   exercise the logic correctly - plus one test that does use a real
-  `std::thread` producer racing a `schedule_periodic()`-driven consumer
+  `std::jthread` producer racing a `schedule_periodic()`-driven consumer
   over wall-clock time (see below), since `spsc_ring<T>` is the one type
   in this codebase whose whole contract is an actual cross-thread handoff.
 
@@ -5577,27 +5577,53 @@ ring, assert the source pointer is still non-null) before assuming the
 by-value signature was fine; a genuine "test what the doc comment
 promises" catch, not a review finding.
 
-**A real second thread, requested separately.** Every
-other test in this file simulates the producer by calling `try_push()`
-directly - single-threaded, matching `external_event_tests.cpp`'s
-established convention. Added one test that doesn't: a real `std::thread`
-producer pushing 2000 values into a 16-slot ring while the loop thread
-drains it via `schedule_periodic()`, using the real `platform::interface`
-(not a fake clock) so the two threads genuinely interleave over
-wall-clock time. `std::jthread` was
-tried first and rejected - its internal stop-token machinery pulls in
-`std::atomic<T>::wait()`/`notify_all()`, and this toolchain's linked
-libc++ doesn't have those symbols available at link time
-(`__atomic_monitor_global`/`__atomic_wait_global_table` undefined
-references), a toolchain gap unrelated to `spsc_ring<T>` itself; plain
-`std::thread` with an explicit `.join()` sidesteps it entirely. Needed
-`find_package(Threads REQUIRED)` + `Threads::Threads` added to
-`est/tests/CMakeLists.txt` - the first test in this codebase to link a
-real thread. Note this codebase's `sanitize` preset is ASan+UBSan only,
-not ThreadSanitizer, so this test's own pass/fail says nothing new about
-the atomics' correctness beyond what the memory-ordering proof above
-already establishes - it exercises the real-OS-thread code path (which
-CI otherwise never does), not a substitute for that proof.
+**A real second thread, requested separately.** Every other test in this
+file simulates the producer by calling `try_push()` directly -
+single-threaded, matching `external_event_tests.cpp`'s established
+convention. Added one test that doesn't: a real `std::jthread` producer
+pushing 2000 values into a 16-slot ring while the loop thread drains it
+via `schedule_periodic()`, using the real `platform::interface` (not a
+fake clock) so the two threads genuinely interleave over wall-clock time.
+Note this codebase's `sanitize` preset is ASan+UBSan only, not
+ThreadSanitizer, so this test's own pass/fail says nothing new about the
+atomics' correctness beyond what the memory-ordering proof above already
+establishes - it exercises the real-OS-thread code path (which CI
+otherwise never does), not a substitute for that proof.
+
+**A real toolchain gap, found and fixed rather than worked around.**
+`std::jthread` initially failed to *link* (not compile): undefined
+references to `std::__1::__atomic_monitor_global`,
+`__atomic_wait_global_table`, `__atomic_notify_all_global_table` - hidden
+helper functions behind `std::atomic<T>::wait()`/`notify_all()`, which
+`std::jthread`'s stop-token machinery uses internally. The first attempt
+worked around it (plain `std::thread` instead, `find_package(Threads
+REQUIRED)` added to `est/tests/CMakeLists.txt`) rather than root-causing
+it - correctly called out as not good enough: nothing about `std::jthread`
+or `std::atomic::wait()` should be unusable on a pinned, purpose-built
+C++23 toolchain. Root cause, confirmed by diffing `nm -D` (dynamic/
+exported symbols) against plain `nm` (every symbol, exported or not) on
+the *same* `libc++.so.1.0` install (`/usr/lib/llvm-22/lib/` and
+`/usr/lib/x86_64-linux-gnu/` are identical files, byte-for-byte - not a
+version-skew issue between two different libc++ builds): the Debian
+`libc++-22-dev` package's shared build gives those three helpers hidden
+visibility, so they never make it into the `.so`'s dynamic symbol table,
+even though the identical-version `libc++.a` *does* contain them (an
+archive's member `.o` files carry every global symbol regardless of the
+visibility attributes that gate a `.so`'s export table - visibility only
+prunes what a shared library exposes, not what a static one contains).
+Fixed at the toolchain level, not per-target: `cmake/toolchain-hosted-
+linux.cmake`'s `CMAKE_EXE_LINKER_FLAGS_INIT` gained `-static-libstdc++`
+(Clang understands this GCC-originated spelling for libc++ too),
+statically linking both `libc++` and `libc++abi` into every binary this
+project produces instead of depending on the packaged `.so`. Verified
+with a standalone repro (`std::jthread` linking against the bare `.so`:
+fails with the same three undefined references; against `-static-
+libstdc++`: links and runs) before touching the real toolchain file. This
+made the `std::thread`/`Threads::Threads` workaround unnecessary -
+reverted back to `std::jthread`, and dropped `find_package(Threads
+REQUIRED)` from `est/tests/CMakeLists.txt` entirely (this toolchain's
+`-pthread` needs, if any, are already satisfied without it - confirmed
+by a from-scratch reconfigure with it removed).
 
 **`bugprone-unchecked-optional-access` on the tests, not the source** -
 `clang-tidy` doesn't recognize `REQUIRE(popped.has_value())` immediately
@@ -5635,7 +5661,7 @@ in and back out round-trips it rather than copying; a value moved into a
 full ring is left unconsumed, not moved-from (the `T&&` bug above, caught
 by its own test); a full integration test draining a pre-filled ring
 through a real `schedule_periodic()` poll loop, matching the composition
-example above end to end; and a real `std::thread` producer racing a
+example above end to end; and a real `std::jthread` producer racing a
 `schedule_periodic()` consumer over wall-clock time (2000 items through a
 16-slot ring).
 

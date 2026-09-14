@@ -190,7 +190,7 @@ TEST_CASE("spsc_ring: drained by a real schedule_periodic() poll loop", "[spsc_r
   REQUIRE(queue.try_pop() == std::nullopt);
 }
 
-TEST_CASE("spsc_ring: a real std::thread producer and the loop-thread consumer stay correct",
+TEST_CASE("spsc_ring: a real std::jthread producer and the loop-thread consumer stay correct",
           "[spsc_ring]") {
   using namespace std::chrono_literals;
 
@@ -218,7 +218,7 @@ TEST_CASE("spsc_ring: a real std::thread producer and the loop-thread consumer s
   // no-op std::move() of an already-trivially-copyable int that
   // clang-tidy flags either of as redundant.
   auto as_prvalue = [](int value) { return value; };
-  std::thread producer([&ring, as_prvalue] {
+  std::jthread producer([&ring, as_prvalue] {
     for (int i = 0; i < item_count; ++i) {
       while (!ring.try_push(as_prvalue(i))) {
         std::this_thread::yield(); // ring momentarily full - real cross-thread backpressure

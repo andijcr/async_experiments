@@ -18,8 +18,24 @@ set(CMAKE_CXX_COMPILER clang++)
 # CMAKE_EXE_LINKER_FLAGS_INIT (rather than CMAKE_CXX_FLAGS directly) is
 # the toolchain-file-correct way to seed this: it's merged with, not
 # overwritten by, whatever a caller passes on the command line.
+#
+# -static-libstdc++ (linker flags only - clang understands this
+# GCC-originated spelling for libc++ too, statically linking libc++ *and*
+# libc++abi instead of the devenv's own libc++-22-dev-packaged .so):
+# Debian's packaged libc++.so.1 doesn't export a handful of hidden-
+# visibility helper symbols (__atomic_monitor_global() and friends,
+# behind an internal `[abi:nqe...]` tag) that std::atomic<T>::wait()/
+# notify_*() - and therefore std::jthread's stop_token machinery - need
+# at link time, even though the identical libc++.a *does* contain them
+# (an archive's member object files keep every global symbol regardless
+# of the visibility attributes that gate what a .so exports). Confirmed
+# by diffing `nm -D` against a plain `nm` on the two forms of the same
+# package/version - not a version-skew issue between two different
+# libc++ builds, just what this Debian package chooses to export
+# dynamically. Statically linking sidesteps the gap entirely rather than
+# working around it per-target.
 set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-stdlib=libc++")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-stdlib=libc++ -static-libstdc++")
 
 # Gates CMake's experimental `import std;` support. This value is
 # specific to the CMake release range it was validated against

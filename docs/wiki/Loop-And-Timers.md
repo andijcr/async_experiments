@@ -779,7 +779,7 @@ threaded, matching this codebase's established convention
 (`external_event_tests.cpp`) - `spsc_ring<T>`'s own contract only
 requires `try_push()`/`try_pop()` never run concurrently with themselves,
 not that they run on genuinely different threads to be exercised
-correctly. One test is the exception: a real `std::thread` producer
+correctly. One test is the exception: a real `std::jthread` producer
 racing a `schedule_periodic()`-driven consumer on the loop thread, using
 the real `platform::interface` (a real clock, a real blocking
 `sleep_until()`) rather than a fake one, so the two threads actually
