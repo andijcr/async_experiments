@@ -6127,6 +6127,96 @@ open for a future, separate decision (revisit once a newer Clang
 snapshot is pinned and these crashes are checked against it, or
 deliberately pursue Plan B instead). No branch, no PR for this attempt.
 
+**Confirmed both crashes are open, unfixed upstream LLVM bugs, not a
+Clang-22-specific gap.** Checked whether a newer Clang would fix either:
+both match known, currently open issues (llvm/llvm-project#208409 for
+the coroutine crash - a regression from LLVM 18, reproduced on LLVM
+main/23.0.0git itself; llvm/llvm-project#148550 for the `EarlyCSE`
+crash, same trigger shape, opened July 2025, still open). Neither is
+something a Clang version bump routes around - both live in shared
+WebAssembly-backend/optimizer passes any similarly recent LLVM build
+carries. Posted as a follow-up comment on issue #99.
+
+**The actual sidestep: `-fno-exceptions`, and a small, principled
+change to `est` itself.** Neither crash's trigger condition
+(`-mexception-handling`'s real wasm exception-handling target-feature)
+is reachable at all under `-fno-exceptions` - verified by rebuilding
+`est`'s own module tree that way: 44 of 48 partitions succeeded with
+zero crashes, the only failure being a genuine, expected compile error
+("cannot use 'try' with exceptions disabled") at `future.cppm`'s own
+`concrete_continuation::run()`. That's not a real loss of
+functionality, though: `-fno-exceptions` makes `throw` illegal
+*everywhere* in the TU, so nothing - including a `.then()` callback's
+own body - can ever throw in the first place, making that `catch`
+block genuinely dead code on this target already. Gated all four real
+`try`/`catch` sites in `est`'s own partitions (`future.cppm` ×2,
+`timer_periodic.cppm`, `platform.cppm`) behind the standard
+`__cpp_exceptions` feature-test macro instead of removing them - the
+exceptions-enabled hosted build keeps its existing behavior unchanged
+(full pipeline re-verified: 264/264 default tests, clean format/tidy,
+214/214 sanitize), and the wasm32 build now compiles the real
+`try`/`catch` code path out entirely rather than needing it deleted.
+
+**Plan A, built and verified for real, end to end.** With that fix,
+rebuilt `estwasm`/`examples/multicolor_larson_scanner/web`/the
+Dockerfile's wasi-sdk sysroot fetch against the `noeh` sysroot variant
++ `-fno-exceptions` (`cmake/toolchain-wasm32.cmake`) - all 64 build
+steps succeed, producing a valid `.wasm`. Two more real, integration-
+level bugs surfaced only once actually *running* the result (not just
+compiling it), caught by inspecting the built binary and a real
+two-instantiation test rather than assumed away:
+
+- The module defined (and exported) its own memory by default -
+  `-Wl,--shared-memory` alone doesn't force an *imported* memory, so
+  two separate `WebAssembly.instantiate()` calls would each have
+  gotten their own independent copy, silently defeating the entire
+  shared-memory design. Fixed with `-Wl,--import-memory` plus explicit
+  `-Wl,--initial-memory=`/`-Wl,--max-memory=` (shared memory requires a
+  fixed max), confirmed via `WebAssembly.Module.imports()`/`exports()`
+  against the actual built binary.
+- `_initialize()`'s disassembly shows the shared-memory data/ctor init
+  is guarded by an atomic compare-and-swap whose "not first" branch is
+  a literal `unreachable` trap, not a wait - meaning exactly one
+  instantiation (the primary, before any Worker starts) may call
+  `_initialize()`; every other instantiation sharing that memory must
+  skip it entirely, or it deterministically traps. Not something a
+  spec reading alone would have surfaced - found by running a real
+  two-instantiation Node test (`node:worker_threads`, mirroring the
+  browser's own Worker/main-thread split) and reading the crash.
+
+With both fixed, the real end-to-end test passes: the Worker's
+`est::loop` genuinely blocks via `Atomics.wait()`, the main thread's
+`push_command()` (a real, synchronous C++ call, not `postMessage`)
+visibly changes the animation through shared memory, and
+`js_worker_ready()`'s one-time handshake hands the main thread stable
+pointers into `led_buffer`'s own intensity arrays. Also verified in a
+real, unflagged headless Chromium (Playwright) end to end: the
+`coi-serviceworker.js` polyfill (vendored, MIT-licensed, unmodified)
+genuinely establishes `crossOriginIsolated` on its own - including
+exercising its COEP-degrade fallback path, the same one a real GitHub
+Pages deployment needs since Pages can't set custom COOP/COEP response
+headers - with the LED strip visibly animating and the glow effect
+(CSS custom properties + `box-shadow`, no per-frame string building)
+rendering as a soft, brightness-scaled halo rather than a flat block.
+
+**What shipped**, all reusing `larson_scanner`/`larson_scanner_app`
+*unmodified* per issue #99's own point: `estwasm` (a third
+`est::platform::interface` backend, `estext`-sibling module, routing
+`now()`/`sleep_until()`/randomness/diagnostics through
+`import_module("env")` JS imports); `examples/
+multicolor_larson_scanner/web/` (a standalone CMake project - its own
+`project()`, its own `wasm32` preset - plus `index.html`/`main.js`/
+`worker.js`/`env_shim.js`/`wasi_shim.js`/the vendored
+`coi-serviceworker.js`); `docker/Dockerfile`'s pinned wasi-sdk sysroot
+fetch (two small release assets, not the full SDK - never wasi-sdk's
+own bundled Clang); a Node-based CI smoke test
+(`examples/multicolor_larson_scanner/web/tests/`) exercising the real
+Worker/main-thread split headlessly, plus an import-section check
+against a fixed allowlist; a new `.github/workflows/ci.yml` job and a
+new `.github/workflows/pages.yml` deploying the page to GitHub Pages
+on push to main (needs a one-time manual "enable Pages for this repo"
+step outside CI, per that workflow's own top comment).
+
 ---
 
 ## Verification for M0

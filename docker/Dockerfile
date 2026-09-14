@@ -100,6 +100,43 @@ RUN arch="$(uname -m)" \
     && /tmp/cmake-install.sh --skip-license --prefix=/usr/local \
     && rm -f /tmp/cmake-install.sh
 
+# --- Pinned wasi-sdk sysroot, for examples/multicolor_larson_scanner/web's
+# wasm32-wasip1-threads build (cmake/toolchain-wasm32.cmake) ---
+# Not wasi-sdk's own bundled Clang - that build stays on this image's
+# pinned Clang ${LLVM_VERSION} throughout, cross-compiling against this
+# sysroot via --target=/--sysroot= the same way any other cross-compile
+# does. Two release assets, not the ~190MB full SDK tarball: `wasi-sysroot`
+# (libc/libm/libc++, headers + compiled libs, for every wasip1(-threads)
+# variant) and `libclang_rt` (compiler-rt builtins only - `est`'s own
+# `import std;` need libc++ but not wasi-sdk's own bundled Clang to supply
+# it).
+#
+# The builtins archive alone isn't enough to link with, though: Clang
+# auto-links `libclang_rt.builtins.a` from whatever `-resource-dir` is
+# active, and that same resource dir also has to keep supplying Clang's
+# own architecture-generic builtin headers (stddef.h, stdarg.h, float.h,
+# ...) - dropping those (by pointing `-resource-dir` at a directory that
+# only has the wasi-sdk builtins lib and nothing else) breaks every
+# `#include_next <stddef.h>` in libc++'s own headers. So this synthesizes
+# one self-contained resource dir for the wasm32 toolchain file to point
+# at: a copy of this image's own Clang ${LLVM_VERSION} resource dir (for
+# the headers) with the wasi-sdk builtins libs overlaid into its `lib/`
+# (for the one directory Clang's auto-link actually needs to find
+# `libclang_rt.builtins.a` under, per target triple).
+ARG WASI_SDK_VERSION=34
+ARG WASI_SDK_RELEASE=34.0
+RUN mkdir -p /opt/wasi-sysroot /opt/wasi-resource-wasm32 \
+    && wget --inet4-only -O /tmp/wasi-sysroot.tar.gz \
+        "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sysroot-${WASI_SDK_RELEASE}.tar.gz" \
+    && tar xzf /tmp/wasi-sysroot.tar.gz -C /opt/wasi-sysroot --strip-components=1 \
+    && rm -f /tmp/wasi-sysroot.tar.gz \
+    && cp -r "$(clang++ -print-resource-dir)/." /opt/wasi-resource-wasm32/ \
+    && wget --inet4-only -O /tmp/libclang_rt.tar.gz \
+        "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/libclang_rt-${WASI_SDK_RELEASE}.tar.gz" \
+    && tar xzf /tmp/libclang_rt.tar.gz -C /opt/wasi-resource-wasm32/lib --strip-components=1 \
+    && rm -f /tmp/libclang_rt.tar.gz \
+    && chmod -R a+rX /opt/wasi-sysroot /opt/wasi-resource-wasm32
+
 # --- Non-root user for local bind-mount ergonomics ---
 RUN groupadd --gid "${USER_GID}" est \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash est

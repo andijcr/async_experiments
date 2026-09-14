@@ -1,0 +1,14 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 4, "minor": 2, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "wasm32",
+      "displayName": "wasm32-wasip1-threads (browser Worker/main-thread build)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/wasm32",
+      "toolchainFile": "${sourceDir}/../../../cmake/toolchain-wasm32.cmake"
+    }
+  ],
+  "buildPresets": [{ "name": "wasm32", "configurePreset": "wasm32" }]
+}
