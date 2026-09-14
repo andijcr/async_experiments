@@ -65,7 +65,7 @@ auto main() -> int {
     est::loop loop;
     const auto loop_guard = est::make_current_loop(loop);
 
-    larson_scanner::led_buffer buffer(40, 0.5F, 0.85F);
+    larson_scanner::led_buffer buffer(40, 20.0F, 0.01F);
 
     // The controller: a real std::jthread genuinely blocks on
     // std::getline() (fine here - it's not the one thread est::loop
@@ -101,7 +101,15 @@ auto main() -> int {
       command_count.store(++pushed, std::memory_order_release);
     });
 
-    auto tick_handle = est::schedule_periodic(20ms, [&buffer] { buffer.tick(); });
+    // The physics tick's own scheduling stays a regular fixed-interval
+    // timer - tick_interval is reused as both schedule_periodic()'s own
+    // interval and the dt argument led_buffer::tick() receives each
+    // time, rather than led_buffer::tick() assuming any particular
+    // cadence on its own (see its own doc comment in
+    // larson_scanner.cppm for why that split matters).
+    constexpr auto tick_interval = 20ms;
+    auto tick_handle = est::schedule_periodic(
+        tick_interval, [&buffer, tick_interval] { buffer.tick(tick_interval); });
     auto render_handle = est::schedule_periodic(
         33ms, [&buffer] { std::println("{}", larson_scanner::render(buffer)); });
     // poll() only - an O(1) load+compare, never touches commands itself;

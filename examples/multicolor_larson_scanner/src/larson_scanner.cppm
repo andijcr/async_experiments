@@ -15,12 +15,12 @@ export namespace larson_scanner {
 
 // One color channel's own Larson ("KITT"/Cylon) scanner: a single point
 // of full brightness bounces back and forth across a `width`-pixel
-// strip, decaying every other pixel by `decay` each tick() - the
-// classic effect. `speed`/`decay` are public and mutable on purpose:
-// the controller (main.cpp) adjusts them live, and a getter/setter
-// pair would add ceremony without buying any real encapsulation -
-// matching est::future_state<T>'s own state_/owner_ members
-// (est/src/future.cppm) for the identical reason.
+// strip, decaying every pixel by `decay` every second - the classic
+// effect. `speed`/`decay` are public and mutable on purpose: the
+// controller (main.cpp) adjusts them live, and a getter/setter pair
+// would add ceremony without buying any real encapsulation - matching
+// est::future_state<T>'s own state_/owner_ members (est/src/future.cppm)
+// for the identical reason.
 struct scanner_channel {
   // Always called positionally from led_buffer's own constructor below,
   // with the same argument order every time; a named-parameter redesign
@@ -29,14 +29,32 @@ struct scanner_channel {
   explicit scanner_channel(std::size_t width, float initial_speed, float initial_decay)
       : speed(initial_speed), decay(initial_decay), intensity_(width, 0.0F) {}
 
-  // One time step: decay every pixel, pin the current position to full
-  // brightness, then advance the position and bounce off either end.
-  // Order matters - the position pinned to 1.0 is *this* tick's
-  // position, not next tick's, so a scanner sitting still (speed == 0)
-  // keeps exactly one pixel lit rather than drifting.
-  void tick() noexcept {
+  // One time step of `dt`: decay every pixel, pin the current position
+  // to full brightness, then advance the position by `speed * dt` and
+  // bounce off either end. Order matters - the position pinned to 1.0
+  // is *this* tick's position, not the next one's, so a scanner sitting
+  // still (speed == 0) keeps exactly one pixel lit rather than
+  // drifting.
+  //
+  // Takes `dt` rather than assuming a fixed step per call so the motion
+  // is genuinely time-independent: `speed` is pixels/second and `decay`
+  // is a per-second falloff factor, not "per call" - calling tick() at
+  // a different cadence (or with a jittered/irregular dt) still moves
+  // and fades the scanner by the physically correct amount. The actual
+  // schedule (how often tick() gets called) is entirely main.cpp's
+  // concern; this function doesn't know or care.
+  //
+  // decay is applied as pow(decay, dt) rather than a plain `decay * dt`
+  // multiply: exponential falloff compounds multiplicatively over time
+  // (v(t) = v(0) * decay^t), so this is what keeps a given `decay`
+  // value's *visual trail length in real time* constant regardless of
+  // how often tick() happens to be called - two 0.5s ticks fade a pixel
+  // by the same total factor as one 1.0s tick.
+  void tick(std::chrono::duration<float> dt) noexcept {
+    const float dt_seconds = dt.count();
+    const float per_tick_decay = std::pow(decay, dt_seconds);
     for (float& v : intensity_) {
-      v *= decay;
+      v *= per_tick_decay;
     }
     // pinned is always < intensity_.size(): position_ starts at 0 and
     // every tick() call below clamps it back into [0, size-1] before
@@ -48,7 +66,7 @@ struct scanner_channel {
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     intensity_[pinned] = 1.0F;
 
-    position_ += static_cast<float>(direction_) * speed;
+    position_ += static_cast<float>(direction_) * speed * dt_seconds;
     const auto last_index = static_cast<float>(intensity_.size() - 1);
     if (position_ >= last_index) {
       position_ = last_index;
@@ -62,9 +80,10 @@ struct scanner_channel {
   [[nodiscard]] auto intensities() const noexcept -> std::span<const float> { return intensity_; }
 
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
-  float speed; // pixels/tick
+  float speed; // pixels/second
   // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
-  float decay; // multiplicative per-pixel falloff per tick, in (0, 1)
+  float decay; // multiplicative per-pixel falloff per *second*, in (0, 1) - see tick()'s own doc
+               // comment
 
 private:
   std::vector<float> intensity_;
@@ -81,10 +100,10 @@ struct led_buffer {
         green(strip_width, initial_speed, initial_decay),
         blue(strip_width, initial_speed, initial_decay) {}
 
-  void tick() noexcept {
-    red.tick();
-    green.tick();
-    blue.tick();
+  void tick(std::chrono::duration<float> dt) noexcept {
+    red.tick(dt);
+    green.tick(dt);
+    blue.tick(dt);
   }
 
   std::size_t width;

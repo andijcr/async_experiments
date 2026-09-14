@@ -5776,6 +5776,45 @@ reason:**
   body inside the `try` - nothing throwing is reachable from `main()`
   outside it any more.
 
+**Follow-up: `tick()` takes an explicit `dt`, not an implicit "one step
+per call."** Review feedback after the initial PR: each scanner's own
+physics should be genuinely time-independent - `tick()` shouldn't
+assume it's always called at exactly the periodic timer's own
+interval, only that the *scheduling* of when it's called stays a
+regular `schedule_periodic()` timer. Both `scanner_channel::tick()`
+and `led_buffer::tick()` now take a `std::chrono::duration<float> dt`
+parameter, and `speed`/`decay` were reinterpreted from "per call" to
+genuinely physical per-second quantities: `speed` stays pixels/second
+(so position advances by `speed * dt.count()`, a plain linear scale),
+but `decay` - a multiplicative per-pixel falloff - can't scale
+linearly with `dt` and stay correct, since exponential decay compounds
+*multiplicatively* over time (`v(t) = v(0) * decay^t`). `tick()`
+applies it as `std::pow(decay, dt.count())` instead, so a pixel's trail
+length in real time stays constant regardless of how often `tick()`
+happens to be called - two `0.5s` ticks fade a pixel by the same total
+factor as one `1.0s` tick (`pow(d, 0.5) * pow(d, 0.5) == pow(d, 1.0)`).
+`main.cpp`'s own physics timer is unchanged in spirit - still a plain
+`schedule_periodic()` at a fixed interval - except that interval is now
+a named `tick_interval` constant reused as both the timer's own period
+and the `dt` argument passed to `buffer.tick()` each time, rather than
+`tick()` assuming any particular cadence on its own. Two real build
+errors surfaced fixing this: a `constexpr` interval still needs
+explicit capture (`[&buffer, tick_interval]`, not `[&buffer]`) once
+it's ODR-used inside the lambda body at runtime; and
+`Catch::Matchers::WithinAbs` is `double`-only, so passing it `float`
+literals tripped this codebase's `-Wdouble-promotion -Werror` - the new
+tests use a plain `float` epsilon comparison instead, matching every
+other assertion in this test file. Two tests added to prove the
+compounding math directly rather than just trusting the derivation:
+one ticking `1s` then two `0.5s` steps and checking the decayed
+intensity matches ticking `1s` once; one comparing two channels
+covering identical ground at different `dt` granularities (`2px/s` at
+`1s` steps vs. `4px/s` at `0.5s` steps) and checking their bounce
+sequences stay identical at every step. Every pre-existing test call
+site was updated to pass `1s` as `dt` (`pow(decay, 1) == decay`, so the
+original numeric expectations needed no changes, only the new
+argument).
+
 **Docs:** this entry (examples aren't documented in `docs/wiki/`, which
 is scoped to `est`/`estext` themselves, not `examples/`).
 
@@ -5794,18 +5833,21 @@ malformed shape (wrong token count, non-numeric value, unknown
 channel/param, trailing garbage); `apply()` exercised against each of
 the four `ChannelSelector` values individually, not just a
 representative pair, once diff-coverage caught the `green`/`blue`
-switch cases going otherwise unexercised.
+switch cases going otherwise unexercised; plus, from the `dt` follow-up
+above, decay compounding correctly across a split `dt`
+(`pow(decay, dt)`) and `speed * dt` determining distance moved rather
+than the call count.
 
-**Verified in the pinned Docker devenv:** 260/260 tests pass (13 new);
-`clang-format`/`clang-tidy` clean over the full tree (every finding
-above fixed, not suppressed without reason); `diff-cover` coverage gate
-against `main` at 100% for both new source files; a manual run (piped
-commands) confirmed the animation, live command handling, and both
-shutdown paths (`quit` and EOF) all work with no hang. The `sanitize`
-preset's own test count (214/214, unchanged) correctly excludes
-`examples/` by design (see this file's own Dockerfile/CI notes) - this
-example's tests aren't part of that run, matching every other
-`examples/*/tests` binary in this codebase.
+**Verified in the pinned Docker devenv:** 262/262 tests pass (15 new
+overall, 2 from the `dt` follow-up); `clang-format`/`clang-tidy` clean
+over the full tree (every finding above fixed, not suppressed without
+reason); `diff-cover` coverage gate against `main` at 100% for both new
+source files; a manual run (piped commands) confirmed the animation,
+live command handling, and both shutdown paths (`quit` and EOF) all
+work with no hang. The `sanitize` preset's own test count (214/214,
+unchanged) correctly excludes `examples/` by design (see this file's
+own Dockerfile/CI notes) - this example's tests aren't part of that
+run, matching every other `examples/*/tests` binary in this codebase.
 
 **Deferred, not this PR:** the WebAssembly+single-HTML-page stretch
 goal from the issue's own follow-up comment (sliders drive scanner
