@@ -1,5 +1,10 @@
 include(FetchContent)
 
+# std::jthread (spsc_ring_tests.cpp's real-thread test) needs libc++'s
+# std::atomic<T>::wait()/notify_all() support, which pulls in pthread on
+# this toolchain - nothing else in this codebase uses threads.
+find_package(Threads REQUIRED)
+
 # SYSTEM (CMake >= 3.25): marks Catch2's own include directories as
 # system headers (-isystem instead of -I), silencing -Wpedantic and
 # friends against Catch2's own internals. Doesn't cover -Wc2y-extensions
@@ -45,7 +50,7 @@ add_executable(est_tests
 # adds that link edge itself, once both est_tests and estext::estext
 # exist (CMP0079 lets another directory's scope add link dependencies to
 # a target it doesn't own).
-target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2)
+target_link_libraries(est_tests PRIVATE est::est Catch2::Catch2 Threads::Threads)
 est_set_warnings(est_tests)
 est_enable_coverage(est_tests)
 est_enable_sanitizers(est_tests)

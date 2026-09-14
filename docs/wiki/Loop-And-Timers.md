@@ -644,13 +644,14 @@ isn't acceptable.
 
 ```cpp
 template <class T>
-  requires std::is_trivially_copyable_v<T> && std::default_initializable<T>
+  requires std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T> &&
+           std::default_initializable<T>
 class spsc_ring {
 public:
   explicit spsc_ring(std::size_t capacity, allocator_type allocator = {});
 
-  [[nodiscard]] auto try_push(T value) noexcept -> bool;      // external-context only
-  [[nodiscard]] auto try_pop() noexcept -> std::optional<T>;  // loop-context only
+  [[nodiscard]] auto try_push(T&& value) noexcept -> bool;     // external-context only
+  [[nodiscard]] auto try_pop() noexcept -> std::optional<T>;   // loop-context only
 };
 ```
 
@@ -666,17 +667,28 @@ indices already needed anyway, no separate atomic count or generation
 bit:
 
 ```cpp
-[[nodiscard]] auto try_push(T value) noexcept -> bool {
+[[nodiscard]] auto try_push(T&& value) noexcept -> bool {
   const auto write_index = write_index_.load(std::memory_order_relaxed);
   const auto next_write = advance(write_index);
   if (next_write == read_index_.load(std::memory_order_acquire)) {
-    return false; // full
+    return false; // full - value untouched, still owned by the caller
   }
-  buffer_[write_index] = value;
+  buffer_[write_index] = std::move(value);
   write_index_.store(next_write, std::memory_order_release);
   return true;
 }
 ```
+
+Takes `T&&`, not `T` by value: the full check has to run *before* `value`
+is touched at all, not just before it's written into `buffer_`. A
+by-value parameter would already have moved out of the caller's object at
+the call site (`try_push(std::move(x))` moves into the parameter
+unconditionally, whether or not the push then succeeds), so a rejected
+push of a move-only `T` would silently destroy it with no way to hand it
+back - exactly the "this data actually matters" guarantee reject-on-full
+exists to uphold. Binding by reference instead defers the move to the one
+`std::move(value)` above, which runs only once the ring is known to have
+room.
 
 `write_index_` is read with `memory_order_relaxed` here for the same
 reason `external_event<T>::poll()` needs no ordering at all to read its
@@ -707,7 +719,7 @@ spelled out explicitly rather than left implicit:
   if (read_index == write_index_.load(std::memory_order_acquire)) {
     return std::nullopt; // empty
   }
-  T value = buffer_[read_index];
+  std::optional<T> value{std::move(buffer_[read_index])};
   read_index_.store(advance(read_index), std::memory_order_release);
   return value;
 }
@@ -720,19 +732,22 @@ itself ever writes `read_index_`), and its `write_index_.load(acquire)`/
 `read_index_.store(release)` pair with `try_push()`'s own release/acquire
 the same way, just with producer and consumer swapped.
 
-**`T` constrained to trivially copyable and default-constructible** -
-deliberately narrow, matching `external_event<T>`'s own "lock-free-
-adjacent" spirit (there, `std::atomic<T>::is_always_lock_free`) applied
-here to a whole slot instead: a plain, POD-like type moves between the
-caller and `buffer_` with an ordinary assignment, with no placement-new/
-manual-destroy bookkeeping anywhere and no possibility of either throwing
-- which is also what keeps `try_push()`/`try_pop()` honestly `noexcept`
-(a bounds-checked `.at()` into `buffer_` would reintroduce exactly the
-exception this class's own `noexcept` promises never happens, for an
-index that's provably always in range by construction - see the
-`NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)`
-comments at each access in `est/src/sync/spsc_ring.cppm` for why the
-unchecked form is correct here, not merely faster).
+**`T` constrained to nothrow-movable and default-constructible** - move,
+not copy: `try_push()`/`try_pop()` move `T` into and out of `buffer_`
+rather than copy it, so a move-only slot type works, most usefully
+`est::spsc_ring<std::unique_ptr<U>>` handing off ownership of a
+heap-allocated item per slot, alongside plain PODs (an `int`, a small
+struct, a `std::chrono` duration). The moves must be `noexcept` - a
+throwing move out of `buffer_` would leave a slot's state ambiguous
+mid-handoff, exactly the hazard `try_push()`/`try_pop()`'s own `noexcept`
+is meant to rule out (also why the `NOLINTNEXTLINE(cppcoreguidelines-pro-
+bounds-avoid-unchecked-container-access)`-marked accesses in
+`est/src/sync/spsc_ring.cppm` stay unchecked: a bounds-checked `.at()`
+would reintroduce exactly that exception, for an index that's provably
+always in range by construction). A trivially copyable `T` satisfies this
+trivially - its "move" is the same non-throwing copy it always was - so
+this is a strict relaxation of the class's original trivially-copyable-
+only constraint, not a different shape.
 
 **Composition with `external_event<T>`/`schedule_periodic()`, not
 inheritance or reuse** - the ring buffer and the periodic timer solve
@@ -757,6 +772,22 @@ over a monotonic write-counter bumped alongside every successful
 `try_push()`, only draining when that counter actually moved - a real
 optimization for that shape, but not something `spsc_ring<T>` itself
 needs to know about either way.
+
+Every other test in `est/tests/spsc_ring_tests.cpp` simulates the
+producer by calling `try_push()` directly from the test body, single-
+threaded, matching this codebase's established convention
+(`external_event_tests.cpp`) - `spsc_ring<T>`'s own contract only
+requires `try_push()`/`try_pop()` never run concurrently with themselves,
+not that they run on genuinely different threads to be exercised
+correctly. One test is the exception: a real `std::thread` producer
+racing a `schedule_periodic()`-driven consumer on the loop thread, using
+the real `platform::interface` (a real clock, a real blocking
+`sleep_until()`) rather than a fake one, so the two threads actually
+interleave over wall-clock time instead of the fake clock's
+instantaneous `sleep_until()` starving the producer of any window to
+run in. `spsc_ring<T>` is the one type in this codebase whose whole
+contract is a real cross-thread handoff, so it earns the one test that
+actually crosses threads.
 
 ## `run()` vs. `run_until_idle()`, and `stop()`
 

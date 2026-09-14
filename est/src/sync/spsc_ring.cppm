@@ -25,16 +25,18 @@ export namespace est {
 // allocator-first stance (docs/wiki/Allocation-Patterns.md) rather than
 // a fixed-size embedded array.
 //
-// T must be trivially copyable and default-constructible: a plain,
-// POD-like "slot" type (an int, a small struct, a std::chrono duration,
-// an enum) that try_push()/try_pop() can move between the caller and
-// buffer_ with an ordinary assignment - no placement-new/manual-destroy
-// bookkeeping anywhere, and no possibility of either throwing. A type
-// needing real construction/destruction logic (owning a std::string, a
-// std::vector, ...) isn't what this class is for - the same "lock-free-
-// adjacent" spirit est::external_event<T>'s own std::atomic<T>::
-// is_always_lock_free constraint already applies to a single value,
-// applied here to a whole slot instead.
+// T must be nothrow-movable and default-constructible: try_push()/
+// try_pop() move T into and out of buffer_ rather than copy it, so a
+// move-only "slot" type - most usefully est::spsc_ring<std::unique_ptr<U>>,
+// handing off ownership of a heap-allocated item per slot - works
+// alongside plain PODs (an int, a small struct, a std::chrono duration).
+// The moves must be noexcept: try_push()/try_pop() are themselves
+// noexcept, and a throwing move out of buffer_ (leaving the slot's state
+// ambiguous mid-handoff) is exactly the hazard that promise is meant to
+// rule out. A trivially copyable T satisfies this trivially - its "move"
+// is the same non-throwing copy it always was - so this is a strict
+// relaxation of the class's original trivially-copyable-only constraint,
+// not a different shape.
 //
 // **Reject-on-full, not overwrite-on-full**: try_push() returns false
 // once the ring is full rather than silently dropping the oldest queued
@@ -44,7 +46,8 @@ export namespace est {
 // telemetry use case) can drain more aggressively instead; this class
 // doesn't guess which policy a given caller wants.
 template <class T>
-  requires std::is_trivially_copyable_v<T> && std::default_initializable<T>
+  requires std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T> &&
+           std::default_initializable<T>
 class spsc_ring {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
@@ -80,7 +83,17 @@ public:
   // actually finished reading, never a stale view that would reject a
   // push the consumer already made room for.
   //
-  // The write into buffer_[write_index_] is a plain, unsynchronized
+  // Takes T&&, not T by value: the full check below has to run *before*
+  // value is touched at all, not just before it's written into buffer_.
+  // A by-value parameter would already have moved-from the caller's
+  // object at the call site (`try_push(std::move(x))` moves into the
+  // parameter unconditionally), so a rejected push of a move-only T would
+  // silently destroy it with no way to hand it back - exactly the "this
+  // data actually matters" guarantee this class exists to uphold. Binding
+  // by reference instead defers the move to the one call to std::move()
+  // below, which only runs once the ring is known to have room.
+  //
+  // The write into buffer_[write_index_] is a plain, unsynchronized move
   // assignment - safe because slot write_index_ is never touched by
   // try_pop() until the release store just below publishes it as
   // readable, and no other producer call can be racing this one (single
@@ -88,11 +101,11 @@ public:
   // slot off to the consumer: it publishes both the new index and,
   // via the acquire load try_pop() pairs it with, the value just written
   // into that slot.
-  [[nodiscard]] auto try_push(T value) noexcept -> bool {
+  [[nodiscard]] auto try_push(T&& value) noexcept -> bool {
     const auto write_index = write_index_.load(std::memory_order_relaxed);
     const auto next_write = advance(write_index);
     if (next_write == read_index_.load(std::memory_order_acquire)) {
-      return false; // full
+      return false; // full - value untouched, still owned by the caller
     }
     // write_index is always < buffer_.size(): it was either the initial
     // 0 or a prior advance() result, and advance() itself never returns
@@ -102,7 +115,7 @@ public:
     // worse than the plain access below, not safer, for a case that
     // provably cannot occur.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    buffer_[write_index] = value;
+    buffer_[write_index] = std::move(value);
     write_index_.store(next_write, std::memory_order_release);
     return true;
   }
@@ -129,7 +142,7 @@ public:
     // read_index is always < buffer_.size(), for the identical reason
     // try_push()'s own write_index access above is - see its comment.
     // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-    T value = buffer_[read_index];
+    std::optional<T> value{std::move(buffer_[read_index])};
     read_index_.store(advance(read_index), std::memory_order_release);
     return value;
   }

@@ -5503,12 +5503,13 @@ below.
   motivating "this data actually matters" examples; an "overwrite oldest"
   policy for a metrics/telemetry use case is left as a real but
   unimplemented future option, not guessed at.
-- **`T`'s constraints** → `std::is_trivially_copyable_v<T> &&
-  std::default_initializable<T>` (a `requires` clause) - a plain,
-  POD-like slot type moved with an ordinary assignment, no placement-new/
-  manual-destroy bookkeeping anywhere, matching `external_event<T>`'s own
-  "lock-free-adjacent" spirit applied to a whole slot instead of one
-  value.
+- **`T`'s constraints** → started as `std::is_trivially_copyable_v<T> &&
+  std::default_initializable<T>`, then relaxed before merge (see below) to
+  `std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T>
+  && std::default_initializable<T>` - a strict superset (a trivially
+  copyable type's "move" is the same non-throwing copy it always was),
+  letting a move-only slot type work too, most usefully
+  `est::spsc_ring<std::unique_ptr<U>>`.
 - **Where it lives** → its own partition, `est/src/sync/spsc_ring.cppm`
   (`:sync.spsc_ring`), alongside `mutex.cppm`/`event.cppm`/
   `external_event.cppm` rather than folded into any of them - genuinely
@@ -5528,7 +5529,10 @@ below.
 - **Testing** → the same single-threaded-simulation approach
   `external_event_tests.cpp` established generalizes cleanly: `try_push()`
   called directly from the test body, no real second thread needed to
-  exercise the logic correctly.
+  exercise the logic correctly - plus one test that does use a real
+  `std::thread` producer racing a `schedule_periodic()`-driven consumer
+  over wall-clock time (see below), since `spsc_ring<T>` is the one type
+  in this codebase whose whole contract is an actual cross-thread handoff.
 
 **A real tension between two `clang-tidy` checks, resolved by keeping the
 unchecked access.** The first draft used `buffer_.at(index)` (bounds-
@@ -5548,6 +5552,53 @@ a `NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
 plus a comment stating the invariant, rather than silently suppressing
 without explanation.
 
+**Relaxed `T` to nothrow-movable before merge, and a real bug that fell
+out of it.** Requested during review: support a move-only slot type (the
+motivating case, `est::spsc_ring<std::unique_ptr<U>>`) rather than only
+trivially copyable ones. The constraint relaxation itself was mechanical
+(`std::move()` into/out of `buffer_` instead of copy-assignment) - but
+`try_push(T value)`'s original by-value parameter turned out to be a real
+correctness bug for a move-only `T`, not just a style question. A
+by-value parameter moves out of the caller's argument at the *call site*,
+unconditionally, before `try_push()`'s own body ever checks whether the
+ring is full - so `try_push(std::move(rejected))` against a full ring
+would already have destroyed `rejected`'s contents with no way to hand
+them back, silently violating this class's own stated "never silently
+drops" guarantee the moment `T` stopped being copyable (copying doesn't
+have this hazard: the discarded parameter is a copy, the caller's
+original is untouched either way, which is exactly why it went unnoticed
+under the original trivially-copyable-only constraint). Fixed by changing
+the parameter to `T&&`: the full check now runs before `value` is touched
+at all, and the one `std::move(value)` that actually consumes it runs
+only once room is confirmed - preserving "leaves it unconsumed" for both
+copyable and move-only `T` alike. Caught by writing the test for exactly
+that guarantee (`est::spsc_ring<std::unique_ptr<int>>`, push into a full
+ring, assert the source pointer is still non-null) before assuming the
+by-value signature was fine; a genuine "test what the doc comment
+promises" catch, not a review finding.
+
+**A real second thread, requested separately.** Every
+other test in this file simulates the producer by calling `try_push()`
+directly - single-threaded, matching `external_event_tests.cpp`'s
+established convention. Added one test that doesn't: a real `std::thread`
+producer pushing 2000 values into a 16-slot ring while the loop thread
+drains it via `schedule_periodic()`, using the real `platform::interface`
+(not a fake clock) so the two threads genuinely interleave over
+wall-clock time. `std::jthread` was
+tried first and rejected - its internal stop-token machinery pulls in
+`std::atomic<T>::wait()`/`notify_all()`, and this toolchain's linked
+libc++ doesn't have those symbols available at link time
+(`__atomic_monitor_global`/`__atomic_wait_global_table` undefined
+references), a toolchain gap unrelated to `spsc_ring<T>` itself; plain
+`std::thread` with an explicit `.join()` sidesteps it entirely. Needed
+`find_package(Threads REQUIRED)` + `Threads::Threads` added to
+`est/tests/CMakeLists.txt` - the first test in this codebase to link a
+real thread. Note this codebase's `sanitize` preset is ASan+UBSan only,
+not ThreadSanitizer, so this test's own pass/fail says nothing new about
+the atomics' correctness beyond what the memory-ordering proof above
+already establishes - it exercises the real-OS-thread code path (which
+CI otherwise never does), not a substitute for that proof.
+
 **`bugprone-unchecked-optional-access` on the tests, not the source** -
 `clang-tidy` doesn't recognize `REQUIRE(popped.has_value())` immediately
 before `popped.value()` as a narrowing guard the way a plain `if` would
@@ -5556,15 +5607,21 @@ be. Rather than `NOLINT`-ing every call site, rewritten to compare the
 `std::nullopt` (`ring.try_pop() == 42`, `ring.try_pop() == std::nullopt`)
 - `std::optional`'s own `operator==` is well-defined either way it's
 engaged, so this sidesteps the question entirely instead of working
-around the checker, and reads more directly besides.
+around the checker, and reads more directly besides. The one test needing
+to actually dereference the popped value (`std::unique_ptr<int>` doesn't
+compare against a raw `int`) confirmed the checker doesn't credit
+`.value()` either, despite it being bounds-checked - narrowing with
+`if (const auto popped = ring.try_pop())`, the same idiom this file's
+`while (const auto item = ...)` drain loops already use, satisfies it.
 
 **Docs:** `docs/wiki/Home.md`'s source-location table; a new
 `:sync.spsc_ring` node and edge in `docs/wiki/Architecture.md`'s
 dependency graph, with a paragraph on why it depends on nothing but
 `:check`; a full new "A stream instead of a value" section in
 `docs/wiki/Loop-And-Timers.md`, right after `external_event<T>`'s own,
-including the composition example and the `.at()`-vs-`noexcept` tension
-above.
+including the composition example, the `.at()`-vs-`noexcept` tension
+above, the `T&&`-not-`T` rationale, and a closing note on the one
+real-thread test.
 
 **Tests added** (`est/tests/spsc_ring_tests.cpp`): empty ring `try_pop()`
 returns `nullopt`; a single push/pop round-trips a value; FIFO order
@@ -5573,15 +5630,21 @@ overwriting; a full ring accepts again once drained; interleaved push/pop
 across many more cycles than `buffer_.size()` stays correct (the classic
 place a mod-arithmetic bug in `advance()` would show up); `capacity()`
 reflects the constructor argument, not `buffer_.size()`; a trivially
-copyable struct works as `T`, not just `int`; and a full integration test
-draining a pre-filled ring through a real `schedule_periodic()` poll
-loop, matching the composition example above end to end.
+copyable struct works as `T`, not just `int`; moving a `std::unique_ptr<int>`
+in and back out round-trips it rather than copying; a value moved into a
+full ring is left unconsumed, not moved-from (the `T&&` bug above, caught
+by its own test); a full integration test draining a pre-filled ring
+through a real `schedule_periodic()` poll loop, matching the composition
+example above end to end; and a real `std::thread` producer racing a
+`schedule_periodic()` consumer over wall-clock time (2000 items through a
+16-slot ring).
 
-**Verified in the pinned Docker devenv:** 244/244 tests pass (9 new);
-`clang-format`/`clang-tidy` clean (both tensions above, resolved before
-this line); 211/211 tests pass under the `sanitize` preset (ASan+UBSan)
-too; `diff-cover` coverage gate against `main` at 98%
-(`spsc_ring.cppm` itself at 100%).
+**Verified in the pinned Docker devenv:** 247/247 tests pass (12 new,
+including 5 re-runs of the real-thread test to check for flakiness -
+none seen); `clang-format`/`clang-tidy` clean over the full tree (every
+tension above resolved, not suppressed); 214/214 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 97% (`spsc_ring.cppm` itself still at 100%).
 
 ---
 
