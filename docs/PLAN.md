@@ -5474,6 +5474,206 @@ confirm it still prints `est::future value: 42`).
 
 ---
 
+### Issue #96: `est::spsc_ring<T>` - a lock-free bounded queue, composing with `external_event<T>`/`schedule_periodic()`
+
+Requested as the natural follow-up to issue #74's own `external_event<T>`:
+"a fixed size circular queue (at runtime) written by the external context
+and read in the loop context, no mutex." Spec'd out first as its own
+issue (#96) before any code, settling the open questions the issue itself
+raised, then implemented largely as spec'd.
+
+**Why this isn't `external_event<T>` generalized.** `external_event<T>`
+is level-triggered on a single value - writes between two `poll()` calls
+collapse into one, the right tradeoff for a sensor reading, wrong for a
+stream where every value matters (log records, incoming frames, queued
+commands). `est::spsc_ring<T>` (`est/src/sync/spsc_ring.cppm`,
+`:sync.spsc_ring`) delivers every successfully pushed value exactly once,
+in order, or rejects it outright while full - never silently drops one.
+The two solve different problems and neither is built in terms of the
+other; see the "composition, not reuse" section of the design comment
+below.
+
+**Open questions from #96, settled:**
+- **Full/empty disambiguation** → `capacity() + 1` slots, the classic
+  trick: full is `advance(write_index) == read_index`, empty is
+  `write_index == read_index`, needing no separate atomic count or
+  generation bit alongside the two indices already required.
+- **Overwrite-on-full vs. reject-on-full** → reject (`try_push()` returns
+  `false`, leaves the value unconsumed) - the safer default for the
+  motivating "this data actually matters" examples; an "overwrite oldest"
+  policy for a metrics/telemetry use case is left as a real but
+  unimplemented future option, not guessed at.
+- **`T`'s constraints** → started as `std::is_trivially_copyable_v<T> &&
+  std::default_initializable<T>`, then relaxed before merge (see below) to
+  `std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_assignable_v<T>
+  && std::default_initializable<T>` - a strict superset (a trivially
+  copyable type's "move" is the same non-throwing copy it always was),
+  letting a move-only slot type work too, most usefully
+  `est::spsc_ring<std::unique_ptr<U>>`.
+- **Where it lives** → its own partition, `est/src/sync/spsc_ring.cppm`
+  (`:sync.spsc_ring`), alongside `mutex.cppm`/`event.cppm`/
+  `external_event.cppm` rather than folded into any of them - genuinely
+  standalone in the dependency graph (depends only on `:check`, not even
+  `:platform`: nothing in its own algorithm needs a clock or a random
+  seed).
+- **Memory ordering** → given its own full writeup in
+  `docs/wiki/Loop-And-Timers.md`'s new "A stream instead of a value"
+  section, as the issue itself asked for: two atomics (`write_index_`,
+  `read_index_`), each written by exactly one side, each side's own
+  `relaxed` self-read paired against the other side's `acquire`/`release`
+  cross-read - `try_push()`'s `write_index_.store(release)` is what
+  actually publishes the pushed value (everything sequenced before it,
+  including the plain unsynchronized write into `buffer_`), paired with
+  `try_pop()`'s own `write_index_.load(acquire)`; the reverse pairing on
+  `read_index_` publishes a freed slot back to the producer the same way.
+- **Testing** → the same single-threaded-simulation approach
+  `external_event_tests.cpp` established generalizes cleanly: `try_push()`
+  called directly from the test body, no real second thread needed to
+  exercise the logic correctly - plus one test that does use a real
+  `std::jthread` producer racing a `schedule_periodic()`-driven consumer
+  over wall-clock time (see below), since `spsc_ring<T>` is the one type
+  in this codebase whose whole contract is an actual cross-thread handoff.
+
+**A real tension between two `clang-tidy` checks, resolved by keeping the
+unchecked access.** The first draft used `buffer_.at(index)` (bounds-
+checked) to satisfy `cppcoreguidelines-pro-bounds-avoid-unchecked-
+container-access` - which immediately tripped `bugprone-exception-escape`
+instead, since `.at()` can throw and both `try_push()`/`try_pop()` are
+(deliberately - see the design comment) `noexcept`. Unlike the earlier
+`current_allocator_new_delete<Derived>` case where two checks wanted
+contradictory things for an equally-valid shape, this one has an actual
+answer: `write_index`/`read_index` are provably always `< buffer_.size()`
+by construction (`advance()` itself never returns otherwise), so a
+bounds check can only ever pass silently or - if the invariant were ever
+violated by a bug - throw straight through a `noexcept` function into
+`std::terminate()`, strictly worse than the plain access, not safer, for
+a case that cannot occur. Reverted to `buffer_[index]`, each site keeping
+a `NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)`
+plus a comment stating the invariant, rather than silently suppressing
+without explanation.
+
+**Relaxed `T` to nothrow-movable before merge, and a real bug that fell
+out of it.** Requested during review: support a move-only slot type (the
+motivating case, `est::spsc_ring<std::unique_ptr<U>>`) rather than only
+trivially copyable ones. The constraint relaxation itself was mechanical
+(`std::move()` into/out of `buffer_` instead of copy-assignment) - but
+`try_push(T value)`'s original by-value parameter turned out to be a real
+correctness bug for a move-only `T`, not just a style question. A
+by-value parameter moves out of the caller's argument at the *call site*,
+unconditionally, before `try_push()`'s own body ever checks whether the
+ring is full - so `try_push(std::move(rejected))` against a full ring
+would already have destroyed `rejected`'s contents with no way to hand
+them back, silently violating this class's own stated "never silently
+drops" guarantee the moment `T` stopped being copyable (copying doesn't
+have this hazard: the discarded parameter is a copy, the caller's
+original is untouched either way, which is exactly why it went unnoticed
+under the original trivially-copyable-only constraint). Fixed by changing
+the parameter to `T&&`: the full check now runs before `value` is touched
+at all, and the one `std::move(value)` that actually consumes it runs
+only once room is confirmed - preserving "leaves it unconsumed" for both
+copyable and move-only `T` alike. Caught by writing the test for exactly
+that guarantee (`est::spsc_ring<std::unique_ptr<int>>`, push into a full
+ring, assert the source pointer is still non-null) before assuming the
+by-value signature was fine; a genuine "test what the doc comment
+promises" catch, not a review finding.
+
+**A real second thread, requested separately.** Every other test in this
+file simulates the producer by calling `try_push()` directly -
+single-threaded, matching `external_event_tests.cpp`'s established
+convention. Added one test that doesn't: a real `std::jthread` producer
+pushing 2000 values into a 16-slot ring while the loop thread drains it
+via `schedule_periodic()`, using the real `platform::interface` (not a
+fake clock) so the two threads genuinely interleave over wall-clock time.
+Note this codebase's `sanitize` preset is ASan+UBSan only, not
+ThreadSanitizer, so this test's own pass/fail says nothing new about the
+atomics' correctness beyond what the memory-ordering proof above already
+establishes - it exercises the real-OS-thread code path (which CI
+otherwise never does), not a substitute for that proof.
+
+**A real toolchain gap, found and fixed rather than worked around.**
+`std::jthread` initially failed to *link* (not compile): undefined
+references to `std::__1::__atomic_monitor_global`,
+`__atomic_wait_global_table`, `__atomic_notify_all_global_table` - hidden
+helper functions behind `std::atomic<T>::wait()`/`notify_all()`, which
+`std::jthread`'s stop-token machinery uses internally. The first attempt
+worked around it (plain `std::thread` instead, `find_package(Threads
+REQUIRED)` added to `est/tests/CMakeLists.txt`) rather than root-causing
+it - correctly called out as not good enough: nothing about `std::jthread`
+or `std::atomic::wait()` should be unusable on a pinned, purpose-built
+C++23 toolchain. Root cause, confirmed by diffing `nm -D` (dynamic/
+exported symbols) against plain `nm` (every symbol, exported or not) on
+the *same* `libc++.so.1.0` install (`/usr/lib/llvm-22/lib/` and
+`/usr/lib/x86_64-linux-gnu/` are identical files, byte-for-byte - not a
+version-skew issue between two different libc++ builds): the Debian
+`libc++-22-dev` package's shared build gives those three helpers hidden
+visibility, so they never make it into the `.so`'s dynamic symbol table,
+even though the identical-version `libc++.a` *does* contain them (an
+archive's member `.o` files carry every global symbol regardless of the
+visibility attributes that gate a `.so`'s export table - visibility only
+prunes what a shared library exposes, not what a static one contains).
+Fixed at the toolchain level, not per-target: `cmake/toolchain-hosted-
+linux.cmake`'s `CMAKE_EXE_LINKER_FLAGS_INIT` gained `-static-libstdc++`
+(Clang understands this GCC-originated spelling for libc++ too),
+statically linking both `libc++` and `libc++abi` into every binary this
+project produces instead of depending on the packaged `.so`. Verified
+with a standalone repro (`std::jthread` linking against the bare `.so`:
+fails with the same three undefined references; against `-static-
+libstdc++`: links and runs) before touching the real toolchain file. This
+made the `std::thread`/`Threads::Threads` workaround unnecessary -
+reverted back to `std::jthread`, and dropped `find_package(Threads
+REQUIRED)` from `est/tests/CMakeLists.txt` entirely (this toolchain's
+`-pthread` needs, if any, are already satisfied without it - confirmed
+by a from-scratch reconfigure with it removed).
+
+**`bugprone-unchecked-optional-access` on the tests, not the source** -
+`clang-tidy` doesn't recognize `REQUIRE(popped.has_value())` immediately
+before `popped.value()` as a narrowing guard the way a plain `if` would
+be. Rather than `NOLINT`-ing every call site, rewritten to compare the
+`std::optional<T>` `try_pop()` returns directly against a value or
+`std::nullopt` (`ring.try_pop() == 42`, `ring.try_pop() == std::nullopt`)
+- `std::optional`'s own `operator==` is well-defined either way it's
+engaged, so this sidesteps the question entirely instead of working
+around the checker, and reads more directly besides. The one test needing
+to actually dereference the popped value (`std::unique_ptr<int>` doesn't
+compare against a raw `int`) confirmed the checker doesn't credit
+`.value()` either, despite it being bounds-checked - narrowing with
+`if (const auto popped = ring.try_pop())`, the same idiom this file's
+`while (const auto item = ...)` drain loops already use, satisfies it.
+
+**Docs:** `docs/wiki/Home.md`'s source-location table; a new
+`:sync.spsc_ring` node and edge in `docs/wiki/Architecture.md`'s
+dependency graph, with a paragraph on why it depends on nothing but
+`:check`; a full new "A stream instead of a value" section in
+`docs/wiki/Loop-And-Timers.md`, right after `external_event<T>`'s own,
+including the composition example, the `.at()`-vs-`noexcept` tension
+above, the `T&&`-not-`T` rationale, and a closing note on the one
+real-thread test.
+
+**Tests added** (`est/tests/spsc_ring_tests.cpp`): empty ring `try_pop()`
+returns `nullopt`; a single push/pop round-trips a value; FIFO order
+across several pushes then pops; `try_push()` rejects once full without
+overwriting; a full ring accepts again once drained; interleaved push/pop
+across many more cycles than `buffer_.size()` stays correct (the classic
+place a mod-arithmetic bug in `advance()` would show up); `capacity()`
+reflects the constructor argument, not `buffer_.size()`; a trivially
+copyable struct works as `T`, not just `int`; moving a `std::unique_ptr<int>`
+in and back out round-trips it rather than copying; a value moved into a
+full ring is left unconsumed, not moved-from (the `T&&` bug above, caught
+by its own test); a full integration test draining a pre-filled ring
+through a real `schedule_periodic()` poll loop, matching the composition
+example above end to end; and a real `std::jthread` producer racing a
+`schedule_periodic()` consumer over wall-clock time (2000 items through a
+16-slot ring).
+
+**Verified in the pinned Docker devenv:** 247/247 tests pass (12 new,
+including 5 re-runs of the real-thread test to check for flakiness -
+none seen); `clang-format`/`clang-tidy` clean over the full tree (every
+tension above resolved, not suppressed); 214/214 tests pass under the
+`sanitize` preset (ASan+UBSan) too; `diff-cover` coverage gate against
+`main` at 97% (`spsc_ring.cppm` itself still at 100%).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
