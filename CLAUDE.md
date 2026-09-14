@@ -15,7 +15,7 @@ it links) before making non-trivial changes.
 
 ## Toolchain
 
-This project needs a pinned **Clang 22/23 snapshot + libc++ + CMake 3.31+ +
+This project needs a pinned **Clang 22/23 snapshot + libc++ + CMake 4.2+ +
 Ninja** — `import std;` and C++20 module support at this level don't exist
 on typical distro toolchains. Always build/test/lint inside the devenv
 container (`docker/Dockerfile`, image `ghcr.io/andijcr/async-experiments-devenv`);
