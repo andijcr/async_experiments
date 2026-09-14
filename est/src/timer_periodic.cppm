@@ -63,6 +63,13 @@ public:
     // would make the chain's real cadence drift away from `interval` by
     // however long each call took, compounding period over period.
     const auto period_start = platform::instance().now();
+    // __cpp_exceptions gate: same reasoning as future.cppm's own
+    // concrete_continuation<Fn, U>::run() comment - fn_ genuinely can
+    // throw when exceptions are enabled, but -fno-exceptions makes
+    // `throw` illegal everywhere in the TU (fn_'s own body included), so
+    // this catch is unreachable dead code the compiler won't let this
+    // function spell on such a build.
+#ifdef __cpp_exceptions
     try {
       fn_();
     } catch (...) {
@@ -81,6 +88,9 @@ public:
       platform::printdbg(
           "est::schedule_periodic: fn() threw an exception - period skipped, chain continues");
     }
+#else
+    fn_();
+#endif
     if (ctrl_->cancelled) { // fn_ itself may have just cancelled
       return;
     }

@@ -83,7 +83,7 @@ jobs:
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
           -v ${{ github.workspace }}:/workspace -w /workspace
           ${{ env.DEVENV_IMAGE }}
-          bash -c 'find est examples -type f \( -name "*.cpp" -o -name "*.cppm" -o -name "*.h" \) -print0 | xargs -0 clang-format --dry-run --Werror'
+          bash -c 'find est estwasm examples -type f \( -name "*.cpp" -o -name "*.cppm" -o -name "*.h" \) -print0 | xargs -0 clang-format --dry-run --Werror'
 
       - name: configure
         run: >
@@ -99,12 +99,23 @@ jobs:
           ${{ env.DEVENV_IMAGE }}
           cmake --build --preset ci
 
+      # estwasm/ isn't included here (unlike the clang-format check above),
+      # and examples/multicolor_larson_scanner/web is explicitly pruned:
+      # both are only ever compiled under the wasm32 cross-toolchain (the
+      # "wasm" job below), which produces its own, separate
+      # compile_commands.json that clang-tidy -p build/ci can't use - the
+      # hosted build's own database has no entry for them at all (a bare
+      # `find est examples` would otherwise reach wasm_exports.cpp, since
+      # it's nested under examples/, and fail hard on `import estwasm`
+      # never resolving). Left as a known, documented gap (docs/PLAN.md's
+      # "Issue #99" entry) rather than papering over it with a synthetic
+      # host-compiled stand-in target.
       - name: clang-tidy check
         run: >
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
           -v ${{ github.workspace }}:/workspace -w /workspace
           ${{ env.DEVENV_IMAGE }}
-          bash -c 'find est examples -type f \( -name "*.cpp" -o -name "*.cppm" \) -print0 | xargs -0 -n1 clang-tidy -p build/ci'
+          bash -c 'find est examples -path "*/multicolor_larson_scanner/web" -prune -o -type f \( -name "*.cpp" -o -name "*.cppm" \) -print0 | xargs -0 -n1 clang-tidy -p build/ci'
 
       - name: test
         run: >
@@ -144,3 +155,57 @@ jobs:
           -v ${{ github.workspace }}:/workspace -w /workspace
           ${{ env.DEVENV_IMAGE }}
           ctest --preset sanitize
+
+  # Independent of "gate" above: examples/multicolor_larson_scanner/web is
+  # its own, fully separate CMake project (cmake/toolchain-wasm32.cmake's
+  # own top comment) targeting wasm32-wasip1-threads instead of this repo's
+  # one hosted-Linux toolchain, so it gets its own job rather than folding
+  # into "gate"'s existing configure/build/test steps. See docs/PLAN.md's
+  # "Issue #99" entry for the full design.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build devenv image (local only, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.DEVENV_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: configure (wasm32)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace/examples/multicolor_larson_scanner/web
+          ${{ env.DEVENV_IMAGE }}
+          cmake --preset wasm32
+
+      - name: build (wasm32)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace/examples/multicolor_larson_scanner/web
+          ${{ env.DEVENV_IMAGE }}
+          cmake --build --preset wasm32
+
+      # Node, not the devenv image, for the smoke test below: this repo's
+      # pinned Clang/CMake toolchain has no reason to also carry a Node
+      # install, and the smoke test's whole point is exercising the
+      # browser-shaped Worker/main-thread/SharedArrayBuffer design with a
+      # real, independent WebAssembly runtime - see
+      # examples/multicolor_larson_scanner/web/tests/smoke_test.mjs's own
+      # top comment.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: wasm smoke test (import-section check + two-instantiation Worker/main-thread run)
+        run: >
+          node examples/multicolor_larson_scanner/web/tests/smoke_test.mjs
+          examples/multicolor_larson_scanner/web/build/wasm32/larson_scanner_wasm

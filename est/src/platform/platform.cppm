@@ -153,13 +153,23 @@ public:
 // rvalue argument here would bind that reference to a temporary about to
 // expire, not extend anything's lifetime the way it might look like it
 // should.
+// __cpp_exceptions gate (est/src/future.cppm's own concrete_continuation<
+// Fn, U>::run() comment has the full reasoning): instance().vprintdbg()
+// genuinely can throw when exceptions are enabled, but -fno-exceptions
+// makes `throw` illegal everywhere in the TU, so nothing reaches this
+// catch on such a build and the compiler won't let this function spell
+// it.
 // NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
 template <class... Ts> void printdbg(std::format_string<Ts...> fmt, Ts&&... args) noexcept {
+#ifdef __cpp_exceptions
   try {
     instance().vprintdbg(fmt.get(), std::make_format_args(args...));
     // NOLINTNEXTLINE(bugprone-empty-catch)
   } catch (...) {
   }
+#else
+  instance().vprintdbg(fmt.get(), std::make_format_args(args...));
+#endif
 }
 
 } // namespace est::platform

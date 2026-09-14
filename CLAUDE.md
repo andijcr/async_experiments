@@ -48,9 +48,9 @@ ctest --preset default --output-on-failure
 ./build/default/examples/spreadsheet/tests/spreadsheet_tests "[protocol]"
 
 # Format: check, then fix
-find est examples -type f \( -name '*.cpp' -o -name '*.cppm' -o -name '*.h' \) \
+find est estwasm examples -type f \( -name '*.cpp' -o -name '*.cppm' -o -name '*.h' \) \
   -print0 | xargs -0 clang-format --dry-run --Werror
-find est examples -type f \( -name '*.cpp' -o -name '*.cppm' -o -name '*.h' \) \
+find est estwasm examples -type f \( -name '*.cpp' -o -name '*.cppm' -o -name '*.h' \) \
   -print0 | xargs -0 clang-format -i
 
 # Lint (needs a completed build first: tidy analyzes a TU that imports a
@@ -71,6 +71,14 @@ llvm-profdata merge -sparse build/ci/profraw/*.profraw -o build/ci/coverage.prof
 llvm-cov export --format=lcov --instr-profile=build/ci/coverage.profdata \
   build/ci/est/tests/est_tests --object=build/ci/est/tests/est_tests > build/ci/coverage.lcov
 diff-cover build/ci/coverage.lcov --compare-branch=origin/main --fail-under=80
+
+# examples/multicolor_larson_scanner/web: a fully separate CMake project
+# (its own preset, its own toolchain file, cmake/toolchain-wasm32.cmake)
+# targeting wasm32-wasip1-threads for a browser Worker/main-thread build -
+# not part of any preset above. Node 18+ needed for the smoke test only.
+cd examples/multicolor_larson_scanner/web
+cmake --preset wasm32 && cmake --build --preset wasm32
+node tests/smoke_test.mjs build/wasm32/larson_scanner_wasm
 ```
 
 CI (`.github/workflows/ci.yml`) runs, in order, the same steps above:

@@ -1,0 +1,94 @@
+name: pages
+
+# Publishes examples/multicolor_larson_scanner/web to GitHub Pages on
+# every push to main - rebuilds the wasm32 artifact the same way ci.yml's
+# own "wasm" job does (that job is what actually gates the build; this
+# one just re-runs it to get a fresh binary to deploy, not a review gate
+# of its own) and copies it alongside the static page files into a Pages
+# artifact.
+#
+# Needs a one-time manual step outside this workflow: GitHub Pages must
+# be enabled for this repository (Settings -> Pages -> Source: GitHub
+# Actions) before the deploy job below can succeed.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "examples/multicolor_larson_scanner/**"
+      - "estwasm/**"
+      - "est/src/**"
+      - "cmake/toolchain-wasm32.cmake"
+      - "docker/Dockerfile"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  DEVENV_IMAGE: est-devenv:pages
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build devenv image (local only, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.DEVENV_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: configure + build (wasm32)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace/examples/multicolor_larson_scanner/web
+          ${{ env.DEVENV_IMAGE }}
+          bash -c 'cmake --preset wasm32 && cmake --build --preset wasm32'
+
+      # A dedicated staging directory rather than deploying web/ directly:
+      # web/ also holds build/ (gitignored, CMake's own state) and
+      # tests/ (the Node smoke test, not part of the deployed page) -
+      # only the actual page files, plus the freshly built .wasm, belong
+      # in the Pages artifact.
+      - name: assemble Pages artifact
+        run: |
+          mkdir -p _site
+          cp examples/multicolor_larson_scanner/web/index.html \
+             examples/multicolor_larson_scanner/web/main.js \
+             examples/multicolor_larson_scanner/web/worker.js \
+             examples/multicolor_larson_scanner/web/env_shim.js \
+             examples/multicolor_larson_scanner/web/wasi_shim.js \
+             examples/multicolor_larson_scanner/web/coi-serviceworker.js \
+             _site/
+          cp examples/multicolor_larson_scanner/web/build/wasm32/larson_scanner_wasm \
+             _site/larson_scanner.wasm
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment

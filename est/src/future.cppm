@@ -117,7 +117,20 @@ public:
   // catching it costs nothing.
   void run() final {
     auto& state = *this->owner_;
+    // __cpp_exceptions (the standard SD-6 feature-test macro - defined
+    // only when exceptions are enabled), not a project-specific gate:
+    // nothing on this path can actually throw once exceptions are off
+    // (-fno-exceptions rejects `throw`/`try`/`catch` everywhere in the
+    // TU, not just here - libc++'s own internal "exceptions" route
+    // through a termination handler instead), so the try/catch is
+    // genuinely unreachable dead code on such a build, not a behavior
+    // this class gives up - it just can't be spelled the same way.
+    // Needed for the wasm32 backend (docs/PLAN.md's "Issue #99" entry):
+    // its compiler crashes on this class when the try/catch is compiled
+    // under real wasm exception-handling support instead.
+#ifdef __cpp_exceptions
     try {
+#endif
       if (state.failed()) {
         downstream_->set_exception(state.get_exception());
       } else if constexpr (std::is_void_v<T>) {
@@ -125,9 +138,11 @@ public:
       } else {
         downstream_->set_value(std::move(state).get());
       }
+#ifdef __cpp_exceptions
     } catch (...) {
       downstream_->set_exception(std::current_exception());
     }
+#endif
   }
 
   // Called only when run() never happened: the inner future_state<T>
@@ -693,7 +708,17 @@ private:
     // separately virtual invoke().
     void run() final {
       auto& state = *this->owner_;
+      // __cpp_exceptions gate: same reasoning as flatten_forwarder<T>::
+      // run()'s own comment above - fn_ genuinely can throw when
+      // exceptions are enabled (that's the entire point of this
+      // try/catch: propagating it to downstream_), but -fno-exceptions
+      // makes `throw` illegal everywhere in the TU, fn_'s own body
+      // included, so nothing reaches this catch on such a build and the
+      // try/catch becomes dead code the compiler won't even let this
+      // class spell.
+#ifdef __cpp_exceptions
       try {
+#endif
         if constexpr (detail::invocable_unwrapped<Fn, T>()) {
           if (state.failed()) {
             // Unwrapped mode's auto-propagate-on-failure, fn_ not called:
@@ -745,9 +770,11 @@ private:
           future<T> view(state.shared_from_this());
           invoke_and_fulfill(view);
         }
+#ifdef __cpp_exceptions
       } catch (...) {
         downstream_->set_exception(std::current_exception());
       }
+#endif
     }
 
     // Called only when run() never invoked fn_ at all: this node's

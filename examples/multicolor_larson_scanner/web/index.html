@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>multicolor_larson_scanner (wasm)</title>
+<style>
+  :root {
+    color-scheme: dark;
+  }
+  body {
+    margin: 0;
+    background: #0b0b0e;
+    color: #ddd;
+    font-family: system-ui, sans-serif;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2rem;
+    padding: 2rem 1rem;
+  }
+  h1 {
+    font-size: 1.1rem;
+    font-weight: 500;
+    color: #888;
+  }
+  #status {
+    font-size: 0.85rem;
+    color: #666;
+  }
+
+  /* The glow effect (docs/PLAN.md's "Issue #99" entry): main.js sets
+     --rgb/--glow per LED per frame from the wasm buffer's own
+     intensities; everything else - color, the soft box-blur halo - is
+     this one static rule, not per-frame string building. */
+  #led-strip {
+    display: flex;
+    gap: 6px;
+    padding: 2rem;
+    background: #000;
+    border-radius: 8px;
+  }
+  .led {
+    --rgb: 0 0 0;
+    --glow: 0;
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    background-color: rgb(var(--rgb) / 1);
+    box-shadow:
+      0 0 calc(var(--glow) * 14px) calc(var(--glow) * 5px) rgb(var(--rgb) / var(--glow)),
+      0 0 calc(var(--glow) * 28px) calc(var(--glow) * 10px) rgb(var(--rgb) / calc(var(--glow) * 0.5));
+  }
+
+  #controls {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 0.5rem 1rem;
+    align-items: center;
+    font-size: 0.85rem;
+    max-width: 28rem;
+    width: 100%;
+  }
+  #controls label {
+    text-align: right;
+    color: #aaa;
+  }
+  #controls output {
+    font-variant-numeric: tabular-nums;
+    color: #888;
+    width: 3.5rem;
+  }
+  #controls input[type="range"] {
+    width: 100%;
+  }
+  #controls input[data-channel="red"] { accent-color: #f44; }
+  #controls input[data-channel="green"] { accent-color: #4f4; }
+  #controls input[data-channel="blue"] { accent-color: #48f; }
+  #controls input[data-channel="all"] { accent-color: #ccc; }
+</style>
+</head>
+<body>
+<h1>multicolor_larson_scanner - est::loop, in a Web Worker</h1>
+<div id="led-strip"></div>
+<div id="status">loading…</div>
+
+<div id="controls">
+  <label for="r-speed">red speed</label>
+  <input id="r-speed" type="range" data-channel="red" data-param="speed" min="0" max="60" step="0.5" value="20" disabled />
+  <output>20</output>
+
+  <label for="r-decay">red decay</label>
+  <input id="r-decay" type="range" data-channel="red" data-param="decay" min="0" max="1" step="0.01" value="0.01" disabled />
+  <output>0.01</output>
+
+  <label for="g-speed">green speed</label>
+  <input id="g-speed" type="range" data-channel="green" data-param="speed" min="0" max="60" step="0.5" value="20" disabled />
+  <output>20</output>
+
+  <label for="g-decay">green decay</label>
+  <input id="g-decay" type="range" data-channel="green" data-param="decay" min="0" max="1" step="0.01" value="0.01" disabled />
+  <output>0.01</output>
+
+  <label for="b-speed">blue speed</label>
+  <input id="b-speed" type="range" data-channel="blue" data-param="speed" min="0" max="60" step="0.5" value="20" disabled />
+  <output>20</output>
+
+  <label for="b-decay">blue decay</label>
+  <input id="b-decay" type="range" data-channel="blue" data-param="decay" min="0" max="1" step="0.01" value="0.01" disabled />
+  <output>0.01</output>
+</div>
+
+<script>
+  // Keeps each slider's own <output> in sync - cosmetic only, no wasm
+  // call here (main.js's own listener on the same input handles that).
+  document.querySelectorAll('#controls input').forEach((input) => {
+    const out = input.nextElementSibling;
+    input.addEventListener('input', () => { out.textContent = input.value; });
+  });
+</script>
+
+<!-- Registered first, before anything else needs SharedArrayBuffer/
+     WebAssembly.Memory({shared:true}) - GitHub Pages can't set the
+     Cross-Origin-Opener-Policy/Cross-Origin-Embedder-Policy response
+     headers SharedArrayBuffer requires, so this polyfill (vendored,
+     unmodified, MIT-licensed) adds them client-side via a Service
+     Worker instead. First load registers the worker and reloads once;
+     that reload is this script's own concern, transparent to main.js. -->
+<script src="coi-serviceworker.js"></script>
+<script type="module" src="main.js"></script>
+</body>
+</html>
