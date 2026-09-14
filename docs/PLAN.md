@@ -5674,6 +5674,158 @@ tension above resolved, not suppressed); 214/214 tests pass under the
 
 ---
 
+### Issue #76: `examples/multicolor_larson_scanner` - three independent scanners, a real controller thread, composing the last several issues' own primitives
+
+Requested: a new example - three independent Larson ("KITT"/Cylon)
+scanners, one per RGB channel with its own speed/decay, animating into
+a shared LED buffer; a controller reading live string commands; an
+output module rendering the buffer as a colored terminal strip. Planned
+out (`/plan`) before any code, with two steers during that planning
+that shaped the final design more than the issue text alone did:
+
+**The controller is a real `std::jthread`, not another
+non-blocking-poll coroutine.** `examples/spreadsheet/src/
+spreadsheet_io.cppm`'s `getline_async()` (issue history, well before
+this one) polls a non-blocking fd from a coroutine specifically to
+avoid blocking the one thread `est::loop` runs on. Asked to use a
+genuine second thread instead: `input_thread` blocks on plain
+`std::getline(std::cin, line)` (fine - it isn't the loop thread),
+pushes each parsed command into an `est::spsc_ring<command>` (issue
+#96), and bumps an `std::atomic<std::size_t>` counter once per push.
+
+**Draining reacts to an event, not a fixed poll.** Second steer: don't
+drain the ring inside a periodic callback's own body. `docs/wiki/
+Loop-And-Timers.md`'s "A stream instead of a value" section (written
+for issue #96) had already named this exact optimization without
+implementing it - *"layer `est::external_event<std::size_t>` over a
+monotonic write-counter bumped alongside every successful
+`try_push()`, only draining when that counter actually moved."* This
+example is that optimization, for real: a 20ms periodic timer calls
+only `external_event<std::size_t>::poll()` (an O(1) load+compare) on
+the write-counter; a small coroutine, `drain_commands()`, `co_await`s
+the bridge's own `wait()` and only touches the ring once actually
+woken. Three primitives from three different issues - `schedule_periodic()`
+(#67-era), `spsc_ring<T>` (#96), `external_event<T>` (#74) - compose at
+one call site exactly as each was designed to, without any of them
+knowing about the others.
+
+**Module split** mirrors `examples/spreadsheet/`'s own
+`spreadsheet.cppm`/`spreadsheet_io.cppm` divide: `src/larson_scanner.cppm`
+is pure logic with no `est::` dependency at all (`scanner_channel::tick()`,
+`led_buffer`, `render()`, `parse_command()`, `apply()`) and is
+independently unit-tested; `main.cpp` is the thin wiring layer (the
+three periodic timers, the ring, the bridge, the input thread,
+`drain_commands()`). `scanner_channel::tick()` decays every pixel by
+`decay`, pins the *current* position to full brightness, then advances
+and bounces off either end - order matters, since a stationary
+scanner (`speed == 0`) needs to stay pinned rather than decay away.
+`render()` renders each pixel as a 24-bit ("truecolor") ANSI-colored
+Unicode block glyph (9 height levels, 0 = a literal space so a fully
+unlit pixel renders as blank, not a sliver), colored from that pixel's
+own R/G/B intensities, height picked by the brightest of the three.
+The command protocol is `"<channel> <param> <value>"` (`channel` ∈
+`{r, g, b, all}`, `param` ∈ `{speed, decay}`, e.g. `"r speed 0.5"`),
+plus a literal `"quit"` line; EOF on stdin synthesizes the same quit
+command, so both shutdown paths converge on one code path
+(`drain_commands()` popping a quit command calls `loop.stop()`).
+Verified manually (piped commands, a real run): both shutdown paths
+exit promptly with no hang waiting on `input_thread`'s join, and a
+live `"r speed 2.0"` visibly changes red's own trail independently of
+green/blue's.
+
+**Real `clang-tidy` findings, each fixed rather than suppressed without
+reason:**
+- `readability-identifier-naming` on the three new enum types
+  (`channel_selector`/`param_kind`/`command_kind`) - this codebase's
+  own established convention for enum *type* names is CamelCase
+  (`spreadsheet::Verb`'s own doc comment: *"this project's first enum,
+  everything else here otherwise matches the codebase's own
+  lower_snake_case"*); renamed to `ChannelSelector`/`ParamKind`/
+  `CommandKind`, enumerators stayed lowercase, matching `Verb`'s own
+  split.
+- `readability-math-missing-parentheses`/`bugprone-incorrect-roundings`
+  on a hand-rolled `* 8.0F + 0.5F` rounding trick in the glyph-selection
+  helper - replaced with `std::lround()`, the fix both diagnostics
+  themselves suggested.
+- `cppcoreguidelines-non-private-member-variables-in-classes` on
+  `scanner_channel::speed`/`decay` (public, mutable, sitting alongside
+  private `intensity_`/`position_`/`direction_`) - a real, deliberate
+  mix (the controller needs cheap direct writes; a getter/setter pair
+  buys no actual encapsulation), `NOLINTNEXTLINE`-suppressed with a
+  comment, matching `est::future_state<T>`'s own `state_`/`owner_`
+  members (`est/src/future.cppm`) for the identical reason - not a new
+  precedent, the second use of an already-established one.
+- `cppcoreguidelines-pro-bounds-avoid-unchecked-container-access` on
+  `intensity_[pinned]` inside `tick()` - `pinned` is provably always
+  `< intensity_.size()` by construction (`position_` starts at 0 and
+  every `tick()` call clamps it back into range before returning), the
+  same shape `est::spsc_ring<T>`'s own unchecked accesses already
+  document (issue #96) - `NOLINTNEXTLINE` plus the invariant, not a
+  silent suppression.
+- `bugprone-easily-swappable-parameters` on `scanner_channel`'s
+  3-argument constructor (`width`, two adjacent `float`s) -
+  `NOLINTNEXTLINE`, since it's always called positionally from
+  `led_buffer`'s own constructor with the same argument order every
+  time; a named-parameter redesign would be ceremony a small, internal
+  type doesn't need.
+- `bugprone-exception-escape` on `main()` - a real gap, not a false
+  positive: `est::spsc_ring<T>`'s/`led_buffer`'s own allocations,
+  `schedule_periodic()`'s precondition checks, and `std::jthread`
+  construction all originally sat *outside* the `try`/`catch(...)`
+  block, reachable without being caught. Fixed by moving the entire
+  body inside the `try` - nothing throwing is reachable from `main()`
+  outside it any more.
+
+**Docs:** this entry (examples aren't documented in `docs/wiki/`, which
+is scoped to `est`/`estext` themselves, not `examples/`).
+
+**Tests added** (`examples/multicolor_larson_scanner/tests/
+larson_scanner_tests.cpp`, all against the pure `larson_scanner`
+module, no I/O): `scanner_channel::tick()`'s bounce sequence made fully
+deterministic via `decay = 0` (the lit pixel traces `0, 1, 2, 1, 0` for
+a width-3 strip); decay actually fading a pixel the scanner has moved
+away from; a stationary scanner (`speed == 0`) staying pinned rather
+than decaying; `led_buffer::tick()` ticking three channels
+independently once their speeds diverge; `render()` against three
+known intensity patterns (fully lit, fully unlit, half-lit) checking
+the exact escape sequence and glyph; `parse_command()` round-tripping
+every channel/param spelling plus `"quit"`, and rejecting every
+malformed shape (wrong token count, non-numeric value, unknown
+channel/param, trailing garbage); `apply()` exercised against each of
+the four `ChannelSelector` values individually, not just a
+representative pair, once diff-coverage caught the `green`/`blue`
+switch cases going otherwise unexercised.
+
+**Verified in the pinned Docker devenv:** 260/260 tests pass (13 new);
+`clang-format`/`clang-tidy` clean over the full tree (every finding
+above fixed, not suppressed without reason); `diff-cover` coverage gate
+against `main` at 100% for both new source files; a manual run (piped
+commands) confirmed the animation, live command handling, and both
+shutdown paths (`quit` and EOF) all work with no hang. The `sanitize`
+preset's own test count (214/214, unchanged) correctly excludes
+`examples/` by design (see this file's own Dockerfile/CI notes) - this
+example's tests aren't part of that run, matching every other
+`examples/*/tests` binary in this codebase.
+
+**Deferred, not this PR:** the WebAssembly+single-HTML-page stretch
+goal from the issue's own follow-up comment (sliders drive scanner
+inputs, a Wasm build runs the animation, CSS "LEDs" show the output -
+no React, viewable straight from a GitHub Pages-hosted single HTML
+file). Corrected during planning: not necessarily an Emscripten
+dependency - this toolchain's own Clang has a native `wasm32` backend
+(`--target=wasm32-unknown-unknown`/`wasm32-wasi`) that emits `.wasm`
+directly, no POSIX emulation layer, no auto-generated JS glue. That's a
+closer fit to this codebase's own architecture than Emscripten would
+be: `est::platform::interface` is already the seam `docs/wiki/
+Architecture.md` describes existing so "a future bare-metal backend
+would be its own similarly separate module," the same as
+`estext::hosted_stdcpp` is for hosted Linux today - a minimal wasm
+backend implementing that interface would plausibly need no POSIX
+layer at all, genuinely closer to "bare metal" than "hosted." Left to
+scope as its own issue when picked up.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
