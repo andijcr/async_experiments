@@ -34,17 +34,35 @@ set(CMAKE_CXX_COMPILER clang++)
 # libc++ builds, just what this Debian package chooses to export
 # dynamically. Statically linking sidesteps the gap entirely rather than
 # working around it per-target.
-set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
+#
+# -Wno-reserved-module-identifier: CMake >= 4.2's CMAKE_CXX_MODULE_STD
+# machinery compiles libc++'s own `std.cppm` (`export module std;`) as
+# part of any target that opts into `import std;` - a synthetic,
+# per-consuming-target build product this project doesn't control the
+# source of. That file's own `export module std;` unconditionally
+# triggers Clang's reserved-module-identifier diagnostic (not gated
+# behind -Wall/-Wextra/-Wpedantic, so est_set_warnings()'s own explicit
+# flag list can't be the thing disabling it) - and since CMake 4.x's
+# synthetic std-module target inherits a consuming target's own PRIVATE
+# compile options (confirmed via CMakeConfigureLog.yaml: the failing
+# command line carries both this file's own flags and est_set_warnings()'s
+# -Werror), that library's own unavoidable warning becomes a hard build
+# failure for every target using `import std;` unless silenced here,
+# before any target's own -Werror can see it.
+set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++ -Wno-reserved-module-identifier")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-stdlib=libc++ -static-libstdc++")
 
-# Gates CMake's experimental `import std;` support. This value is
-# specific to the CMake release range it was validated against
-# (3.30.0-3.31.7); docker/Dockerfile's pinned CMAKE_VERSION (3.31.0)
-# falls inside that range. Must be set before project() - a toolchain
-# file's content runs at exactly that point, which is why this lives
-# here and not in the top-level CMakeLists.txt (CMAKE_CXX_MODULE_STD,
-# the project-level opt-in that actually requests the std module once
-# this gate allows it, is set there instead).
+# Gates CMake's experimental `import std;` support. This UUID is the
+# per-release activation value CMake documents for its own version
+# (Help/dev/experimental.rst in CMake's own source tree) - it changes
+# whenever the experimental feature's shape changes, so it's tied to
+# docker/Dockerfile's pinned CMAKE_VERSION, not portable across CMake
+# versions on its own. Current value is CMake 4.4.0's. Must be set
+# before project() - a toolchain file's content runs at exactly that
+# point, which is why this lives here and not in the top-level
+# CMakeLists.txt (CMAKE_CXX_MODULE_STD, the project-level opt-in that
+# actually requests the std module once this gate allows it, is set
+# there instead).
 #
 # Depends on docker/Dockerfile's `/usr/lib/share/libc++/v1` symlink:
 # Debian's libc++-${LLVM_VERSION}-dev package ships a
@@ -52,4 +70,4 @@ set(CMAKE_EXE_LINKER_FLAGS_INIT "-stdlib=libc++ -static-libstdc++")
 # relative to a flat install prefix Debian's packaging doesn't actually
 # have, so that symlink is what makes the real, versioned module sources
 # resolvable. See that file's comment for the layout details.
-set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "0e5b6991-d74f-4b3d-a41c-cf096e0b2508")
+set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "f35a9ac6-8463-4d38-8eec-5d6008153e7d")

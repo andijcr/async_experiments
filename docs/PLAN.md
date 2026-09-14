@@ -5946,6 +5946,114 @@ backend implementing that interface would plausibly need no POSIX
 layer at all, genuinely closer to "bare metal" than "hosted." Left to
 scope as its own issue when picked up.
 
+### Issue #99: WebAssembly build, M0 spike - a real CMake gap, then a real fix
+
+Issue #99 (github.com/andijcr/async_experiments/issues/99) reopened the
+WebAssembly stretch goal deferred out of issue #76/PR #98, adding a CSS
+box-blur glow effect for the LED output. Planned out (`/plan`), then
+steered mid-planning toward a more ambitious design than the plan's own
+first draft: rather than bypassing `est::loop` entirely and letting JS
+drive ticks directly (this plan's own original, lower-risk direction),
+see whether `est::loop` can genuinely *block*, the way it's designed to,
+inside a Web Worker - `Atomics.wait()` (the one real OS-level blocking
+primitive JS exposes) is only callable on a Worker thread, so a
+`est::platform::interface` wasm backend whose `sleep_until()` blocks via
+`Atomics.wait()` is only achievable there, which in turn - since a
+blocked Worker can't process `postMessage` at all - means genuine
+WebAssembly threads (one shared `WebAssembly.Memory`, `est::spsc_ring<T>`/
+`est::external_event<T>` reused for real, exactly as designed) rather
+than a plain JS-driven bypass. Framed as two upfront spikes (M0: does
+`import std;` work for a `wasm32` cross-compile at all; M0.5: shared
+memory across two instances of one module) deciding feasibility, with an
+explicit stop condition per steer: if a spike fails, stop and document
+findings on the issue - no silent fallback to the simpler bypass design.
+
+**M0, first attempt: a real, well-diagnosed blocker.** Fetched a pinned
+wasi-sdk-34 release purely for its `share/wasi-sysroot` (renamed
+`wasm32-wasi` → `wasm32-wasip1`/`wasm32-wasip1-threads` since this
+project's toolchain was last touched) and its `lib/clang/23` resource
+tree (compiler-rt builtins - this project's own Clang 22 package ships
+none for wasm32). Root-caused, methodically, several real (non-workaround)
+fixes along the way - `CMAKE_CXX_FLAGS_INIT` needing `--target=`/
+`--sysroot=` explicitly (CMake's own libc++-detection probe doesn't add
+them), wasi-sdk-34's classic headers living only under per-target/
+per-eh-variant subdirectories, `-mexception-handling`/
+`-D_WASI_EMULATED_SIGNAL` for wasi-libc's own `<csetjmp>`/`<csignal>`
+guards - before hitting the actual blocker: CMake 3.31 (this project's
+pin) resolves `import std;`'s module sources via `clang++
+-print-resource-dir`, which reports the compiler's own *built-in*
+default unconditionally, ignoring any `-resource-dir=`/`--sysroot=`/
+`--target=` passed alongside it - so it always compiled the *host's*
+own libc++-22 `std.cppm` against wasm32 flags instead of the
+wasi-sysroot's own, with no toolchain-file-level fix. Posted the full
+diagnostic chain to issue #99 and stopped there, per the stop condition
+- no Plan B built.
+
+**Then a real fix: CMake itself, not a wrapper.** Asked directly whether
+a newer CMake could help, or whether a filesystem-trick wrapper
+(relocating/hardlinking the compiler binary so its own default
+resource-dir traversal lands on the right files) was needed instead.
+Researched CMake's own gitlab issue tracker and found `import std;`'s
+module-source resolution was substantially reworked upstream: **CMake
+4.2** (commit landed 2025-09-11) added `CMAKE_CXX_STDLIB_MODULES_JSON`
+(an explicit override for the exact `-print-resource-dir`-based
+detection that broke M0) and `CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES`
+(extra `-isystem` paths fed into the stdlib-detection probe itself,
+fixing the earlier "Only `libc++` is supported" failure mode too) - both
+sanctioned, toolchain-file-settable variables, no CMake source patching,
+no relocated/hardlinked compiler, no symlink farm. Verified for real
+before committing to it: fetched CMake 4.4.0, retried the exact M0
+translation unit (`import std;` for `wasm32-wasip1-threads`) with the
+two new variables set, and it linked - a genuine `.wasm` binary (`\0asm`
+magic bytes confirmed), using the wasi-sysroot's own module sources this
+time, not the host's.
+
+**Bumped the project's own pinned CMake** (`docker/Dockerfile`'s
+`ARG CMAKE_VERSION`, 3.31.0 → 4.4.0) on the strength of that spike -
+this fixes a real gap for the *existing* hosted build too, not just the
+wasm effort, so it's landing as its own change rather than staying
+wasm-scoped. `cmake/toolchain-hosted-linux.cmake`'s own
+`CMAKE_EXPERIMENTAL_CXX_IMPORT_STD` UUID moved to CMake 4.4.0's current
+activation value (`f35a9ac6-...` - CMake bumps this UUID whenever the
+experimental feature's own shape changes, so it's tied to the pinned
+CMake version, not portable across versions on its own).
+
+**One real regression surfaced by the bump, fixed, not suppressed
+without reason:** CMake ≥4.2's revised `import std;` machinery compiles
+libc++'s own `std.cppm` as a synthetic *per-consuming-target* build
+product - and that synthetic target turned out to inherit a consuming
+target's own `PRIVATE` compile options (confirmed via the actual failing
+command line), meaning `est_set_warnings()`'s own `-Werror` started
+reaching `std.cppm`'s unconditional (not gated behind `-Wall`/`-Wextra`)
+`-Wreserved-module-identifier` diagnostic on `export module std;` -
+libc++'s own code, not anything this project can fix at the source.
+Added `-Wno-reserved-module-identifier` to
+`cmake/toolchain-hosted-linux.cmake`'s own `CMAKE_CXX_FLAGS_INIT`
+(toolchain-wide, matching `-stdlib=libc++`'s own "every target needs
+this" placement, and ordered so it isn't re-escalated by a later
+target's own `-Werror`, unlike a hypothetical `-Wno-error=` spelling
+would have risked).
+
+**Verified in the pinned Docker devenv**, image rebuilt with CMake
+4.4.0 (network constraints in this environment blocked a from-scratch
+`docker build` at the pre-existing, unrelated `apt.llvm.org` step - the
+same LLVM/Clang 22 install this project already pins, unchanged by this
+work - so the already-built image was patched in place with the new
+CMake and re-tagged; a real CI run, with normal network access, builds
+this Dockerfile from scratch as usual): `cmake --preset default` +
+`cmake --build --preset default` clean; `ctest --preset default` 264/264;
+`clang-format --dry-run --Werror` clean; `cmake --preset ci` +
+`cmake --build --preset ci` clean (the `-Wreserved-module-identifier`
+fix confirmed load-bearing here specifically); `clang-tidy -p build/ci`
+clean over the whole tree; `ctest --preset ci` 264/264; the coverage gate
+(no source lines in this infra-only diff, so nothing for it to check);
+`cmake --preset sanitize` + `cmake --build --preset sanitize` +
+`ctest --preset sanitize` 214/214.
+
+M0.5 (shared memory across two wasm module instances) and the real M0
+retry against the now-bumped pinned toolchain are still pending -
+next steps on issue #99, not yet done as of this entry.
+
 ---
 
 ## Verification for M0
