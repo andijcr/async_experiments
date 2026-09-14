@@ -6050,9 +6050,28 @@ clean over the whole tree; `ctest --preset ci` 264/264; the coverage gate
 `cmake --preset sanitize` + `cmake --build --preset sanitize` +
 `ctest --preset sanitize` 214/214.
 
-M0.5 (shared memory across two wasm module instances) and the real M0
-retry against the now-bumped pinned toolchain are still pending -
-next steps on issue #99, not yet done as of this entry.
+**M0 retry and M0.5, against the real bumped devenv image: both hold.**
+`import std;` for `wasm32-wasip1-threads` now succeeds (valid `.wasm`,
+`\0asm` magic verified). Stretch-checked further by compiling all 19 of
+`est`'s own `.cppm` partitions (not just a synthetic TU) - also
+succeeds end-to-end, once switched the wasm32 toolchain file to the
+wasi-sysroot's `eh` (exceptions-enabled) variant and dropped
+`-fno-exceptions -fno-rtti`: `future.cppm`'s `concrete_continuation::
+run()` genuinely uses `try`/`catch` to propagate exceptions from
+continuations, which the original `import std;`-only spike's
+`-fno-exceptions` simplification can't coexist with. M0.5 (shared
+memory across two independently-instantiated copies of one module,
+static init running exactly once): a minimal `est`-free `.wasm`,
+instantiated once as a simulated main thread and once in a real
+`node:worker_threads` Worker sharing one `WebAssembly.Memory({shared:
+true})` - the worker's own first read of a non-zero-init global came
+back correctly initialized (not zero, not garbage), and writes made
+from the worker were immediately visible to the main-thread instance's
+reads. Both results posted to issue #99. Per the stop condition, both
+spikes holding means the next step is the real Plan A build - the
+`estwasm` platform backend, the Worker/shared-memory wiring, the HTML
+page - as its own branch/PR closing issue #99, not yet started as of
+this entry.
 
 ---
 
