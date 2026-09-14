@@ -6073,6 +6073,60 @@ spikes holding means the next step is the real Plan A build - the
 page - as its own branch/PR closing issue #99, not yet started as of
 this entry.
 
+**Plan A build, started for real: blocked on genuine Clang 22.1.8
+wasm32 backend instability, not a flags problem.** Wrote the real
+pieces - `estwasm` (a third `est::platform::interface` backend,
+`estext`-sibling, routing `now()`/`sleep_until()`/randomness/
+diagnostics through `import_module("env")` JS imports, `sleep_until()`
+blocking via `Atomics.wait`), a standalone `examples/
+multicolor_larson_scanner/web/` CMake project reusing `est`/
+`larson_scanner`/`larson_scanner_app` unmodified, `wasm_exports.cpp`
+(`boot()`/`push_command()`), and `docker/Dockerfile`'s wasi-sdk sysroot
+fetch. Building it for real (not just `import std;`/`import est;` in
+isolation, M0's own scope) surfaced two independent, reproducible Clang
+22.1.8 wasm32-backend crashes on genuine, unmodified application code:
+
+1. Any real C++20 coroutine body (confirmed with a minimal, `est`-free
+   `co_await std::suspend_never{}` repro, and with the real
+   `larson_scanner_app::drain_commands()` - `future<T>` itself is a
+   coroutine return type, so this isn't avoidable) segfaults Clang's
+   `coro-split` pass when `-mexception-handling` is active *and*
+   optimizations are off (`-O0`, this toolchain's implicit default).
+   `-mexception-handling` itself isn't optional either - the `eh`
+   sysroot variant's own precompiled `libc++abi.a` requires it
+   (`__cpp_exception`/`_Unwind_RaiseException` aren't provided any
+   other way on this target), and `future_state<T>`'s own exception
+   propagation needs the `eh` variant.
+2. Raising the optimization level to `-O1`/`-O2` (which does avoid
+   crash 1) instead segfaults a *different* pass (`EarlyCSE`,
+   `llvm::simplifyInstruction`) compiling `larson_scanner.cppm`'s
+   `parse_command()` - plain `std::istringstream`/`operator>>` usage,
+   nothing exotic, no coroutines involved at all.
+
+Two unrelated crashes, in two different LLVM passes, on two different
+and unremarkable pieces of real code, surfacing only once actual
+optimization-level/flag combinations a real build needs were tried
+together (M0's own spikes never exercised a real coroutine body or
+`std::istringstream` - both passed because they were narrower than the
+actual application). That pattern - each fix uncovering a new, distinct
+crash elsewhere - is read as genuine wasm32-backend instability in this
+exact pinned Clang snapshot for real C++23-modules code, not a
+toolchain-flag gap this project can tune its way around the way M0's
+own `-print-resource-dir` gap was.
+
+Per the stop condition (docs/PLAN.md's own steer, and the comment
+already posted to issue #99): stopping here rather than stacking
+further per-file/per-optimization-level workarounds (which the pattern
+above suggests would just keep surfacing new crashes one file at a
+time) or falling back to Plan B. The `estwasm`/`web/`/Dockerfile
+changes written during this attempt were reverted rather than
+committed - they don't produce a working artifact, and this project's
+own standards (CLAUDE.md) are against landing known-fragile workarounds.
+Findings posted as a follow-up comment on issue #99; the issue stays
+open for a future, separate decision (revisit once a newer Clang
+snapshot is pinned and these crashes are checked against it, or
+deliberately pursue Plan B instead). No branch, no PR for this attempt.
+
 ---
 
 ## Verification for M0
