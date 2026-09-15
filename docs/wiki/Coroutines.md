@@ -775,3 +775,48 @@ before this refactor - whichever loop drains a mutex's deferred
 completions must outlive every mutex whose waiters it enqueues, and a
 caller must not let that loop keep running past a mutex's destruction
 while a waiter is still queued on it.
+
+## Cancellation: `stop_token` vs. abandonment
+
+Abandonment (`detail::abandoned_exception`, above) and `est::stop_token`/
+`est::stop_source` (`est:sync.stop_token`) solve two different problems
+that both end up completing a pending `future<T>` with an exception -
+easy to conflate, since both funnel through the same `set_exception()`
+channel, but they answer different questions:
+
+- **Abandonment answers "will anything ever resume this again?"** It only
+  ever fires from a destructor-time drain (`future_state<T>::~future_state()`,
+  `loop::drain_pending()`) - the *owner* of whatever a coroutine/waiter was
+  suspended on going away. There is no way to abandon something on demand;
+  it's purely a teardown-time cleanup so a suspended frame doesn't leak
+  forever with nothing left able to resume it.
+- **`stop_token` answers "please stop waiting, even though the thing you're
+  waiting on is still perfectly alive and might still complete."** A
+  `stop_source`/`stop_token` pair (built directly on `future<void>` -
+  `stop_token::stopped()` is a `future<void>` any number of independent
+  consumers can `co_await`/`then_fast()` via `clone()`) is an explicit,
+  on-demand signal a caller controls, unrelated to any object's lifetime.
+
+`est::with_stop<T>(future<T> operation, const stop_token& token)`
+(`est:with_stop`) races `operation` against `token.stopped()` and
+resolves the moment either one does - the returned `future<T>` fails with
+`est::operation_cancelled` if the token wins. Its honestly-scoped
+limitation: it only stops the *caller* from waiting further; `operation`
+itself keeps running in the background until it completes on its own
+(matching `when_any()`/`when_all()`/`when_any_succeeds()`'s own already-
+accepted "never cancels the ones that haven't finished yet" limitation -
+see [Architecture](Architecture.md)). Eagerly freeing an arbitrary
+suspended coroutine or queued `mutex::lock()`/`counting_event::wait()`
+waiter would need `intrusive_list<T>::remove()` from the middle, which
+doesn't exist (`enqueue`/`dequeue`/`drain` only) - out of scope for now.
+
+The one case where cancellation *is* genuinely eager - not just "stop
+watching" - is a timed wait: `est::sleep_for(delay, const stop_token&)`/
+`est::sleep_until(deadline, const stop_token&)` (`est:with_stop`) build on
+`loop::cancel_timer(timer_id)`, which pulls a still-pending
+`detail::sleep_resume_node` out of `loop`'s timer queue early and
+completes it via the same `abandon()` path `drain_pending()` uses at
+teardown - real, immediate reclamation, not a flag checked later. This
+works only because `loop` already tracks pending timers by id
+(`schedule_timer()` returns one); no such id exists for a queued
+`intrusive_list` waiter.

@@ -97,6 +97,24 @@ template <class T, class... Args>
   return std::move(fut);
 }
 
+// The failure-case sibling to make_ready_future() above: builds a fresh
+// future<T> against est::current_loop(), already completed with
+// `exception` - sugar over make_promise_future<T>() followed by
+// promise<T>::set_exception(), for a caller that doesn't need to hold the
+// promise itself (e.g. an already-cancelled fast path that never needs to
+// schedule anything).
+// By-value on purpose: `exception` is std::move()-d into
+// std::make_exception_ptr() below, but clang-tidy's dataflow can't see
+// through that dependent (template-parameter-typed) call to confirm it,
+// and flags the parameter as copied-but-only-read regardless.
+template <class T, class Exception>
+// NOLINTNEXTLINE(performance-unnecessary-value-param)
+[[nodiscard]] auto make_failed_future(Exception exception) -> future<T> {
+  auto [prom, fut] = make_promise_future<T>();
+  prom.set_exception(std::make_exception_ptr(std::move(exception)));
+  return std::move(fut);
+}
+
 } // namespace est
 
 namespace est::detail {

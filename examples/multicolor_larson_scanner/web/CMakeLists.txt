@@ -45,6 +45,7 @@ target_sources(est
       "${EST_ROOT}/est/src/sync/event.cppm"
       "${EST_ROOT}/est/src/sync/external_event.cppm"
       "${EST_ROOT}/est/src/sync/spsc_ring.cppm"
+      "${EST_ROOT}/est/src/sync/stop_token.cppm"
       "${EST_ROOT}/est/src/timer.cppm"
       "${EST_ROOT}/est/src/loop.cppm"
       "${EST_ROOT}/est/src/util/current_loop.cppm"
@@ -54,6 +55,7 @@ target_sources(est
       "${EST_ROOT}/est/src/when_all.cppm"
       "${EST_ROOT}/est/src/when_any.cppm"
       "${EST_ROOT}/est/src/when_any_succeeds.cppm"
+      "${EST_ROOT}/est/src/with_stop.cppm"
 )
 target_compile_features(est PUBLIC cxx_std_23)
 
