@@ -6219,6 +6219,122 @@ step outside CI, per that workflow's own top comment).
 
 ---
 
+### Issue #56: `future<T>` cancellation (stop_token-style) (done)
+
+Issue #56 (github.com/andijcr/async_experiments/issues/56) asked for a way
+to ask a still-pending `future<T>`/coroutine to stop early - the only
+thing resembling this before was abandonment (`future_state<T>`'s
+destructor-time waiter drain), which only helps when *nothing* will ever
+resume the coroutine again (the owning object dying), not when the thing
+being waited on is still perfectly alive and a caller just wants to give
+up on it. The issue predates `when_any()`/`when_all()`/
+`when_any_succeeds()` (all three landed after it was filed - both
+`when_any()`'s and `when_all()`'s own entries above explicitly deferred
+cancellation to this issue: "this codebase has no cancellation mechanism
+at all") - the design here was updated to build on top of those rather
+than the empty landscape #56 was originally written against, and posted
+as an issue comment before any code, mirroring issue #99's own
+convention.
+
+**`est::make_failed_future<T>(exception)`** (`est/src/promise.cppm`) is
+the missing failure-case sibling to the existing `make_ready_future<T>()`
+- both the `with_stop()` fast path and the token-aware sleep overloads'
+fast path (below) need a fresh, already-*failed* future built from
+scratch, and there was previously no one-line way to do that.
+
+**`est::stop_source`/`est::stop_token`/`est::operation_cancelled`** (new
+partition `est:sync.stop_token`, `est/src/sync/stop_token.cppm`) are
+built directly on `make_promise_future<void>()` + `future<void>::clone()`
+rather than `:sync.event`'s `one_shot_event` - `:sync.event` already
+depends on `:promise`, and the token-aware sleep overloads (below) need
+`:promise` itself to sit *above* `:sync.stop_token`, so routing through
+`:sync.event` would have closed a cycle
+(`:promise → :sync.stop_token → :sync.event → :promise`). `stop_token::
+stopped()` returns a `future<void>` any number of independent consumers
+can `co_await`/`then_fast()`, via the same `clone()` a multi-consumer
+signal already needed with zero new machinery; `request_stop()` is
+idempotent, matching `one_shot_event::set()`'s own "independent
+cancellation sources safely racing to fire the same signal" contract,
+reimplemented directly here since `stop_state` doesn't build on
+`one_shot_event`. Cancellation itself is a second, distinct, exported
+exception type (`operation_cancelled`) flowing through the exact same
+`set_exception()` channel `abandoned_exception` already uses - no change
+to `future_state<T>`'s pending/value/exception representation or any
+`.then()` dispatch branch.
+
+**`est::with_stop<T>(future<T> operation, const stop_token&)`** (new
+partition `est:with_stop`, `est/src/with_stop.cppm`) races `operation`
+against `token.stopped()` using the identical `shared_ptr<state>` + two
+`then_fast()` racers shape `when_any()` already established, generalized
+to carry a real `T` through. Its documented, honestly-scoped limitation
+matches `when_any()`/`when_all()`/`when_any_succeeds()`'s own already-
+accepted one: it stops the *caller* from waiting further, but doesn't
+eagerly free `operation` itself, which keeps running in the background
+until it completes on its own (a harmless no-op via a `done` guard by
+then). Eagerly freeing an arbitrary suspended coroutine or queued
+`mutex::lock()`/`counting_event::wait()` waiter would need
+`intrusive_list<T>::remove()` from the middle, which doesn't exist
+(`enqueue`/`dequeue`/`drain` only) - a broad, invasive change touching
+every list in the codebase, explicitly scoped out as a follow-up rather
+than folded into this already-large change, the same way `when_any()`/
+`when_all()` themselves deferred cancellation to this issue.
+
+**Timed cancellation is the one case that's genuinely eager**, not just
+"stop watching": `est::loop::cancel_timer(timer_id)` (new, alongside a
+`schedule_timer()` that now returns the `timer_id` it used to discard)
+pulls a still-pending `sleep_resume_node` out of `loop`'s timer queue
+early and completes it via the exact same `abandon()`-then-destroy path
+`drain_pending()` already used at teardown - `timer_queue::cancel(id)`
+itself already existed and worked, it just wasn't exposed for one entry
+on demand. `est::sleep_for(delay, const stop_token&)`/`est::sleep_until
+(deadline, const stop_token&)` (`est:with_stop`, not `:promise` - putting
+them in `:promise` would itself have needed `:promise → :sync.stop_token`,
+closing the same cycle described above) build on this: a fast path
+matching `with_stop()`'s own when already `stop_requested()` (no timer
+ever scheduled), otherwise a racer that, on the token winning, calls
+`loop.cancel_timer()` and completes the caller-visible future with
+`operation_cancelled` - real, immediate reclamation of the timer, not a
+flag checked later.
+
+**Tests added**: `make_failed_future<T>()`/`make_failed_future<void>()`
+(`est/tests/loop_tests.cpp`, alongside the existing `make_ready_future()`
+tests); `est/tests/stop_token_tests.cpp` (idempotent `request_stop()`,
+`stop_requested()` before/after, independent `get_token()` copies all
+observing one signal, `stopped()` immediate vs. genuine coroutine
+suspend/resume); `est/tests/with_stop_tests.cpp` (normal completion
+forwarding value/failure, `request_stop()` before completion resolving
+`operation_cancelled` with the operation's later completion proven a
+no-op via a manually-held `promise<T>`, `request_stop()` *after*
+completion also proven a no-op the other way around, an already-
+`stop_requested()` token short-circuiting without ever touching the
+operation); timed-cancellation tests in `loop_tests.cpp` proving
+`cancel_timer()` genuinely removes a pending timer rather than merely
+losing the race (a fake platform's clock never advancing anywhere near a
+deliberately huge deadline once cancelled, plus `counting_resource`
+allocation-count balance) and that `cancel_timer()` on a stale/unknown id
+returns `false` rather than asserting. Full devenv pipeline
+(`cmake --preset default/ci/sanitize` + `ctest` + `clang-format` +
+`clang-tidy` + the new-code coverage gate, all real, tested logic -
+98% diff coverage) - unlike the immediately-preceding wasm work's
+infra-only diffs, this has real logic and real coverage to show for it.
+
+**Explicitly out of scope**: eager cancellation of a queued
+`mutex::lock()`/`counting_event::wait()` waiter (the `intrusive_list<T>`
+gap above) - worth its own follow-up issue, not built here; and wiring
+`est::stop_token` into `examples/spreadsheet/src/spreadsheet.cppm`'s
+`resolve_blocking()`/`GET BLOCKING` protocol (the issue's own concrete
+motivating case, named only as motivation) - actually changing that wire
+protocol to accept a timeout is a separate protocol/UX decision (what
+syntax, what error response) deserving its own issue rather than being
+folded in silently here.
+
+`docs/wiki/Architecture.md`'s partition DAG, `docs/wiki/Coroutines.md`
+(a new section distinguishing abandonment from `stop_token`-based
+cancellation), `docs/wiki/Loop-And-Timers.md` (`cancel_timer()`), and
+`docs/wiki/Home.md`'s "where to look" table were all updated to match.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

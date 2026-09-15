@@ -17,6 +17,7 @@ target_sources(est
       src/sync/event.cppm
       src/sync/external_event.cppm
       src/sync/spsc_ring.cppm
+      src/sync/stop_token.cppm
       src/timer.cppm
       src/loop.cppm
       src/util/current_loop.cppm
@@ -26,6 +27,7 @@ target_sources(est
       src/when_all.cppm
       src/when_any.cppm
       src/when_any_succeeds.cppm
+      src/with_stop.cppm
 )
 
 target_compile_features(est PUBLIC cxx_std_23)

@@ -415,10 +415,11 @@ min-heap *and* the node in `loop`'s own `pending_timers_` list, keyed by the
 timer queue's own id:
 
 ```cpp
-void schedule_timer(detail::timer_node& node, clock::time_point deadline) {
+auto schedule_timer(detail::timer_node& node, clock::time_point deadline) -> timer_id {
   pending_timers_.reserve(pending_timers_.size() + 1);   // see below
   const auto id = timers_.schedule_at(deadline);
   pending_timers_.push_back(pending_entry{.id = id, .node = &node});
+  return id;
 }
 ```
 
@@ -462,6 +463,46 @@ to find its node, and calls `fire()` — which for a `sleep_for()`-created
 node just does `prom.set_value()`, which in turn triggers `future_state<
 void>::complete()`, which enqueues *its* continuations onto the same
 ready-queue `drain_ready()` will pick up on the loop's next iteration.
+
+### `cancel_timer()`: pulling a still-pending registration out early
+
+`schedule_timer()`'s returned `timer_id` (`timer_queue<allocator_type>::id`)
+is what a caller keeps if it might need to cancel that specific
+registration later - most callers (`sleep_until()` with no `stop_token`,
+`schedule_periodic()`'s own re-arming) simply discard it. `cancel_timer()`
+does one iteration of what `drain_pending()` already does for *every*
+pending timer at teardown, on demand, for exactly one:
+
+```cpp
+[[nodiscard]] auto cancel_timer(timer_id id) noexcept -> bool {
+  const auto it = std::ranges::find(pending_timers_, id, &pending_entry::id);
+  if (it == pending_timers_.end()) {
+    return false;   // already fired, or stale
+  }
+  timers_.cancel(id);
+  auto* node = it->node;
+  pending_timers_.erase(it);
+  detail::abandon_timer_node(*node);
+  return true;
+}
+```
+
+Returns `false`, a no-op, if `id` no longer names a pending entry - it may
+already have fired (and been erased by `fire_ready_timers()`) by the time
+a caller gets around to cancelling it; a single-threaded race a
+token-driven canceller can't rule out ahead of time. `timers_.cancel(id)`
+itself already existed and already worked (used internally by
+`drain_pending()`'s own teardown loop above) - this just exposes the same
+capability for one entry, on demand, instead of only at loop destruction.
+`detail::abandon_timer_node()` completes the node exactly like teardown
+does (`sleep_resume_node::abandon()` sets its promise's exception to
+`abandoned_exception`), so a plain `loop.cancel_timer(id)` alone always
+surfaces as an abandoned wait - `est::sleep_for(delay, stop_token)`/
+`est::sleep_until(deadline, stop_token)` (`est:with_stop`) build on this to
+surface `est::operation_cancelled` instead, by racing the caller-visible
+future against `token.stopped()` rather than exposing `sleep_resume_node`'s
+own promise directly - see
+[Coroutines](Coroutines.md#cancellation-stop_token-vs-abandonment).
 
 ## Periodic timers: `schedule_periodic()`
 

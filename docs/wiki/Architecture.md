@@ -28,6 +28,8 @@ graph BT
   when_all[":when_all<br/>when_all(), detail::when_all_state"]
   when_any[":when_any<br/>when_any()"]
   when_any_succeeds[":when_any_succeeds<br/>when_any_succeeds(), detail::when_any_succeeds_state"]
+  stop_token[":sync.stop_token<br/>stop_source, stop_token, operation_cancelled"]
+  with_stop[":with_stop<br/>with_stop(), token-aware sleep_for/sleep_until"]
 
   check --> platform
   event --> check
@@ -84,6 +86,17 @@ graph BT
   when_any_succeeds --> promise
   when_any_succeeds --> shared_ptr
   when_any_succeeds --> current_loop
+  stop_token --> future
+  stop_token --> promise
+  stop_token --> shared_ptr
+  stop_token --> current_loop
+  with_stop --> future
+  with_stop --> promise
+  with_stop --> loop
+  with_stop --> platform
+  with_stop --> stop_token
+  with_stop --> shared_ptr
+  with_stop --> current_loop
 ```
 
 The one non-obvious edge is **`:loop` sits *below* `:future`/`:promise`, not
@@ -191,6 +204,33 @@ block against. No `:sync.event` edge, unlike `:when_all`/`:when_any` -
 see [Continuation Node Mechanism](Continuation-Node-Mechanism.md#estwhen_any_succeeds-when-a-result-has-to-carry-a-value)
 for the full mechanism and why a plain `promise<bool>` fits better here
 than an event does.
+
+`:sync.stop_token` (`stop_source`/`stop_token`/`operation_cancelled` -
+[Coroutines](Coroutines.md#cancellation-stop_token-vs-abandonment))
+is built directly on `:future`/`:promise` rather than `:sync.event`'s
+`one_shot_event` - `:sync.event` already depends on `:promise`
+(`promise_resume_node<T>`), and `:with_stop` (below) needs `:promise`
+itself to sit *above* `:sync.stop_token` for its token-aware
+`sleep_for()`/`sleep_until()` overloads, so routing `:sync.stop_token`
+through `:sync.event` would close a cycle
+(`:promise → :sync.stop_token → :sync.event → :promise`). Building
+`detail::stop_state` directly on `make_promise_future<void>()` +
+`future<void>::clone()` sidesteps that entirely, keeping `:sync.stop_token`
+at the same DAG depth as `:promise` itself, not lower.
+
+`:with_stop` (`with_stop<T>()`, plus the token-aware `sleep_for()`/
+`sleep_until()` overloads) sits above both `:promise` and
+`:sync.stop_token` - the one partition in this codebase that depends on
+`:sync.stop_token` at all. The token-aware sleep overloads live here
+rather than in `:promise` itself precisely to avoid that cycle: putting
+them in `:promise` would need `:promise → :sync.stop_token`, closing the
+same loop back through `:sync.stop_token → :promise` described above.
+`:loop` is needed directly (not just through `:promise`) for
+`loop::cancel_timer()`/`loop::timer_id`, the mechanism that makes a timed
+wait's cancellation genuinely eager rather than merely "stop watching" -
+see [Coroutines](Coroutines.md#cancellation-stop_token-vs-abandonment)
+for the distinction and [Loop and Timers](Loop-And-Timers.md) for
+`cancel_timer()` itself.
 
 `:util.current_loop` is the other partition worth calling out - the
 free functions `est::make_current_loop(loop&)`/`est::current_loop()`
