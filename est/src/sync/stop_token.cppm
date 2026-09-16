@@ -20,13 +20,6 @@ namespace est::detail {
 struct stop_state {
   promise<void> prom;
   future<void> fut;
-  // Guards request_stop() against a second promise<void>::set_value()
-  // call, which future_state<void>'s own check_not_completed() would
-  // otherwise assert on - a plain bool, not atomic, matching every other
-  // piece of loop-thread-only state in this codebase (est:loop's own
-  // periodic_timer_control, for the identical "more than one independent
-  // holder might race to fire the same one-shot signal" reason).
-  bool fired = false;
 };
 
 } // namespace est::detail
@@ -55,8 +48,11 @@ class stop_token {
 public:
   // Non-blocking check - what with_stop()'s and the token-aware
   // sleep_for()/sleep_until()'s own already-cancelled fast paths use to
-  // skip registering a continuation/scheduling a timer at all.
-  [[nodiscard]] auto stop_requested() const noexcept -> bool { return state_->fired; }
+  // skip registering a continuation/scheduling a timer at all. Reads
+  // future_state<void>'s own pending/value state via fut.ready() directly
+  // (synchronous the instant request_stop() calls set_value() - no
+  // separate "fired" flag to keep in sync with it).
+  [[nodiscard]] auto stop_requested() const noexcept -> bool { return state_->fut.ready(); }
 
   // A future<void> that becomes ready the moment request_stop() is
   // called (or already is, if it already was) - clone() (est:future)
@@ -81,23 +77,24 @@ public:
   explicit stop_source(allocator_type allocator = current_allocator())
       : state_(make_state(allocator)) {}
 
-  // Idempotent: a second call is a harmless no-op (detail::stop_state::fired
-  // guards it) - matching the "independent cancellation sources safely
-  // racing to fire the same signal" property one_shot_event::set()
-  // documents (est:sync.event), reimplemented here directly since
-  // stop_state doesn't build on one_shot_event (see this file's own top
-  // comment for why).
+  // Idempotent: a second call is a harmless no-op, guarded by fut.ready()
+  // rather than a separate bool - matching the "independent cancellation
+  // sources safely racing to fire the same signal" property
+  // one_shot_event::set() documents (est:sync.event), reimplemented here
+  // directly since stop_state doesn't build on one_shot_event (see this
+  // file's own top comment for why). A second set_value() call would trip
+  // future_state<void>::check_not_completed()'s assertion, so the guard
+  // is load-bearing, not just an optimization.
   void request_stop() noexcept {
-    if (state_->fired) {
+    if (state_->fut.ready()) {
       return;
     }
-    state_->fired = true;
     state_->prom.set_value();
   }
 
   [[nodiscard]] auto get_token() const noexcept -> stop_token { return stop_token(state_); }
 
-  [[nodiscard]] auto stop_requested() const noexcept -> bool { return state_->fired; }
+  [[nodiscard]] auto stop_requested() const noexcept -> bool { return state_->fut.ready(); }
 
 private:
   // make_promise_future<void>() always resolves current_allocator()
