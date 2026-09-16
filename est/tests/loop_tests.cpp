@@ -498,7 +498,7 @@ TEST_CASE("make_failed_future<T>(exception) returns an already-failed future car
   const auto guard = est::make_current_loop(loop);
   auto future = est::make_failed_future<int>(std::runtime_error("boom"));
   REQUIRE(future.ready());
-  REQUIRE(future.failed());
+  REQUIRE(future.ready_with_failure());
   REQUIRE_THROWS_AS(future.get(), std::runtime_error);
 }
 
@@ -507,7 +507,7 @@ TEST_CASE("make_failed_future<void>(exception) returns an already-failed future<
   const auto guard = est::make_current_loop(loop);
   auto future = est::make_failed_future<void>(std::runtime_error("boom"));
   REQUIRE(future.ready());
-  REQUIRE(future.failed());
+  REQUIRE(future.ready_with_failure());
   REQUIRE_THROWS_AS(future.get(), std::runtime_error);
 }
 
@@ -565,7 +565,7 @@ TEST_CASE("sleep_for(delay, stop_token): resolves normally when the token never 
 
   loop.run_until_idle();
   REQUIRE(fut.ready());
-  REQUIRE_FALSE(fut.failed());
+  REQUIRE_FALSE(fut.ready_with_failure());
 }
 
 TEST_CASE("sleep_for(delay, stop_token): request_stop() before the deadline resolves early with "
@@ -593,7 +593,7 @@ TEST_CASE("sleep_for(delay, stop_token): request_stop() before the deadline reso
     loop.run_until_idle();
 
     REQUIRE(fut.ready());
-    REQUIRE(fut.failed());
+    REQUIRE(fut.ready_with_failure());
     REQUIRE_THROWS_AS(fut.get(), est::operation_cancelled);
     // The fake clock never had to advance - nothing left pending once the
     // timer was cancelled, so run_until_idle() returned without ever
@@ -622,7 +622,7 @@ TEST_CASE("sleep_for(delay, stop_token): an already-stop_requested() token resol
 
   auto fut = est::sleep_for(1000s, source.get_token());
   REQUIRE(fut.ready()); // resolved inline - the fast path never touches loop::schedule_timer()
-  REQUIRE(fut.failed());
+  REQUIRE(fut.ready_with_failure());
   REQUIRE_THROWS_AS(fut.get(), est::operation_cancelled);
 
   loop.run_until_idle(); // nothing pending - must return immediately

@@ -256,7 +256,7 @@ void run() final {
   auto& state = *this->owner_;
   try {
     if constexpr (detail::invocable_unwrapped<Fn, T>()) {
-      if (state.failed()) {                        // "unwrapped", auto-propagate
+      if (state.ready_with_failure()) {                        // "unwrapped", auto-propagate
         downstream_->set_exception(state.get_exception());
       } else if constexpr (std::is_void_v<T>) {
         invoke_and_fulfill();                        // "unwrapped", T = void
@@ -283,7 +283,7 @@ void run() final {
   `T = void`): called *only* on success, with the value itself. On failure,
   `Fn` is skipped entirely and the exception is forwarded straight into
   `downstream_` via `get_exception()` — a plain pointer copy, not a
-  throw/catch round-trip, since `failed()` already established there's an
+  throw/catch round-trip, since `ready_with_failure()` already established there's an
   exception waiting. When `Fn` also accepts `T&&` (by value, by `const T&`,
   or by `T&&`/`auto&&` itself — excludes a purely lvalue-bound callback like
   `[](auto& value)`) and this node is the sole `shared_ptr<future_state<T>>`
@@ -296,7 +296,7 @@ void run() final {
 - **Wrapped** (`Fn` invocable with `future<T>&`): always called, success or
   failure, with a *fresh* `future<T>` view built via `shared_from_this()` —
   never a stored one, since a continuation only ever runs once. `Fn`
-  inspects `ready()`/`failed()`/`get()` itself to decide what to do. No
+  inspects `ready()`/`ready_with_failure()`/`get()` itself to decide what to do. No
   implicit unwrap, no auto-propagation.
 
 Checked in that order — unwrapped first — so a generic callback (e.g. an
@@ -472,7 +472,7 @@ public:
 
   void run() final {
     auto& state = *this->owner_;
-    if (state.failed()) {
+    if (state.ready_with_failure()) {
       downstream_->set_exception(state.get_exception());
       return;
     }
@@ -516,7 +516,7 @@ The forwarding logic this node needs is fixed — it never varies by
 closure, only by `T` — so `flatten_forwarder<T>` bakes that one shape in
 directly: no `Fn` member, no lambda, no `future<T>` view built via
 `shared_from_this()` (it operates on `*owner_`, which already exposes
-`failed()`/`get_exception()`/`get()` publicly). Every flattening `.then()`
+`ready_with_failure()`/`get_exception()`/`get()` publicly). Every flattening `.then()`
 at the same inner value type `T` reuses the *same* `flatten_forwarder<T>`
 instantiation, instead of minting a fresh node type per `(T, Fn, U)` call
 site — fewer template instantiations overall for a codebase with many
@@ -543,7 +543,7 @@ has the same story from that page's own angle (total allocation counts per
 issue #54) resolves once every one of `futures` is *accounted for* -
 completed or abandoned, succeeded or failed - each input stays owned by
 the caller (`when_all()` only ever registers `then_fast()` continuations
-on it, never moves or consumes it), which inspects `failed()`/`get()` on
+on it, never moves or consumes it), which inspects `ready_with_failure()`/`get()` on
 whichever of them it cares about afterward. Internally, it's a small
 counting barrier: a shared `detail::when_all_state{one_shot_event<manual>
 event; int remaining;}`, and one tracking chain per input
@@ -744,7 +744,7 @@ template <class T>
 void when_any_succeeds_track(future<T>& input, shared_ptr<when_any_succeeds_state> state) {
   input
       .then_fast([](future<T>& in) {
-        if (in.failed()) {
+        if (in.ready_with_failure()) {
           std::rethrow_exception(in.get_exception());
         }
       })
@@ -752,7 +752,7 @@ void when_any_succeeds_track(future<T>& input, shared_ptr<when_any_succeeds_stat
         if (state->done) {
           return;
         }
-        if (completed.failed()) {
+        if (completed.ready_with_failure()) {
           if (--state->remaining == 0) {
             state->done = true;
             state->result.set_value(false);
@@ -778,7 +778,7 @@ being *abandoned* instead of completed lands here identically without
 any code of this class's own - `abandon()` (above) always completes its
 own downstream with an exception, whether or not the callback above
 ever even ran. The second stage, then, only ever has to ask "did this
-stage fail" - a plain `completed.failed()` - to learn "did `input` fail
+stage fail" - a plain `completed.ready_with_failure()` - to learn "did `input` fail
 to produce anything," never needing to tell an ordinary failure and an
 abandonment apart.
 

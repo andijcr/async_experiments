@@ -66,7 +66,7 @@ TEST_CASE("stop_token::stopped() resolves immediately when already stop_requeste
 
   auto fut = source.get_token().stopped();
   REQUIRE(fut.ready());
-  REQUIRE_FALSE(fut.failed());
+  REQUIRE_FALSE(fut.ready_with_failure());
 }
 
 TEST_CASE("stop_token::stopped() is unready until request_stop() is called, then becomes ready "

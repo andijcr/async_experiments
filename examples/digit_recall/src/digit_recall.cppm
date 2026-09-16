@@ -81,7 +81,7 @@ enum class RoundResult : std::uint8_t { correct, wrong, timed_out, interrupted, 
 
   co_await est::when_any(guarded_answer, timeout);
 
-  if (timeout.ready() && !timeout.failed()) {
+  if (timeout.ready_with_value()) {
     co_return RoundResult::timed_out;
   }
 
@@ -89,7 +89,7 @@ enum class RoundResult : std::uint8_t { correct, wrong, timed_out, interrupted, 
   // free it for real instead of leaving it to fire uselessly later.
   round_stop.request_stop();
 
-  if (guarded_answer.failed()) {
+  if (guarded_answer.ready_with_failure()) {
     // Either session_token fired mid-round, or the underlying read
     // itself failed (real stdin EOF, in production) - both just mean
     // "this round can't continue," so both funnel through operation_

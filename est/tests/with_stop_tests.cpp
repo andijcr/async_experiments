@@ -17,7 +17,7 @@ TEST_CASE("with_stop(): normal completion (token never fires) forwards the opera
   loop.run_until_idle();
 
   REQUIRE(fut.ready());
-  REQUIRE_FALSE(fut.failed());
+  REQUIRE_FALSE(fut.ready_with_failure());
   REQUIRE(fut.get() == 42);
 }
 
@@ -33,7 +33,7 @@ TEST_CASE("with_stop(): normal completion forwards the operation's own failure u
   loop.run_until_idle();
 
   REQUIRE(fut.ready());
-  REQUIRE(fut.failed());
+  REQUIRE(fut.ready_with_failure());
   REQUIRE_THROWS_AS(fut.get(), std::runtime_error);
 }
 
@@ -52,7 +52,7 @@ TEST_CASE("with_stop(): request_stop() before the operation completes resolves w
   loop.run_until_idle();
 
   REQUIRE(fut.ready());
-  REQUIRE(fut.failed());
+  REQUIRE(fut.ready_with_failure());
   REQUIRE_THROWS_AS(fut.get(), est::operation_cancelled);
 
   // The operation was cancelled from the caller's point of view, but
@@ -79,7 +79,7 @@ TEST_CASE("with_stop(): an already-stop_requested() token short-circuits to oper
   auto fut = est::with_stop(std::move(operation), source.get_token());
 
   REQUIRE(fut.ready());
-  REQUIRE(fut.failed());
+  REQUIRE(fut.ready_with_failure());
   REQUIRE_THROWS_AS(fut.get(), est::operation_cancelled);
 
   // `operation` was never registered against - dropping `prom` unfulfilled
@@ -121,5 +121,5 @@ TEST_CASE("with_stop<void>(): normal completion forwards success", "[with_stop][
   loop.run_until_idle();
 
   REQUIRE(fut.ready());
-  REQUIRE_FALSE(fut.failed());
+  REQUIRE_FALSE(fut.ready_with_failure());
 }

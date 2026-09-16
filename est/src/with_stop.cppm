@@ -62,7 +62,7 @@ template <class T>
       return;
     }
     state->done = true;
-    if (op.failed()) {
+    if (op.ready_with_failure()) {
       state->result.set_exception(op.get_exception());
     } else if constexpr (std::is_void_v<T>) {
       state->result.set_value();
@@ -142,7 +142,7 @@ export namespace est {
       return;
     }
     state->done = true;
-    if (tf.failed()) {
+    if (tf.ready_with_failure()) {
       state->result.set_exception(tf.get_exception());
     } else {
       state->result.set_value();

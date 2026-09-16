@@ -487,20 +487,36 @@ TEST_CASE("a throwing continuation's node and downstream future are freed, not l
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
-// --- Issue #23: redesigned chaining - failed(), unwrapped-vs-wrapped
+// --- Issue #23: redesigned chaining - ready_with_failure(), unwrapped-vs-wrapped
 // then(), future<void>, and monadic flattening. ---
 
-TEST_CASE("failed() is false on success and true once set_exception() runs", "[future]") {
+TEST_CASE("ready_with_failure() is false on success and true once set_exception() runs",
+          "[future]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   auto [value_promise, value_future] = est::make_promise_future<int>();
-  REQUIRE_FALSE(value_future.failed());
+  REQUIRE_FALSE(value_future.ready_with_failure());
   value_promise.set_value(1);
-  REQUIRE_FALSE(value_future.failed());
+  REQUIRE_FALSE(value_future.ready_with_failure());
 
   auto [error_promise, error_future] = est::make_promise_future<int>();
   error_promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
-  REQUIRE(error_future.failed());
+  REQUIRE(error_future.ready_with_failure());
+}
+
+TEST_CASE("ready_with_value() is false while pending or failed, true only once set_value() runs",
+          "[future]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [value_promise, value_future] = est::make_promise_future<int>();
+  REQUIRE_FALSE(value_future.ready_with_value()); // still pending
+  value_promise.set_value(1);
+  REQUIRE(value_future.ready_with_value());
+  REQUIRE_FALSE(value_future.ready_with_failure());
+
+  auto [error_promise, error_future] = est::make_promise_future<int>();
+  error_promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
+  REQUIRE_FALSE(error_future.ready_with_value()); // ready, but not with a value
 }
 
 TEST_CASE("then() with a plain-value callback (unwrapped) runs with the parent's value",
@@ -530,12 +546,13 @@ TEST_CASE(
   loop.run_until_idle();
 
   REQUIRE_FALSE(invoked);
-  REQUIRE(chained.failed());
+  REQUIRE(chained.ready_with_failure());
   REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
 }
 
-TEST_CASE("a wrapped (future<T>&) then() callback can inspect failed() instead of catching",
-          "[future]") {
+TEST_CASE(
+    "a wrapped (future<T>&) then() callback can inspect ready_with_failure() instead of catching",
+    "[future]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   auto [promise, future] = est::make_promise_future<int>();
@@ -543,7 +560,7 @@ TEST_CASE("a wrapped (future<T>&) then() callback can inspect failed() instead o
 
   bool saw_failure = false;
   auto chained = future.then([&](est::future<int>& state) {
-    saw_failure = state.failed();
+    saw_failure = state.ready_with_failure();
     return -1;
   });
   loop.run_until_idle();
@@ -585,7 +602,7 @@ TEST_CASE("a generic callback, defaulted to unwrapped, is skipped and auto-propa
   loop.run_until_idle();
 
   REQUIRE_FALSE(invoked);
-  REQUIRE(chained.failed());
+  REQUIRE(chained.ready_with_failure());
   REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
 }
 
@@ -596,7 +613,7 @@ TEST_CASE("future<void>: set_value()/get() round-trip with nothing to carry", "[
   REQUIRE_FALSE(future.ready());
   promise.set_value();
   REQUIRE(future.ready());
-  REQUIRE_FALSE(future.failed());
+  REQUIRE_FALSE(future.ready_with_failure());
   future.get(); // must not throw
   SUCCEED("get() returned without throwing");
 }
@@ -606,7 +623,7 @@ TEST_CASE("future<void>: set_exception()/get() rethrows", "[future][void]") {
   const auto loop_guard = est::make_current_loop(loop);
   auto [promise, future] = est::make_promise_future<void>();
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
-  REQUIRE(future.failed());
+  REQUIRE(future.ready_with_failure());
   REQUIRE_THROWS_AS(future.get(), std::runtime_error);
 }
 
@@ -641,13 +658,14 @@ TEST_CASE("future<void>: an unwrapped (no-argument) then() is skipped and propag
   REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
 }
 
-TEST_CASE("future<void>: a wrapped then() always runs and can inspect failed()", "[future][void]") {
+TEST_CASE("future<void>: a wrapped then() always runs and can inspect ready_with_failure()",
+          "[future][void]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   auto [promise, future] = est::make_promise_future<void>();
   bool saw_failure = false;
   auto chained = future.then([&](est::future<void>& state) {
-    saw_failure = state.failed();
+    saw_failure = state.ready_with_failure();
     return 0;
   });
   promise.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
@@ -669,7 +687,7 @@ TEST_CASE("a void-returning then() callback produces a future<void>", "[future][
   loop.run_until_idle();
   REQUIRE(invoked);
   REQUIRE(chained.ready());
-  REQUIRE_FALSE(chained.failed());
+  REQUIRE_FALSE(chained.ready_with_failure());
   chained.get(); // void, must not throw
 }
 
@@ -731,7 +749,7 @@ TEST_CASE("flattening propagates the inner future's failure into the outer futur
   });
   promise.set_value(1);
   loop.run_until_idle();
-  REQUIRE(chained.failed());
+  REQUIRE(chained.ready_with_failure());
   REQUIRE_THROWS_AS(chained.get(), std::runtime_error);
 }
 
@@ -827,7 +845,7 @@ TEST_CASE("dropping an abandoned inner future_state completes the flattened futu
     loop.run_until_idle(); // drains the now-completed `chained`, resuming (and
                            // finishing) the suspended coroutine
 
-    REQUIRE(result.failed());
+    REQUIRE(result.ready_with_failure());
     REQUIRE_THROWS_AS(result.get(), std::runtime_error);
   }
   REQUIRE(resource.allocations > 0);
@@ -924,7 +942,7 @@ TEST_CASE("an exception thrown in a coroutine's body surfaces through get()",
   // already ran by the time coro() returns.
   auto fut = coro(loop);
   REQUIRE(fut.ready());
-  REQUIRE(fut.failed());
+  REQUIRE(fut.ready_with_failure());
   REQUIRE_THROWS_AS(fut.get(), std::runtime_error);
 }
 
@@ -988,7 +1006,7 @@ TEST_CASE("an exception in the awaited future propagates across co_await", "[fut
   loop.run_until_idle(); // resumes into the rethrow, uncaught -> unhandled_exception()
 
   REQUIRE(fut.ready());
-  REQUIRE(fut.failed());
+  REQUIRE(fut.ready_with_failure());
   REQUIRE_THROWS_AS(fut.get(), std::runtime_error);
 }
 

@@ -80,8 +80,8 @@ TEST_CASE("when_any() resolves on a failed future the same as a succeeded one", 
   loop.run_until_idle();
 
   REQUIRE(combined.ready());
-  REQUIRE_FALSE(combined.failed()); // when_any() itself never fails
-  REQUIRE(first_future.failed());
+  REQUIRE_FALSE(combined.ready_with_failure()); // when_any() itself never fails
+  REQUIRE(first_future.ready_with_failure());
   REQUIRE_THROWS_AS(first_future.get(), std::runtime_error);
 }
 

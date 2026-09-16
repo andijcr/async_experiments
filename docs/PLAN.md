@@ -6366,6 +6366,27 @@ program end to end (piped `quit`/wrong-answer/EOF/timeout input inside
 the devenv container), not by the unit tests alone, which never
 exercise `main()` itself.
 
+**`future<T>`/`future_state<T>` gained `ready_with_value()`**, and
+**`failed()` was renamed to `ready_with_failure()`** (both on
+`future_state<T>` and `future<T>`) - a follow-up prompted by
+`digit_recall.cppm`'s own `timeout.ready() && !timeout.failed()` check
+after its `when_any()` race, which is exactly the pattern
+`est::when_any()`'s own doc comment already describes as the intended
+way to find out which future won a race, and won cleanly. `ready_with_
+value()` collapses that combination into one call, computed the same
+way `ready()`/`ready_with_failure()` already are - straight off
+`result_`'s own variant index, no new state. `ready_with_failure()` is
+a pure rename, not a new method: `failed()` predates this PR (Issue
+#23) and was already used in `future.cppm`'s own dispatch logic,
+`with_stop.cppm`, `when_any_succeeds.cppm`, and every test file that
+exercises failure - renamed everywhere it appeared (source, tests, and
+`docs/wiki/Continuation-Node-Mechanism.md`, which documents current
+behavior) so the three queries read as a matched trio:
+`ready()`/`ready_with_value()`/`ready_with_failure()`. Historical
+`docs/PLAN.md` entries describing the original `failed()` addition
+(Issue #23 and later) were deliberately left using that name - they
+narrate what happened at the time, not the code as it reads today.
+
 ---
 
 ## Verification for M0
