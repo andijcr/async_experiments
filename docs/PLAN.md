@@ -6333,6 +6333,39 @@ folded in silently here.
 cancellation), `docs/wiki/Loop-And-Timers.md` (`cancel_timer()`), and
 `docs/wiki/Home.md`'s "where to look" table were all updated to match.
 
+**`examples/digit_recall`**, added afterward on the same PR: a small
+terminal reflex game (`sleep_sort`/`spreadsheet`-shaped - a testable
+core module, an untested `*_io.cppm` talking to a real fd, a thin
+`main.cpp` driver), built specifically to demonstrate `stop_token`/
+`with_stop<T>()` end to end rather than only in unit tests. The player
+is shown a random digit string and has to type it back before a
+per-round deadline (`difficulty * length * base_unit`); a correct
+answer grows either `difficulty` or `length` for the next round. Two
+cancellation points, deliberately shaped to be genuinely different
+rather than the same mechanism twice:
+
+- The round's own timeout is cancelled *eagerly* via a token-aware
+  `sleep_for()` the instant an answer arrives - real proof this isn't
+  just "stop watching": `digit_recall_tests.cpp`'s own correct-answer
+  test uses the identical fake-clock-never-advances idiom
+  `loop_tests.cpp` uses for `loop::cancel_timer()` itself.
+- A whole-session time budget can cut a round short via `with_stop()`
+  even while the player is still mid-keystroke - honestly non-eager:
+  the underlying read keeps running, unobserved, exactly matching that
+  function's own documented limitation (also unit-tested: completing
+  the abandoned read after the fact is proven a no-op).
+
+Caught one real bug building it: `main()` initially left `loop.run()`
+blocked on the session-length timer even after the game itself ended
+(`quit`/a wrong or timed-out round) - `run()` only returns once nothing
+is pending, and that timer was still sitting there with up to 90 real
+seconds left. Fixed by having the session's own completion eagerly
+cancel that timer and call `loop.stop()`, rather than waiting for
+`run()` to drain everything on its own - caught by actually running the
+program end to end (piped `quit`/wrong-answer/EOF/timeout input inside
+the devenv container), not by the unit tests alone, which never
+exercise `main()` itself.
+
 ---
 
 ## Verification for M0
