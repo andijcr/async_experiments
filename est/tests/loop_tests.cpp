@@ -340,13 +340,13 @@ TEST_CASE("higher-priority ready work drains before lower-priority work, regardl
   // background.
   auto [background_promise, background_future] = est::make_promise_future<int>();
   background_promise.set_value(0);
-  auto background = background_future.then(
-      [&](est::future<int>&) { order.push_back(4); }, est::Priority::background);
+  auto background = background_future.then([&](est::future<int>&) { order.push_back(4); },
+                                           est::Priority::background);
 
   auto [critical_promise, critical_future] = est::make_promise_future<int>();
   critical_promise.set_value(0);
-  auto critical = critical_future.then([&](est::future<int>&) { order.push_back(1); },
-                                        est::Priority::critical);
+  auto critical =
+      critical_future.then([&](est::future<int>&) { order.push_back(1); }, est::Priority::critical);
 
   auto [normal_promise, normal_future] = est::make_promise_future<int>();
   normal_promise.set_value(0);
@@ -355,8 +355,7 @@ TEST_CASE("higher-priority ready work drains before lower-priority work, regardl
 
   auto [high_promise, high_future] = est::make_promise_future<int>();
   high_promise.set_value(0);
-  auto high =
-      high_future.then([&](est::future<int>&) { order.push_back(2); }, est::Priority::high);
+  auto high = high_future.then([&](est::future<int>&) { order.push_back(2); }, est::Priority::high);
 
   loop.run_until_idle();
   REQUIRE(order == std::vector{1, 2, 3, 4});
@@ -379,9 +378,8 @@ TEST_CASE("then()/then_fast() default to inheriting current_priority() at the ca
     // then_fast() runs inline, right here, so the callback observes
     // current_priority() still raised - proving the default argument
     // resolved to priority::high at this call site, not priority::normal.
-    future.then_fast([&](est::future<int>&) {
-      REQUIRE(est::current_priority() == est::Priority::high);
-    });
+    future.then_fast(
+        [&](est::future<int>&) { REQUIRE(est::current_priority() == est::Priority::high); });
   }
   REQUIRE(est::current_priority() == est::Priority::normal);
 }
@@ -405,13 +403,14 @@ TEST_CASE("an explicit priority argument overrides inheritance from current_prio
   // Explicit priority::critical must win over the still-lowered ambient,
   // draining first despite being registered second.
   auto overridden = overridden_future.then([&](est::future<int>&) { order.push_back(1); },
-                                            est::Priority::critical);
+                                           est::Priority::critical);
 
   loop.run_until_idle();
   REQUIRE(order == std::vector{1, 2});
 }
 
-TEST_CASE("set_priority() nests and restores the previous value, like a stack", "[loop][priority]") {
+TEST_CASE("set_priority() nests and restores the previous value, like a stack",
+          "[loop][priority]") {
   REQUIRE(est::current_priority() == est::Priority::normal);
   {
     const auto outer = est::set_priority(est::Priority::high);

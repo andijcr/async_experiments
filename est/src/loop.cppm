@@ -49,7 +49,9 @@ export namespace est {
 // inherits the same priority by default, without threading a parameter
 // through every call in between. Defaults to Priority::normal on a thread/
 // core nothing has ever raised or lowered.
-[[nodiscard]] inline auto current_priority() noexcept -> Priority { return detail::tls_priority; }
+[[nodiscard]] inline auto current_priority() noexcept -> Priority {
+  return detail::tls_priority;
+}
 
 // Raises or lowers current_priority() for the caller's own scope -
 // modeled on est::make_current_loop()/est::platform::override_instance()'s
@@ -300,9 +302,7 @@ public:
   }
 
   explicit loop(allocator_type allocator = {}, scheduler_type scheduler = eager_scheduler)
-      : allocator_(allocator),
-        scheduler_(std::move(scheduler)),
-        timers_(allocator),
+      : allocator_(allocator), scheduler_(std::move(scheduler)), timers_(allocator),
         pending_timers_(allocator) {}
   loop(const loop&) = delete;
   auto operator=(const loop&) -> loop& = delete;
