@@ -6469,6 +6469,25 @@ built at the time, not the code as it reads today.
 
 ---
 
+### GitHub wiki sync (`.github/workflows/wiki.yml`)
+
+With the GitHub wiki enabled for this repo, added a workflow that
+mirrors `docs/wiki/*.md` into it (a wholly separate git repo,
+`<repo>.wiki.git`) on every push to `main` that touches `docs/wiki/`,
+plus `workflow_dispatch` for an on-demand run. Deliberately one-way and
+additive-only: it copies/overwrites the wiki's same-named pages, never
+deletes one `docs/wiki/` doesn't have, so the in-tree copy stays the
+single source of truth (per this file's own top-level rule that
+`docs/wiki/` "must stay in sync with the code as it changes") rather
+than the wiki becoming a second, independently-editable copy that can
+drift from it. Handles the wiki's git repo not existing yet (GitHub only
+creates it lazily, on the first page ever saved) by falling back to
+`git init` locally instead of failing the job, so the very first run
+right after enabling the wiki still works without a manual placeholder
+page first.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
