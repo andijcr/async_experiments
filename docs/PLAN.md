@@ -6486,6 +6486,22 @@ creates it lazily, on the first page ever saved) by falling back to
 right after enabling the wiki still works without a manual placeholder
 page first.
 
+Extended the same workflow to also mirror this very file, `docs/PLAN.md`
+itself, into the wiki as a page named `Journal` - it already *is* a
+journal (this file's own top comment: "every milestone, review finding,
+and bug fix, in the order it happened"), so publishing it alongside the
+reader's-guide pages just makes that explicit rather than leaving it
+reachable only via a repo-relative link. `docs/wiki/Home.md` gained one
+added sentence pointing at it, deliberately *alongside* its existing
+`[docs/PLAN.md](../PLAN.md)` link rather than replacing it: that relative
+link is correct when `Home.md` is read in-repo (a real sibling-of-parent
+path, `docs/wiki/Home.md` -> `docs/PLAN.md`) but would resolve to nothing
+once mirrored into the wiki's flat page namespace, while a page-name link
+(`Journal.md`, matching every other cross-page link already in that
+file) is correct only in the wiki. Keeping both, rather than picking one
+and breaking the other context, was cheaper than making every relative
+link in `docs/wiki/` context-aware.
+
 ---
 
 ## Verification for M0

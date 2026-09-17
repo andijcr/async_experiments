@@ -1,25 +1,29 @@
 name: wiki
 
-# Mirrors docs/wiki/*.md into this repo's GitHub wiki (its own separate
-# git repo, <repo>.wiki.git) on every push to main that touches
-# docs/wiki/ - the wiki stays a read-only mirror of what's already
-# reviewed and merged in-tree, not a second, independently-editable copy
-# that can drift from it (see CLAUDE.md's "docs/wiki/ must stay in sync
-# with the code" rule - this keeps that true on the wiki side too).
-# Additive/overwrite only: copies docs/wiki/*.md over the wiki repo's
-# same-named pages, never deletes a wiki page docs/wiki/ doesn't have
-# (so a page created directly on the wiki, outside this sync, survives).
+# Mirrors docs/wiki/*.md, plus docs/PLAN.md (as a "Journal" page), into
+# this repo's GitHub wiki (its own separate git repo, <repo>.wiki.git) on
+# every push to main that touches either - the wiki stays a read-only
+# mirror of what's already reviewed and merged in-tree, not a second,
+# independently-editable copy that can drift from it (see CLAUDE.md's
+# "docs/wiki/ must stay in sync with the code" rule, and PLAN.md's own
+# "decision log ... kept scrupulously up to date" - this keeps both true
+# on the wiki side too). Additive/overwrite only: copies over the wiki
+# repo's same-named pages, never deletes a wiki page this sync doesn't
+# own (so a page created directly on the wiki, outside this sync,
+# survives).
 #
 # Needs GitHub wiki enabled for this repository (Settings -> Features ->
 # Wikis) before the push step below can succeed - workflow_dispatch lets
 # this run on demand too, e.g. to populate the wiki for the first time
-# right after enabling it, without waiting for the next docs/wiki/ change.
+# right after enabling it, without waiting for the next docs/wiki/ or
+# docs/PLAN.md change.
 
 on:
   push:
     branches: [main]
     paths:
       - "docs/wiki/**"
+      - "docs/PLAN.md"
       - ".github/workflows/wiki.yml"
   workflow_dispatch: {}
 
@@ -46,8 +50,10 @@ jobs:
             git -C wiki remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
           }
 
-      - name: copy pages from docs/wiki/
-        run: cp docs/wiki/*.md wiki/
+      - name: copy pages from docs/wiki/, plus docs/PLAN.md as Journal.md
+        run: |
+          cp docs/wiki/*.md wiki/
+          cp docs/PLAN.md wiki/Journal.md
 
       - name: commit and push if anything changed
         working-directory: wiki
