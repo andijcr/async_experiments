@@ -13,7 +13,8 @@ this way (every milestone, every reviewed design decision, every bug found
 and fixed, with dates and reasoning) see [`docs/PLAN.md`](../PLAN.md) in the
 repository root — it is the project's full decision log and is kept
 scrupulously up to date. This wiki summarizes and cross-references it rather
-than duplicating it.
+than duplicating it. The same file is also mirrored here as
+[Journal](Journal.md), for reading it without leaving the wiki.
 
 ## Pages
 

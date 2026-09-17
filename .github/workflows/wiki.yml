@@ -1,0 +1,69 @@
+name: wiki
+
+# Mirrors docs/wiki/*.md, plus docs/PLAN.md (as a "Journal" page), into
+# this repo's GitHub wiki (its own separate git repo, <repo>.wiki.git) on
+# every push to main that touches either - the wiki stays a read-only
+# mirror of what's already reviewed and merged in-tree, not a second,
+# independently-editable copy that can drift from it (see CLAUDE.md's
+# "docs/wiki/ must stay in sync with the code" rule, and PLAN.md's own
+# "decision log ... kept scrupulously up to date" - this keeps both true
+# on the wiki side too). Additive/overwrite only: copies over the wiki
+# repo's same-named pages, never deletes a wiki page this sync doesn't
+# own (so a page created directly on the wiki, outside this sync,
+# survives).
+#
+# Needs GitHub wiki enabled for this repository (Settings -> Features ->
+# Wikis) before the push step below can succeed - workflow_dispatch lets
+# this run on demand too, e.g. to populate the wiki for the first time
+# right after enabling it, without waiting for the next docs/wiki/ or
+# docs/PLAN.md change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/wiki/**"
+      - "docs/PLAN.md"
+      - ".github/workflows/wiki.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # actions/checkout can't be pointed at <repo>.wiki directly when
+      # the wiki has never had a page saved (GitHub only creates its git
+      # repo lazily, on the first page) - a plain `git clone` falls back
+      # to initializing one locally instead of failing the whole job, so
+      # the very first run (right after enabling the wiki) still works.
+      - name: checkout or initialize the wiki repo
+        run: |
+          git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki || {
+            echo "wiki repo has no pages yet - initializing"
+            mkdir wiki
+            git -C wiki init -b master
+            git -C wiki remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
+          }
+
+      - name: copy pages from docs/wiki/, plus docs/PLAN.md as Journal.md
+        run: |
+          cp docs/wiki/*.md wiki/
+          cp docs/PLAN.md wiki/Journal.md
+
+      - name: commit and push if anything changed
+        working-directory: wiki
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -- '*.md'
+          if git diff --cached --quiet; then
+            echo "wiki already up to date"
+            exit 0
+          fi
+          git commit -m "Sync wiki from docs/wiki/ @ ${GITHUB_SHA::7}"
+          git push origin HEAD:master
