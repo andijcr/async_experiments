@@ -293,6 +293,40 @@ TEST_CASE("yield_execution() lets already-ready work run first", "[loop]") {
   REQUIRE(order == std::vector{1, 2});
 }
 
+TEST_CASE("yield_execution() inherits current_priority() instead of always defaulting to "
+          "normal (issue #31)",
+          "[loop][priority]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::optional<est::future<void>> yielded;
+
+  // marker's own node reaches loop's ready-queue (at Priority::normal)
+  // before yield_execution()'s below, chronologically - so if
+  // yield_execution() incorrectly defaulted to Priority::normal too (a
+  // real bug this regression test caught: yield_execution() re-enters
+  // ready_ directly, est:promise's own doc comment, never through
+  // future_awaiter<T>::await_suspend() - the usual place a co_await
+  // inherits ambient priority), FIFO ordering within that shared level
+  // would run marker's callback before `yielded` is even ready. If
+  // yield_execution() correctly inherits Priority::critical instead, its
+  // own node must run first regardless, since loop::eager_scheduler
+  // always drains the highest non-empty level first.
+  auto [marker_promise, marker_future] = est::make_promise_future<int>();
+  marker_promise.set_value(0);
+  bool yield_ready_when_marker_ran = false;
+  auto marker = marker_future.then([&](est::future<int>&) {
+    yield_ready_when_marker_ran = yielded.has_value() && yielded->ready();
+  });
+
+  {
+    const auto raised = est::set_priority(est::Priority::critical);
+    yielded = est::yield_execution();
+  }
+
+  loop.run_until_idle();
+  REQUIRE(yield_ready_when_marker_ran);
+}
+
 TEST_CASE("a then() registered on a timer-driven future runs once the timer fires", "[loop]") {
   using namespace std::chrono_literals;
   fake_platform fake;

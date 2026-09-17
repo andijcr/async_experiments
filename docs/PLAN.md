@@ -6621,6 +6621,32 @@ samples were now stale) and extended with a new "Priority levels and the
 pluggable scheduler" subsection; `docs/wiki/Home.md`'s lookup table
 updated to match.
 
+**A code review of the same PR caught a real gap** before it shipped:
+`est::yield_execution()` (`est/src/promise.cppm`) and
+`counting_event<Mode>::wait()`'s slow path (`est/src/sync/event.cppm` -
+which `est::mutex::lock()` is built directly on) each construct their own
+`detail::promise_resume_node<void>` and hand it to `loop::enqueue_ready()`
+(directly, or later via `set()`) without ever stamping `priority_level`
+from `current_priority()` - both silently defaulted to `Priority::normal`
+regardless of the caller's actual ambient priority, since neither goes
+through `future_awaiter<T>::await_suspend()` (the usual place a `co_await`
+inherits it). Unlike the flatten/monadic path (`detail::
+flatten_forwarder<T>`, `spawn()`) - explicitly documented as staying at
+`Priority::normal` for now - this one wasn't a deliberate exclusion,
+just an oversight: a coroutine running at `Priority::critical` that then
+`co_await`s `yield_execution()` or a contended `est::mutex::lock()` would
+silently drop to normal priority for its resumption, exactly the kind of
+priority inversion the whole inheritance mechanism exists to prevent.
+Fixed by stamping `priority_level = current_priority()` at both
+construction sites. Two new regression tests (`est/tests/loop_tests.cpp`,
+`est/tests/event_tests.cpp`) catch it directly: a marker at
+`Priority::normal` is enqueued to `loop`'s ready-queue *before* the
+`yield_execution()`/`wait()` call under test, so if either incorrectly
+defaulted to normal too, FIFO ordering within that shared level would run
+the marker first, before the future under test is even ready - both tests
+assert it isn't. All 302 tests pass (300 + these 2); full devenv pipeline
+re-verified.
+
 ---
 
 ## Verification for M0

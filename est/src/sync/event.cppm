@@ -223,6 +223,14 @@ public:
     }
     auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
     auto* node = new detail::promise_resume_node<void>(std::move(prom));
+    // Stamped from current_priority() for the identical reason
+    // yield_execution()'s own doc comment gives (est:promise): this node
+    // reaches loop::enqueue_ready() later, from set() (below), never
+    // through future_awaiter<T>::await_suspend() - without this, a
+    // coroutine co_await-ing wait() (or est::mutex::lock(), built
+    // directly on this) at some raised priority would silently drop to
+    // Priority::normal for its resumption.
+    node->priority_level = current_priority();
     waiters_.enqueue(*node);
     return std::move(fut);
   }
