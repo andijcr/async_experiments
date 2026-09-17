@@ -32,6 +32,8 @@ add_executable(est_tests
   when_all_tests.cpp
   when_any_tests.cpp
   when_any_succeeds_tests.cpp
+  stop_token_tests.cpp
+  with_stop_tests.cpp
 )
 # Catch2::Catch2, not Catch2::Catch2WithMain: test_main.cpp supplies its
 # own main() (installing a platform::interface before any TEST_CASE

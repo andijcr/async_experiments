@@ -53,7 +53,7 @@ export namespace est {
 // watching them once when_any() itself has returned. Each future<T>&
 // stays owned by the caller (when_any() only ever registers then_fast()
 // continuations on it, never consumes or moves it) - once the returned
-// future<void> is ready, the caller inspects ready()/failed()/get() on
+// future<void> is ready, the caller inspects ready()/ready_with_failure()/get() on
 // whichever of `futures` it cares about to find out which one actually
 // won (or which ones, if more than one happened to finish together -
 // "any one" doesn't promise there's exactly one).

@@ -179,6 +179,7 @@ class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
   using clock = std::chrono::steady_clock;
+  using timer_id = timer_queue<allocator_type>::id;
 
   explicit loop(allocator_type allocator = {})
       : allocator_(allocator), timers_(allocator), pending_timers_(allocator) {}
@@ -222,10 +223,37 @@ public:
   // exactly to catch that, but check() compiles away entirely under
   // NDEBUG (est:check), turning the desync into a dereference of
   // pending_timers_.end() instead of a caught precondition violation.
-  void schedule_timer(detail::timer_node& node, clock::time_point deadline) {
+  //
+  // Returns the id timer_queue::schedule_at() assigned, so a caller that
+  // wants to cancel this specific registration later can do so via
+  // cancel_timer() below - most callers (sleep_until() without a
+  // stop_token, schedule_periodic()'s own re-arming) simply discard it.
+  auto schedule_timer(detail::timer_node& node, clock::time_point deadline) -> timer_id {
     pending_timers_.reserve(pending_timers_.size() + 1);
     const auto id = timers_.schedule_at(deadline);
     pending_timers_.push_back(pending_entry{.id = id, .node = &node});
+    return id;
+  }
+
+  // Cancels a still-pending registration from schedule_timer() above,
+  // completing it the same way drain_pending() completes every other
+  // still-queued timer_node on teardown - abandon(), then destroy. Returns
+  // false (a no-op) if `id` already fired or was already cancelled: unlike
+  // drain_pending() (which unconditionally walks every entry), this has to
+  // find one specific entry first, since the timer may have already fired
+  // and been erased by fire_ready_timers() by the time a caller gets
+  // around to cancelling it - a race a token-driven canceller (est:promise's
+  // token-aware sleep_for()/sleep_until()) can't rule out ahead of time.
+  [[nodiscard]] auto cancel_timer(timer_id id) noexcept -> bool {
+    const auto it = std::ranges::find(pending_timers_, id, &pending_entry::id);
+    if (it == pending_timers_.end()) {
+      return false;
+    }
+    timers_.cancel(id);
+    auto* node = it->node;
+    pending_timers_.erase(it);
+    detail::abandon_timer_node(*node);
+    return true;
   }
 
   // Runs until both the ready-queue and the timer queue are empty - for

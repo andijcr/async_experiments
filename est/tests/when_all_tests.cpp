@@ -82,7 +82,7 @@ TEST_CASE("when_all() counts a failed future the same as a succeeded one", "[whe
   // The core of issue #54's resolved failure semantics: when_all() itself
   // never fails and never inspects which input failed - it just waits for
   // every one of them to be done, success or failure - the caller checks
-  // failed()/get() on each input future afterward.
+  // ready_with_failure()/get() on each input future afterward.
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   auto [first_promise, first_future] = est::make_promise_future<int>();
@@ -94,10 +94,10 @@ TEST_CASE("when_all() counts a failed future the same as a succeeded one", "[whe
   loop.run_until_idle();
 
   REQUIRE(combined.ready());
-  REQUIRE_FALSE(combined.failed());
-  REQUIRE_FALSE(first_future.failed());
+  REQUIRE_FALSE(combined.ready_with_failure());
+  REQUIRE_FALSE(first_future.ready_with_failure());
   REQUIRE(first_future.get() == 1);
-  REQUIRE(second_future.failed());
+  REQUIRE(second_future.ready_with_failure());
   REQUIRE_THROWS_AS(second_future.get(), std::runtime_error);
 }
 

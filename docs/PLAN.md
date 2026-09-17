@@ -6219,6 +6219,256 @@ step outside CI, per that workflow's own top comment).
 
 ---
 
+### Issue #56: `future<T>` cancellation (stop_token-style) (done)
+
+Issue #56 (github.com/andijcr/async_experiments/issues/56) asked for a way
+to ask a still-pending `future<T>`/coroutine to stop early - the only
+thing resembling this before was abandonment (`future_state<T>`'s
+destructor-time waiter drain), which only helps when *nothing* will ever
+resume the coroutine again (the owning object dying), not when the thing
+being waited on is still perfectly alive and a caller just wants to give
+up on it. The issue predates `when_any()`/`when_all()`/
+`when_any_succeeds()` (all three landed after it was filed - both
+`when_any()`'s and `when_all()`'s own entries above explicitly deferred
+cancellation to this issue: "this codebase has no cancellation mechanism
+at all") - the design here was updated to build on top of those rather
+than the empty landscape #56 was originally written against, and posted
+as an issue comment before any code, mirroring issue #99's own
+convention.
+
+**`est::make_failed_future<T>(exception)`** (`est/src/promise.cppm`) is
+the missing failure-case sibling to the existing `make_ready_future<T>()`
+- both the `with_stop()` fast path and the token-aware sleep overloads'
+fast path (below) need a fresh, already-*failed* future built from
+scratch, and there was previously no one-line way to do that.
+
+**`est::stop_source`/`est::stop_token`/`est::operation_cancelled`** (new
+partition `est:sync.stop_token`, `est/src/sync/stop_token.cppm`) are
+built directly on `make_promise_future<void>()` + `future<void>::clone()`
+rather than `:sync.event`'s `one_shot_event` - `:sync.event` already
+depends on `:promise`, and the token-aware sleep overloads (below) need
+`:promise` itself to sit *above* `:sync.stop_token`, so routing through
+`:sync.event` would have closed a cycle
+(`:promise → :sync.stop_token → :sync.event → :promise`). `stop_token::
+stopped()` returns a `future<void>` any number of independent consumers
+can `co_await`/`then_fast()`, via the same `clone()` a multi-consumer
+signal already needed with zero new machinery; `request_stop()` is
+idempotent, matching `one_shot_event::set()`'s own "independent
+cancellation sources safely racing to fire the same signal" contract,
+reimplemented directly here since `stop_state` doesn't build on
+`one_shot_event`. Cancellation itself is a second, distinct, exported
+exception type (`operation_cancelled`) flowing through the exact same
+`set_exception()` channel `abandoned_exception` already uses - no change
+to `future_state<T>`'s pending/value/exception representation or any
+`.then()` dispatch branch.
+
+**`est::with_stop<T>(future<T> operation, const stop_token&)`** (new
+partition `est:with_stop`, `est/src/with_stop.cppm`) races `operation`
+against `token.stopped()` using the identical `shared_ptr<state>` + two
+`then_fast()` racers shape `when_any()` already established, generalized
+to carry a real `T` through. Its documented, honestly-scoped limitation
+matches `when_any()`/`when_all()`/`when_any_succeeds()`'s own already-
+accepted one: it stops the *caller* from waiting further, but doesn't
+eagerly free `operation` itself, which keeps running in the background
+until it completes on its own (a harmless no-op via a `done` guard by
+then). Eagerly freeing an arbitrary suspended coroutine or queued
+`mutex::lock()`/`counting_event::wait()` waiter would need
+`intrusive_list<T>::remove()` from the middle, which doesn't exist
+(`enqueue`/`dequeue`/`drain` only) - a broad, invasive change touching
+every list in the codebase, explicitly scoped out as a follow-up rather
+than folded into this already-large change, the same way `when_any()`/
+`when_all()` themselves deferred cancellation to this issue.
+
+**Timed cancellation is the one case that's genuinely eager**, not just
+"stop watching": `est::loop::cancel_timer(timer_id)` (new, alongside a
+`schedule_timer()` that now returns the `timer_id` it used to discard)
+pulls a still-pending `sleep_resume_node` out of `loop`'s timer queue
+early and completes it via the exact same `abandon()`-then-destroy path
+`drain_pending()` already used at teardown - `timer_queue::cancel(id)`
+itself already existed and worked, it just wasn't exposed for one entry
+on demand. `est::sleep_for(delay, const stop_token&)`/`est::sleep_until
+(deadline, const stop_token&)` (`est:with_stop`, not `:promise` - putting
+them in `:promise` would itself have needed `:promise → :sync.stop_token`,
+closing the same cycle described above) build on this: a fast path
+matching `with_stop()`'s own when already `stop_requested()` (no timer
+ever scheduled), otherwise a racer that, on the token winning, calls
+`loop.cancel_timer()` and completes the caller-visible future with
+`operation_cancelled` - real, immediate reclamation of the timer, not a
+flag checked later.
+
+**Tests added**: `make_failed_future<T>()`/`make_failed_future<void>()`
+(`est/tests/loop_tests.cpp`, alongside the existing `make_ready_future()`
+tests); `est/tests/stop_token_tests.cpp` (idempotent `request_stop()`,
+`stop_requested()` before/after, independent `get_token()` copies all
+observing one signal, `stopped()` immediate vs. genuine coroutine
+suspend/resume); `est/tests/with_stop_tests.cpp` (normal completion
+forwarding value/failure, `request_stop()` before completion resolving
+`operation_cancelled` with the operation's later completion proven a
+no-op via a manually-held `promise<T>`, `request_stop()` *after*
+completion also proven a no-op the other way around, an already-
+`stop_requested()` token short-circuiting without ever touching the
+operation); timed-cancellation tests in `loop_tests.cpp` proving
+`cancel_timer()` genuinely removes a pending timer rather than merely
+losing the race (a fake platform's clock never advancing anywhere near a
+deliberately huge deadline once cancelled, plus `counting_resource`
+allocation-count balance) and that `cancel_timer()` on a stale/unknown id
+returns `false` rather than asserting. Full devenv pipeline
+(`cmake --preset default/ci/sanitize` + `ctest` + `clang-format` +
+`clang-tidy` + the new-code coverage gate, all real, tested logic -
+98% diff coverage) - unlike the immediately-preceding wasm work's
+infra-only diffs, this has real logic and real coverage to show for it.
+
+**Explicitly out of scope**: eager cancellation of a queued
+`mutex::lock()`/`counting_event::wait()` waiter (the `intrusive_list<T>`
+gap above) - worth its own follow-up issue, not built here; and wiring
+`est::stop_token` into `examples/spreadsheet/src/spreadsheet.cppm`'s
+`resolve_blocking()`/`GET BLOCKING` protocol (the issue's own concrete
+motivating case, named only as motivation) - actually changing that wire
+protocol to accept a timeout is a separate protocol/UX decision (what
+syntax, what error response) deserving its own issue rather than being
+folded in silently here.
+
+`docs/wiki/Architecture.md`'s partition DAG, `docs/wiki/Coroutines.md`
+(a new section distinguishing abandonment from `stop_token`-based
+cancellation), `docs/wiki/Loop-And-Timers.md` (`cancel_timer()`), and
+`docs/wiki/Home.md`'s "where to look" table were all updated to match.
+
+**`examples/digit_recall`**, added afterward on the same PR: a small
+terminal reflex game (`sleep_sort`/`spreadsheet`-shaped - a testable
+core module, an untested `*_io.cppm` talking to a real fd, a thin
+`main.cpp` driver), built specifically to demonstrate `stop_token`/
+`with_stop<T>()` end to end rather than only in unit tests. The player
+is shown a random digit string and has to type it back before a
+per-round deadline (`difficulty * length * base_unit`); a correct
+answer grows either `difficulty` or `length` for the next round. Two
+cancellation points, deliberately shaped to be genuinely different
+rather than the same mechanism twice:
+
+- The round's own timeout is cancelled *eagerly* via a token-aware
+  `sleep_for()` the instant an answer arrives - real proof this isn't
+  just "stop watching": `digit_recall_tests.cpp`'s own correct-answer
+  test uses the identical fake-clock-never-advances idiom
+  `loop_tests.cpp` uses for `loop::cancel_timer()` itself.
+- A whole-session time budget can cut a round short via `with_stop()`
+  even while the player is still mid-keystroke - honestly non-eager:
+  the underlying read keeps running, unobserved, exactly matching that
+  function's own documented limitation (also unit-tested: completing
+  the abandoned read after the fact is proven a no-op).
+
+Caught one real bug building it: `main()` initially left `loop.run()`
+blocked on the session-length timer even after the game itself ended
+(`quit`/a wrong or timed-out round) - `run()` only returns once nothing
+is pending, and that timer was still sitting there with up to 90 real
+seconds left. Fixed by having the session's own completion eagerly
+cancel that timer and call `loop.stop()`, rather than waiting for
+`run()` to drain everything on its own - caught by actually running the
+program end to end (piped `quit`/wrong-answer/EOF/timeout input inside
+the devenv container), not by the unit tests alone, which never
+exercise `main()` itself.
+
+**`future<T>`/`future_state<T>` gained `ready_with_value()`**, and
+**`failed()` was renamed to `ready_with_failure()`** (both on
+`future_state<T>` and `future<T>`) - a follow-up prompted by
+`digit_recall.cppm`'s own `timeout.ready() && !timeout.failed()` check
+after its `when_any()` race, which is exactly the pattern
+`est::when_any()`'s own doc comment already describes as the intended
+way to find out which future won a race, and won cleanly. `ready_with_
+value()` collapses that combination into one call, computed the same
+way `ready()`/`ready_with_failure()` already are - straight off
+`result_`'s own variant index, no new state. `ready_with_failure()` is
+a pure rename, not a new method: `failed()` predates this PR (Issue
+#23) and was already used in `future.cppm`'s own dispatch logic,
+`with_stop.cppm`, `when_any_succeeds.cppm`, and every test file that
+exercises failure - renamed everywhere it appeared (source, tests, and
+`docs/wiki/Continuation-Node-Mechanism.md`, which documents current
+behavior) so the three queries read as a matched trio:
+`ready()`/`ready_with_value()`/`ready_with_failure()`. Historical
+`docs/PLAN.md` entries describing the original `failed()` addition
+(Issue #23 and later) were deliberately left using that name - they
+narrate what happened at the time, not the code as it reads today.
+
+**`promise<T>::get_future()` was added**, and `detail::stop_state` was
+removed as a result. `get_future()` is the producer-side mirror of
+`future<T>::clone()` (`est/src/future.cppm`): given a `promise<T>`, it
+returns a fresh `future<T>` aliasing the same `future_state<T>`, any
+number of times, constrained to `T = void`/scalar `T` for the identical
+moved-from-hazard reason `clone()` already is. This is the safe
+direction - unlike a hypothetical `future<T>::get_promise()` (considered
+earlier in this same PR's design discussion and rejected: it would let a
+caller fabricate a second producer from an existing future, breaking the
+structural single-producer guarantee `promise<T>`'s move-only-ness
+exists to provide), `get_future()` only ever adds more consumers, the
+same thing `clone()` already safely allows.
+
+With `get_future()` available, `est::stop_source`/`est::stop_token`
+(`est/src/sync/stop_token.cppm`) no longer need `detail::stop_state`, a
+`promise<void>`+`future<void>` pair wrapped in its own separately-
+allocated `shared_ptr<stop_state>` control block - that wrapper was pure
+duplication, since `promise<T>`/`future<T>` are already thin
+`est::shared_ptr<future_state<T>>` handles sharing one allocation
+between them. `stop_source` now holds a bare `promise<void>`; `stop_token`
+now holds a bare `future<void>`, derived from the promise on demand via
+`get_future()` at `get_token()` time (and, internally, every time
+`stop_source` itself needs to query `ready()` for `request_stop()`'s
+idempotency guard or `stop_requested()` - each call constructs and
+immediately discards a throwaway `future<void>`, a plain non-atomic
+refcount bump/decrement, not a new allocation). This removes one heap
+allocation from every `stop_source` construction (the now-gone
+`stop_state` control block) and, as a side effect, fixes a minor
+existing wart: `stop_source`'s own `allocator_type` constructor
+parameter used to control only where that (now-removed) wrapper lived,
+never the `future_state<void>` itself, which always resolved
+`current_allocator()` internally regardless of what was passed in -
+`stop_source`'s constructor now forwards `allocator` to
+`detail::make_promise_future_impl<void>()` (`est/src/promise.cppm`)
+directly, so it genuinely controls where the `future_state<void>` lives.
+
+**A code review of this same change caught a real regression before it
+shipped**: `stop_token`'s doc comment claims it's copyable, "matching
+`std::stop_token`'s own copyable-handle shape" - true when it held a
+`shared_ptr<detail::stop_state>` (implicitly copyable), but silently
+false once its only member became a bare `future<void>`, since
+`future<T>` itself deletes its copy constructor. The implicitly-declared
+copy constructor a class gets from a non-copyable member is itself
+deleted, so `stop_token` had quietly become move-only, contradicting its
+own comment - no test caught it, since nothing in this codebase happened
+to copy a `stop_token` object directly (every consumer calls
+`get_token()` again instead). Fixed by giving `stop_token` an explicit
+copy constructor/assignment built on `future<void>::clone()` (the same
+tool `stopped()` already uses) - each copy gets its own `future<void>`
+handle, all aliasing the same underlying `future_state<void>`.
+
+The same review raised the question for `stop_source` too: it now holds
+a bare `promise<void>`, and `promise<T>` is *also* move-only, so
+`stop_source` silently lost copyability the identical way. Decided,
+deliberately, **not** to restore it: `std::stop_source` genuinely is
+copyable in the real standard (copies share one stop-state, part of
+treating `stop_source`/`stop_token` symmetrically as cheap, shared
+handles - P2175), but restoring that here would need `promise<void>`
+wrapped in its own `shared_ptr` again, since `promise<T>`'s move-only-
+ness is what keeps "at most one producer" structural rather than merely
+documented - undoing the one allocation this entire change exists to
+remove, for a property nothing in this codebase currently uses (no
+caller copies a `stop_source`; every consumer shares via `stop_token`
+instead). `stop_source`'s own doc comment now says so explicitly, so the
+narrowing reads as an intentional, documented scope decision rather than
+an accident matching `stop_token`'s.
+
+Tests: two new cases in `est/tests/future_tests.cpp` for
+`get_future()` itself (aliases the original before/after `set_value()`,
+and repeated calls each an independent handle onto the same state); one
+new case in `est/tests/stop_token_tests.cpp` proving `stop_token`
+copy-construction and copy-assignment both observe the same
+`request_stop()` as their original.
+Full devenv pipeline re-verified (`cmake --preset default/ci/sanitize` +
+`ctest` + `clang-format` + `clang-tidy` + the coverage gate).
+`docs/wiki/Architecture.md`'s `:sync.stop_token` description updated to
+match; `docs/PLAN.md`'s own entries above describing the original
+`detail::stop_state` design were left as-is - they narrate what was
+built at the time, not the code as it reads today.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

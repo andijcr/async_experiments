@@ -105,7 +105,7 @@ public:
   // comment on why run() lives here now instead of behind a second,
   // separately virtual invoke().
   //
-  // The state.failed() branch lives inside the same try as the success
+  // The state.ready_with_failure() branch lives inside the same try as the success
   // path, not before it (an earlier version of this method had it as an
   // early return ahead of the try, unlike concrete_continuation<Fn, U>'s
   // own identical branch, which was always inside its try) - nothing on
@@ -131,7 +131,7 @@ public:
 #ifdef __cpp_exceptions
     try {
 #endif
-      if (state.failed()) {
+      if (state.ready_with_failure()) {
         downstream_->set_exception(state.get_exception());
       } else if constexpr (std::is_void_v<T>) {
         downstream_->set_value();
@@ -463,15 +463,28 @@ public:
   // a value - lets a then() continuation that took future_state<T>& (see
   // then() below) inspect success/failure without calling get() (which
   // would rethrow) just to find out.
-  [[nodiscard]] auto failed() const noexcept -> bool {
+  [[nodiscard]] auto ready_with_failure() const noexcept -> bool {
     return std::holds_alternative<std::exception_ptr>(result_);
   }
 
+  // The other half of ready_with_failure() above - true once ready() and
+  // the stored result is a value rather than an exception. Not just
+  // `ready() && !ready_with_failure()` spelled out at each call site:
+  // the combination shows up wherever a caller inspects a future after a
+  // when_any()-style race to find out which one actually won *and* won
+  // cleanly (est::when_any()'s own doc comment, est:when_any) - one call
+  // instead of two, with no new state (still read straight off result_,
+  // exactly like ready()/ready_with_failure() themselves).
+  [[nodiscard]] auto ready_with_value() const noexcept -> bool {
+    return ready() && !ready_with_failure();
+  }
+
   // Returns the stored exception_ptr directly, without going through
-  // get()'s throw/rethrow. Precondition: failed(). Pairs with failed()
-  // for a caller that already knows there's an exception waiting and
-  // wants to forward it without paying for a throw/catch round-trip
-  // just to retrieve a pointer - used internally by then()'s
+  // get()'s throw/rethrow. Precondition: ready_with_failure(). Pairs
+  // with ready_with_failure() for a caller that already knows there's
+  // an exception waiting and wants to forward it without paying for a
+  // throw/catch round-trip just to retrieve a pointer - used internally
+  // by then()'s
   // unwrapped-mode auto-propagate path and the monadic-flatten
   // forwarding continuation (both below). std::get<...> would throw
   // std::bad_variant_access if the precondition were violated, which -
@@ -565,7 +578,7 @@ public:
   //     future_state succeeded or failed, with a fresh future<T> view of
   //     *this (built via shared_from_this() - future_state is a detail,
   //     not what a callback should see, see this class's own doc
-  //     comment); fn inspects ready()/failed()/get() to decide what to
+  //     comment); fn inspects ready()/ready_with_failure()/get() to decide what to
   //     do. No implicit unwrap.
   // Checked in that order - unwrapped first - so a generic callback (e.g.
   // an `auto&`/`auto&&` lambda, incidentally invocable both ways) is
@@ -720,9 +733,9 @@ private:
       try {
 #endif
         if constexpr (detail::invocable_unwrapped<Fn, T>()) {
-          if (state.failed()) {
+          if (state.ready_with_failure()) {
             // Unwrapped mode's auto-propagate-on-failure, fn_ not called:
-            // failed() already tells us there's an exception waiting, so
+            // ready_with_failure() already tells us there's an exception waiting, so
             // fetching it via get_exception() is a plain pointer copy -
             // cheaper than the alternative of calling get() purely to
             // have it rethrow into the catch below, even though this
@@ -979,13 +992,23 @@ public:
 
   [[nodiscard]] auto ready() const noexcept -> bool { return state_->ready(); }
 
-  [[nodiscard]] auto failed() const noexcept -> bool { return state_->failed(); }
+  [[nodiscard]] auto ready_with_failure() const noexcept -> bool {
+    return state_->ready_with_failure();
+  }
+
+  // See future_state<T>::ready_with_value()'s own doc comment - one call
+  // in place of `ready() && !ready_with_failure()`, most useful right
+  // after a when_any()-style race to find out which future actually won
+  // *and* won cleanly.
+  [[nodiscard]] auto ready_with_value() const noexcept -> bool {
+    return state_->ready_with_value();
+  }
 
   // Returns the stored exception_ptr directly, without going through
-  // get()'s throw/rethrow. Precondition: failed(). Pairs with failed()
-  // for a caller that already knows there's an exception waiting and
-  // wants to forward or inspect it without paying for a throw/catch
-  // round-trip just to retrieve a pointer.
+  // get()'s throw/rethrow. Precondition: ready_with_failure(). Pairs
+  // with ready_with_failure() for a caller that already knows there's an
+  // exception waiting and wants to forward or inspect it without paying
+  // for a throw/catch round-trip just to retrieve a pointer.
   [[nodiscard]] auto get_exception() const noexcept -> std::exception_ptr {
     return state_->get_exception();
   }

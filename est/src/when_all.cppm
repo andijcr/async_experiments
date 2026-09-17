@@ -101,7 +101,7 @@ export namespace est {
 // exception out of any of them itself. Each future<T>& stays owned by
 // the caller (when_all() only ever registers then_fast() continuations
 // on it, never consumes or moves it), so once the returned future<void>
-// is ready, the caller inspects failed()/get() on whichever of `futures`
+// is ready, the caller inspects ready_with_failure()/get() on whichever of `futures`
 // it cares about, exactly as if it had awaited each one individually.
 //
 // An empty pack resolves immediately, ready() the moment when_all()
