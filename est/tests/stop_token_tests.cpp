@@ -102,6 +102,28 @@ TEST_CASE("stop_token::stopped(): two independent tokens each get their own futu
   REQUIRE(second.ready());
 }
 
+TEST_CASE("stop_token is copyable, and a copy observes the same request_stop() as its original",
+          "[stop_token]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  est::stop_source source;
+  auto original = source.get_token();
+
+  // The copy itself is what this test exercises, not incidental.
+  // NOLINTNEXTLINE(performance-unnecessary-copy-initialization)
+  est::stop_token copy_constructed(original);
+  REQUIRE_FALSE(copy_constructed.stop_requested());
+
+  est::stop_token copy_assigned = source.get_token();
+  copy_assigned = original;
+
+  source.request_stop();
+
+  REQUIRE(original.stop_requested());
+  REQUIRE(copy_constructed.stop_requested());
+  REQUIRE(copy_assigned.stop_requested());
+}
+
 TEST_CASE("a coroutine can co_await stop_token::stopped(), genuinely suspending until "
           "request_stop()",
           "[stop_token][coroutine]") {

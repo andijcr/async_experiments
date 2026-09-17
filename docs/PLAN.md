@@ -6423,11 +6423,43 @@ never the `future_state<void>` itself, which always resolved
 `detail::make_promise_future_impl<void>()` (`est/src/promise.cppm`)
 directly, so it genuinely controls where the `future_state<void>` lives.
 
+**A code review of this same change caught a real regression before it
+shipped**: `stop_token`'s doc comment claims it's copyable, "matching
+`std::stop_token`'s own copyable-handle shape" - true when it held a
+`shared_ptr<detail::stop_state>` (implicitly copyable), but silently
+false once its only member became a bare `future<void>`, since
+`future<T>` itself deletes its copy constructor. The implicitly-declared
+copy constructor a class gets from a non-copyable member is itself
+deleted, so `stop_token` had quietly become move-only, contradicting its
+own comment - no test caught it, since nothing in this codebase happened
+to copy a `stop_token` object directly (every consumer calls
+`get_token()` again instead). Fixed by giving `stop_token` an explicit
+copy constructor/assignment built on `future<void>::clone()` (the same
+tool `stopped()` already uses) - each copy gets its own `future<void>`
+handle, all aliasing the same underlying `future_state<void>`.
+
+The same review raised the question for `stop_source` too: it now holds
+a bare `promise<void>`, and `promise<T>` is *also* move-only, so
+`stop_source` silently lost copyability the identical way. Decided,
+deliberately, **not** to restore it: `std::stop_source` genuinely is
+copyable in the real standard (copies share one stop-state, part of
+treating `stop_source`/`stop_token` symmetrically as cheap, shared
+handles - P2175), but restoring that here would need `promise<void>`
+wrapped in its own `shared_ptr` again, since `promise<T>`'s move-only-
+ness is what keeps "at most one producer" structural rather than merely
+documented - undoing the one allocation this entire change exists to
+remove, for a property nothing in this codebase currently uses (no
+caller copies a `stop_source`; every consumer shares via `stop_token`
+instead). `stop_source`'s own doc comment now says so explicitly, so the
+narrowing reads as an intentional, documented scope decision rather than
+an accident matching `stop_token`'s.
+
 Tests: two new cases in `est/tests/future_tests.cpp` for
 `get_future()` itself (aliases the original before/after `set_value()`,
-and repeated calls each an independent handle onto the same state);
-`est/tests/stop_token_tests.cpp` needed no changes - it only ever
-exercised `stop_source`/`stop_token`'s public API, which is unchanged.
+and repeated calls each an independent handle onto the same state); one
+new case in `est/tests/stop_token_tests.cpp` proving `stop_token`
+copy-construction and copy-assignment both observe the same
+`request_stop()` as their original.
 Full devenv pipeline re-verified (`cmake --preset default/ci/sanitize` +
 `ctest` + `clang-format` + `clang-tidy` + the coverage gate).
 `docs/wiki/Architecture.md`'s `:sync.stop_token` description updated to

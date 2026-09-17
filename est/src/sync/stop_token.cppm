@@ -37,6 +37,25 @@ class stop_source;
 // est::future<T> is already built on, est:util.shared_ptr).
 class stop_token {
 public:
+  // Copyable, matching std::stop_token's own copyable-handle shape - each
+  // copy clones its own future<void> (future<T>::clone(), est:future)
+  // rather than sharing fut_ by member-wise copy, since future<T> is
+  // itself deliberately move-only. Every clone still aliases the same
+  // underlying future_state<void>, so all copies observe the identical
+  // signal - this is load-bearing, not just boilerplate: a bare
+  // future<void> member (unlike the shared_ptr<stop_state> an earlier
+  // version of this class held) makes the implicit copy constructor
+  // ill-formed, so without this, stop_token would silently become
+  // move-only despite this doc comment's own claim.
+  stop_token(const stop_token& other) : fut_(other.fut_.clone()) {}
+  auto operator=(const stop_token& other) -> stop_token& {
+    fut_ = other.fut_.clone();
+    return *this;
+  }
+  stop_token(stop_token&&) noexcept = default;
+  auto operator=(stop_token&&) noexcept -> stop_token& = default;
+  ~stop_token() = default;
+
   // Non-blocking check - what with_stop()'s and the token-aware
   // sleep_for()/sleep_until()'s own already-cancelled fast paths use to
   // skip registering a continuation/scheduling a timer at all. Reads
@@ -61,6 +80,16 @@ private:
 // Owns the cancellation signal a stop_token (above) observes - request_stop()
 // is the one thing that ever fires it. Mirrors est::mutex/est::counting_event's
 // own allocator-first construction (current_allocator() default, :util.current_loop).
+//
+// Move-only, unlike stop_token above (and unlike std::stop_source's own
+// copyable contract): it holds a bare promise<void> (below), and
+// promise<T> is deliberately move-only (est:promise) so "at most one
+// producer" stays structural rather than merely documented - copying a
+// stop_source would need a second, independent promise<void> able to
+// complete the same future_state<void>, exactly the hazard that
+// invariant exists to rule out. Nothing in this codebase needs more than
+// one owning handle per cancellation signal; every consumer shares via
+// stop_token (copyable, above), not by copying the stop_source itself.
 //
 // Holds a bare promise<void>, not a promise/future pair behind a shared
 // control block of its own: promise<T>/future<T> are already thin
