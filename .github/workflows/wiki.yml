@@ -13,10 +13,15 @@ name: wiki
 # survives).
 #
 # Needs GitHub wiki enabled for this repository (Settings -> Features ->
-# Wikis) before the push step below can succeed - workflow_dispatch lets
-# this run on demand too, e.g. to populate the wiki for the first time
-# right after enabling it, without waiting for the next docs/wiki/ or
-# docs/PLAN.md change.
+# Wikis), AND at least one page saved once through the wiki's own web
+# editor (https://github.com/<repo>/wiki) - GitHub only provisions a
+# wiki's underlying git repo lazily, the first time a page is saved that
+# way, and *nothing* pushed via git (this workflow included) can bootstrap
+# that from scratch: `git push` to a wiki with zero pages fails the same
+# "Repository not found" way `git clone` does. workflow_dispatch lets
+# this run on demand (e.g. right after that one-time manual step, without
+# waiting for the next docs/wiki/ or docs/PLAN.md change) - it does not
+# remove the need for that step itself.
 
 on:
   push:
@@ -39,12 +44,15 @@ jobs:
       # actions/checkout can't be pointed at <repo>.wiki directly when
       # the wiki has never had a page saved (GitHub only creates its git
       # repo lazily, on the first page) - a plain `git clone` falls back
-      # to initializing one locally instead of failing the whole job, so
-      # the very first run (right after enabling the wiki) still works.
+      # to initializing one locally instead of failing the whole job here.
+      # This only gets the *local* half working, though - see this file's
+      # own top comment: the later push step still needs that one-time
+      # manual page save to have happened, and fails with a clear message
+      # (not a bare git error) if it hasn't.
       - name: checkout or initialize the wiki repo
         run: |
           git clone "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git" wiki || {
-            echo "wiki repo has no pages yet - initializing"
+            echo "wiki repo has no pages yet - initializing locally"
             mkdir wiki
             git -C wiki init -b master
             git -C wiki remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.wiki.git"
@@ -66,4 +74,7 @@ jobs:
             exit 0
           fi
           git commit -m "Sync wiki from docs/wiki/ @ ${GITHUB_SHA::7}"
-          git push origin HEAD:master
+          if ! git push origin HEAD:master; then
+            echo "::error::Push to the wiki repo failed. If this is the very first sync, GitHub only creates a wiki's underlying git repo once a page has been saved through its own web editor - visit https://github.com/${{ github.repository }}/wiki, save any placeholder page once, then re-run this workflow (Actions -> wiki -> Run workflow)."
+            exit 1
+          fi

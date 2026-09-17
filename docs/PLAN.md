@@ -6502,6 +6502,23 @@ file) is correct only in the wiki. Keeping both, rather than picking one
 and breaking the other context, was cheaper than making every relative
 link in `docs/wiki/` context-aware.
 
+**The workflow's first real run, on merge to `main`, failed** - `git
+clone .wiki.git` correctly hit the "wiki has never had a page saved"
+case and fell back to a local `git init` as designed, but the later
+`git push` to that same not-yet-existing remote failed the identical way
+(`remote: Repository not found`), which the workflow hadn't accounted
+for. Root cause, confirmed via the repo API (`has_wiki: true`) and a
+direct clone probe: enabling the wiki feature alone doesn't provision its
+underlying git repo - GitHub only does that the first time a page is
+saved through the wiki's own web editor, and no git operation (push
+included) can substitute for that one-time step. Fixed the workflow to
+say so plainly - both in its own top comment (previously, incorrectly,
+implying `workflow_dispatch` alone could bootstrap an empty wiki) and as
+an `::error::` with the exact URL and next step if the push fails - rather
+than leaving a future occurrence to a bare, cryptic git exit code. The
+manual step itself (saving one placeholder page via the web UI) is still
+outstanding and has to happen before this workflow can succeed for real.
+
 ---
 
 ## Verification for M0
