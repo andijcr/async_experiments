@@ -214,9 +214,11 @@ itself to sit *above* `:sync.stop_token` for its token-aware
 `sleep_for()`/`sleep_until()` overloads, so routing `:sync.stop_token`
 through `:sync.event` would close a cycle
 (`:promise → :sync.stop_token → :sync.event → :promise`). Building
-`detail::stop_state` directly on `make_promise_future<void>()` +
-`future<void>::clone()` sidesteps that entirely, keeping `:sync.stop_token`
-at the same DAG depth as `:promise` itself, not lower.
+`stop_source`/`stop_token` directly on `promise<void>`/`future<void>` -
+a bare `promise<void>` in `stop_source`, a bare `future<void>` in
+`stop_token`, derived from it on demand via `promise<void>::get_future()`
+(`:promise`) - sidesteps that entirely, keeping `:sync.stop_token` at the
+same DAG depth as `:promise` itself, not lower.
 
 `:with_stop` (`with_stop<T>()`, plus the token-aware `sleep_for()`/
 `sleep_until()` overloads) sits above both `:promise` and

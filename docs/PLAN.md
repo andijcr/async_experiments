@@ -6387,6 +6387,54 @@ behavior) so the three queries read as a matched trio:
 (Issue #23 and later) were deliberately left using that name - they
 narrate what happened at the time, not the code as it reads today.
 
+**`promise<T>::get_future()` was added**, and `detail::stop_state` was
+removed as a result. `get_future()` is the producer-side mirror of
+`future<T>::clone()` (`est/src/future.cppm`): given a `promise<T>`, it
+returns a fresh `future<T>` aliasing the same `future_state<T>`, any
+number of times, constrained to `T = void`/scalar `T` for the identical
+moved-from-hazard reason `clone()` already is. This is the safe
+direction - unlike a hypothetical `future<T>::get_promise()` (considered
+earlier in this same PR's design discussion and rejected: it would let a
+caller fabricate a second producer from an existing future, breaking the
+structural single-producer guarantee `promise<T>`'s move-only-ness
+exists to provide), `get_future()` only ever adds more consumers, the
+same thing `clone()` already safely allows.
+
+With `get_future()` available, `est::stop_source`/`est::stop_token`
+(`est/src/sync/stop_token.cppm`) no longer need `detail::stop_state`, a
+`promise<void>`+`future<void>` pair wrapped in its own separately-
+allocated `shared_ptr<stop_state>` control block - that wrapper was pure
+duplication, since `promise<T>`/`future<T>` are already thin
+`est::shared_ptr<future_state<T>>` handles sharing one allocation
+between them. `stop_source` now holds a bare `promise<void>`; `stop_token`
+now holds a bare `future<void>`, derived from the promise on demand via
+`get_future()` at `get_token()` time (and, internally, every time
+`stop_source` itself needs to query `ready()` for `request_stop()`'s
+idempotency guard or `stop_requested()` - each call constructs and
+immediately discards a throwaway `future<void>`, a plain non-atomic
+refcount bump/decrement, not a new allocation). This removes one heap
+allocation from every `stop_source` construction (the now-gone
+`stop_state` control block) and, as a side effect, fixes a minor
+existing wart: `stop_source`'s own `allocator_type` constructor
+parameter used to control only where that (now-removed) wrapper lived,
+never the `future_state<void>` itself, which always resolved
+`current_allocator()` internally regardless of what was passed in -
+`stop_source`'s constructor now forwards `allocator` to
+`detail::make_promise_future_impl<void>()` (`est/src/promise.cppm`)
+directly, so it genuinely controls where the `future_state<void>` lives.
+
+Tests: two new cases in `est/tests/future_tests.cpp` for
+`get_future()` itself (aliases the original before/after `set_value()`,
+and repeated calls each an independent handle onto the same state);
+`est/tests/stop_token_tests.cpp` needed no changes - it only ever
+exercised `stop_source`/`stop_token`'s public API, which is unchanged.
+Full devenv pipeline re-verified (`cmake --preset default/ci/sanitize` +
+`ctest` + `clang-format` + `clang-tidy` + the coverage gate).
+`docs/wiki/Architecture.md`'s `:sync.stop_token` description updated to
+match; `docs/PLAN.md`'s own entries above describing the original
+`detail::stop_state` design were left as-is - they narrate what was
+built at the time, not the code as it reads today.
+
 ---
 
 ## Verification for M0

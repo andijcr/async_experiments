@@ -46,6 +46,25 @@ public:
 
   void set_exception(std::exception_ptr exception) { state_->set_exception(std::move(exception)); }
 
+  // Returns a future<T> aliasing the same future_state as *this - the
+  // producer-side mirror of future<T>::clone() (est:future): any number
+  // of independent future<T> handles can be derived straight from a
+  // promise, each seeing the same eventual result, without the caller
+  // needing to have already held on to one. Unlike a hypothetical
+  // future<T>::get_promise() (considered and rejected - see docs/PLAN.md),
+  // this doesn't fabricate a second producer: promise<T> stays exactly as
+  // move-only as ever, so at most one entity can ever call
+  // set_value()/set_exception() on a given future_state<T> - get_future()
+  // only ever adds more consumers, the same safe direction clone() already
+  // supports. Constrained to T = void or a scalar T for the identical
+  // reason clone() is - see its own doc comment for the moved-from hazard
+  // this sidesteps.
+  [[nodiscard]] auto get_future() const -> future<T>
+    requires(std::is_void_v<T> || std::is_scalar_v<T>)
+  {
+    return future<T>(state_);
+  }
+
 private:
   shared_ptr<future_state<T>> state_;
 };

@@ -424,6 +424,39 @@ TEST_CASE("dropping the future doesn't prevent the promise from completing", "[f
   SUCCEED("no crash");
 }
 
+TEST_CASE("promise::get_future() derives a future aliasing the original, before and after "
+          "set_value()",
+          "[future]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, original] = est::make_promise_future<int>();
+
+  auto derived = promise.get_future();
+  REQUIRE_FALSE(derived.ready());
+  REQUIRE_FALSE(original.ready());
+
+  promise.set_value(7);
+  REQUIRE(derived.ready());
+  REQUIRE(derived.get() == 7);
+  REQUIRE(original.ready()); // same future_state - both see the same completion
+}
+
+TEST_CASE("promise::get_future() can be called more than once, each call an independent handle "
+          "onto the same future_state",
+          "[future]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, original] = est::make_promise_future<void>();
+
+  auto first = promise.get_future();
+  auto second = promise.get_future();
+  promise.set_value();
+
+  REQUIRE(first.ready());
+  REQUIRE(second.ready());
+  REQUIRE(original.ready());
+}
+
 TEST_CASE("a registered continuation is freed even if never invoked (broken promise)", "[future]") {
   // Guards future_state's destructor draining its continuation list: a
   // then() registered on a future whose promise is dropped without ever
