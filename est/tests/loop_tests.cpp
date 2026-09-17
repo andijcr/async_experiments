@@ -327,6 +327,134 @@ TEST_CASE("multiple pending timers all fire, earliest deadline first", "[loop]")
   REQUIRE(order == std::vector{1, 2, 3});
 }
 
+TEST_CASE("higher-priority ready work drains before lower-priority work, regardless of enqueue "
+          "order (issue #31)",
+          "[loop][priority]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::vector<int> order;
+
+  // Enqueued background, then critical, then normal, then high - drain
+  // order should be entirely by priority (eager_scheduler, loop::
+  // eager_scheduler), not enqueue order: critical, high, normal,
+  // background.
+  auto [background_promise, background_future] = est::make_promise_future<int>();
+  background_promise.set_value(0);
+  auto background = background_future.then(
+      [&](est::future<int>&) { order.push_back(4); }, est::Priority::background);
+
+  auto [critical_promise, critical_future] = est::make_promise_future<int>();
+  critical_promise.set_value(0);
+  auto critical = critical_future.then([&](est::future<int>&) { order.push_back(1); },
+                                        est::Priority::critical);
+
+  auto [normal_promise, normal_future] = est::make_promise_future<int>();
+  normal_promise.set_value(0);
+  auto normal =
+      normal_future.then([&](est::future<int>&) { order.push_back(3); }, est::Priority::normal);
+
+  auto [high_promise, high_future] = est::make_promise_future<int>();
+  high_promise.set_value(0);
+  auto high =
+      high_future.then([&](est::future<int>&) { order.push_back(2); }, est::Priority::high);
+
+  loop.run_until_idle();
+  REQUIRE(order == std::vector{1, 2, 3, 4});
+}
+
+TEST_CASE("then()/then_fast() default to inheriting current_priority() at the call site "
+          "(issue #31)",
+          "[loop][priority]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  REQUIRE(est::current_priority() == est::Priority::normal);
+
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_value(0);
+
+  {
+    const auto raised = est::set_priority(est::Priority::high);
+    REQUIRE(est::current_priority() == est::Priority::high);
+    // then_fast() runs inline, right here, so the callback observes
+    // current_priority() still raised - proving the default argument
+    // resolved to priority::high at this call site, not priority::normal.
+    future.then_fast([&](est::future<int>&) {
+      REQUIRE(est::current_priority() == est::Priority::high);
+    });
+  }
+  REQUIRE(est::current_priority() == est::Priority::normal);
+}
+
+TEST_CASE("an explicit priority argument overrides inheritance from current_priority() "
+          "(issue #31)",
+          "[loop][priority]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::vector<int> order;
+
+  const auto lowered = est::set_priority(est::Priority::background);
+
+  auto [inherited_promise, inherited_future] = est::make_promise_future<int>();
+  inherited_promise.set_value(0);
+  // No explicit priority - inherits the still-lowered ambient value.
+  auto inherited = inherited_future.then([&](est::future<int>&) { order.push_back(2); });
+
+  auto [overridden_promise, overridden_future] = est::make_promise_future<int>();
+  overridden_promise.set_value(0);
+  // Explicit priority::critical must win over the still-lowered ambient,
+  // draining first despite being registered second.
+  auto overridden = overridden_future.then([&](est::future<int>&) { order.push_back(1); },
+                                            est::Priority::critical);
+
+  loop.run_until_idle();
+  REQUIRE(order == std::vector{1, 2});
+}
+
+TEST_CASE("set_priority() nests and restores the previous value, like a stack", "[loop][priority]") {
+  REQUIRE(est::current_priority() == est::Priority::normal);
+  {
+    const auto outer = est::set_priority(est::Priority::high);
+    REQUIRE(est::current_priority() == est::Priority::high);
+    {
+      const auto inner = est::set_priority(est::Priority::background);
+      REQUIRE(est::current_priority() == est::Priority::background);
+    }
+    REQUIRE(est::current_priority() == est::Priority::high);
+  }
+  REQUIRE(est::current_priority() == est::Priority::normal);
+}
+
+TEST_CASE("a continuation registered while another is running inherits that node's own "
+          "priority, not whatever was ambient before it started (issue #31)",
+          "[loop][priority]") {
+  // The "main chain of computation inherits its priority" half of issue
+  // #31: loop::run_one() sets current_priority() to the running node's own
+  // priority_level for the whole duration of its run() - proven here by
+  // registering a high-priority continuation whose own callback registers
+  // a *second*, un-prioritized then() and checks what it inherits.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::optional<est::Priority> observed;
+
+  auto [promise, future] = est::make_promise_future<int>();
+  promise.set_value(0);
+  auto chain = future.then(
+      [&](est::future<int>&) {
+        auto [inner_promise, inner_future] = est::make_promise_future<int>();
+        inner_promise.set_value(0);
+        // No explicit priority given - its default argument reads
+        // current_priority() right here, mid-run_one(), which should be
+        // priority::high (this outer node's own), not priority::normal.
+        return inner_future.then_fast(
+            [&](est::future<int>&) { observed = est::current_priority(); });
+      },
+      est::Priority::high);
+
+  loop.run_until_idle();
+  REQUIRE(observed == est::Priority::high);
+}
+
 TEST_CASE(
     "a continuation that appears to exceed the long-running threshold still completes normally",
     "[loop]") {
