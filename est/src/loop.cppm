@@ -19,7 +19,11 @@ export namespace est {
 // of living directly on ready_node/timer_node themselves (see ready_node's
 // own doc comment below). Four levels, not an open-ended count: issue #31
 // settled on "a few levels suffice" rather than a numeric/unbounded scale.
-enum class Priority : std::uint8_t { background, normal, high, critical };
+// max_priority aliases the highest real level (not a fifth one) so
+// loop::priority_levels (below) can be derived from it instead of
+// carrying its own separately-maintained "4".
+// NOLINTNEXTLINE(readability-enum-initial-value)
+enum class Priority : std::uint8_t { background, normal, high, critical, max_priority = critical };
 
 } // namespace est
 
@@ -257,7 +261,8 @@ public:
   // One FIFO ready-queue per priority level (est::Priority, above) -
   // scheduler_type (below) picks which of these a given drain pass pops
   // from next.
-  static constexpr std::size_t priority_levels = 4;
+  static constexpr std::size_t priority_levels =
+      static_cast<std::size_t>(Priority::max_priority) + 1;
   using ready_queues = std::array<intrusive_list<detail::ready_node>, priority_levels>;
 
   // The pluggable drain policy: given every level's own queue, pops and
