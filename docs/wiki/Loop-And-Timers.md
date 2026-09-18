@@ -390,13 +390,17 @@ traffic can starve a lower level indefinitely.
 
 **Explicitly out of scope so far** (documented, not built): a
 fairness-oriented "proportionate" scheduler alternative that bounds how
-long a level can starve; starvation *detection* itself, proposed to mirror
-`reset_loop_stall_detection()`/`detect_loop_stall()` above exactly (per-
-level head-pointer-hasn't-advanced-in-N-ms, delegated to
-`platform::interface` the same way); and priority support on `spawn()`
-(issue #58, not implemented yet either) and the flatten/monadic path
-(`detail::flatten_forwarder<T>`, always `Priority::normal`) - all real,
-deliberate follow-ups rather than gaps nobody noticed.
+long a level can starve (issue #108); starvation *detection* itself,
+proposed to mirror `reset_loop_stall_detection()`/`detect_loop_stall()`
+above exactly (per-level head-pointer-hasn't-advanced-in-N-ms, delegated
+to `platform::interface` the same way - issue #109); and priority support
+on `spawn()` (issue #58, not implemented yet either) - real, deliberate
+follow-ups rather than gaps nobody noticed. The flatten/monadic path
+(`detail::flatten_forwarder<T>`) was briefly in this same state - it
+missed the two bypass-path fixes above - but is now fixed too (issue
+#110): `fulfill()` (`est/src/future.cppm`) stamps `priority_level =
+current_priority()` on the forwarder node it constructs, the same way
+`yield_execution()`/`counting_event<Mode>::wait()` do.
 
 ## Timers: `schedule_timer()`, and the `future<void>` bridge
 
