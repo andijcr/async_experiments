@@ -168,6 +168,39 @@ TEST_CASE("with_timeout(): the operation winning eagerly cancels the deadline ti
   REQUIRE(resource.allocations == resource.deallocations);
 }
 
+TEST_CASE("with_timeout(): loop teardown while both racers are still pending completes the "
+          "returned future instead of leaving it stuck (issue #113)",
+          "[with_timeout]") {
+  using namespace std::chrono_literals;
+  counting_resource resource;
+  fake_platform fake;
+  const auto platform_guard = est::platform::override_instance(fake);
+  {
+    est::loop loop{&resource};
+    const auto loop_guard = est::make_current_loop(loop);
+    auto [prom, operation] = est::make_promise_future<int>();
+
+    auto fut = est::with_timeout(std::move(operation), 1000s);
+    REQUIRE_FALSE(fut.ready());
+
+    // Neither racer has run yet: `operation` is still pending, and so is
+    // the deadline timer. loop.drain_pending() (est:loop - exactly what
+    // make_current_loop()'s own guard calls at scope exit, and ~loop()
+    // calls too) abandons both without running either - this is the
+    // scenario that used to leave `fut` stuck forever, back when
+    // with_timeout<T>()'s own timer racer bridged through a second future
+    // (issue #113): detail::with_timeout_timer_node::abandon() now
+    // completes `fut` directly instead.
+    loop.drain_pending();
+
+    REQUIRE(fut.ready());
+    REQUIRE(fut.ready_with_failure());
+    REQUIRE_THROWS(fut.get());
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
+}
+
 TEST_CASE("with_timeout<void>(): normal completion forwards success", "[with_timeout][void]") {
   using namespace std::chrono_literals;
   fake_platform fake;

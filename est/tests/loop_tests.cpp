@@ -801,11 +801,12 @@ TEST_CASE("sleep_for(delay, stop_token): request_stop() before the deadline reso
     // calling platform::instance().sleep_until().
     REQUIRE(fake.current == decltype(fake.current){});
   }
-  // The cancelled sleep_resume_node (est:promise) was actually freed via
-  // loop::cancel_timer()'s own abandon()-then-destroy path above, not
-  // merely left pending until loop teardown - allocations/deallocations
-  // still balance either way, but combined with the clock assertion above,
-  // this confirms cancel_timer() ran for real rather than being a no-op.
+  // The cancelled timer node (detail::sleep_stop_timer_node, est:with_stop)
+  // was actually freed via loop::cancel_timer()'s own abandon()-then-destroy
+  // path above, not merely left pending until loop teardown -
+  // allocations/deallocations still balance either way, but combined with
+  // the clock assertion above, this confirms cancel_timer() ran for real
+  // rather than being a no-op.
   REQUIRE(resource.allocations > 0);
   REQUIRE(resource.allocations == resource.deallocations);
 }
@@ -828,4 +829,38 @@ TEST_CASE("sleep_for(delay, stop_token): an already-stop_requested() token resol
 
   loop.run_until_idle(); // nothing pending - must return immediately
   REQUIRE(fake.current == decltype(fake.current){});
+}
+
+TEST_CASE("sleep_for(delay, stop_token): loop teardown while the timer is still pending and the "
+          "token hasn't fired completes the returned future instead of leaving it stuck "
+          "(issue #113)",
+          "[loop][stop_token]") {
+  using namespace std::chrono_literals;
+  counting_resource resource;
+  fake_platform fake;
+  const auto platform_guard = est::platform::override_instance(fake);
+  {
+    est::loop loop{&resource};
+    const auto loop_guard = est::make_current_loop(loop);
+    est::stop_source source;
+
+    auto fut = est::sleep_for(1000s, source.get_token());
+    REQUIRE_FALSE(fut.ready());
+
+    // Neither racer has run yet - the token was never requested, and the
+    // deadline timer is still pending. loop.drain_pending() (est:loop -
+    // exactly what make_current_loop()'s own guard calls at scope exit,
+    // and ~loop() calls too) abandons it without firing it -
+    // detail::sleep_stop_timer_node::abandon() (est:with_stop) completes
+    // `fut` directly instead of leaving it stuck, the fix for issue #113's
+    // own bridged-future gap this overload used to share with
+    // with_timeout<T>().
+    loop.drain_pending();
+
+    REQUIRE(fut.ready());
+    REQUIRE(fut.ready_with_failure());
+    REQUIRE_THROWS(fut.get());
+  }
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
 }

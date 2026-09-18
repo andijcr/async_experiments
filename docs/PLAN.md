@@ -6826,6 +6826,70 @@ Full pipeline re-verified again after these fixes: 308/308 (`ci`), clean
 
 ---
 
+### Allocation simplification for `with_timeout<T>()`/`with_stop.cppm`'s `sleep_until(deadline, stop_token)`, and a real fix for issue #113
+
+Delegated the question "does `with_timeout<T>()` allocate more than it
+needs to?" to a research subagent before touching any code. Its finding:
+`with_timeout<T>()` and `with_stop.cppm`'s own `sleep_until(deadline, const
+stop_token&)` (the shape it deliberately mirrors) both did 6 allocations
+per call - not because `with_timeout<T>()` was doing anything wasteful its
+sibling avoided, but because both built the deadline-timer racer the same
+way: `detail::sleep_resume_node` (the generic node behind the plain,
+non-racing `sleep_until()`/`sleep_for()` in `promise.cppm`) completes a
+`promise<void>`, which needed its own `future_state<void>` allocation plus
+a `.then_fast()` continuation node just to bridge that result back out
+into the combinator's own shared racer state. `sleep_resume_node` was the
+natural thing to reach for - already built, already tested, and it kept
+every racer in these combinators looking identical (a plain `future<T>` +
+a `.then_fast()` lambda), rather than special-casing the timer side as a
+bespoke node. The cost of that uniformity: two allocations spent on a
+round-trip that was otherwise pure overhead.
+
+Fix (applied to both `est/src/with_timeout.cppm` and `est/src/with_stop.cppm`,
+kept mirrored per their own doc comments): a dedicated timer-node type per
+combinator (`detail::with_timeout_timer_node<T>`,
+`detail::sleep_stop_timer_node`) holding a `shared_ptr` to the combinator's
+own racer state directly, with `fire()`/`abandon()` writing straight into
+`state->result` instead of completing a second future. 6 allocations per
+call down to 4 (the result `future<T>`'s own state, the racer state, the
+timer node, and one remaining `.then_fast()` node for the operation/token
+racer - the timer racer no longer needs one).
+
+A second, more consequential effect fell out of removing the bridge: issue
+#113's stuck-future gap - `loop::drain_pending()`'s two-phase abandonment
+(pending timers first, then whatever that cascades into `ready_`) could
+abandon-instead-of-run a still-queued `.then_fast()` continuation, silently
+dropping the bridge future's own completion and leaving the combinator's
+returned future permanently pending if the loop tore down while both
+racers were still in flight. With the bridge gone, a still-pending timer
+node's `abandon()` completes `state->result` directly, in
+`drain_pending()`'s *first* phase - there's no intermediate `ready_` node
+left for the second phase to lose. This closes the gap for both
+`with_timeout<T>()` and `with_stop.cppm`'s `sleep_until(deadline, const
+stop_token&)`, not just documents around it. `done` is checked and set
+inside `fire()`/`abandon()` themselves now (not only inside the surviving
+racer's own `.then_fast()` callback), since `loop::cancel_timer()` calls
+`abandon()` synchronously - the operation/token racer winning and calling
+`cancel_timer()` on an already-fired timer needs the same guard on the
+same call stack.
+
+Two new regression tests prove the fix rather than just asserting it:
+`est/tests/with_timeout_tests.cpp` and `est/tests/loop_tests.cpp` each gained
+a "loop teardown while both racers are still pending" case that calls
+`loop.drain_pending()` directly (what `make_current_loop()`'s own guard and
+`~loop()` both call) with the operation/token never having fired and the
+deadline timer still pending, then asserts the returned future is
+`ready_with_failure()` instead of checking nothing (which is what the
+identical scenario used to do before this fix - permanently hang, the
+exact shape of the earlier, deliberately-removed sixth `with_timeout` test
+from the previous entry above, except this time it actually passes).
+
+Full pipeline re-verified: 310/310 (`default`), clean `clang-format`, clean
+build + clean `clang-tidy` + 93% diff coverage (`ci`), `sanitize` 253/253,
+wasm32 build + Node smoke test clean.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
