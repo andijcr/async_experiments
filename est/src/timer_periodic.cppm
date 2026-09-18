@@ -100,8 +100,13 @@ public:
                                      // loop-resolving call in this codebase
                                      // already documents
     const auto offset = jitter_();
-    auto* next = new periodic_timer_node(std::move(fn_), interval_, jitter_, ctrl_);
+    // Guarded until schedule_timer() actually succeeds (it does a real
+    // allocation of its own, not noexcept, est:loop) - without this, a
+    // bad_alloc there would leak `next`, since nothing else references it
+    // yet. Released only on the line right after a successful call.
+    auto next = std::make_unique<periodic_timer_node>(std::move(fn_), interval_, jitter_, ctrl_);
     loop_ref.schedule_timer(*next, period_start + interval_ + offset);
+    next.release();
   }
 
   // No abandon() override: a periodic chain dying alongside its loop (or
@@ -169,8 +174,12 @@ schedule_periodic(loop::clock::duration interval, Fn fn, loop::clock::duration m
   auto ctrl = shared_ptr<detail::periodic_timer_control>::make(current_allocator());
   jitter jit(max_jitter);
   const auto first_offset = jit();
-  auto* node = new detail::periodic_timer_node<Fn>(std::move(fn), interval, jit, ctrl);
+  // Guarded until schedule_timer() actually succeeds - see
+  // detail::periodic_timer_node<Fn>::fire()'s own re-arming call, just
+  // above, for the identical hazard this protects against.
+  auto node = std::make_unique<detail::periodic_timer_node<Fn>>(std::move(fn), interval, jit, ctrl);
   loop_ref.schedule_timer(*node, platform::instance().now() + interval + first_offset);
+  node.release();
   return periodic_timer_handle(std::move(ctrl));
 }
 

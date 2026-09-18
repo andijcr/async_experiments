@@ -193,8 +193,7 @@ export namespace est {
   // est:with_timeout's own with_timeout<T>() for the identical hazard
   // this protects against (a bad_alloc there would otherwise leak the
   // node, since nothing else references it yet).
-  std::unique_ptr<detail::sleep_stop_timer_node> timer_node_guard(
-      new detail::sleep_stop_timer_node(state));
+  auto timer_node_guard = std::make_unique<detail::sleep_stop_timer_node>(state);
   state->id = loop_ref.schedule_timer(*timer_node_guard, deadline);
   timer_node_guard.release();
 

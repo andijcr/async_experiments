@@ -527,8 +527,9 @@ can reuse it directly instead of building and immediately discarding one:
     return make_ready_future<void>();
   }
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::promise_resume_node<void>(std::move(prom));
+  auto node = std::make_unique<detail::promise_resume_node<void>>(std::move(prom));
   waiters_.enqueue(*node);
+  node.release(); // ownership transfers to waiters_
   return std::move(fut);
 }
 ```

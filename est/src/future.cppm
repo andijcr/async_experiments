@@ -681,9 +681,11 @@ private:
     auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator);
     auto downstream_for_node = downstream; // copy: the node keeps its own reference too
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-    auto* node = new node_type(std::forward<Fn>(fn), std::move(downstream_for_node));
+    auto node = std::make_unique<node_type>(std::forward<Fn>(fn), std::move(downstream_for_node));
     node->priority_level = prio;
     set_continuation(*node, run_inline_if_ready);
+    node.release(); // ownership transfers to whichever of set_continuation()'s
+                    // own paths reached (waiters_, ready_, or run-then-delete)
     return future<downstream_value_type>(std::move(downstream));
   }
 
@@ -867,7 +869,7 @@ private:
     // result, so the two are always the same type here.
     template <class R> void fulfill(R&& result) {
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
-        auto* node = new detail::flatten_forwarder<U>(downstream_);
+        auto node = std::make_unique<detail::flatten_forwarder<U>>(downstream_);
         // Stamped from current_priority(), not left at ready_node's own
         // Priority::normal default (issue #110): fulfill() runs
         // synchronously inside whichever node's run() invoked this
@@ -879,6 +881,8 @@ private:
         // back to Priority::normal for this one flattened hop.
         node->priority_level = current_priority();
         result.state_->set_continuation(*node);
+        node.release(); // ownership transfers to whichever of set_continuation()'s
+                        // own paths reached (waiters_, ready_, or run-then-delete)
       } else {
         downstream_->set_value(std::forward<R>(result));
       }
@@ -1355,9 +1359,11 @@ public:
   // needing to pass it anywhere - co_await's own syntax has no room for
   // an extra argument the way then()/then_fast() do.
   void await_suspend(std::coroutine_handle<> handle) {
-    auto* node = new future_resume_node<T>(handle);
+    auto node = std::make_unique<future_resume_node<T>>(handle);
     node->priority_level = current_priority();
     future_.state_->set_continuation(*node);
+    node.release(); // ownership transfers to whichever of set_continuation()'s
+                    // own paths reached (waiters_, ready_, or run-then-delete)
   }
 
   // Moves the value out rather than copying it: co_await is inherently a

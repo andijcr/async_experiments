@@ -148,6 +148,17 @@ Every owned object (a `shared_ptr<T>` control block, a continuation node,
 global `new`/`delete`. Keep new owning types consistent with this rather
 than defaulting to unconstrained allocation.
 
+Prefer automatic memory management over a naked `new`/`delete` pair: reach
+for `est::shared_ptr<T>::make()` (shared ownership) or
+`std::unique_ptr<T>`/`std::make_unique<T>()` (single ownership) at the
+allocation site. Where a lower-level primitive genuinely needs a raw owning
+pointer handed off to something else (`est::loop`'s own `ready_`/
+`pending_timers_` containers, which store a plain `detail::ready_node*`/
+`timer_node*`), construct the node via `std::make_unique<T>()`, perform the
+handoff, and call `.release()` only once that handoff has actually
+succeeded - never a bare `new` followed by an unguarded call that could
+throw and leak it.
+
 ### Single-threaded, no atomics
 
 `est::loop` is driven from exactly one call stack; `shared_ptr`'s ref count

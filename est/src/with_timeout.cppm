@@ -171,8 +171,7 @@ template <class T>
   // there would leak the node, since nothing else references it yet.
   // Released (ownership transferred to loop's own pending_timers_) only on
   // the line right after a successful call.
-  std::unique_ptr<detail::with_timeout_timer_node<T>> timer_node_guard(
-      new detail::with_timeout_timer_node<T>(state));
+  auto timer_node_guard = std::make_unique<detail::with_timeout_timer_node<T>>(state);
   state->id = loop_ref.schedule_timer(*timer_node_guard, platform::instance().now() + timeout);
   timer_node_guard.release();
 
