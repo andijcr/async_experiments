@@ -6647,6 +6647,57 @@ the marker first, before the future under test is even ready - both tests
 assert it isn't. All 302 tests pass (300 + these 2); full devenv pipeline
 re-verified.
 
+### Issue #110: the flatten/monadic path didn't inherit `Priority` either
+
+The third bypass path, found in a post-merge follow-up pass over #31's
+priority mechanism (not the code review that caught the two above -
+`docs/PLAN.md`'s own "Issue #31" entry above already named this one
+explicitly as a known, deliberate exclusion, "staying at `Priority::normal`
+for now" - but never actually filed a tracking issue for it, and it turned
+out to be worth fixing rather than leaving open). `future_state<T>::
+then_impl()`'s inner `fulfill()` (`est/src/future.cppm`) constructs a
+`detail::flatten_forwarder<U>` node whenever a `.then()` callback itself
+returns a `future<U>` (automatic flattening instead of a nested
+`future<future<U>>`) - and, like `yield_execution()`/`counting_event::
+wait()` before the earlier fix, never touched that node's `priority_level`,
+silently defaulting to `Priority::normal` regardless of the outer chain's
+own priority. A chain built entirely at `Priority::critical` that happened
+to flatten a nested future dropped to normal for that one hop, and
+whatever ran after it inherited normal too (`run_one()`'s ambient-priority
+guard reads whichever node is actually running).
+
+Fixed identically to the earlier two: `node->priority_level =
+current_priority();` right after construction, before `set_continuation()`
+- `fulfill()` runs synchronously inside whichever node's `run()` invoked
+the outer `.then()` callback, and `run_one()` has already set
+`current_priority()` to that node's own priority for the whole call, so
+reading it back is correct (the same reasoning the `yield_execution()` fix
+documents).
+
+**The test gap, checked explicitly before writing the regression test**:
+existing coverage tested the flatten path (correctness, move-not-copy,
+failure propagation, void flattening, leak-freedom) and the priority
+mechanism (inheritance, override, nesting, chain-inherits-running-node's-
+priority) thoroughly, but never in combination - no test passed a
+`Priority` argument through a `.then()` callback that returns a future.
+New test (`est/tests/loop_tests.cpp`) uses the same discriminating pattern
+as the earlier fix: a `Priority::normal` marker enqueued before an
+already-ready outer `future<int>` whose `.then(fn, Priority::critical)`
+callback returns another already-ready `future<int>` (triggering the
+flatten branch); the marker's own callback checks whether the flattened
+result is already ready by the time it runs. Verified the test actually
+discriminates before trusting it: temporarily reverted the fix and
+confirmed the test fails (`REQUIRE( flattened_ready_when_marker_ran )`
+false) before restoring the fix and confirming it passes. All 303 tests
+pass (302 + this one); full devenv pipeline (format, `ci` build+test,
+`clang-tidy`, 100% new-code coverage, `sanitize` build+test, wasm32 build)
+re-verified. Also filed two further #31 follow-ups that had no tracking
+issue at all - a proportionate/fairness scheduler (#108) and starvation
+detection mirroring the existing stall-detector (#109) - and added the
+missing `spawn()` priority-parameter scope note to #58, closing every gap
+between #31's original design discussion and what actually has a tracking
+issue today.
+
 ---
 
 ## Verification for M0

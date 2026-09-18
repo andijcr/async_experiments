@@ -327,6 +327,46 @@ TEST_CASE("yield_execution() inherits current_priority() instead of always defau
   REQUIRE(yield_ready_when_marker_ran);
 }
 
+TEST_CASE("the flatten/monadic path inherits current_priority() instead of always "
+          "defaulting to normal (issue #110)",
+          "[loop][priority]") {
+  // marker's own node reaches ready_[normal] before the flattened
+  // continuation's below, chronologically - so if fulfill()'s
+  // detail::flatten_forwarder<int> incorrectly defaulted to
+  // Priority::normal too (issue #110: fulfill() constructs it directly,
+  // est:future, never through future_awaiter<T>::await_suspend() or
+  // then()'s own Priority parameter - the usual places a node inherits
+  // ambient priority), FIFO ordering within that shared level would run
+  // marker's callback before `flattened` is even ready. If
+  // flatten_forwarder<int> correctly inherits Priority::critical
+  // instead, it must run first regardless, since loop::eager_scheduler
+  // always drains the highest non-empty level first.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::optional<est::future<int>> flattened;
+
+  auto [marker_promise, marker_future] = est::make_promise_future<int>();
+  marker_promise.set_value(0);
+  bool flattened_ready_when_marker_ran = false;
+  auto marker = marker_future.then([&](est::future<int>&) {
+    flattened_ready_when_marker_ran = flattened.has_value() && flattened->ready();
+  });
+
+  // Already-ready outer future whose then() callback returns another
+  // already-ready future<int> - triggers fulfill()'s flatten branch
+  // (detail::flatten_forwarder<int>), registered while current_priority()
+  // is Priority::critical (run_one()'s own ambient-priority guard, set
+  // for the whole duration of the outer continuation's run()).
+  auto [outer_promise, outer_future] = est::make_promise_future<int>();
+  outer_promise.set_value(1);
+  flattened = outer_future.then([](est::future<int>&) { return est::make_ready_future<int>(2); },
+                                est::Priority::critical);
+
+  loop.run_until_idle();
+  REQUIRE(flattened_ready_when_marker_ran);
+  REQUIRE(flattened->get() == 2);
+}
+
 TEST_CASE("a then() registered on a timer-driven future runs once the timer fires", "[loop]") {
   using namespace std::chrono_literals;
   fake_platform fake;

@@ -868,6 +868,16 @@ private:
     template <class R> void fulfill(R&& result) {
       if constexpr (detail::is_future_v<std::decay_t<R>>) {
         auto* node = new detail::flatten_forwarder<U>(downstream_);
+        // Stamped from current_priority(), not left at ready_node's own
+        // Priority::normal default (issue #110): fulfill() runs
+        // synchronously inside whichever node's run() invoked this
+        // outer .then() callback, and run_one() (est:loop) has already
+        // set current_priority() to that node's own priority_level for
+        // the whole duration of the call - the identical reasoning
+        // yield_execution()'s own fix (est:promise) documents. Without
+        // this, a chain built entirely at a raised priority would drop
+        // back to Priority::normal for this one flattened hop.
+        node->priority_level = current_priority();
         result.state_->set_continuation(*node);
       } else {
         downstream_->set_value(std::forward<R>(result));
