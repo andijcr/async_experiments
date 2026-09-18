@@ -222,7 +222,7 @@ public:
       return make_ready_future<void>();
     }
     auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-    auto* node = new detail::promise_resume_node<void>(std::move(prom));
+    auto node = std::make_unique<detail::promise_resume_node<void>>(std::move(prom));
     // Stamped from current_priority() for the identical reason
     // yield_execution()'s own doc comment gives (est:promise): this node
     // reaches loop::enqueue_ready() later, from set() (below), never
@@ -231,7 +231,8 @@ public:
     // directly on this) at some raised priority would silently drop to
     // Priority::normal for its resumption.
     node->priority_level = current_priority();
-    waiters_.enqueue(*node);
+    waiters_.enqueue(*node); // noexcept (est:util.intrusive_list) - release() right after
+    node.release();          // is still the same ownership-transfer idiom used throughout
     return std::move(fut);
   }
 

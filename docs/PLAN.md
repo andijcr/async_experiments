@@ -6890,6 +6890,65 @@ wasm32 build + Node smoke test clean.
 
 ---
 
+### Issue #114: convert naked `new`/`delete` to `unique_ptr`
+
+Filed right after the with_timeout/with_stop allocation-simplification pass
+above found (and fixed) two of these; this issue asked for the same
+treatment across the rest of `est/src`. A full audit found 8 remaining
+naked `new` sites, all following the same shape: `auto* node = new
+T(args); loop_ref.enqueue_ready(*node)/schedule_timer(*node, ...);` - the
+node's true ownership transfers implicitly to whichever of `est::loop`'s
+containers takes the raw pointer, with nothing but convention holding that
+together in between.
+
+- `est/src/promise.cppm`: `sleep_until()` (calls `schedule_timer()`, not
+  `noexcept` - a real leak-on-`bad_alloc` site, same class as the ones
+  already fixed in `with_timeout.cppm`/`with_stop.cppm`), `yield_execution()`
+  (calls `enqueue_ready()`, `noexcept` - no actual leak risk today, but
+  still a naked `new`).
+- `est/src/sync/event.cppm`: `counting_event<Mode>::wait()`'s slow path
+  (`waiters_.enqueue()`, `noexcept`).
+- `est/src/future.cppm`: `future_state<T>::then_impl()` (registers a
+  `concrete_continuation<Fn, U>` via `set_continuation()`), `fulfill()`'s
+  flatten branch (registers a `detail::flatten_forwarder<U>`, same call),
+  `future_awaiter<T>::await_suspend()` (registers a `future_resume_node<T>`,
+  same call) - `set_continuation()` isn't marked `noexcept`, but in
+  practice only reaches `waiters_.enqueue()`/`loop::enqueue_ready()`
+  (both `noexcept`) or a guaranteed-safe `shared_from_this()`.
+- `est/src/timer_periodic.cppm`: `periodic_timer_node<Fn>::fire()`'s own
+  re-arming `new` and `schedule_periodic()`'s initial one - both call
+  `schedule_timer()`, both real leak-on-`bad_alloc` sites.
+
+Converted every site to `std::make_unique<T>(args...)` immediately followed
+by `.release()` right after the handoff call succeeds - the identical
+guard-then-release idiom the with_timeout/with_stop fix above already
+established, generalized to every remaining site regardless of whether
+today's handoff happens to be `noexcept` (uniform treatment reads more
+consistently than special-casing the two that don't strictly need it, and
+costs nothing - `release()` after a `noexcept` call is just as safe as
+after a throwing one). Also converted the two already-guarded sites in
+`with_timeout.cppm`/`with_stop.cppm` from `std::unique_ptr<T> guard(new
+T(args))` to `std::make_unique<T>(args)` for the same reason - both forms
+were already accepted by the issue's own wording, but `make_unique`
+reads slightly cleaner and leaves zero remaining `new` expressions for an
+owning pointer anywhere in the tree. `est::shared_ptr<T>::make()` was
+never in scope for this - it already goes through
+`std::pmr::polymorphic_allocator::new_object()`, never a raw `new`
+expression, so there was nothing to convert there.
+
+A repo-wide grep after the fact (`est/src`, `examples`, `estwasm`,
+`estext`) confirms zero remaining naked `new` expressions for an owning
+pointer, and zero naked `delete` statements (every deletion already went
+through the `std::unique_ptr<Node>(&node)`-then-implicit-destruction
+idiom `est::loop`'s own `run_one()`/`fire_ready_timers()`/
+`abandon_ready_node()`/`abandon_timer_node()` established).
+
+Full pipeline re-verified: 310/310 (`default`), clean `clang-format`, clean
+build + clean `clang-tidy` + 95% diff coverage (`ci`), `sanitize` 253/253,
+wasm32 build + Node smoke test clean.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

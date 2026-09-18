@@ -26,7 +26,7 @@ complex `.then()` chain actually cost."
    allocation to worry about, unlike `std::shared_ptr<T>` built via `new
    T` then wrapped — `make()` is already the `make_shared`-equivalent
    path, always.
-2. **`new Concrete(args...)`** — a *direct*, un-shared allocation for a
+2. **`std::make_unique<Concrete>(args...)`** — a *direct*, un-shared allocation for a
    continuation or timer node (`concrete_continuation<Fn, U>`,
    `est:promise`'s `sleep_resume_node`/`promise_resume_node<T>`, the latter
    shared with `est:sync.event`). These are
@@ -66,8 +66,9 @@ node directly on the inner future's own `future_state<U>`, reached through
 `future_state<X>` instantiation for exactly this one internal call site):
 
 ```cpp
-auto* node = new detail::flatten_forwarder<U>(downstream_);
+auto node = std::make_unique<detail::flatten_forwarder<U>>(downstream_);
 result.state_->set_continuation(*node);
+node.release(); // ownership transfers to set_continuation()'s own path
 ```
 
 `flatten_forwarder<T>` is templated on the inner value type

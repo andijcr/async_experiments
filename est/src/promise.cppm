@@ -241,8 +241,16 @@ export namespace est {
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::sleep_resume_node(std::move(prom));
+  // Guarded until schedule_timer() actually succeeds: it does a real
+  // allocation of its own (pending_timers_.reserve(), timer_queue::
+  // schedule_at(), neither noexcept, est:loop) - without this, a bad_alloc
+  // there would leak the node, since nothing else references it yet.
+  // Released (ownership transferred to loop's own pending_timers_) only on
+  // the line right after a successful call - same idiom est:with_timeout/
+  // est:with_stop's own timer-racer nodes use.
+  auto node = std::make_unique<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
+  node.release();
   return std::move(fut);
 }
 
@@ -268,7 +276,7 @@ export namespace est {
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::promise_resume_node<void>(std::move(prom));
+  auto node = std::make_unique<detail::promise_resume_node<void>>(std::move(prom));
   // Stamped from current_priority(), not left at ready_node's own
   // Priority::normal default: co_await yield_execution() re-enters
   // ready_ directly rather than through future_awaiter<T>::
@@ -278,7 +286,8 @@ export namespace est {
   // instant it yields, exactly the priority inversion issue #31's whole
   // inheritance mechanism exists to prevent.
   node->priority_level = current_priority();
-  loop_ref.enqueue_ready(*node);
+  loop_ref.enqueue_ready(*node); // noexcept (est:loop) - release() right after is still the
+  node.release();                // same ownership-transfer idiom every site here uses
   return std::move(fut);
 }
 

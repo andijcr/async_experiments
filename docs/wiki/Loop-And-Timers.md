@@ -415,8 +415,9 @@ this split exists):
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline) -> future<void> {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::sleep_resume_node(std::move(prom));
+  auto node = std::make_unique<detail::sleep_resume_node>(std::move(prom));
   loop_ref.schedule_timer(*node, deadline);
+  node.release(); // schedule_timer() isn't noexcept - guarded until it succeeds
   return std::move(fut);
 }
 ```
@@ -451,8 +452,9 @@ this one):
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::promise_resume_node<void>(std::move(prom));
+  auto node = std::make_unique<detail::promise_resume_node<void>>(std::move(prom));
   loop_ref.enqueue_ready(*node);
+  node.release(); // ownership transfers to ready_
   return std::move(fut);
 }
 ```
@@ -502,8 +504,9 @@ wait()`'s fast path, for instance:
     return make_ready_future<void>();
   }
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::promise_resume_node<void>(std::move(prom));
+  auto node = std::make_unique<detail::promise_resume_node<void>>(std::move(prom));
   waiters_.enqueue(*node);
+  node.release(); // ownership transfers to waiters_
   return std::move(fut);
 }
 ```
@@ -631,8 +634,9 @@ void fire() override {
   if (ctrl_->cancelled) { return; }   // fn_ itself may have just cancelled
   auto& loop_ref = current_loop();    // resolved fresh, same as every other node
   const auto offset = jitter_();
-  auto* next = new periodic_timer_node(std::move(fn_), interval_, jitter_, ctrl_);
+  auto next = std::make_unique<periodic_timer_node>(std::move(fn_), interval_, jitter_, ctrl_);
   loop_ref.schedule_timer(*next, period_start + interval_ + offset);
+  next.release(); // schedule_timer() isn't noexcept - guarded until it succeeds
 }
 ```
 

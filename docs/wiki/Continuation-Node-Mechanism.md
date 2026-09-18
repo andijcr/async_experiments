@@ -116,8 +116,9 @@ template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
   auto downstream = shared_ptr<future_state<downstream_value_type>>::make(allocator);
   auto downstream_for_node = downstream; // copy: the node keeps its own reference too
   using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
-  auto* node = new node_type(std::forward<Fn>(fn), std::move(downstream_for_node));
+  auto node = std::make_unique<node_type>(std::forward<Fn>(fn), std::move(downstream_for_node));
   set_continuation(*node);
+  node.release(); // ownership transfers to set_continuation()'s own path
   return future<downstream_value_type>(std::move(downstream));
 }
 ```
@@ -433,8 +434,9 @@ the outer `downstream_`:
 ```cpp
 template <class R> void fulfill(R&& result) {
   if constexpr (detail::is_future_v<std::decay_t<R>>) {
-    auto* node = new detail::flatten_forwarder<U>(downstream_);
+    auto node = std::make_unique<detail::flatten_forwarder<U>>(downstream_);
     result.state_->set_continuation(*node);
+    node.release(); // ownership transfers to set_continuation()'s own path
   } else {
     downstream_->set_value(std::forward<R>(result));
   }
