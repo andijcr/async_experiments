@@ -6698,6 +6698,196 @@ missing `spawn()` priority-parameter scope note to #58, closing every gap
 between #31's original design discussion and what actually has a tracking
 issue today.
 
+## Issue #57: `est::with_timeout<T>()`
+
+Implements the issue's own ask - bound how long a `future<T>` is allowed
+to take - now that both of its named dependencies (#54's `when_any()`/
+`when_all()`, #56's cancellation machinery) exist. The issue's original
+proposed composition, "essentially `when_any(operation, sleep_for(timeout))`",
+was speculative from before either primitive was built; having both now
+made it possible to see a real gap in that composition rather than just
+implement it as first proposed: neither `when_any()` nor `with_stop<T>()`/
+`stop_token` has a way to reach into the timer it would be racing against
+to cancel it, so building `with_timeout<T>()` on top of them would leave a
+fired-but-unused deadline timer sitting in `loop`'s timer queue for its
+full duration even after `operation` already won.
+
+Built instead as its own racer (`est/src/with_timeout.cppm`, new partition
+`est:with_timeout`), directly on `:promise`'s own pieces
+(`detail::sleep_resume_node`, `loop::schedule_timer()`/`cancel_timer()`) -
+exactly the shape `est:with_stop`'s own `sleep_until(deadline, const
+stop_token&)` already established, for the identical reason (that overload
+isn't built on `with_stop<T>()` either, same doc-comment reasoning). When
+`operation` wins the race, the now-redundant deadline timer is reclaimed
+immediately via `loop::cancel_timer()` rather than left to fire uselessly
+later - genuinely eager cancellation, not just "stop watching." When the
+deadline wins, the returned future fails with a new, distinct exception,
+`est::operation_timed_out` - deliberately not a reuse of `operation_cancelled`
+(`est:sync.stop_token`): `with_timeout<T>()` has no `stop_token` of its
+own, so a caller catching `operation_cancelled` elsewhere to mean
+"something explicitly requested cancellation" shouldn't also have to catch
+it for "this simply took too long," a different condition.
+
+Same honestly-scoped limitation as `with_stop<T>()`/`when_any()`/
+`when_all()`/`when_any_succeeds()`: losing the race only stops the
+*caller* from waiting on `operation` further, it keeps running in the
+background until it completes on its own (the eventual completion reaches
+an already-`done`-guarded racer and is silently dropped).
+
+Five new tests (`est/tests/with_timeout_tests.cpp`, matching
+`with_stop_tests.cpp`'s own shape): normal completion forwards value/
+failure unchanged; the deadline firing resolves `operation_timed_out` and
+the operation's later completion is a no-op; `with_timeout<void>()`'s
+success path. The eager-cancellation test mirrors `loop_tests.cpp`'s own
+`sleep_for(delay, stop_token)` cancellation test exactly - a deliberately
+huge timeout (1000s) plus asserting the fake clock never had to advance
+(so `run_until_idle()` never called `platform::instance().sleep_until()`
+toward that deadline) proves the timer was actually pulled out early, not
+merely left to fire later; combined with an allocation-balance check via
+`counting_resource`. Verified this test actually discriminates before
+trusting it, same as issue #110's own regression test: temporarily removed
+the `cancel_timer()` call and confirmed the test fails (clock advances to
+`1000s`, the assertion catches it) before restoring the fix and confirming
+it passes.
+
+**A sixth test, attempted and dropped - a real finding, not a test bug.**
+Tried to cover the `tf.ready_with_failure()` branch (the deadline timer
+itself getting abandoned rather than firing normally) by tearing the loop
+down while both racers were still pending. It never worked, and tracing
+through why turned up something genuine: `loop::drain_pending()`
+(`est/src/loop.cppm`) abandons `pending_timers_` first, then - in the
+*same* call - abandons whatever's sitting in `ready_`, including any node
+that timer abandonment itself just enqueued there via the completed
+timer's own `waiters_` drain. A `then_fast()`-registered racer reaches its
+callback through `run()`, but a node still sitting in `ready_` when
+`drain_pending()` reaches its second phase gets `abandon()` instead -
+which `concrete_continuation<Fn, U>::abandon()` (`est/src/future.cppm`)
+implements by completing its own *discarded* downstream future directly,
+without ever invoking `fn_`. So the callback that would forward the
+abandonment into `with_timeout<T>()`'s own `state->result` never runs, and
+the future `with_timeout<T>()` returned is left permanently pending - not
+completed with a timeout, not with an exception, just stuck. Confirmed via
+`~loop()` too (`~loop() { drain_pending(); }` - identical path). This
+isn't specific to `with_timeout<T>()`: `with_stop.cppm`'s own
+`sleep_until(deadline, const stop_token&)` has the structurally identical
+`tf.ready_with_failure()` branch, reached the same way, and by the same
+reasoning is equally unreachable there - a pre-existing, latent gap in the
+`then_fast()`-pair-of-racers combinator shape itself, not something this
+change introduced. Left the branch in place (documented in a comment
+explaining exactly why it's currently unreachable, mirroring
+`with_stop.cppm`'s own shape) rather than deleting it as dead code, since
+`drain_pending()`'s single-pass behavior isn't necessarily permanent (#103's
+registry rearchitecture could change it) - but didn't try to *fix* the
+underlying stuck-future gap here, since it's shared by already-shipped code
+and deserves its own deliberate look, not a fix folded into an unrelated
+issue. Diff coverage lands at 85% (comfortably past the 80% gate) rather
+than the 100% recent PRs have hit, entirely on this one now-understood,
+documented gap plus unexercised `platform::interface`/`memory_resource`
+stub overrides the test file's own fixtures must implement but don't all
+need.
+
+All 308 tests pass (303 + these 5); full devenv pipeline (format, `ci`
+build+test, `clang-tidy`, 85% new-code coverage, `sanitize` build+test,
+wasm32 build - the wasm32 project needed its own separate `CMakeLists.txt`
+updated with the new partition too, caught by that build failing) re-
+verified. `docs/wiki/Coroutines.md`'s "Cancellation: `stop_token` vs.
+abandonment" section gets a new subsection; `Home.md`'s lookup table
+updated to match.
+
+**Code review pass (PR #112), two findings, both fixed:**
+
+1. The stuck-future gap above was real but wasn't disclosed on
+   `with_timeout<T>()`'s own public doc comment - a caller reading only the
+   exported API had no way to know about it. Filed as its own issue (#113 -
+   full trace-through, proposed directions, cross-references both affected
+   `with_stop.cppm` call sites) rather than left as just a PR-description
+   aside, and the doc comment now names it explicitly and points at #113.
+2. `new detail::sleep_resume_node(...)` immediately followed by
+   `schedule_timer()` (which does its own, non-`noexcept` allocation -
+   `pending_timers_.reserve()`, `timer_queue::schedule_at()`) wasn't
+   exception-safe: a `bad_alloc` from `schedule_timer()` would leak the
+   just-allocated node, since nothing referenced it yet. Reproduces an
+   identical pre-existing ordering in `with_stop.cppm`'s own token-aware
+   `sleep_until()` and `promise.cppm`'s plain `sleep_until()` - not
+   introduced here, but now existing at a third call site was reason enough
+   to fix this one directly rather than let it spread further unaddressed.
+   Fixed with a `std::unique_ptr` guard, released only after
+   `schedule_timer()` returns successfully - ownership transfers to
+   `loop`'s own `pending_timers_` at that point, matching the codebase's
+   existing "guard until handed off" idiom (`run_one()`'s own
+   `unique_ptr<ready_node>` guard, `est:loop`). The other two call sites
+   weren't touched (out of scope for this PR - a pre-existing pattern
+   shared by already-shipped code, same reasoning as #113 above).
+
+Diff coverage moved to 88% with the doc-comment/guard additions (still the
+same one documented, currently-unreachable branch as the only real gap).
+Full pipeline re-verified again after these fixes: 308/308 (`ci`), clean
+`clang-tidy`, `sanitize` 251/251, wasm32 build clean.
+
+---
+
+### Allocation simplification for `with_timeout<T>()`/`with_stop.cppm`'s `sleep_until(deadline, stop_token)`, and a real fix for issue #113
+
+Delegated the question "does `with_timeout<T>()` allocate more than it
+needs to?" to a research subagent before touching any code. Its finding:
+`with_timeout<T>()` and `with_stop.cppm`'s own `sleep_until(deadline, const
+stop_token&)` (the shape it deliberately mirrors) both did 6 allocations
+per call - not because `with_timeout<T>()` was doing anything wasteful its
+sibling avoided, but because both built the deadline-timer racer the same
+way: `detail::sleep_resume_node` (the generic node behind the plain,
+non-racing `sleep_until()`/`sleep_for()` in `promise.cppm`) completes a
+`promise<void>`, which needed its own `future_state<void>` allocation plus
+a `.then_fast()` continuation node just to bridge that result back out
+into the combinator's own shared racer state. `sleep_resume_node` was the
+natural thing to reach for - already built, already tested, and it kept
+every racer in these combinators looking identical (a plain `future<T>` +
+a `.then_fast()` lambda), rather than special-casing the timer side as a
+bespoke node. The cost of that uniformity: two allocations spent on a
+round-trip that was otherwise pure overhead.
+
+Fix (applied to both `est/src/with_timeout.cppm` and `est/src/with_stop.cppm`,
+kept mirrored per their own doc comments): a dedicated timer-node type per
+combinator (`detail::with_timeout_timer_node<T>`,
+`detail::sleep_stop_timer_node`) holding a `shared_ptr` to the combinator's
+own racer state directly, with `fire()`/`abandon()` writing straight into
+`state->result` instead of completing a second future. 6 allocations per
+call down to 4 (the result `future<T>`'s own state, the racer state, the
+timer node, and one remaining `.then_fast()` node for the operation/token
+racer - the timer racer no longer needs one).
+
+A second, more consequential effect fell out of removing the bridge: issue
+#113's stuck-future gap - `loop::drain_pending()`'s two-phase abandonment
+(pending timers first, then whatever that cascades into `ready_`) could
+abandon-instead-of-run a still-queued `.then_fast()` continuation, silently
+dropping the bridge future's own completion and leaving the combinator's
+returned future permanently pending if the loop tore down while both
+racers were still in flight. With the bridge gone, a still-pending timer
+node's `abandon()` completes `state->result` directly, in
+`drain_pending()`'s *first* phase - there's no intermediate `ready_` node
+left for the second phase to lose. This closes the gap for both
+`with_timeout<T>()` and `with_stop.cppm`'s `sleep_until(deadline, const
+stop_token&)`, not just documents around it. `done` is checked and set
+inside `fire()`/`abandon()` themselves now (not only inside the surviving
+racer's own `.then_fast()` callback), since `loop::cancel_timer()` calls
+`abandon()` synchronously - the operation/token racer winning and calling
+`cancel_timer()` on an already-fired timer needs the same guard on the
+same call stack.
+
+Two new regression tests prove the fix rather than just asserting it:
+`est/tests/with_timeout_tests.cpp` and `est/tests/loop_tests.cpp` each gained
+a "loop teardown while both racers are still pending" case that calls
+`loop.drain_pending()` directly (what `make_current_loop()`'s own guard and
+`~loop()` both call) with the operation/token never having fired and the
+deadline timer still pending, then asserts the returned future is
+`ready_with_failure()` instead of checking nothing (which is what the
+identical scenario used to do before this fix - permanently hang, the
+exact shape of the earlier, deliberately-removed sixth `with_timeout` test
+from the previous entry above, except this time it actually passes).
+
+Full pipeline re-verified: 310/310 (`default`), clean `clang-format`, clean
+build + clean `clang-tidy` + 93% diff coverage (`ci`), `sanitize` 253/253,
+wasm32 build + Node smoke test clean.
+
 ---
 
 ## Verification for M0

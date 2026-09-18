@@ -90,25 +90,79 @@ namespace est::detail {
 // token racer here also calls loop::cancel_timer(id), making this the one
 // case in the codebase where cancellation is genuinely eager rather than
 // just "stop watching" (loop::cancel_timer() makes pulling the
-// still-pending sleep_resume_node (est:promise) out of the timer queue
-// early cheap and safe). Not built on with_stop<T>() itself: with_stop()
-// has no way to reach into the timer it's racing against to cancel it -
-// this needs its own racer that also knows the timer_id.
+// still-pending timer node out of the timer queue early cheap and safe).
+// Not built on with_stop<T>() itself: with_stop() has no way to reach
+// into the timer it's racing against to cancel it - this needs its own
+// racer that also knows the timer_id.
 //
 // `done` is set before cancel_timer() is called (below), not after: if
 // the timer had already fired naturally by the time the token wins the
 // race, cancel_timer() returns false and is a no-op, but the timer's own
-// completion (sleep_resume_node::fire(), est:promise, already run by then)
-// would otherwise land on the same result via the first racer below -
-// setting `done` first guarantees that racer sees it and backs off,
-// however cancel_timer()'s own abandon()-driven cascade (if the timer
-// was still pending) is scheduled to run.
+// completion (sleep_stop_timer_node::fire(), just below, already run by
+// then) would otherwise land on the same result via the first racer
+// below - setting `done` first guarantees that racer sees it and backs
+// off, however cancel_timer()'s own abandon()-driven cascade (if the
+// timer was still pending) is scheduled to run.
 struct sleep_stop_state {
   explicit sleep_stop_state(promise<void> result) noexcept : result(std::move(result)) {}
 
   promise<void> result;
   loop::timer_id id{};
   bool done = false;
+};
+
+// The deadline-timer racer itself: writes directly into the shared
+// sleep_stop_state from fire()/abandon() instead of completing a second,
+// bridging future_state<void> the way detail::sleep_resume_node
+// (est:promise) would - that shape needs a then_fast() continuation on
+// the bridge future just to unpack its result straight back out into this
+// same sleep_stop_state, which is wasted work when the timer racer can
+// write there directly: fewer allocations per call (one future_state<void>
+// and one continuation node fewer), and, as a consequence, no
+// intermediate ready_-queue node left for loop::drain_pending()'s second
+// phase to abandon-instead-of-run (est:loop) - a still-pending
+// sleep_stop_timer_node is abandoned directly, in drain_pending()'s first
+// phase, which is what closes issue #113's gap for this combinator (est:
+// with_timeout's own with_timeout_timer_node mirrors this same fix, for
+// the identical reason).
+//
+// `done` is checked (and set) here too, not only in the two then_fast()
+// racers below: loop::cancel_timer() (est:loop) calls abandon()
+// synchronously, so the token racer winning and calling cancel_timer()
+// reaches this same guard on the same call stack.
+class sleep_stop_timer_node final : public timer_node,
+                                    public current_allocator_new_delete<sleep_stop_timer_node> {
+public:
+  explicit sleep_stop_timer_node(shared_ptr<sleep_stop_state> state) noexcept
+      : state_(std::move(state)) {}
+
+  void fire() override {
+    if (state_->done) {
+      return;
+    }
+    state_->done = true;
+    state_->result.set_value();
+  }
+
+  // abandoned_exception (est:loop) - reached when loop::drain_pending()
+  // (est:loop) abandons this node still pending at teardown, and (as a
+  // guarded no-op) when the token racer below wins and calls
+  // loop::cancel_timer() on an already-`done` state - see this class's
+  // own doc comment above.
+  void abandon() noexcept override {
+    if (state_->done) {
+      return;
+    }
+    state_->done = true;
+    state_->result.set_exception(std::make_exception_ptr(abandoned_exception()));
+  }
+
+  // operator new/delete inherited from current_allocator_new_delete<T>
+  // (est:util.current_loop) - see sleep_resume_node's own doc comment
+  // (est:promise) for why every concrete timer_node needs its own pair.
+
+private:
+  shared_ptr<sleep_stop_state> state_;
 };
 
 } // namespace est::detail
@@ -118,10 +172,13 @@ export namespace est {
 // Same as est::sleep_until() (est:promise), but the wait can be cut
 // short: if `token` is stopped before `deadline`, the underlying timer is
 // cancelled early (loop::cancel_timer(), est:loop - not merely
-// stopped-watching, the pending sleep_resume_node is actually reclaimed)
-// and the returned future fails with operation_cancelled instead of ever
-// reaching `deadline`. See detail::sleep_stop_state's own doc comment
-// above for the racer mechanics.
+// stopped-watching, the pending timer node is actually reclaimed) and the
+// returned future fails with operation_cancelled instead of ever reaching
+// `deadline`. See detail::sleep_stop_state/detail::sleep_stop_timer_node's
+// own doc comments above for the racer mechanics - including why, unlike
+// an earlier version of this function, loop teardown while both racers
+// are still pending no longer leaves the returned future permanently
+// pending (issue #113).
 [[nodiscard]] inline auto sleep_until(loop::clock::time_point deadline, const stop_token& token)
     -> future<void> {
   if (token.stop_requested()) { // fast path - matches with_stop<T>()'s own,
@@ -129,25 +186,18 @@ export namespace est {
   }
 
   auto& loop_ref = current_loop();
-  auto [timer_prom, timer_fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* node = new detail::sleep_resume_node(std::move(timer_prom));
-  const auto id = loop_ref.schedule_timer(*node, deadline);
-
   auto [prom, fut] = make_promise_future<void>();
   auto state = shared_ptr<detail::sleep_stop_state>::make(current_allocator(), std::move(prom));
-  state->id = id;
 
-  std::move(timer_fut).then_fast([state](future<void>& tf) {
-    if (state->done) {
-      return;
-    }
-    state->done = true;
-    if (tf.ready_with_failure()) {
-      state->result.set_exception(tf.get_exception());
-    } else {
-      state->result.set_value();
-    }
-  });
+  // Guarded until schedule_timer() actually succeeds - see
+  // est:with_timeout's own with_timeout<T>() for the identical hazard
+  // this protects against (a bad_alloc there would otherwise leak the
+  // node, since nothing else references it yet).
+  std::unique_ptr<detail::sleep_stop_timer_node> timer_node_guard(
+      new detail::sleep_stop_timer_node(state));
+  state->id = loop_ref.schedule_timer(*timer_node_guard, deadline);
+  timer_node_guard.release();
+
   token.stopped().then_fast([state](future<void>&) {
     if (state->done) {
       return;

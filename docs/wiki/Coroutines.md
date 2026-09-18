@@ -814,9 +814,56 @@ The one case where cancellation *is* genuinely eager - not just "stop
 watching" - is a timed wait: `est::sleep_for(delay, const stop_token&)`/
 `est::sleep_until(deadline, const stop_token&)` (`est:with_stop`) build on
 `loop::cancel_timer(timer_id)`, which pulls a still-pending
-`detail::sleep_resume_node` out of `loop`'s timer queue early and
+`detail::sleep_stop_timer_node` out of `loop`'s timer queue early and
 completes it via the same `abandon()` path `drain_pending()` uses at
 teardown - real, immediate reclamation, not a flag checked later. This
 works only because `loop` already tracks pending timers by id
 (`schedule_timer()` returns one); no such id exists for a queued
 `intrusive_list` waiter.
+
+`sleep_stop_timer_node`'s `fire()`/`abandon()` write straight into the
+shared racer state instead of completing a second, bridging
+`future_state<void>` the way `detail::sleep_resume_node` (`est:promise`,
+what plain `sleep_until()`/`sleep_for()` use) would - fewer allocations
+per call, and, since a still-pending timer's `abandon()` now runs
+directly from `loop::drain_pending()`'s own first phase rather than
+cascading through a `then_fast()` continuation that could land in
+`drain_pending()`'s second phase instead, loop teardown while both
+racers are still pending no longer leaves the returned future
+permanently pending (issue #113 - `with_timeout<T>()` below shares the
+identical fix, for the identical reason).
+
+### `with_timeout<T>()` - the inverse race, same eager-cancellation trick
+
+`est::with_timeout<T>(future<T> operation, loop::clock::duration timeout)`
+(`est:with_timeout`, issue #57) races `operation` against a deadline timer
+instead of a caller-supplied `stop_token` - conceptually `with_stop<T>()`'s
+mirror image: there, the token winning cancels nothing on its own (the
+*caller* built the token and decides what, if anything, to do about it);
+here, `operation` winning is what triggers the eager cancellation, of the
+deadline timer this combinator scheduled for itself.
+
+Not built on `with_stop<T>()`/`stop_token`, despite those being the
+combinator's own issue's original proposed composition ("essentially
+`when_any(operation, sleep_for(timeout))`") - neither primitive has a way
+to reach into the timer it's racing against to cancel it, so composing
+from them would leave a fired-but-unused deadline timer sitting in
+`loop`'s timer queue for its full duration even after `operation` already
+won. `with_timeout<T>()` is its own racer instead, built directly on
+`loop::schedule_timer()`/`cancel_timer()` via its own dedicated
+`detail::with_timeout_timer_node<T>` - the exact same shape
+`sleep_until(deadline, const stop_token&)`'s own `sleep_stop_timer_node`
+above uses, for the identical reason (including the same fix for issue
+#113: loop teardown while both racers are still pending no longer leaves
+the returned future permanently pending).
+
+Fails with `est::operation_timed_out` if the deadline wins - a third,
+distinct exception alongside `detail::abandoned_exception` and
+`operation_cancelled`, deliberately not reused: `with_timeout<T>()` has no
+`stop_token` of its own, so a caller catching `operation_cancelled`
+elsewhere to mean "something explicitly requested cancellation" shouldn't
+also have to catch it for "this simply took too long." Same honestly-
+scoped limitation as `with_stop<T>()`/`when_any()`/`when_all()`/
+`when_any_succeeds()`: losing the race only stops the *caller* from
+waiting on `operation` further, it keeps running in the background until
+it completes on its own.
