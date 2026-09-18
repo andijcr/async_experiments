@@ -65,6 +65,43 @@ TEST_CASE("counting_event<automatic>: wait() on an unsignaled event suspends unt
   REQUIRE_FALSE(ev.has_waiters());
 }
 
+TEST_CASE("counting_event<Mode>::wait()'s slow path inherits current_priority() instead of "
+          "always defaulting to normal (issue #31)",
+          "[event][priority]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  est::counting_event<EventResetMode::automatic> ev;
+
+  // marker's own node reaches loop's ready-queue (at est::Priority::normal)
+  // before wait()'s below, chronologically - so if wait()'s slow path
+  // incorrectly defaulted to Priority::normal too (a real bug this
+  // regression test caught: the waiter node only reaches loop's
+  // ready-queue later, from set() below, never through
+  // future_awaiter<T>::await_suspend() - the usual place a co_await
+  // inherits ambient priority), FIFO ordering within that shared level
+  // would run marker's callback before `waited` is even ready. If wait()
+  // correctly inherits Priority::critical instead (which est::mutex::
+  // lock() also relies on, being built directly on this), its own node
+  // must run first regardless, since loop::eager_scheduler always drains
+  // the highest non-empty level first.
+  auto [marker_promise, marker_future] = est::make_promise_future<int>();
+  marker_promise.set_value(0);
+  bool wait_ready_when_marker_ran = false;
+  std::optional<est::future<void>> waited;
+  auto marker = marker_future.then([&](est::future<int>&) {
+    wait_ready_when_marker_ran = waited.has_value() && waited->ready();
+  });
+
+  {
+    const auto raised = est::set_priority(est::Priority::critical);
+    waited = ev.wait();
+  }
+  ev.set();
+
+  loop.run_until_idle();
+  REQUIRE(wait_ready_when_marker_ran);
+}
+
 // A long, deliberately linear sequence of independent steps, matching
 // mutex_tests.cpp's own justification for the same NOLINT on similarly
 // shaped scenarios.

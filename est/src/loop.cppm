@@ -7,6 +7,71 @@ import :timer;
 import :util.intrusive_list;
 import :util.scope_exit;
 
+export namespace est {
+
+// The (small, fixed) set of levels a ready-to-run continuation
+// (est::detail::ready_node's own priority_level field, below) carries -
+// which of loop's per-level ready queues a scheduler drains from next.
+// Lives here, not alongside current_loop()/current_allocator() in
+// :util.current_loop, because :loop cannot import that partition back (it
+// already imports :loop) - the same constraint that already keeps
+// detail::current_allocator_new_delete<T> a separate mixin there instead
+// of living directly on ready_node/timer_node themselves (see ready_node's
+// own doc comment below). Four levels, not an open-ended count: issue #31
+// settled on "a few levels suffice" rather than a numeric/unbounded scale.
+// max_priority aliases the highest real level (not a fifth one) so
+// loop::priority_levels (below) can be derived from it instead of
+// carrying its own separately-maintained "4".
+// NOLINTNEXTLINE(readability-enum-initial-value)
+enum class Priority : std::uint8_t { background, normal, high, critical, max_priority = critical };
+
+} // namespace est
+
+namespace est::detail {
+
+// current_priority()/set_priority()'s own backing storage (export
+// namespace est, below) - thread_local for the identical reason
+// est::detail::tls_context (est:util.current_loop) is: this codebase's
+// eventual target is one loop per core, each with its own independent
+// notion of "what priority is ambient right now," no cross-core
+// synchronization needed.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline thread_local Priority tls_priority = Priority::normal;
+
+} // namespace est::detail
+
+export namespace est {
+
+// The priority a freshly registered continuation/resume node inherits by
+// default - read at registration time (future_state<T>::then()/
+// then_fast()'s own `Priority prio = current_priority()` default
+// argument, est:future) or explicitly, by a coroutine, right before a
+// co_await it wants raised (future_awaiter<T>::await_suspend(), est:future).
+// loop::run_one() (below) sets this to whatever priority the
+// currently-running node itself carries for the duration of its run() -
+// so anything that node goes on to register (another then()/co_await)
+// inherits the same priority by default, without threading a parameter
+// through every call in between. Defaults to Priority::normal on a thread/
+// core nothing has ever raised or lowered.
+[[nodiscard]] inline auto current_priority() noexcept -> Priority {
+  return detail::tls_priority;
+}
+
+// Raises or lowers current_priority() for the caller's own scope -
+// modeled on est::make_current_loop()/est::platform::override_instance()'s
+// own RAII shape (built the same way, on est::scope_exit), but a plain
+// save/restore stack rather than a single slot with a checked precondition
+// against nesting: unlike "which loop is current," nested priority scopes
+// are the expected, common case (a background chain lowering it inside a
+// caller that already raised it), not a programming error.
+[[nodiscard]] inline auto set_priority(Priority new_priority) noexcept {
+  const auto previous = detail::tls_priority;
+  detail::tls_priority = new_priority;
+  return scope_exit([previous]() noexcept { detail::tls_priority = previous; });
+}
+
+} // namespace est
+
 // Type-erased primitives est::loop's ready-queue and pending-timer list
 // hold, kept fully independent of est::future/est::promise: :loop needs a
 // type-erased "thing to run" for its ready-queue, and est::future's own
@@ -70,6 +135,18 @@ public:
   virtual ~ready_node() = default;
 
   virtual void run() = 0;
+
+  // Which of loop's per-level ready queues this node belongs on
+  // (est::Priority, above) - set by whatever registers this node
+  // (future_state<T>::then_impl()/set_continuation(), est:future) after
+  // construction, before it's ever handed to enqueue_ready() below; every
+  // concrete node type defaults to Priority::normal by simply never
+  // touching this field. A plain public field, not a getter/setter pair -
+  // matching intrusive_list_node::next's own already-public, no-accessor
+  // style (est:util.intrusive_list): there is no invariant here to
+  // protect, just a value loop::enqueue_ready() reads and a caller sets.
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  Priority priority_level = Priority::normal;
 
   // Called exactly once, immediately before a node that never ran is
   // deleted (loop::drain_pending() below) - never called on a node that
@@ -181,8 +258,57 @@ public:
   using clock = std::chrono::steady_clock;
   using timer_id = timer_queue<allocator_type>::id;
 
-  explicit loop(allocator_type allocator = {})
-      : allocator_(allocator), timers_(allocator), pending_timers_(allocator) {}
+  // One FIFO ready-queue per priority level (est::Priority, above) -
+  // scheduler_type (below) picks which of these a given drain pass pops
+  // from next.
+  static constexpr std::size_t priority_levels =
+      static_cast<std::size_t>(Priority::max_priority) + 1;
+  using ready_queues = std::array<intrusive_list<detail::ready_node>, priority_levels>;
+
+  // The pluggable drain policy: given every level's own queue, pops and
+  // returns whichever node should run next (nullptr once every level is
+  // empty) - it does the pop itself, not just picks a level, since a
+  // fairness-oriented policy (issue #31's "proportionate" scheduler, not
+  // implemented yet) needs to track its own per-level state to decide
+  // that, not just react to whichever level loop happens to ask about.
+  // Type-erased, not a virtual base: unlike est::platform::interface (the
+  // framework's one deliberate runtime-polymorphic OOP seam), a scheduler
+  // decision happens on the hottest path this codebase has - once per
+  // ready node, every single one - so this is meant to be the same kind
+  // of type erasure est::shared_ptr's std::pmr::polymorphic_allocator
+  // already is throughout this codebase, not a second inheritance
+  // hierarchy alongside platform::interface.
+  //
+  // std::function, not std::move_only_function as issue #31 itself
+  // proposed: the pinned Clang 22 libc++ snapshot this codebase builds
+  // against doesn't implement std::move_only_function yet
+  // (__cpp_lib_move_only_function is undefined) - std::function's own
+  // copy-constructible-callable requirement costs nothing in practice for
+  // a scheduler (the eager one below is a stateless function pointer; a
+  // future fairness-oriented one only needs plain, copyable per-level
+  // counters), so this is a pragmatic substitute, not a design change -
+  // worth revisiting once libc++ catches up.
+  using scheduler_type = std::function<detail::ready_node*(ready_queues&)>;
+
+  // The default scheduler: always drains the highest non-empty level
+  // first - simple, and matches "critical actually means critical," at
+  // the accepted cost that a busy higher level can starve a lower one
+  // indefinitely (issue #31's own open question; a fairness-oriented
+  // "proportionate" alternative is a documented follow-up, not built
+  // here). Priority's own declaration order (background < normal < high
+  // < critical) doubles as the scan order, highest value first.
+  [[nodiscard]] static auto eager_scheduler(ready_queues& queues) noexcept -> detail::ready_node* {
+    for (auto& level : std::ranges::reverse_view(queues)) {
+      if (auto* node = level.dequeue()) {
+        return node;
+      }
+    }
+    return nullptr;
+  }
+
+  explicit loop(allocator_type allocator = {}, scheduler_type scheduler = eager_scheduler)
+      : allocator_(allocator), scheduler_(std::move(scheduler)), timers_(allocator),
+        pending_timers_(allocator) {}
   loop(const loop&) = delete;
   auto operator=(const loop&) -> loop& = delete;
   loop(loop&&) = delete;
@@ -201,8 +327,19 @@ public:
   // Pushes an already-ready unit of work onto the ready-queue, for the
   // next drain pass inside run()/run_until_idle() - called by
   // est::future_state<T>::complete() (est:future) instead of invoking a
-  // continuation inline.
-  void enqueue_ready(detail::ready_node& node) noexcept { ready_.enqueue(node); }
+  // continuation inline. Routed into the level `node`'s own priority_level
+  // (ready_node's own field, above) names - already set by whoever
+  // registered `node` (future_state<T>::then_impl()/set_continuation(),
+  // est:future), defaulting to Priority::normal for anything that never
+  // touches it.
+  void enqueue_ready(detail::ready_node& node) noexcept {
+    // node.priority_level is Priority, a 4-valued enum (background through
+    // critical) - static_cast<size_t> of it is always in [0, priority_levels),
+    // so this index is safe by construction despite not being a compile-time
+    // constant.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-constant-array-index,cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    ready_[static_cast<std::size_t>(node.priority_level)].enqueue(node);
+  }
 
   // Registers `node` to fire() once `deadline` passes - the primitive a
   // higher-level timer-driven future builds on (est::sleep_for(),
@@ -330,7 +467,9 @@ public:
       detail::abandon_timer_node(*entry.node);
     }
     pending_timers_.clear();
-    ready_.drain(detail::abandon_ready_node);
+    for (auto& level : ready_) {
+      level.drain(detail::abandon_ready_node);
+    }
   }
 
 private:
@@ -369,7 +508,7 @@ private:
   }
 
   void drain_ready() {
-    while (auto* node = ready_.dequeue()) {
+    while (auto* node = scheduler_(ready_)) {
       run_one(*node);
       if (stop_requested_) {
         return;
@@ -409,14 +548,24 @@ private:
   //
   // static: touches no member of *this any more - long_running_threshold
   // (below) is itself a static member, and everything else here is
-  // either the node parameter or est::platform::instance() - now that
-  // destroy_guard() (a non-static member, needing an implicit `this` to
-  // call at all) is gone from this body, nothing left requires an
-  // instance. drain_ready() below still calls this the same way either
+  // either the node parameter, est::platform::instance(), or the ambient
+  // current_priority()/set_priority() thread_local (est::Priority, above)
+  // - now that destroy_guard() (a non-static member, needing an implicit
+  // `this` to call at all) is gone from this body, nothing left requires
+  // an instance. drain_ready() below still calls this the same way either
   // way (`run_one(*node)`, implicitly `this->run_one(*node)` for a
   // static member too).
+  //
+  // priority_guard set before the stall-detection bracket, not after:
+  // this is what makes "the main chain of computation inherits its
+  // priority" (issue #31) actually happen - anything `node.run()` itself
+  // goes on to register (another then()/co_await) reads current_priority()
+  // as its own default, so it needs to already read back `node`'s own
+  // priority_level for the whole duration of this call, not just around
+  // it.
   static void run_one(detail::ready_node& node) {
     const std::unique_ptr<detail::ready_node> guard(&node);
+    const auto priority_guard = set_priority(node.priority_level);
     platform::instance().reset_loop_stall_detection();
     node.run();
     platform::instance().detect_loop_stall(long_running_threshold);
@@ -437,7 +586,8 @@ private:
   static constexpr clock::duration long_running_threshold = std::chrono::milliseconds(50);
 
   allocator_type allocator_;
-  intrusive_list<detail::ready_node> ready_;
+  scheduler_type scheduler_;
+  ready_queues ready_;
   timer_queue<allocator_type> timers_;
   std::pmr::vector<pending_entry> pending_timers_;
   bool stop_requested_ = false;

@@ -269,6 +269,15 @@ export namespace est {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());
   auto* node = new detail::promise_resume_node<void>(std::move(prom));
+  // Stamped from current_priority(), not left at ready_node's own
+  // Priority::normal default: co_await yield_execution() re-enters
+  // ready_ directly rather than through future_awaiter<T>::
+  // await_suspend() (est:future), which is the usual place a co_await
+  // inherits the calling coroutine's ambient priority - without this,
+  // a coroutine running at Priority::critical would drop to normal the
+  // instant it yields, exactly the priority inversion issue #31's whole
+  // inheritance mechanism exists to prevent.
+  node->priority_level = current_priority();
   loop_ref.enqueue_ready(*node);
   return std::move(fut);
 }

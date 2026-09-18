@@ -446,6 +446,11 @@ public:
       node.bind_owner(this->shared_from_this());
       if (run_inline_if_ready) {
         const std::unique_ptr<continuation_node> owned(&node);
+        // Mirrors loop::run_one()'s own ambient-priority bracket
+        // (est:loop) for the deferred path - anything owned->run() itself
+        // goes on to register should inherit *this* node's priority too,
+        // not whatever was ambient before then_fast() was called.
+        const auto priority_guard = set_priority(node.priority_level);
         owned->run();
         return;
       }
@@ -620,8 +625,15 @@ public:
   // the calling handle's own reference immediately instead of leaving it
   // held until the handle itself goes out of scope. Issue #64 (the move)
   // / #71 (the && overload).
-  template <detail::then_callback_for<T> Fn> auto then(Fn&& fn) {
-    return then_impl(std::forward<Fn>(fn), /*run_inline_if_ready=*/false);
+  // prio defaults to current_priority() (est:loop) - read at the call
+  // site, not inside then_impl() - so "no priority given" means "inherit
+  // whatever's ambient right now" (issue #31): loop::run_one() sets that
+  // ambient value to the currently-running node's own priority for the
+  // duration of its run(), so a chain of then() calls inherits by default
+  // without threading a parameter through every intermediate call.
+  template <detail::then_callback_for<T> Fn>
+  auto then(Fn&& fn, Priority prio = current_priority()) {
+    return then_impl(std::forward<Fn>(fn), /*run_inline_if_ready=*/false, prio);
   }
 
   // then_fast(): identical to then() above (same wrapped/unwrapped
@@ -652,8 +664,9 @@ public:
   // "fast" from also having to thread through the monadic-flatten case
   // keeps this addition to a single call site's behavior, not a second
   // property every future-returning path in this class has to carry.
-  template <detail::then_callback_for<T> Fn> auto then_fast(Fn&& fn) {
-    return then_impl(std::forward<Fn>(fn), /*run_inline_if_ready=*/true);
+  template <detail::then_callback_for<T> Fn>
+  auto then_fast(Fn&& fn, Priority prio = current_priority()) {
+    return then_impl(std::forward<Fn>(fn), /*run_inline_if_ready=*/true, prio);
   }
 
 private:
@@ -661,7 +674,7 @@ private:
   // every way except whether a continuation registered on an
   // already-ready future_state runs inline or defers through est::loop;
   // see set_continuation()'s own run_inline_if_ready parameter.
-  template <class Fn> auto then_impl(Fn&& fn, bool run_inline_if_ready) {
+  template <class Fn> auto then_impl(Fn&& fn, bool run_inline_if_ready, Priority prio) {
     using decayed_fn = std::decay_t<Fn>;
     using downstream_value_type = detail::unwrap_future_t<raw_result_t<decayed_fn>>;
     auto allocator = current_allocator();
@@ -669,6 +682,7 @@ private:
     auto downstream_for_node = downstream; // copy: the node keeps its own reference too
     using node_type = concrete_continuation<decayed_fn, downstream_value_type>;
     auto* node = new node_type(std::forward<Fn>(fn), std::move(downstream_for_node));
+    node->priority_level = prio;
     set_continuation(*node, run_inline_if_ready);
     return future<downstream_value_type>(std::move(downstream));
   }
@@ -1081,7 +1095,9 @@ public:
   // qualified overload of the same signature - a real lvalue future<T>
   // handle is the only caller that needs this one; an rvalue always binds
   // the other overload instead).
-  template <class Fn> auto then(Fn&& fn) & { return state_->then(std::forward<Fn>(fn)); }
+  template <class Fn> auto then(Fn&& fn, Priority prio = current_priority()) & {
+    return state_->then(std::forward<Fn>(fn), prio);
+  }
 
   // Same, for a caller that no longer needs *this once the continuation
   // is registered (`std::move(future).then(fn)`; a plain temporary -
@@ -1093,9 +1109,9 @@ public:
   // `concrete_continuation<Fn, U>::run()`'s own `count() == 1` check
   // (issue #64, `future_state<T>::then()`'s own doc comment) could come
   // back false. Issue #71.
-  template <class Fn> auto then(Fn&& fn) && {
+  template <class Fn> auto then(Fn&& fn, Priority prio = current_priority()) && {
     auto state = std::move(state_);
-    return state->then(std::forward<Fn>(fn));
+    return state->then(std::forward<Fn>(fn), prio);
   }
 
   // Forwards to future_state<T>::then_fast() (see its own doc comment) -
@@ -1114,11 +1130,13 @@ public:
   // scope. Kept anyway so a caller that no longer needs *this can still
   // say so, same as with then() - it just isn't what makes the
   // difference here.
-  template <class Fn> auto then_fast(Fn&& fn) & { return state_->then_fast(std::forward<Fn>(fn)); }
+  template <class Fn> auto then_fast(Fn&& fn, Priority prio = current_priority()) & {
+    return state_->then_fast(std::forward<Fn>(fn), prio);
+  }
 
-  template <class Fn> auto then_fast(Fn&& fn) && {
+  template <class Fn> auto then_fast(Fn&& fn, Priority prio = current_priority()) && {
     auto state = std::move(state_);
-    return state->then_fast(std::forward<Fn>(fn));
+    return state->then_fast(std::forward<Fn>(fn), prio);
   }
 
   // Suspends the calling coroutine until *this becomes ready, resuming
@@ -1318,8 +1336,17 @@ public:
   // node it needs, happens at all.
   [[nodiscard]] auto await_ready() const noexcept -> bool { return future_.ready(); }
 
+  // node->priority_level stamped from current_priority() explicitly, not
+  // left at ready_node's own Priority::normal default: this is the other
+  // half of issue #31's inheritance (then()/then_fast()'s own `prio =
+  // current_priority()` default argument is the first) - a coroutine
+  // resumed at some priority that then co_awaits something should have
+  // *that* resumption also run at the same priority by default, without
+  // needing to pass it anywhere - co_await's own syntax has no room for
+  // an extra argument the way then()/then_fast() do.
   void await_suspend(std::coroutine_handle<> handle) {
     auto* node = new future_resume_node<T>(handle);
+    node->priority_level = current_priority();
     future_.state_->set_continuation(*node);
   }
 

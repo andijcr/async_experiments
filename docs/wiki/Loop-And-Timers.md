@@ -235,18 +235,32 @@ experiment's findings.
 
 ## The ready-queue
 
-`loop::enqueue_ready(detail::ready_node&)` pushes onto `ready_`, an
-`est::intrusive_list<detail::ready_node>` — the same generic intrusive-list
-container `est::counting_event<Mode>` (which `est::mutex` now builds
-`lock()` on top of - issue #67) and `est::future_state<T>` each use for
-their own queues (see [Architecture](Architecture.md)), templated here on
-`detail::ready_node` specifically so `dequeue()` already hands back a
-`detail::ready_node*` directly, no cast needed. `run_until_idle()`/`run()`
-drain it via `drain_ready()`:
+`loop::enqueue_ready(detail::ready_node&)` pushes onto `ready_`, a
+`loop::ready_queues` - `std::array<est::intrusive_list<detail::ready_node>,
+priority_levels>`, one FIFO queue per `est::Priority` level (four: see
+"Priority levels and the pluggable scheduler" below) rather than a single
+list. Each per-level list is the same generic intrusive-list container
+`est::counting_event<Mode>` (which `est::mutex` now builds `lock()` on top
+of - issue #67) and `est::future_state<T>` each use for their own queues
+(see [Architecture](Architecture.md)), templated on `detail::ready_node`
+specifically so `dequeue()` already hands back a `detail::ready_node*`
+directly, no cast needed. `enqueue_ready()` routes into the level
+`node.priority_level` names:
+
+```cpp
+void enqueue_ready(detail::ready_node& node) noexcept {
+  ready_[static_cast<std::size_t>(node.priority_level)].enqueue(node);
+}
+```
+
+`run_until_idle()`/`run()` drain the whole `ready_queues` array via
+`drain_ready()`, delegating the actual "which level next" decision to
+`scheduler_` (a `std::function<detail::ready_node*(ready_queues&)>` - see
+below):
 
 ```cpp
 void drain_ready() {
-  while (auto* node = ready_.dequeue()) {
+  while (auto* node = scheduler_(ready_)) {
     run_one(*node);
     if (stop_requested_) {
       return;
@@ -255,17 +269,18 @@ void drain_ready() {
 }
 ```
 
-Because the list is re-checked fresh on every iteration, a continuation that
-itself completes *another* `future_state` (cascading a further continuation
-onto the same ready-queue) gets picked up within the same drain pass — an
-arbitrarily deep, purely synchronous chain resolves inside one
-`run_until_idle()` call, not one call per link.
+Because the array is re-checked fresh on every iteration, a continuation
+that itself completes *another* `future_state` (cascading a further
+continuation onto the same ready-queue) gets picked up within the same
+drain pass — an arbitrarily deep, purely synchronous chain resolves inside
+one `run_until_idle()` call, not one call per link.
 
-`run_one()` does three things around actually invoking the node:
+`run_one()` does four things around actually invoking the node:
 
 ```cpp
 void run_one(detail::ready_node& node) {
   const std::unique_ptr<detail::ready_node> guard(&node); // always destroy, however this exits
+  const auto priority_guard = set_priority(node.priority_level);
   platform::instance().reset_loop_stall_detection();
   node.run();
   platform::instance().detect_loop_stall(long_running_threshold);
@@ -283,6 +298,9 @@ void run_one(detail::ready_node& node) {
   shrank to exactly `unique_ptr<Node>(&node)`, the template stopped
   earning its keep over writing the same one line at each of the two
   call sites.
+- **`priority_guard`** sets the ambient `current_priority()` to `node`'s
+  own priority for the whole duration of `node.run()` - see "Priority
+  levels and the pluggable scheduler" below for why.
 - **Long-running-callback detection**: single-threaded means one slow
   continuation blocks everything else the loop owns — timers, other ready
   work, all of it — with nothing able to preempt it. Measuring and
@@ -303,6 +321,82 @@ void run_one(detail::ready_node& node) {
   reporting) a stall in parallel while the callback is still running,
   rather than only finding out once it returns — without `run_one()`
   itself changing at all.
+
+### Priority levels and the pluggable scheduler
+
+Issue #31 (four levels - `est::Priority`: `background`, `normal`, `high`,
+`critical`) lets a caller ask that some ready work run before other ready
+work, rather than every continuation being equally FIFO regardless of how
+much it matters. Each `detail::ready_node` carries its own
+`priority_level` field (a plain public member, defaulting to
+`Priority::normal` - no getter/setter, matching
+`intrusive_list_node::next`'s own already-public style), and
+`enqueue_ready()` (above) routes purely off that field.
+
+**Setting it explicitly**: `future<T>::then()`/`then_fast()` take an
+optional trailing `Priority` argument:
+
+```cpp
+auto response = handle_event(request).then(respond, est::Priority::high);
+```
+
+**Inheriting it implicitly**: omitting that argument doesn't default to
+`Priority::normal` - it defaults to `est::current_priority()`, read *at the
+`then()`/`then_fast()` call site itself* (`priority prio =
+current_priority()` as the parameter's own default-argument expression).
+`current_priority()`/`set_priority()` (an RAII guard, modeled on
+`make_current_loop()`'s own shape but a plain save/restore stack rather
+than a single slot - nested priority scopes are the expected case here, not
+a programming error) are a `thread_local`, exactly like
+`current_loop()`/`current_allocator()`, but declared in `:loop` itself
+rather than `:util.current_loop` - that partition already imports `:loop`,
+so `:loop` importing back would be circular, the identical constraint that
+already keeps `detail::current_allocator_new_delete<T>` a separate mixin
+in `:util.current_loop` instead of living directly on `ready_node`.
+
+This is what makes *inheritance through a chain* work automatically,
+without threading a parameter through every intermediate call:
+`run_one()`'s `priority_guard` (above) sets `current_priority()` to the
+currently-running node's own `priority_level` for the whole duration of
+its `run()` - so anything that callback goes on to register (another
+`then()`, or a `co_await` - `future_awaiter<T>::await_suspend()` stamps
+its own resume node's `priority_level` from `current_priority()` the same
+way, since `co_await`'s syntax has no room for an extra argument the way
+`then()` does) inherits the same priority by default. A caller that wants
+to opt a chain *out* of inheriting (a "background" sub-chain kicked off
+from otherwise high-priority work) passes `Priority::background`
+explicitly, or wraps the dispatch in its own `set_priority()` scope.
+
+**Draining**: `loop::scheduler_` is a `std::function<detail::ready_node*(
+ready_queues&)>` - it pops and returns the next node to run itself
+(`nullptr` once every level is empty), not just picks a level, since a
+fairness-oriented policy needs to track its own per-level state to decide
+that. `std::function`, not `std::move_only_function` as the issue itself
+first proposed: the pinned Clang 22 libc++ snapshot this codebase builds
+against doesn't implement `std::move_only_function` yet
+(`__cpp_lib_move_only_function` is undefined) - a pragmatic substitute, not
+a design change, since every scheduler this codebase actually needs only
+closes over plain, copyable state (counters, at most). Deliberately a
+type-erased callable rather than a second `platform::interface`-style
+virtual base: a scheduler decision happens on the hottest path this
+codebase has, once per ready node, so it stays the same kind of type
+erasure `std::pmr::polymorphic_allocator` already is throughout this
+codebase, not a second inheritance hierarchy.
+
+`loop::eager_scheduler` (the default, set by `loop`'s constructor) always
+drains the highest non-empty level first - simple, and matches "critical
+actually means critical," at the accepted cost that sustained high-priority
+traffic can starve a lower level indefinitely.
+
+**Explicitly out of scope so far** (documented, not built): a
+fairness-oriented "proportionate" scheduler alternative that bounds how
+long a level can starve; starvation *detection* itself, proposed to mirror
+`reset_loop_stall_detection()`/`detect_loop_stall()` above exactly (per-
+level head-pointer-hasn't-advanced-in-N-ms, delegated to
+`platform::interface` the same way); and priority support on `spawn()`
+(issue #58, not implemented yet either) and the flatten/monadic path
+(`detail::flatten_forwarder<T>`, always `Priority::normal`) - all real,
+deliberate follow-ups rather than gaps nobody noticed.
 
 ## Timers: `schedule_timer()`, and the `future<void>` bridge
 

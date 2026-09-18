@@ -6521,6 +6521,134 @@ outstanding and has to happen before this workflow can succeed for real.
 
 ---
 
+### Issue #31: priority levels for `est::loop`'s ready-queue
+
+Design discussion happened directly on the issue (four levels
+- `est::Priority::background`/`normal`/`high`/`critical` - a plain
+parameter on `then()`/`then_fast()` defaulting to inherit `current_priority()`
+rather than anything wired into a specific primitive like
+`est::external_event<T>`, and a pluggable scheduler rather than a fixed
+drain order). Implemented the self-contained core: priority levels, the
+`ready_node` field, the scheduler abstraction with an eager default, and
+`then()`/`then_fast()`'s inheritance via an ambient `current_priority()`/
+`set_priority()` - deliberately leaving the proportionate (fairness)
+scheduler, starvation detection (`platform::interface` additions mirroring
+the existing stall detector), and `spawn()`'s own priority parameter (issue
+#58, itself not implemented yet) as documented follow-ups rather than
+folding an already-large design into one PR.
+
+**`est::Priority`** (`est/src/loop.cppm`) - four levels, declared (and
+exported) directly in `:loop` rather than alongside
+`current_loop()`/`current_allocator()` in `:util.current_loop`: that
+partition already imports `:loop`, so `:loop` importing back would be
+circular, the identical constraint that already keeps
+`detail::current_allocator_new_delete<T>` a separate mixin there instead of
+living directly on `ready_node`/`timer_node`. `detail::ready_node` gains a
+plain public `priority_level` field (defaulting to `Priority::normal`,
+matching `intrusive_list_node::next`'s own already-public, no-accessor
+style - there's no invariant here to protect).
+
+**`est::current_priority()`/`est::set_priority()`** - a `thread_local`
+ambient value plus an RAII guard, modeled on `make_current_loop()`'s own
+shape (built on `est::scope_exit` the same way) but a plain save/restore
+stack rather than a single slot with a checked precondition against
+nesting: nested priority scopes are the expected, common case here (a
+background chain lowering it inside a caller that already raised it), not
+a programming error the way two loops both being "current" is.
+
+**Inheritance, not just explicit setting**: `future_state<T>::then()`/
+`then_fast()` (and `future<T>`'s four forwarding overloads) gained a
+trailing `Priority prio = current_priority()` parameter - the default
+argument is evaluated at the `then()`/`then_fast()` call site itself, so
+omitting it means "inherit whatever's ambient right now," while an
+explicit value overrides it. `loop::run_one()` sets `current_priority()` to
+the currently-running node's own `priority_level` for the whole duration of
+its `run()` (mirrored in `future_state<T>::set_continuation()`'s own
+inline-run path for `then_fast()`, for consistency) - this is what makes a
+*chain* inherit automatically: anything a running continuation goes on to
+register picks up its priority by default, without threading a parameter
+through every intermediate call.
+`future_awaiter<T>::await_suspend()` stamps its own resume node's
+`priority_level` from `current_priority()` explicitly, the same way, since
+`co_await`'s own syntax has no room for an extra argument the way
+`then()`/`then_fast()` do.
+
+**The scheduler**: `loop::ready_` became a `ready_queues` -
+`std::array<intrusive_list<detail::ready_node>, 4>`, one FIFO per level -
+drained by a pluggable `loop::scheduler_type`, set once at construction
+(defaulting to `loop::eager_scheduler`, which always drains the highest
+non-empty level first). `std::function`, not `std::move_only_function` as
+the issue itself proposed: the pinned Clang 22 libc++ snapshot this
+codebase builds against doesn't implement `std::move_only_function` yet
+(`__cpp_lib_move_only_function` is undefined) - confirmed by a failed build
+before switching. `std::function`'s copy-constructible-callable requirement
+costs nothing in practice here (the eager scheduler is a stateless function
+pointer; a future fairness-oriented one only needs plain, copyable
+per-level counters), so this is a pragmatic substitute, not a design
+change - worth revisiting once libc++ catches up. Deliberately type-erased
+rather than a second `platform::interface`-style virtual base: a scheduler
+decision happens on the hottest path this codebase has, once per ready
+node, so it stays the same kind of type erasure
+`std::pmr::polymorphic_allocator` already is throughout this codebase
+(`est::shared_ptr` et al.), not a second inheritance hierarchy alongside
+`platform::interface` - `CLAUDE.md`'s own "platform is the only
+runtime-polymorphic seam" claim stays true.
+
+**Explicitly out of scope, documented on the issue and in
+`docs/wiki/Loop-And-Timers.md`**: the proportionate/fairness scheduler
+(eager can starve a lower level indefinitely under sustained higher-
+priority load - accepted for now); starvation *detection* itself (proposed
+to mirror `reset_loop_stall_detection()`/`detect_loop_stall()` exactly, via
+new `platform::interface` methods taking each level's head pointer);
+`spawn()`'s own priority parameter (issue #58, not implemented); and the
+monadic-flatten path (`detail::flatten_forwarder<T>`), which still always
+runs at `Priority::normal` rather than inheriting - not touched in this
+pass.
+
+**Tests** (`est/tests/loop_tests.cpp`): higher-priority ready work drains
+before lower-priority work regardless of enqueue order; `then()`/
+`then_fast()` default to inheriting `current_priority()` at the call site;
+an explicit priority argument overrides that inheritance; `set_priority()`
+nests and restores correctly, like a stack; a continuation registered from
+inside a running node inherits *that node's* priority, not whatever was
+ambient before it started. All 300/300 existing tests pass unchanged - the
+default-everything-`normal` behavior is exactly the prior single-queue
+FIFO ordering. Full devenv pipeline (`cmake --preset default/ci/sanitize` +
+`ctest` + `clang-format` + `clang-tidy` + the coverage gate - 100% diff
+coverage) plus the separate `wasm32` project build, all re-verified.
+`docs/wiki/Loop-And-Timers.md`'s "The ready-queue" section updated (code
+samples were now stale) and extended with a new "Priority levels and the
+pluggable scheduler" subsection; `docs/wiki/Home.md`'s lookup table
+updated to match.
+
+**A code review of the same PR caught a real gap** before it shipped:
+`est::yield_execution()` (`est/src/promise.cppm`) and
+`counting_event<Mode>::wait()`'s slow path (`est/src/sync/event.cppm` -
+which `est::mutex::lock()` is built directly on) each construct their own
+`detail::promise_resume_node<void>` and hand it to `loop::enqueue_ready()`
+(directly, or later via `set()`) without ever stamping `priority_level`
+from `current_priority()` - both silently defaulted to `Priority::normal`
+regardless of the caller's actual ambient priority, since neither goes
+through `future_awaiter<T>::await_suspend()` (the usual place a `co_await`
+inherits it). Unlike the flatten/monadic path (`detail::
+flatten_forwarder<T>`, `spawn()`) - explicitly documented as staying at
+`Priority::normal` for now - this one wasn't a deliberate exclusion,
+just an oversight: a coroutine running at `Priority::critical` that then
+`co_await`s `yield_execution()` or a contended `est::mutex::lock()` would
+silently drop to normal priority for its resumption, exactly the kind of
+priority inversion the whole inheritance mechanism exists to prevent.
+Fixed by stamping `priority_level = current_priority()` at both
+construction sites. Two new regression tests (`est/tests/loop_tests.cpp`,
+`est/tests/event_tests.cpp`) catch it directly: a marker at
+`Priority::normal` is enqueued to `loop`'s ready-queue *before* the
+`yield_execution()`/`wait()` call under test, so if either incorrectly
+defaulted to normal too, FIFO ordering within that shared level would run
+the marker first, before the future under test is even ready - both tests
+assert it isn't. All 302 tests pass (300 + these 2); full devenv pipeline
+re-verified.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
