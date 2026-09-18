@@ -74,12 +74,30 @@ public:
 // arbitrary suspended coroutine or queued waiter would need
 // intrusive_list<T>::remove() from the middle, which doesn't exist - see
 // those combinators' own doc comments for the same gap.
+//
+// Known hazard, not just the above: if loop teardown (loop::
+// drain_pending(), est:loop - reached via make_current_loop()'s own guard
+// or ~loop() alike) happens while *both* racers are still pending, the
+// future this function returns can be left permanently pending - never
+// completed with a value, an exception, or anything else - rather than
+// failing with operation_timed_out or an abandonment error. A caller
+// co_awaiting it in that scenario never resumes. Tracked, not fixed here
+// - issue #113 - shared by with_stop<T>()/sleep_until(deadline, const
+// stop_token&) (est:with_stop) as the identical, pre-existing gap.
 template <class T>
 [[nodiscard]] auto with_timeout(future<T> operation, loop::clock::duration timeout) -> future<T> {
   auto& loop_ref = current_loop();
   auto [timer_prom, timer_fut] = detail::make_promise_future_impl<void>(current_allocator());
-  auto* timer_node = new detail::sleep_resume_node(std::move(timer_prom));
-  const auto id = loop_ref.schedule_timer(*timer_node, platform::instance().now() + timeout);
+  // Guarded until schedule_timer() actually succeeds: it does a real
+  // allocation of its own (pending_timers_.reserve(), timer_queue::
+  // schedule_at(), neither noexcept, est:loop) - without this, a bad_alloc
+  // there would leak the node, since nothing else references it yet.
+  // Released (ownership transferred to loop's own pending_timers_) only on
+  // the line right after a successful call.
+  std::unique_ptr<detail::sleep_resume_node> timer_node_guard(
+      new detail::sleep_resume_node(std::move(timer_prom)));
+  const auto id = loop_ref.schedule_timer(*timer_node_guard, platform::instance().now() + timeout);
+  timer_node_guard.release();
 
   auto [prom, fut] = make_promise_future<T>();
   auto state =
@@ -115,10 +133,11 @@ template <class T>
       // but drain_pending() then abandons whatever's freshly sitting in
       // ready_ too, in that same call - so this then_fast() callback
       // never actually runs via that path, same as sleep_until(deadline,
-      // const stop_token&)'s own analogous branch (est:with_stop). Kept
-      // for the same reason that one is: documents the intended
-      // behavior and survives if drain_pending()'s single-pass shape
-      // ever changes (e.g. under #103's registry rearchitecture).
+      // const stop_token&)'s own analogous branch (est:with_stop) - see
+      // issue #113 for the full trace-through. Kept for the same reason
+      // that one is: documents the intended behavior and survives if
+      // drain_pending()'s single-pass shape ever changes (e.g. under
+      // #103's registry rearchitecture, or a #113 fix).
       state->result.set_exception(tf.get_exception());
     } else {
       state->result.set_exception(std::make_exception_ptr(operation_timed_out()));

@@ -6794,6 +6794,36 @@ verified. `docs/wiki/Coroutines.md`'s "Cancellation: `stop_token` vs.
 abandonment" section gets a new subsection; `Home.md`'s lookup table
 updated to match.
 
+**Code review pass (PR #112), two findings, both fixed:**
+
+1. The stuck-future gap above was real but wasn't disclosed on
+   `with_timeout<T>()`'s own public doc comment - a caller reading only the
+   exported API had no way to know about it. Filed as its own issue (#113 -
+   full trace-through, proposed directions, cross-references both affected
+   `with_stop.cppm` call sites) rather than left as just a PR-description
+   aside, and the doc comment now names it explicitly and points at #113.
+2. `new detail::sleep_resume_node(...)` immediately followed by
+   `schedule_timer()` (which does its own, non-`noexcept` allocation -
+   `pending_timers_.reserve()`, `timer_queue::schedule_at()`) wasn't
+   exception-safe: a `bad_alloc` from `schedule_timer()` would leak the
+   just-allocated node, since nothing referenced it yet. Reproduces an
+   identical pre-existing ordering in `with_stop.cppm`'s own token-aware
+   `sleep_until()` and `promise.cppm`'s plain `sleep_until()` - not
+   introduced here, but now existing at a third call site was reason enough
+   to fix this one directly rather than let it spread further unaddressed.
+   Fixed with a `std::unique_ptr` guard, released only after
+   `schedule_timer()` returns successfully - ownership transfers to
+   `loop`'s own `pending_timers_` at that point, matching the codebase's
+   existing "guard until handed off" idiom (`run_one()`'s own
+   `unique_ptr<ready_node>` guard, `est:loop`). The other two call sites
+   weren't touched (out of scope for this PR - a pre-existing pattern
+   shared by already-shipped code, same reasoning as #113 above).
+
+Diff coverage moved to 88% with the doc-comment/guard additions (still the
+same one documented, currently-unreachable branch as the only real gap).
+Full pipeline re-verified again after these fixes: 308/308 (`ci`), clean
+`clang-tidy`, `sanitize` 251/251, wasm32 build clean.
+
 ---
 
 ## Verification for M0
