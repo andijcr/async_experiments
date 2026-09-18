@@ -820,3 +820,36 @@ teardown - real, immediate reclamation, not a flag checked later. This
 works only because `loop` already tracks pending timers by id
 (`schedule_timer()` returns one); no such id exists for a queued
 `intrusive_list` waiter.
+
+### `with_timeout<T>()` - the inverse race, same eager-cancellation trick
+
+`est::with_timeout<T>(future<T> operation, loop::clock::duration timeout)`
+(`est:with_timeout`, issue #57) races `operation` against a deadline timer
+instead of a caller-supplied `stop_token` - conceptually `with_stop<T>()`'s
+mirror image: there, the token winning cancels nothing on its own (the
+*caller* built the token and decides what, if anything, to do about it);
+here, `operation` winning is what triggers the eager cancellation, of the
+deadline timer this combinator scheduled for itself.
+
+Not built on `with_stop<T>()`/`stop_token`, despite those being the
+combinator's own issue's original proposed composition ("essentially
+`when_any(operation, sleep_for(timeout))`") - neither primitive has a way
+to reach into the timer it's racing against to cancel it, so composing
+from them would leave a fired-but-unused deadline timer sitting in
+`loop`'s timer queue for its full duration even after `operation` already
+won. `with_timeout<T>()` is its own racer instead, built directly on
+`:promise`'s pieces (`detail::sleep_resume_node`,
+`loop::schedule_timer()`/`cancel_timer()`) - the exact same shape
+`sleep_until(deadline, const stop_token&)` above already uses, for the
+identical reason.
+
+Fails with `est::operation_timed_out` if the deadline wins - a third,
+distinct exception alongside `detail::abandoned_exception` and
+`operation_cancelled`, deliberately not reused: `with_timeout<T>()` has no
+`stop_token` of its own, so a caller catching `operation_cancelled`
+elsewhere to mean "something explicitly requested cancellation" shouldn't
+also have to catch it for "this simply took too long." Same honestly-
+scoped limitation as `with_stop<T>()`/`when_any()`/`when_all()`/
+`when_any_succeeds()`: losing the race only stops the *caller* from
+waiting on `operation` further, it keeps running in the background until
+it completes on its own.

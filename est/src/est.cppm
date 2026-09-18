@@ -31,3 +31,4 @@ export import :when_all;
 export import :when_any;
 export import :when_any_succeeds;
 export import :with_stop;
+export import :with_timeout;

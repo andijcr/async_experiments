@@ -121,3 +121,4 @@ constructs one, and `platform::override_instance()`s it
 | `est::when_any_succeeds()` (fixed-arity and `std::span` overloads), `detail::when_any_succeeds_state` | `est/src/when_any_succeeds.cppm` |
 | `est::stop_source`, `est::stop_token`, `est::operation_cancelled` | `est/src/sync/stop_token.cppm` |
 | `est::with_stop<T>()`, token-aware `sleep_for()`/`sleep_until()` overloads | `est/src/with_stop.cppm` |
+| `est::with_timeout<T>()`, `est::operation_timed_out` | `est/src/with_timeout.cppm` |

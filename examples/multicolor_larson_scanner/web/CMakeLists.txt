@@ -56,6 +56,7 @@ target_sources(est
       "${EST_ROOT}/est/src/when_any.cppm"
       "${EST_ROOT}/est/src/when_any_succeeds.cppm"
       "${EST_ROOT}/est/src/with_stop.cppm"
+      "${EST_ROOT}/est/src/with_timeout.cppm"
 )
 target_compile_features(est PUBLIC cxx_std_23)
 
