@@ -278,6 +278,16 @@ template <class Fn, class T> consteval auto invocable_unwrapped() -> bool {
 // all, checked first or not. Checking invocable_unwrapped first means
 // such an Fn is fully satisfied - and short-circuits away from ever
 // instantiating the wrapped check - before that ever happens.
+//
+// std::invocable<Fn&, future<T>&> only ever calls Fn with an lvalue (the
+// concrete_continuation<Fn, U>::run() call site below passes a named
+// local, never a temporary), so a wrapped Fn may take `future<T>&` or
+// `const future<T>&` - both bind fine to that lvalue - but not
+// `future<T>` by value (would need to copy-construct from the lvalue,
+// and future<T>'s copy constructor is deleted - the same "use of a
+// deleted function" hard error invocable_unwrapped's own comment above
+// calls out, not a graceful SFINAE failure) or `future<T>&&` (an lvalue
+// doesn't bind to an rvalue reference parameter at all).
 template <class Fn, class T>
 concept then_callback_for = invocable_unwrapped<Fn, T>() || std::invocable<Fn&, future<T>&>;
 
