@@ -1004,6 +1004,57 @@ protected:
 
 export namespace est {
 
+// The strict counterpart to future<T>::get() (below): a single-use,
+// move-only wrapper around an already-successfully-extracted T, returned
+// by future<T>::take() instead of T directly. Where get() has no
+// compile-time enforcement against being called more than once (a
+// deliberate choice kept exactly as it was - see get()'s own doc comment,
+// and issue #116's own investigation comment for the full design
+// discussion this and take() came out of), value() carries a real,
+// clang [[consumable]]-checked guarantee that it runs at most once -
+// calling it twice, or on an already-moved-from extraction<T>, is a
+// compile-time warning under -Wconsumed (enabled repo-wide,
+// cmake/CompilerWarnings.cmake), not a silent logic bug.
+//
+// [[clang::consumable]] instead of deducing-this, deliberately: Clang's
+// consumed-analysis attributes (callable_when/set_typestate) verifiably
+// do not track state through an explicit object parameter at all (tested
+// directly against the pinned Clang 22 - see issue #116) - only a
+// classic ref-qualified method participates in the analysis. value() is
+// therefore `&&`-qualified the old-fashioned way, the one method in this
+// header that deliberately isn't deducing-this.
+//
+// Purely a wrapper around a value get() itself already produced -
+// take() (future<T>::take(), below) is sugar over
+// std::move(*this).get(), not a second, independent extraction path, so
+// every existing move-vs-copy/move-only-T guarantee get() already has
+// applies here unchanged.
+template <class T> class [[clang::consumable(unconsumed)]] extraction {
+public:
+  [[clang::return_typestate(unconsumed)]]
+  explicit extraction(T value)
+      : value_(std::move(value)) {}
+
+  extraction(const extraction&) = delete;
+  auto operator=(const extraction&) -> extraction& = delete;
+  [[clang::return_typestate(unconsumed)]]
+  extraction(extraction&&) noexcept = default;
+  auto operator=(extraction&&) noexcept -> extraction& = default;
+  ~extraction() = default;
+
+  // Precondition (clang [[consumable]]-checked, not just documented):
+  // callable at most once, and only on an rvalue - matching
+  // future<T>::get()'s own rvalue-consuming path, the one this forwards
+  // to via take().
+  [[nodiscard, clang::callable_when(unconsumed), clang::set_typestate(consumed)]]
+  auto value() && -> T {
+    return std::move(value_);
+  }
+
+private:
+  T value_;
+};
+
 // Consumer handle: a thin, move-only view over a future_state<T>, backed
 // by an est::shared_ptr so destroying a future does not destroy the
 // future_state if something else - a still-live est::promise, or a
@@ -1061,6 +1112,23 @@ public:
     } else {
       return std::move(*self.state_).get();
     }
+  }
+
+  // The strict counterpart to get() above, for a caller that specifically
+  // wants a real, clang [[consumable]]-checked guarantee against
+  // extracting the value more than once, rather than get()'s own
+  // documented-but-unenforced contract - see extraction<T>'s own doc
+  // comment (est:future) for the full reasoning, and issue #116 for the
+  // design discussion this came out of. Pure sugar over
+  // std::move(*this).get() - the same move-vs-copy dispatch, the same
+  // move-only-T support, nothing new happening here except wrapping the
+  // result. Constrained off T = void: a future<void> carries no value to
+  // guard against a double extraction of in the first place, and
+  // extraction<T>'s own T value_ member couldn't name `void` regardless.
+  [[nodiscard, clang::return_typestate(unconsumed)]] auto take() && -> extraction<T>
+    requires(!std::is_void_v<T>)
+  {
+    return extraction<T>(std::move(*this).get());
   }
 
   // Returns another future<T> aliasing the same future_state as *this -

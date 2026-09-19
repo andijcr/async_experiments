@@ -7003,6 +7003,85 @@ time - test-only).
 
 ---
 
+### Issue #116: `future<T>::take()`/`est::extraction<T>` - a real, compile-time single-extraction guarantee
+
+Investigated three alternatives (posted as issue comments before
+implementing anything, per this repo's own "design first, comment on the
+issue, then build" convention): reverting `get()` to classic ref-qualified
+overloads plus Clang's `-Wconsumed` consumed-analysis attributes; fully
+embracing the issue's own "safe by default, ref-count decides" proposal
+with a debug-only `check()` (matching `future_state<T>::check_not_completed()`'s
+own precedent) as the realistic safety net for that direction; and a
+third, additive option - a small, dedicated proxy type carrying the real
+compile-time guarantee, alongside `get()` left untouched. Chose the third:
+lowest risk, doesn't touch anything #117/PR #118 just finished
+documenting, and (verified directly, not assumed) needs zero
+special-casing for move-only `T`.
+
+**`est::extraction<T>`** (new, `est/src/future.cppm`): a small, move-only,
+`[[clang::consumable(unconsumed)]]`-annotated wrapper around a value
+already produced by `get()`. `value() &&` is `[[clang::callable_when(unconsumed),
+clang::set_typestate(consumed)]]` - calling it twice, or on an
+already-moved-from `extraction<T>`, is now a compile error under
+`-Wconsumed`, not a silent logic bug. Deliberately *not* deducing-this
+(the one method in `est:future` that isn't): confirmed empirically during
+issue #116's own investigation that Clang's consumed-analysis attributes
+don't track state through an explicit object parameter at all, and
+`extraction<T>` is small and self-contained enough that giving up
+deducing-this for this one class costs nothing elsewhere.
+
+**`future<T>::take() &&`** (new): pure sugar over `std::move(*this).get()`,
+wrapping the result in `extraction<T>` - inherits every existing `get()`
+guarantee (move-vs-copy dispatch, move-only `T` support) unchanged.
+Constrained off `T = void` (`requires(!std::is_void_v<T>)`) - nothing to
+guard a double extraction of for a `future<void>`.
+
+**`-Wconsumed` enabled repo-wide** (`cmake/CompilerWarnings.cmake`, under
+`-Werror` like every other warning here) - narrow in practice, since
+`extraction<T>` is the only `[[clang::consumable]]`-annotated type in the
+codebase, so it can only ever fire against that one type's own callers.
+Verified the whole `ci`/`sanitize`/wasm32 pipeline stays clean with it on.
+
+Two real implementation gotchas, both found by writing the tests and
+tracing through the actual compiler diagnostics rather than assuming the
+mechanism would just work, matching this session's own established
+discipline:
+- A single, genuinely correct `std::move(extraction_var).value()` call
+  produces a `-Wconsumed` false positive when written directly inside a
+  Catch2 `REQUIRE(...)`/`CHECK(...)` argument, for a *named*
+  `extraction<T>` variable - Catch2's own expression-decomposition macros
+  appear to reference a named sub-expression's type more than once
+  (template/decltype machinery for printing the LHS/RHS on failure),
+  confusing this syntactic analysis even though the call only executes
+  once at runtime. Worked around by extracting via `.value()` in its own
+  plain statement first, then `REQUIRE()`-ing the already-extracted
+  result - documented directly in `future_tests.cpp`'s own section
+  comment so the next person adding a test here doesn't have to
+  rediscover it.
+- `static_assert(!requires(est::future<void>&& f) { std::move(f).take(); })`
+  (attempted, to guard `future<void>::take()` not existing) doesn't work
+  either, for a *third*, distinct reason from the `then()`/`then_fast()`
+  deduced-return-type case #117/PR #118 already found: verified directly
+  that a `requires`-clause on an *ordinary* (non-template) member function
+  of a class template isn't SFINAE-friendly inside a `requires(){...}`
+  expression on this toolchain, even with an explicit (non-deduced)
+  return type - a minimal, unrelated reproduction hard-errors with
+  "invalid reference to function... constraints not satisfied" instead of
+  making the requires-expression false. Removed the test; documented the
+  finding in prose instead (matching how #117/PR #118 handled the
+  identical-outcome, different-mechanism case).
+
+Verified the actual enforcement works end to end, not just in isolated
+scratch probes: temporarily reintroduced a deliberate double-`.value()`
+call into `future_tests.cpp`, confirmed it fails to compile with exactly
+the expected `-Wconsumed` diagnostic, then reverted it before committing.
+
+Full pipeline verified: 320/320 (`default`), clean `clang-format`, clean
+build + clean `clang-tidy` + 100% diff coverage (`ci`), `sanitize`
+263/263, wasm32 build + Node smoke test clean.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
