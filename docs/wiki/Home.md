@@ -114,7 +114,7 @@ constructs one, and `platform::override_instance()`s it
 | `est::loop` (incl. `timer_id`/`cancel_timer()`), `ready_node`, `timer_node`, `detail::abandoned_exception`, `est::Priority`, `current_priority()`/`set_priority()` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::schedule_periodic()`, `est::periodic_timer_handle`, `detail::periodic_timer_node<Fn>` | `est/src/timer_periodic.cppm` |
-| `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
+| `est::future_state<T>`, `est::future<T>` (incl. `clone()`, `take()`), `est::extraction<T>`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `make_failed_future()`, `sleep_for()`/`sleep_until()`, `detail::promise_resume_node<T>` | `est/src/promise.cppm` |
 | `est::when_all()` (fixed-arity and `std::span` overloads), `detail::when_all_state` | `est/src/when_all.cppm` |
 | `est::when_any()` (fixed-arity and `std::span` overloads) | `est/src/when_any.cppm` |
