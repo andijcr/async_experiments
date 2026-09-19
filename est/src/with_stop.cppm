@@ -67,6 +67,22 @@ template <class T>
     } else if constexpr (std::is_void_v<T>) {
       state->result.set_value();
     } else {
+      // Unconditional move, no owner_.count()-style check first (unlike
+      // concrete_continuation<Fn, U>::run()'s own unwrapped-mode dispatch,
+      // est:future) - safe here without one because `operation` was taken
+      // by value above and this is the only continuation ever registered
+      // on it, so by the time this callback runs, op's future_state has
+      // no other live reference to race: future<T>::clone() (the only way
+      // to get a second handle onto the same future_state) is constrained
+      // to void/scalar T (future.cppm), so a non-scalar T can't have been
+      // cloned, and nothing here calls .then()/.then_fast() on `operation`
+      // a second time. This invariant is caller-enforced, not
+      // compiler-checked: a caller that independently attaches its own
+      // continuation to `operation` before passing it to with_stop() (via
+      // its lvalue then()/then_fast() overload) would race that
+      // continuation against this move - don't do that (issue #116's
+      // investigation covers why a general, automatic fix for this isn't
+      // being pursued).
       state->result.set_value(std::move(op).get());
     }
   });

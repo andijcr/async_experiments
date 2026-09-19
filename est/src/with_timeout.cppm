@@ -186,6 +186,17 @@ template <class T>
     } else if constexpr (std::is_void_v<T>) {
       state->result.set_value();
     } else {
+      // Unconditional move, safe by the identical structural argument
+      // est::with_stop()'s own analogous call makes (est:with_stop): T
+      // taken by value above, this is the only continuation ever
+      // registered on `operation`, and future<T>::clone() - the only way
+      // to get a second handle onto the same future_state - is
+      // constrained to void/scalar T (future.cppm), so no other live
+      // reference can be racing this move for non-scalar T. Caller-
+      // enforced, not compiler-checked (issue #116's investigation covers
+      // why a general fix isn't being pursued): don't independently
+      // attach a continuation to `operation` before handing it to
+      // with_timeout().
       state->result.set_value(std::move(op).get());
     }
   });

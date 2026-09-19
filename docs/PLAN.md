@@ -7082,6 +7082,112 @@ build + clean `clang-tidy` + 100% diff coverage (`ci`), `sanitize`
 
 ---
 
+### Issue #116 revisited: `take()`/`extraction<T>` reverted (PR #119)
+
+Merged and closed in the entry above, then reconsidered and reverted
+(clean `git revert` of PR #119's squash-merge commit, `est/src/future.cppm`
+and the rest of that diff back out entirely).
+
+Re-reading the issue's actual text against what shipped exposed a real
+mismatch. The issue asked for `get()` itself to stop trusting the caller's
+syntactic choice (`f.get()` vs. `std::move(f).get()`) and instead decide
+move-vs-copy from the *live ref count of the future_state* - the same
+`owner_.count() == 1` check `concrete_continuation<Fn, U>::run()` already
+does internally for `then()`/`then_fast()` - with a `-Wconsumed`-style
+annotation proposed only as the safety net for the one case a
+refcount-based `get()` still can't make safe by construction (sole owner,
+called twice).
+
+What got built instead left `get()` completely untouched and added a
+parallel, opt-in `take()`/`extraction<T>` that only guards against calling
+`.value()` twice on a value `get()` had *already* extracted. That's a real
+but different guarantee, and it doesn't touch the hazard the issue actually
+named: `std::move(f).get()` racing a still-live clone of the same
+future_state, silently corrupting the clone's view - a refcount-aware
+`get()` would fix this structurally; `take()` does nothing for it. Worse,
+`take()`'s real audience turned out to be narrow: `then()`/`then_fast()`
+already get the count()==1 dispatch for free, and `co_await` structurally
+consumes exactly once, so the only callers who'd ever reach for `take()`
+are manual, non-coroutine code holding a `future<T>` handle directly - a
+much smaller slice of the problem than "make `get()` safe by default." A
+new type, a new repo-wide `-Werror` warning flag, and `-Wconsumed`'s own
+two documented false-positive gotchas were a lot of surface for a guarantee
+that's adjacent to, not a fulfillment of, what #116 asked for.
+
+Issue #116 reopened; a refcount-driven `get()` redesign (or a decision to
+close it as not worth the complexity, given the tension between "safe by
+default" and static double-consumption detection already surfaced during
+the `take()` investigation) is still open for a future pass.
+
+---
+
+### Issue #116 closed: investigated the wrapped-mode call sites directly, decided against a `get()` redesign
+
+Before deciding whether a refcount-driven `get()` redesign is worth
+building, traced through the actual codebase rather than reasoning
+abstractly: every real place a `then()`/`then_fast()` continuation
+receives a wrapped `future<T>&` and extracts a value from it (not just
+`ready_with_failure()`/`get_exception()`).
+
+First, clarified what a wrapped-mode callback's signature can even be:
+`then_callback_for`'s wrapped half is exactly `std::invocable<Fn&,
+future<T>&>`, and `concrete_continuation<Fn, U>::run()` always passes a
+named local (`future<T> view(state.shared_from_this())`), never a
+temporary - so only `future<T>&` or `const future<T>&` work (both bind to
+that lvalue); `future<T>` by value hard-errors (copy ctor deleted) and
+`future<T>&&` simply doesn't bind. Documented directly on
+`then_callback_for` (`est/src/future.cppm`) - this wasn't spelled out
+anywhere before.
+
+Then grepped every wrapped-mode callback in `est/src` for one that
+actually calls `.get()`/`std::move(...).get()` on the wrapped future
+(as opposed to just inspecting `ready_with_failure()`). Exactly two:
+`with_stop()` (`with_stop.cppm:70`, now shifted a few lines by the doc
+comment below) and `with_timeout()` (`with_timeout.cppm:189`) - both
+`then()`/`then_fast()`-based combinators taking `T` by value and
+`std::move`-ing it into a single `then_fast()` registration, then
+unconditionally `std::move(op).get()`-ing inside. `when_all`/`when_any`/
+`when_any_succeeds`'s own wrapped-mode stages never call `.get()` at all.
+
+Both of those two are safe today, but by a structural argument, not a
+runtime check: `future<T>::clone()` - the only way to get a second live
+handle onto the same `future_state` - is constrained to `void`/scalar `T`
+(`future.cppm`), so a non-scalar `T` can't have been cloned, and neither
+combinator registers more than the one continuation. The gap: that's a
+caller-enforced invariant, not a compiler-checked one, and neither file
+documented it - nothing stops (or even warns about) a caller who
+independently attaches their own continuation to the same `future<T>`
+before handing it to `with_stop()`/`with_timeout()` by value, which would
+race that continuation against the combinator's own move. Fixed the cheap
+part: added a doc comment at both `.get()` call sites explaining exactly
+why the move is safe and what a caller must not do, mirroring
+`future<T>::clone()`'s own doc comment's style of reasoning.
+
+Decided against the redesign itself. The unwrapped path's
+`owner_.count() == 1` check works because it happens *before* any
+`future<T>` handle exists - at that point `owner_` really is the only
+reference anywhere. That doesn't port cleanly to the wrapped path: by the
+time a wrapped callback can call `get()`, there are structurally at least
+two live references (the node's own `owner_`, still held until `run()`
+returns, plus the `view`/`op` handle itself), so a naive `state_.count()
+== 1` check inside `get()` would see 2 in the exact case that's actually
+safe today and silently fall back to copying - regressing `with_stop()`/
+`with_timeout()` from a free move to a guaranteed copy. Making this work
+for real needs `get()` (or whatever it delegates to) to know how to
+discount its own transient references, which is real design work with no
+existing call site asking for it - the only two consumers that matter
+today already get correctness for free from the structural argument
+above, and the narrow gap that argument leaves (a caller double-attaching
+a continuation) doesn't occur anywhere in this codebase.
+
+Closed as "investigated, not pursuing a redesign," with the doc-comment
+fix landing in its place. Full pipeline re-verified after the doc
+additions: 317/317 (`default`), clean `clang-format`/`clang-tidy`,
+`sanitize` 260/260, wasm32 build + smoke test clean (doc-only changes to
+`.cppm` files, so no coverage-gate-relevant new lines).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
