@@ -6949,6 +6949,60 @@ wasm32 build + Node smoke test clean.
 
 ---
 
+### Issue #117: verify `future<T>`/`promise<T>` for a move-only `T`
+
+"Verify that a future of a move only type works or require some special
+care." It works, end to end - `set_value(std::move(...))`/
+`std::move(future).get()`, `co_await`, `then()`/`then_fast()`, and the
+flatten path (already had one regression test of its own,
+`future_tests.cpp`'s "flattening a then() that returns a
+future<unique_ptr<T>> moves, not copies, the value") - confirmed with 7 new
+`std::unique_ptr<int>`-based test cases added to `future_tests.cpp` rather
+than just reasoned about from the source, since this is exactly the kind
+of template/SFINAE question worth actually compiling.
+
+One real constraint, matching the issue's own guess ("the continuation
+taking the param only by ref"): a `.then()`/`.then_fast()` callback
+registered on a `future<T>` for a move-only `T` must take the value by
+reference (`const T&`, or a generic `auto&`/`auto&&`), never by plain
+value. `concrete_continuation<Fn, U>::run()` (`future.cppm`) compiles both
+of its `owner_.count() == 1` runtime branches unconditionally whenever `Fn`
+is invocable with `T&&` - the move-out path and the reference-read path
+alike, since which one actually executes is a runtime decision, not a
+compile-time one - and the reference-read path would need to
+copy-construct a by-value `Fn`'s parameter, which a move-only `T` can't
+do.
+
+That rejection does happen cleanly, at the `.then()`/`.then_fast()` call
+site itself: `then_callback_for<Fn, T>`'s own `std::invocable<Fn&, const
+T&>` check is already false for a by-value `Fn` on a move-only `T`
+(selecting a deleted copy constructor inside an unevaluated
+`requires`-expression's checked call makes the requirement simply
+unsatisfied, not a hard error - genuinely SFINAE-friendly). Tried to pin
+this down with a `static_assert(!requires(...))` test, the same idiom
+`spsc_ring_tests.cpp` already uses for its own move-only-vs-copyable
+checks - a real, if minor, finding: it doesn't work here, because
+`future<T>::then()`/`then_fast()` (the outer wrappers a caller actually
+calls) declare a deduced `auto` return type, so determining it means
+instantiating their *body*, and a body-instantiation failure is a hard
+compiler error, not a substitution failure, even from inside an
+otherwise-unevaluated `requires`-expression - discovered by writing the
+static_assert, watching the whole file fail to compile with a real
+"no matching member function" hard error instead of the clean
+"constraints not satisfied" one, and tracing through why. Removed that
+test; documented the finding in prose instead (`future_tests.cpp`'s own
+section comment, and `docs/wiki/Continuation-Node-Mechanism.md`'s new
+"Move-only `T`" subsection, which ties it to the identical
+deleted-function/body-instantiation principle that section already
+documents for wrapped-mode callbacks).
+
+Full pipeline verified: 317/317 (`default`), clean `clang-format`, clean
+build + clean `clang-tidy` + 100% diff coverage (`ci`), `sanitize`
+260/260, wasm32 build + Node smoke test clean (no `est/src` changes this
+time - test-only).
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

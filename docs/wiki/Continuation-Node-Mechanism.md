@@ -339,6 +339,39 @@ consistent. An `Fn` matching neither shape still fails right at the
 deep inside `run()`'s own
 instantiation.
 
+### Move-only `T` (issue #117)
+
+`future<T>`/`promise<T>` work for a move-only `T` (`std::unique_ptr<int>`,
+say) end to end - `set_value(std::move(...))`/`std::move(future).get()`,
+`co_await`, the flatten path ("Flattening is not a special case" below) -
+with one real constraint that follows directly from the dispatch above: a
+`then()`/`then_fast()` callback must take the value by reference (`const
+T&`, or a generic `auto&`/`auto&&`), never by plain value. `run()`'s own
+body (above) compiles *both* runtime branches of the `owner_.count() == 1`
+check unconditionally, whichever `Fn` is invocable with `T&&` - the move-out
+path and the reference-read path alike, since which one actually executes
+is a runtime decision, not a compile-time one. A by-value `Fn` would need
+the reference-read path to copy-construct its parameter from the `T&`
+`state.get()` returns there, which a move-only `T` can't do.
+
+This does get caught before `run()` is ever instantiated: `then_callback_for<Fn, T>`'s
+own `std::invocable<Fn&, const T&>` check is already false for a by-value
+`Fn` on a move-only `T` (selecting a deleted copy constructor inside an
+unevaluated `requires`-expression's checked call makes that requirement
+simply unsatisfied, not a hard error - a genuinely SFINAE-friendly check,
+unlike the wrapped-mode one discussed just above), so such a callback is
+rejected right at the `then()`/`then_fast()` call site. It just can't be
+asserted on with `static_assert(!requires(...))` from outside the module:
+`future<T>::then()`/`then_fast()` (the outer wrappers a caller actually
+calls, not `future_state<T>`'s own already-constrained ones they forward
+to - see "What `then()` actually builds" above) declare a deduced `auto`
+return type, so determining it means instantiating their *body* - and,
+exactly like the generic-lambda-in-wrapped-mode case just above, a
+body-instantiation failure is a hard compiler error, not a substitution
+failure, even from inside an otherwise-unevaluated `requires`-expression.
+Same underlying principle (only substitution into a signature is
+SFINAE-protected; instantiating a body never is), one layer further out.
+
 ## `then_fast()`: running inline instead of deferring
 
 Issue #65: `co_await` on an already-ready `future<T>` resumes inline
