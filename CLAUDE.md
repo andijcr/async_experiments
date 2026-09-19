@@ -8,17 +8,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 from scratch as real C++20 modules (no headers for the framework's own
 code). Namespace `est`: a monotonic-clock/assert-failure platform seam, a
 run loop, a future/promise pair (also usable as a coroutine return type), an
-intrusive-waiter-list mutex, and a small set of allocator-aware utilities
-(`shared_ptr`, `intrusive_list`, `scope_exit`). `docs/wiki/Home.md` is the
-canonical reader's guide to how the code works today; read it (and the pages
-it links) before making non-trivial changes.
+intrusive-waiter-list mutex and event/ring-buffer primitives, cooperative
+cancellation (`stop_token`/`with_stop`), a family of future combinators
+(`when_all`/`when_any`/`when_any_succeeds`/`with_timeout`), and a small set
+of allocator-aware utilities (`shared_ptr`, `intrusive_list`, `scope_exit`).
+`docs/wiki/Home.md` is the canonical reader's guide to how the code works
+today; read it (and the pages it links) before making non-trivial changes.
 
 ## Toolchain
 
-This project needs a pinned **Clang 22/23 snapshot + libc++ + CMake 4.2+ +
+This project needs a pinned **Clang 22/23 snapshot + libc++ + CMake 4.4.0 +
 Ninja** — `import std;` and C++20 module support at this level don't exist
-on typical distro toolchains. Always build/test/lint inside the devenv
-container (`docker/Dockerfile`, image `ghcr.io/andijcr/async-experiments-devenv`);
+on typical distro toolchains. CMake is pinned to that exact version, not
+just a minimum: `CMAKE_EXPERIMENTAL_CXX_IMPORT_STD`'s UUID
+(`cmake/toolchain-hosted-linux.cmake`) is specific to what CMake 4.4.0's
+`import std;` support expects, and needs updating in lockstep with any
+future CMake bump. Always build/test/lint inside the devenv container
+(`docker/Dockerfile`, image `ghcr.io/andijcr/async-experiments-devenv`);
 don't assume a bare `cmake`/`clang++` on the host will work.
 
 ```sh
@@ -88,22 +94,29 @@ Every step must pass; all of them are required status checks.
 
 ## Architecture
 
-### Two modules, one direction
+### One core module, separate backends
 
 - **`est`** (`est/src/est.cppm`) is the framework itself: one C++ module
   made of partitions (one per source file under `est/src/`), forming a
   strict DAG — `:platform` → `:check`/`:timer` → `:loop` → `:future` →
-  `:promise`, with `:sync.mutex` and `:util.current_loop` depending on
-  `:loop`/`:future`/`:promise` as needed. `import est;` alone gives zero
-  trace of any concrete backend.
+  `:promise`, with `:sync.mutex`, `:util.current_loop`,
+  `:timer.periodic`, `:when_all`/`:when_any`/`:when_any_succeeds`, and
+  `:with_stop`/`:with_timeout` depending on `:loop`/`:future`/`:promise`
+  as needed. `import est;` alone gives zero trace of any concrete
+  backend.
 - **`estext`** (`estext/src/hosted_stdcpp.cppm`) is a wholly separate
-  module holding `estext::hosted_stdcpp`, the one concrete
+  module holding `estext::hosted_stdcpp`, the hosted-Linux
   `platform::interface` implementation (`std::chrono` clock,
   `std::this_thread` sleep, `std::cerr` diagnostics). It `import est;`s the
-  finished product and is never the reverse — a future bare-metal backend
-  would be its own similarly separate module.
+  finished product and is never the reverse.
+- **`estwasm`** (`estwasm/src/platform_wasm.cppm`) is a third, similarly
+  separate module — a `platform::interface` backend for a wasm32
+  WebAssembly sandbox instead of a real OS, routing every platform
+  question through `import_module("env")` JS imports. Only built by
+  `examples/multicolor_larson_scanner/web`'s own separate CMake project
+  (see "Common commands" below), not by any of the main presets.
 - A program that wants a working backend does both: `import est; import
-  estext;`, constructs a `hosted_stdcpp`, and installs it via
+  estext;` (or `estwasm`), constructs the backend, and installs it via
   `est::platform::override_instance()` at the top of its own `main()`
   (see `examples/*/main.cpp`, `est/tests/test_main.cpp`). Nothing installs
   a default backend as a side effect of `import est;`.
@@ -132,10 +145,18 @@ that make that possible).
   return type (no separate `task<T>`). See `docs/wiki/Continuation-Node-Mechanism.md`
   and `docs/wiki/Allocation-Patterns.md` for the node hierarchy and the
   exact allocation cost of chains.
-- `est::mutex` — an intrusive waiter list + lock word (not OS-backed);
-  `lock()` is awaitable, guarding a critical section across a coroutine
-  suspension point, and `acquire()` returns a `future<lock_guard>` for
-  non-coroutine callers.
+- `est::counting_event<Mode>` / `est::mutex` — an intrusive waiter list +
+  count/lock word (not OS-backed); `wait()`/`lock()` are awaitable,
+  guarding a critical section across a coroutine suspension point, and
+  `acquire()` returns a `future<lock_guard>` for non-coroutine callers.
+  `est::binary_event<Mode>`/`est::one_shot_event<Mode>` layer stricter
+  constraints on top without re-implementing any of it.
+- `est::stop_source`/`est::stop_token`, `est::with_stop()` — cooperative
+  cancellation: a `stop_token` races any `future<T>` (`with_stop()`) or,
+  eagerly, a timed sleep. `est::when_all()`/`when_any()`/
+  `when_any_succeeds()`, `est::with_timeout()` — the other future
+  combinators, all the same "shared state + racing `then_fast()`
+  continuations, first one wins" shape.
 - `est::shared_ptr<T>` / `est::intrusive_list<T>` (`est/src/util/`) — the
   generic, non-atomic reference-counted pointer and intrusive list every
   owned/queued object above is built on.
