@@ -7082,6 +7082,45 @@ build + clean `clang-tidy` + 100% diff coverage (`ci`), `sanitize`
 
 ---
 
+### Issue #116 revisited: `take()`/`extraction<T>` reverted (PR #119)
+
+Merged and closed in the entry above, then reconsidered and reverted
+(clean `git revert` of PR #119's squash-merge commit, `est/src/future.cppm`
+and the rest of that diff back out entirely).
+
+Re-reading the issue's actual text against what shipped exposed a real
+mismatch. The issue asked for `get()` itself to stop trusting the caller's
+syntactic choice (`f.get()` vs. `std::move(f).get()`) and instead decide
+move-vs-copy from the *live ref count of the future_state* - the same
+`owner_.count() == 1` check `concrete_continuation<Fn, U>::run()` already
+does internally for `then()`/`then_fast()` - with a `-Wconsumed`-style
+annotation proposed only as the safety net for the one case a
+refcount-based `get()` still can't make safe by construction (sole owner,
+called twice).
+
+What got built instead left `get()` completely untouched and added a
+parallel, opt-in `take()`/`extraction<T>` that only guards against calling
+`.value()` twice on a value `get()` had *already* extracted. That's a real
+but different guarantee, and it doesn't touch the hazard the issue actually
+named: `std::move(f).get()` racing a still-live clone of the same
+future_state, silently corrupting the clone's view - a refcount-aware
+`get()` would fix this structurally; `take()` does nothing for it. Worse,
+`take()`'s real audience turned out to be narrow: `then()`/`then_fast()`
+already get the count()==1 dispatch for free, and `co_await` structurally
+consumes exactly once, so the only callers who'd ever reach for `take()`
+are manual, non-coroutine code holding a `future<T>` handle directly - a
+much smaller slice of the problem than "make `get()` safe by default." A
+new type, a new repo-wide `-Werror` warning flag, and `-Wconsumed`'s own
+two documented false-positive gotchas were a lot of surface for a guarantee
+that's adjacent to, not a fulfillment of, what #116 asked for.
+
+Issue #116 reopened; a refcount-driven `get()` redesign (or a decision to
+close it as not worth the complexity, given the tension between "safe by
+default" and static double-consumption detection already surfaced during
+the `take()` investigation) is still open for a future pass.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
