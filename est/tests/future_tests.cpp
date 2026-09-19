@@ -1022,6 +1022,158 @@ TEST_CASE("a coroutine can co_await a future built from a then() chain, genuinel
   REQUIRE(fut.get() == 50);
 }
 
+// --- Move-only T (issue #117: "verify that a future<T> of a move only
+// type works, or require some special care") ---
+//
+// It works, end to end - set_value()/get(), then()/then_fast(), co_await,
+// and the flatten path (already covered above, "flattening a then() that
+// returns a future<unique_ptr<T>> moves, not copies, the value") - with
+// one real constraint a caller has to respect: a then()/then_fast()
+// callback registered on a future<T> for a move-only T must take the
+// value by reference (const T&, or a generic auto&/auto&& lambda), never
+// by plain value. concrete_continuation<Fn, U>::run() (future.cppm)
+// compiles both of its runtime branches unconditionally whenever Fn is
+// also invocable with T&& - the move-out path
+// (invoke_and_fulfill(std::move(state).get())), taken when this node is
+// the future_state's sole owner, and the reference-read path
+// (invoke_and_fulfill(state.get())), taken when it isn't - since which
+// one actually runs is a runtime decision (owner_.count() == 1), not a
+// compile-time one. A by-value Fn would need the reference-read path to
+// copy-construct its parameter from the T& state.get() returns, which a
+// move-only T can't do - so a by-value callback fails to compile, with a
+// diagnostic naming then_callback_for<Fn, T> (this file's own concept
+// gating then()/then_fast()) as the reason. Genuinely tried to pin this
+// down with a static_assert(!requires(...)) test alongside the others
+// below, the same idiom spsc_ring_tests.cpp already uses for its own
+// move-only-vs-copyable checks - it doesn't work here: future<T>::then()/
+// then_fast() (the outer, future<T>-level wrappers, not future_state<T>'s
+// own already-concept-constrained ones they forward to) declare a
+// deduced `auto` return type, so determining that return type means
+// fully instantiating their body - and a body-instantiation failure is a
+// hard compiler error, not a substitution failure, even from inside an
+// otherwise-unevaluated requires-expression. The rejection is real and
+// happens right at the then()/then_fast() call site (not buried inside
+// concrete_continuation<Fn, U>), just not something this test file can
+// assert on without triggering the exact hard error it would be trying
+// to confirm.
+//
+// std::unique_ptr<int> throughout, the same move-only stand-in the
+// flatten test above already uses - simple, and it would fail to compile
+// the moment any of these paths silently regressed into copying.
+
+TEST_CASE("set_value(std::move(...)) then std::move(future).get() round-trips a move-only value",
+          "[future][move-only]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<std::unique_ptr<int>>();
+  promise.set_value(std::make_unique<int>(42));
+
+  REQUIRE(future.ready());
+  // NOLINTNEXTLINE(bugprone-use-after-move) - false positive, see the
+  // unique_ptr flatten test's own NOLINTNEXTLINE comment above.
+  REQUIRE(*std::move(future).get() == 42);
+}
+
+TEST_CASE("an unwrapped then() taking const T& observes a move-only value without copying it, "
+          "sole owner",
+          "[future][move-only]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<std::unique_ptr<int>>();
+  promise.set_value(std::make_unique<int>(1));
+
+  int observed = 0;
+  // const T&, not by value - see this section's own top comment for why a
+  // move-only T requires this shape.
+  std::move(future).then([&](const std::unique_ptr<int>& value) { observed = *value; });
+  loop.run_until_idle();
+
+  REQUIRE(observed == 1);
+}
+
+TEST_CASE("an unwrapped then() taking const T& observes a move-only value without copying it, "
+          "even when another handle keeps the future_state's ref count above 1",
+          "[future][move-only]") {
+  // The move-only analogue of "then() copies the stored value when
+  // another handle still shares the future_state" above: here the
+  // callback takes const T&, so concrete_continuation<Fn, U>::run()'s
+  // count()-isn't-1 branch (a plain reference read, never a copy) is what
+  // actually runs - the only shape a move-only T can take this path
+  // through at all.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<std::unique_ptr<int>>();
+  promise.set_value(std::make_unique<int>(2));
+
+  int observed = 0;
+  future.then([&](const std::unique_ptr<int>& value) { observed = *value; });
+  loop.run_until_idle();
+
+  REQUIRE(observed == 2);
+  REQUIRE(future.ready_with_value()); // `future` itself still owns its own reference, untouched
+}
+
+TEST_CASE("then() can produce a move-only value from a const-ref callback", "[future][move-only]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<int>();
+  auto chained = future.then([](const int& value) { return std::make_unique<int>(value + 1); });
+  promise.set_value(9);
+  loop.run_until_idle();
+
+  REQUIRE(chained.ready());
+  // NOLINTNEXTLINE(bugprone-use-after-move) - false positive, see the
+  // unique_ptr flatten test's own NOLINTNEXTLINE comment above.
+  REQUIRE(*std::move(chained).get() == 10);
+}
+
+TEST_CASE("then_fast() taking const T& observes a move-only value without copying it",
+          "[future][move-only]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto [promise, future] = est::make_promise_future<std::unique_ptr<int>>();
+  promise.set_value(std::make_unique<int>(7));
+
+  int observed = 0;
+  std::move(future).then_fast([&](const std::unique_ptr<int>& value) { observed = *value; });
+
+  REQUIRE(observed == 7); // then_fast() on an already-ready future runs inline, no loop drain
+}
+
+TEST_CASE("make_ready_future<T>() builds an already-ready future for a move-only T",
+          "[future][move-only]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  auto fut = est::make_ready_future<std::unique_ptr<int>>(std::make_unique<int>(5).release());
+
+  REQUIRE(fut.ready());
+  // NOLINTNEXTLINE(bugprone-use-after-move) - false positive, see the
+  // unique_ptr flatten test's own NOLINTNEXTLINE comment above.
+  REQUIRE(*std::move(fut).get() == 5);
+}
+
+TEST_CASE("a coroutine can co_return and co_await a move-only value",
+          "[future][move-only][coroutine]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto inner = [](est::loop&, int x) -> est::future<std::unique_ptr<int>> {
+    co_return std::make_unique<int>(x * 2);
+  };
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-reference-coroutine-parameters)
+  auto outer = [](est::loop& loop_ref, decltype(inner)& inner_coro) -> est::future<int> {
+    auto value = co_await inner_coro(loop_ref, 21);
+    co_return *value + 1;
+  };
+
+  // Both coroutines run synchronously to completion here, same reason as
+  // "a coroutine can co_await another coroutine's future, chaining
+  // values" above - neither one ever actually suspends.
+  auto fut = outer(loop, inner);
+  REQUIRE(fut.ready());
+  REQUIRE(fut.get() == 43);
+}
+
 TEST_CASE("an exception in the awaited future propagates across co_await", "[future][coroutine]") {
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
