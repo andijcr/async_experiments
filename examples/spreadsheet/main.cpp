@@ -52,13 +52,22 @@ auto run_server(spreadsheet::sheet* sheet_instance) -> est::future<void> {
       continue;
     }
 
-    // Deliberately discarded: the dispatched command's own future_state
-    // (and, for GET BLOCKING, its pending resolve_blocking() coroutine)
-    // stays alive on its own via the then() continuation queued on it -
-    // see docs/wiki/Allocation-Patterns.md - not via this handle.
-    spreadsheet::execute(sheet_instance, std::move(parsed)).then([](const std::string& response) {
-      std::println("{}", response);
-    });
+    // est::spawn() (issue #58) - not a discarded handle relying on the
+    // then() continuation below to keep the dispatched command's own
+    // future_state (and, for GET BLOCKING, its pending resolve_blocking()
+    // coroutine) alive on its own (docs/wiki/Allocation-Patterns.md):
+    // spawn() gives it an explicit, loop-owned reason to stay alive
+    // instead, and reports an unhandled exception (a genuine bug, not a
+    // normal response) via its default diagnostic hook rather than
+    // silently dropping it. current_loop(), not a coroutine reference
+    // parameter on run_server() itself: main() installs this loop as
+    // current for run_server()'s entire lifetime (est::make_current_loop()'s
+    // own guard, below), so resolving it fresh here is exactly the "no
+    // loop& threaded through explicitly" convention every other
+    // current_loop()-based entry point in this codebase already follows.
+    est::spawn(est::current_loop(),
+               spreadsheet::execute(sheet_instance, std::move(parsed))
+                   .then([](const std::string& response) { std::println("{}", response); }));
   }
 }
 
