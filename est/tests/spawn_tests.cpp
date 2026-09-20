@@ -82,13 +82,37 @@ auto suspending_coro(bool* completed) -> est::future<void> {
   *completed = true;
 }
 
+// est::spawn()'s exception hook is thread_local (est/src/spawn.cppm's own
+// top comment), not scoped to any one est::loop - it persists across
+// TEST_CASEs in this same binary/thread unless something puts it back.
+// Every test below that could observe or change it declares one of these
+// right after its platform_guard, saving whatever was installed and
+// restoring it on scope exit - without this, a test that installs a
+// custom hook (e.g. "lets a caller install a custom exception hook")
+// would leak that hook into whichever test happens to run next, making
+// the suite's outcome depend on Catch2's run order instead of each test's
+// own setup.
+class hook_reset_guard {
+public:
+  hook_reset_guard() : previous_(est::spawn_exception_hook()) {}
+  ~hook_reset_guard() { est::set_spawn_exception_hook(previous_); }
+  hook_reset_guard(const hook_reset_guard&) = delete;
+  hook_reset_guard(hook_reset_guard&&) = delete;
+  auto operator=(const hook_reset_guard&) -> hook_reset_guard& = delete;
+  auto operator=(hook_reset_guard&&) -> hook_reset_guard& = delete;
+
+private:
+  est::spawn_exception_hook_type previous_;
+};
+
 } // namespace
 
 TEST_CASE("spawn() dispatches a future<T> that completes successfully", "[spawn]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   auto [prom, fut] = est::make_promise_future<int>();
 
   est::spawn(std::move(fut));
@@ -101,8 +125,9 @@ TEST_CASE("spawn() dispatches a future<T> that completes successfully", "[spawn]
 TEST_CASE("spawn() reports an unhandled exception via the default hook", "[spawn]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   auto [prom, fut] = est::make_promise_future<int>();
 
   est::spawn(std::move(fut));
@@ -122,8 +147,9 @@ TEST_CASE("spawn() reports an unhandled exception via the default hook", "[spawn
 TEST_CASE("spawn()'s default hook suppresses operation_cancelled", "[spawn]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   auto [prom, fut] = est::make_promise_future<int>();
 
   est::spawn(std::move(fut));
@@ -137,8 +163,9 @@ TEST_CASE("spawn()'s default hook suppresses an already-abandoned future's excep
   using namespace std::chrono_literals;
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   auto [prom, operation] = est::make_promise_future<int>();
 
   // with_timeout()'s own timer racer completes its returned future with
@@ -166,11 +193,12 @@ TEST_CASE("spawn() lets a caller install a custom exception hook that sees every
           "[spawn]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
 
   int hook_calls = 0;
-  est::set_spawn_exception_hook(loop, [&hook_calls](const std::exception_ptr&) { ++hook_calls; });
+  est::set_spawn_exception_hook([&hook_calls](const std::exception_ptr&) { ++hook_calls; });
 
   auto [prom, fut] = est::make_promise_future<int>();
   est::spawn(std::move(fut));
@@ -184,22 +212,23 @@ TEST_CASE("spawn() lets a caller install a custom exception hook that sees every
   REQUIRE(fake.diagnostic_count == 0); // the default printer never ran
 }
 
-TEST_CASE("est::set_spawn_exception_hook(loop, nullptr) resets to the default hook, not to empty",
+TEST_CASE("est::set_spawn_exception_hook(nullptr) resets to the default hook, not to empty",
           "[spawn]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
 
   int hook_calls = 0;
-  est::set_spawn_exception_hook(loop, [&hook_calls](const std::exception_ptr&) { ++hook_calls; });
-  est::set_spawn_exception_hook(loop, nullptr); // reset - back to the default, exemptions and all
+  est::set_spawn_exception_hook([&hook_calls](const std::exception_ptr&) { ++hook_calls; });
+  est::set_spawn_exception_hook(nullptr); // reset - back to the default, exemptions and all
 
   // The invariant itself, checked directly at the storage level (not just
   // observed indirectly through spawn()'s own behavior below): resetting
   // via nullptr installs a real value, it doesn't just leave the slot
-  // empty for spawn()'s own self-heal to paper over later.
-  REQUIRE(loop.spawn_exception_hook());
+  // empty.
+  REQUIRE(est::spawn_exception_hook());
 
   auto [prom, fut] = est::make_promise_future<int>();
   est::spawn(std::move(fut));
@@ -210,34 +239,11 @@ TEST_CASE("est::set_spawn_exception_hook(loop, nullptr) resets to the default ho
   REQUIRE(fake.diagnostic_count == 0); // and the default's own exemption applies again
 }
 
-TEST_CASE("est::make_current_loop_with_spawn() preserves a hook set before registration",
-          "[spawn]") {
-  recording_platform fake;
-  const auto platform_guard = est::platform::override_instance(fake);
-  est::loop loop;
-
-  int hook_calls = 0;
-  // Set before make_current_loop_with_spawn() runs - its own `if
-  // (!spawn_exception_hook())` guard must see this and leave it alone,
-  // not overwrite it with the default the way an unconditional install
-  // would.
-  est::set_spawn_exception_hook(loop, [&hook_calls](const std::exception_ptr&) { ++hook_calls; });
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
-
-  auto [prom, fut] = est::make_promise_future<int>();
-  est::spawn(std::move(fut));
-  prom.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
-  loop.run_until_idle();
-
-  REQUIRE(hook_calls == 1);
-  REQUIRE(fake.diagnostic_count == 0); // the default printer never ran
-}
-
 TEST_CASE("spawn() accepts a callable, invoking it synchronously at the call site", "[spawn]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
 
   bool invoked = false;
   est::spawn([&invoked] {
@@ -253,12 +259,13 @@ TEST_CASE("spawn() stamps the given Priority on its own completion continuation 
           "[spawn][priority]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
 
   std::vector<est::Priority> order;
   est::set_spawn_exception_hook(
-      loop, [&order](const std::exception_ptr&) { order.push_back(est::current_priority()); });
+      [&order](const std::exception_ptr&) { order.push_back(est::current_priority()); });
 
   auto [prom_low, fut_low] = est::make_promise_future<int>();
   auto [prom_high, fut_high] = est::make_promise_future<int>();
@@ -280,12 +287,13 @@ TEST_CASE("spawn() defaults its Priority to current_priority() at the call site"
           "[spawn][priority]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  const hook_reset_guard hook_guard;
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
 
   std::optional<est::Priority> observed;
   est::set_spawn_exception_hook(
-      loop, [&observed](const std::exception_ptr&) { observed = est::current_priority(); });
+      [&observed](const std::exception_ptr&) { observed = est::current_priority(); });
 
   auto [prom, fut] = est::make_promise_future<int>();
   {
@@ -302,7 +310,7 @@ TEST_CASE("spawn() lets an unobserved coroutine run to completion", "[spawn][cor
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
   bool completed = false;
 
   est::spawn([&completed] { return suspending_coro(&completed); });
@@ -321,7 +329,7 @@ TEST_CASE("spawn()'s completion continuation is reclaimed on loop teardown even 
   counting_resource resource;
   {
     est::loop loop{&resource};
-    const auto loop_guard = est::make_current_loop_with_spawn(loop);
+    const auto loop_guard = est::make_current_loop(loop);
     auto [prom, fut] = est::make_promise_future<int>();
 
     est::spawn(std::move(fut));

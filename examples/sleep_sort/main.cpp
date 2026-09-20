@@ -40,7 +40,7 @@ auto main() -> int {
     std::println("input: {}", numbers);
 
     est::loop loop;
-    const auto loop_guard = est::make_current_loop_with_spawn(loop);
+    const auto loop_guard = est::make_current_loop(loop);
     using namespace std::chrono_literals;
 
     constexpr auto unit = 100ms;

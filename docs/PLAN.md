@@ -7481,3 +7481,71 @@ Full pipeline re-run clean: `default` build + 329/329 `ctest` passed,
 `clang-format` clean, `ci` build + `clang-tidy` clean (0 warnings from
 this codebase's own files), 96% diff coverage, `sanitize` 272/272
 (ASan+UBSan clean), wasm32 build + Node smoke test clean.
+
+---
+
+### Issue #58 revisited (PR #122 review): spawn()'s exception hook moves to a `thread_local` in `:spawn`, decoupled from `loop`
+
+A third review comment on the same PR, on `loop.cppm`'s now-removed
+`spawn_exception_hook_` member: "I think the Hook should be thread local
+global hook in the spawn module, for now it doesn't need to be connected
+to the loop at all."
+
+Correct, and it dissolves both pieces of machinery the previous two
+review rounds had just added. Reporting an unhandled exception from a
+spawned task is a per-thread policy (which `platform::printdbg()` to
+call, which exceptions are routine) - not a property of any one `loop`
+object, and this codebase already has exactly one `thread_local` "current
+loop" per thread/core (`:util.current_loop`'s own `tls_context`) to begin
+with, so tying the hook to a specific `loop` instance bought nothing.
+Moved the hook into `est/src/spawn.cppm` itself as
+`detail::spawn_exception_hook_storage`, `thread_local`, statically
+initialized directly to `default_spawn_exception_hook` - mirroring
+`:util.current_loop`'s own `tls_context` shape (a `namespace est::detail`
+block for the storage, sandwiched between two `export namespace est`
+blocks for the public accessors, same as that file).
+
+Static initialization to a real value from the moment the thread starts
+is strictly stronger than the previous round's "installed once at
+registration time" - there's no registration step at all now, and no
+"not yet installed" state to guard against, so both `est::
+make_current_loop_with_spawn()` (the registration wrapper the *previous*
+round added) and `spawn()`'s own `est::check()` precondition (added for
+the same reason) are gone. `spawn()` itself no longer touches `current_loop()`
+at all either: a `then_fast()` continuation already dispatches through
+whatever loop owns `task`'s own `future_state`, established when `task`
+was created - `spawn()` never actually needed a loop reference for its
+own job, only for the hook it no longer stores there. `loop.cppm` loses
+`exception_hook_type`, `set_spawn_exception_hook()`,
+`spawn_exception_hook()`, and the `spawn_exception_hook_` member entirely
+- it goes back to knowing nothing about spawn() at all, the same "`:loop`
+never names `future<T>`" purity this file's own top comment already
+established for everything else.
+
+One real test-isolation hazard this surfaced: a `thread_local` hook
+persists across `TEST_CASE`s in the same binary, unlike the old
+per-`loop` storage where each test's own fresh `est::loop` gave it a
+clean slate implicitly. A test that installs a custom hook and never
+resets it would otherwise leak into whichever test Catch2 happens to run
+next. Added `hook_reset_guard` (`spawn_tests.cpp`, anonymous namespace) -
+saves `est::spawn_exception_hook()` on construction, restores it on
+destruction - and put one in every `TEST_CASE` that could observe or
+change the hook. Verified with `est_tests '[spawn]' --order rand
+--rng-seed <n>` across several seeds: passes regardless of run order,
+confirming the guard actually does its job rather than happening to pass
+under Catch2's default (file/declaration) order.
+
+One clang-tidy fix: `bugprone-throwing-static-initialization` flagged the
+`thread_local` initializer (`std::function`'s constructor is
+conservatively treated as potentially-throwing in general) -
+`NOLINTNEXTLINE`, since the actual target is a plain, captureless
+function pointer, always within `std::function`'s guaranteed small-object
+buffer, so this specific construction can't allocate and can't throw.
+
+Full pipeline re-run clean: `default` build + 328/328 `ctest` passed (one
+fewer than the previous round - the "make_current_loop_with_spawn()
+preserves a hook set before registration" test no longer applies to
+anything and was removed, not replaced), `clang-format` clean, `ci`
+build + `clang-tidy` clean (0 warnings from this codebase's own files),
+95% diff coverage, `sanitize` 271/271 (ASan+UBSan clean), wasm32 build +
+Node smoke test clean.

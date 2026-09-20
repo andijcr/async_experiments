@@ -1,12 +1,10 @@
 export module est:spawn;
 
 import std;
-import :check;
 import :future;
 import :loop;
 import :platform;
 import :sync.stop_token;
-import :util.current_loop;
 
 // Issue #58: dispatching a coroutine without awaiting it (fire-and-forget,
 // letting a later .then() continuation observe the result) used to mean
@@ -48,18 +46,38 @@ import :util.current_loop;
 // wants spawn() as a real consumer of it, rather than reintroducing this
 // same tracking shape ad hoc.
 //
-// spawn() also no longer takes an explicit loop& (PR #122 review): it
-// resolves est::current_loop() (:util.current_loop) instead, the same
-// ambient mechanism make_promise_future()/sleep_for()/sleep_until()/
-// yield_execution()/est::mutex/est::counting_event<Mode> already resolve
-// through. A caller registers a loop once via
-// est::make_current_loop_with_spawn() (below) - a thin wrapper around
-// est::make_current_loop() (:util.current_loop) that also installs the
-// default exception hook if nothing has set one yet. Doing this once, at
-// registration time, replaces an earlier version of spawn() that
-// self-healed a still-empty hook lazily on every call.
+// spawn() also no longer takes an explicit loop& (PR #122 review): a
+// then_fast() continuation dispatches through whatever loop already owns
+// `task`'s own future_state (established when `task` was created, not by
+// spawn() itself), so spawn() never needed a loop& to do its own job in
+// the first place.
+//
+// The exception hook (below) is a thread_local, not something stored on
+// loop at all (also PR #122 review): reporting an unhandled exception
+// from a spawned task is a per-thread policy - which platform::printdbg()
+// to call, which exceptions are routine - not a property of any one loop
+// object, and this codebase already has exactly one thread_local "current
+// loop" per thread/core (:util.current_loop) to begin with, so tying the
+// hook to a specific loop instance bought nothing. Storing it thread_local
+// here also means it's statically initialized to
+// default_spawn_exception_hook (below) once per thread, for free - no
+// registration step, no "still empty" state to self-heal or guard against
+// at all. An earlier version of this file instead stored the hook on
+// est::loop (loop::exception_hook_type/set_spawn_exception_hook()/
+// spawn_exception_hook()) and needed a whole registration wrapper
+// (est::make_current_loop_with_spawn()) plus a spawn()-side est::check()
+// precondition just to keep it non-empty - both gone now, along with the
+// coupling to loop that made them necessary.
 
 export namespace est {
+
+// The type est::set_spawn_exception_hook()/est::spawn_exception_hook()
+// (below) traffic in - std::function, not std::move_only_function,
+// matching every other std::function-shaped customization point in this
+// codebase (est::loop::scheduler_type's own doc comment has the reasoning:
+// a hook a caller may want to copy into more than one place, unlike a
+// single-owner completion callback).
+using spawn_exception_hook_type = std::function<void(const std::exception_ptr&)>;
 
 // The default hook spawn() installs when a caller hasn't set their own via
 // est::set_spawn_exception_hook() (below): a best-effort diagnostic via
@@ -99,42 +117,50 @@ inline void default_spawn_exception_hook(const std::exception_ptr& eptr) noexcep
 #endif
 }
 
-// The preferred way to install (or reset) loop's spawn() exception hook -
-// prefer this over calling loop::set_spawn_exception_hook() (est:loop)
-// directly. Keeps the invariant spawn() itself (below) relies on: once
-// anything has touched loop's hook through this entry point, it's never
-// empty again. Passing an empty/null `hook` explicitly resets to
-// default_spawn_exception_hook() above, rather than forwarding the empty
-// value through and leaving loop with nothing installed -
-// loop::set_spawn_exception_hook() itself can't provide this guarantee on
-// its own, since :loop has no way to name default_spawn_exception_hook
-// (this file's own top comment on why :loop can't import :spawn).
-inline void set_spawn_exception_hook(loop& loop_ref, loop::exception_hook_type hook) {
-  loop_ref.set_spawn_exception_hook(hook ? std::move(hook)
-                                         : loop::exception_hook_type(default_spawn_exception_hook));
+} // namespace est
+
+namespace est::detail {
+
+// thread_local, not a single process-global, matching :util.current_loop's
+// own tls_context (same reasoning: this codebase's ultimate target is one
+// loop per core on a shared-memory, no-MMU multicore machine, and each
+// core only ever touches its own hook). Statically initialized to
+// default_spawn_exception_hook - never empty from the moment this thread
+// starts, so nothing downstream needs to guard against a "not yet
+// installed" state.
+//
+// bugprone-throwing-static-initialization flags std::function's own
+// constructor as potentially-throwing in general (an allocation for a
+// target too large for its small-object buffer) - not a real risk here:
+// the target is a plain, captureless function pointer, always small
+// enough for std::function's guaranteed SBO, so this construction never
+// allocates and can't throw in practice.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables,bugprone-throwing-static-initialization)
+inline thread_local spawn_exception_hook_type spawn_exception_hook_storage =
+    default_spawn_exception_hook;
+
+} // namespace est::detail
+
+export namespace est {
+
+// Installs (or resets) this thread's spawn() exception hook. Passing an
+// empty/null `hook` resets to default_spawn_exception_hook() above rather
+// than leaving the slot empty - the same "reset to default, never to
+// nothing" invariant this file's own storage keeps by construction (above)
+// stays true after an explicit reset too.
+inline void set_spawn_exception_hook(spawn_exception_hook_type hook) {
+  detail::spawn_exception_hook_storage =
+      hook ? std::move(hook) : spawn_exception_hook_type(default_spawn_exception_hook);
 }
 
-// Registers loop_ref as the current loop (est::make_current_loop(),
-// :util.current_loop) and makes sure it has a spawn exception hook
-// installed - the default one, unless something has already set a
-// different one via set_spawn_exception_hook() above. Doing this once,
-// here, at registration time is what lets spawn() below read
-// loop_ref.spawn_exception_hook() unconditionally instead of re-checking
-// on every call - the preferred way to bring up a loop for any program
-// that uses est::spawn(). Plain est::make_current_loop() still works for
-// a loop that never calls spawn() at all (every other current_loop()-based
-// entry point - make_promise_future(), sleep_for(), est::mutex, ... -
-// doesn't touch this hook either way).
-[[nodiscard]] auto make_current_loop_with_spawn(loop& loop_ref) {
-  if (!loop_ref.spawn_exception_hook()) {
-    set_spawn_exception_hook(loop_ref, nullptr);
-  }
-  return make_current_loop(loop_ref);
+// This thread's currently-installed spawn() exception hook.
+[[nodiscard]] inline auto spawn_exception_hook() noexcept -> const spawn_exception_hook_type& {
+  return detail::spawn_exception_hook_storage;
 }
 
 // Dispatches `task` as a fire-and-forget operation (issue #58): registers
 // a then_fast() continuation that reports an unhandled exception through
-// current_loop()'s own installed hook. `prio` matches then()/then_fast()'s
+// this thread's installed hook (above). `prio` matches then()/then_fast()'s
 // own trailing, inheriting Priority parameter (issue #31/#106) - stamped
 // on this same completion continuation, the one node this task's own
 // dispatch actually owns.
@@ -146,28 +172,14 @@ inline void set_spawn_exception_hook(loop& loop_ref, loop::exception_hook_type h
 // until it completes, exactly like every other combinator in this
 // codebase (with_stop(), with_timeout(), when_all(), when_any(),
 // when_any_succeeds()) already relies on for the futures they register
-// continuations on.
-//
-// Resolves current_loop() rather than taking a loop& parameter, matching
-// every other ambient-aware entry point here (make_promise_future(),
-// sleep_for()/sleep_until(), est::mutex, est::counting_event<Mode>) -
-// register the loop first via est::make_current_loop_with_spawn() above.
-// The check() below is this function's own precondition, distinct from
-// current_loop()'s: it catches a loop registered via plain
-// est::make_current_loop() instead of the spawn-aware wrapper, which
-// would otherwise leave the hook empty and turn a genuine unhandled
-// exception into an opaque std::bad_function_call instead of a clear
-// diagnostic naming the fix.
+// continuations on. then_fast() dispatches through whatever loop already
+// owns `task`'s own future_state - spawn() never needs a loop& of its own
+// to do this, and doesn't take one.
 template <class T> void spawn(future<T> task, Priority prio = current_priority()) {
-  loop& loop_ref = current_loop();
   detail::discard(std::move(task).then_fast(
-      [&loop_ref](future<T>& f) {
+      [](future<T>& f) {
         if (f.ready_with_failure()) {
-          check(static_cast<bool>(loop_ref.spawn_exception_hook()),
-                "est::spawn(): the current loop has no exception hook installed - "
-                "register it via est::make_current_loop_with_spawn() instead of "
-                "est::make_current_loop()");
-          loop_ref.spawn_exception_hook()(f.get_exception());
+          spawn_exception_hook()(f.get_exception());
         }
       },
       prio));

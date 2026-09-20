@@ -109,7 +109,7 @@ auto main() -> int {
   // NOLINTEND(cppcoreguidelines-pro-type-vararg)
 
   est::loop loop;
-  const auto loop_guard = est::make_current_loop_with_spawn(loop);
+  const auto loop_guard = est::make_current_loop(loop);
 
   est::stop_source session_stop;       // fires once the session's overall time
                                        // budget elapses - see below

@@ -393,38 +393,6 @@ public:
     return true;
   }
 
-  // The installable hook for est::spawn()'s (est:spawn) own unhandled-
-  // exception diagnostic (issue #58) - stored here as a generic
-  // customization point (mirroring scheduler_type above; see its own doc
-  // comment for why std::function, not std::move_only_function) rather
-  // than hard-coding any particular policy, exactly as :loop never names
-  // est::future<T>/est::promise<T> (this file's own top comment). The
-  // exemption logic for routine outcomes like cancellation lives in
-  // est:spawn's own default hook, not here, since :sync.stop_token's
-  // operation_cancelled isn't something this file can name either.
-  //
-  // This raw setter allows an empty std::function through unchanged -
-  // :loop has no way to know what est:spawn's own default hook even is,
-  // so it can't enforce "never empty" on its own. est::set_spawn_exception_hook()
-  // (est:spawn) is the higher-level entry point that actually keeps the
-  // invariant this class's own spawn_exception_hook() below relies on: it
-  // installs est::default_spawn_exception_hook() in place of a null/empty
-  // `hook` instead of forwarding the empty one through - prefer that one
-  // so "reset to default" and "install a real hook" are both spelled the
-  // same way. est::make_current_loop_with_spawn() (est:spawn) installs it
-  // once, at loop-registration time, for any loop that will call
-  // est::spawn() - the preferred way to bring one up instead of calling
-  // this raw setter (or plain est::make_current_loop()) directly.
-  using exception_hook_type = std::function<void(const std::exception_ptr&)>;
-
-  void set_spawn_exception_hook(exception_hook_type hook) noexcept {
-    spawn_exception_hook_ = std::move(hook);
-  }
-
-  [[nodiscard]] auto spawn_exception_hook() const noexcept -> const exception_hook_type& {
-    return spawn_exception_hook_;
-  }
-
   // Runs until both the ready-queue and the timer queue are empty - for
   // tests/examples that shouldn't block forever.
   void run_until_idle() { run_impl(); }
@@ -622,7 +590,6 @@ private:
   ready_queues ready_;
   timer_queue<allocator_type> timers_;
   std::pmr::vector<pending_entry> pending_timers_;
-  exception_hook_type spawn_exception_hook_;
   bool stop_requested_ = false;
   bool running_ = false;
 };

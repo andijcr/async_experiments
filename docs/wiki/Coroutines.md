@@ -901,20 +901,11 @@ first overload - sugar for `spawn(some_coroutine(args...))` when writing
 `spawn([&] { return some_coroutine(args...); })` reads better at a given
 call site.
 
-**No explicit `loop&` parameter.** `spawn()` resolves `est::current_loop()`
-(`:util.current_loop`) itself, matching every other ambient-aware entry
-point here (`make_promise_future()`, `sleep_for()`/`sleep_until()`,
-`est::mutex`, `est::counting_event<Mode>`). A caller registers a loop once
-via `est::make_current_loop_with_spawn(loop&)` instead of plain
-`est::make_current_loop(loop&)` - a thin wrapper that also installs the
-default exception hook (below) if nothing has set one yet, replacing an
-earlier version of `spawn()` that self-healed a still-empty hook lazily
-on every call (a PR review comment on issue #58 pointed out that
-installation belonged at registration time, not inside `spawn()`'s own
-hot path). `spawn()` itself carries a `check()` precondition that fires
-with a clear message - naming the fix - if a loop was registered via
-plain `make_current_loop()` instead, rather than crashing opaquely on an
-empty hook the first time a spawned task actually fails.
+**No explicit `loop&` parameter.** A `then_fast()` continuation dispatches
+through whatever loop already owns `task`'s own `future_state` (established
+when `task` was created, not by `spawn()`), so `spawn()` never needed a
+`loop&` to do its own job - plain `est::make_current_loop(loop&)`
+(`:util.current_loop`) is all a caller needs, nothing spawn-specific.
 
 **Pure sugar over `then_fast()`, no separate tracking collection.**
 `spawn()` registers exactly one continuation and relies on the same
@@ -937,18 +928,29 @@ was removed rather than kept for a hypothetical future consumer -
 revisit if issue #103's own central waiter registry ever lands and wants
 `spawn()` as a real consumer of it.
 
-**The exception hook.** `spawn()`'s default behavior - unless a caller
-installs their own via `est::set_spawn_exception_hook(loop&, hook)` -
-prints a diagnostic via `platform::printdbg()` for an unhandled exception,
-except `est::operation_cancelled` and `detail::abandoned_exception`: both
-are routine, expected outcomes of normal cancellation/shutdown, not bugs,
-so warning about them by default would spam every ordinary teardown. A
+**The exception hook is `thread_local`, not tied to any one `loop`.**
+`spawn()`'s default behavior - unless a caller installs their own via
+`est::set_spawn_exception_hook(hook)` - prints a diagnostic via
+`platform::printdbg()` for an unhandled exception, except
+`est::operation_cancelled` and `detail::abandoned_exception`: both are
+routine, expected outcomes of normal cancellation/shutdown, not bugs, so
+warning about them by default would spam every ordinary teardown. A
 caller-installed hook sees every exception unfiltered - it decides for
-itself what counts as routine. Prefer `est::set_spawn_exception_hook()`
-over `loop::set_spawn_exception_hook()` (the raw, `est:loop`-level setter)
-directly: the free function keeps the invariant a `null`/empty `hook`
-resets to the default rather than leaving the slot empty, since `:loop`
-itself has no way to name `default_spawn_exception_hook`.
+itself what counts as routine.
+
+Reporting an unhandled exception is a per-thread policy, not a property
+of any one `loop` object - this codebase already has exactly one
+thread_local "current loop" per thread/core (`:util.current_loop`)
+to begin with, so tying the hook to a specific `loop` instance bought
+nothing. An earlier version stored the hook on `est::loop` itself and
+needed a registration wrapper (`est::make_current_loop_with_spawn()`)
+plus a `spawn()`-side `est::check()` precondition just to keep it
+non-empty; storing it `thread_local` in `est/src/spawn.cppm` instead
+means it's statically initialized to `default_spawn_exception_hook` once
+per thread, for free - never empty, no registration step, nothing to
+self-heal or guard against. `est::set_spawn_exception_hook(nullptr)`
+resets to the default rather than leaving the slot empty, the same
+invariant the static initialization itself already keeps.
 
 **`future<T>` is `[[nodiscard]]`, making `spawn()` the one sanctioned
 discard.** Without this, nothing stopped a caller from bypassing `spawn()`

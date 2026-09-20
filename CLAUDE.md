@@ -161,10 +161,12 @@ that make that possible).
   combinators, all the same "shared state + racing `then_fast()`
   continuations, first one wins" shape.
 - `est::spawn(future<T> | callable, Priority prio = current_priority())`
-  — explicit ownership for fire-and-forget dispatch; resolves
-  `est::current_loop()` (register one via `est::make_current_loop_with_spawn()`),
-  and reports an unhandled exception (default: `platform::printdbg()`,
-  exempting routine cancellation/shutdown) instead of silently dropping it.
+  — explicit ownership for fire-and-forget dispatch; no `loop&` parameter,
+  since a `then_fast()` continuation dispatches through whatever loop
+  already owns the task's own `future_state`. Reports an unhandled
+  exception through a `thread_local` hook (default: `platform::printdbg()`,
+  exempting routine cancellation/shutdown; override via
+  `est::set_spawn_exception_hook()`) instead of silently dropping it.
 - `est::shared_ptr<T>` / `est::intrusive_list<T>` (`est/src/util/`) — the
   generic, non-atomic reference-counted pointer and intrusive list every
   owned/queued object above is built on.
