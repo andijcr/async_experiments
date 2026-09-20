@@ -35,9 +35,9 @@ namespace est::detail {
 // no-op.
 template <class T>
 void when_any_track(future<T>& input, shared_ptr<one_shot_event<EventResetMode::manual>> event) {
-  input.then_fast([](future<T>&) {}).then_fast([event = std::move(event)](future<void>&) {
+  discard(input.then_fast([](future<T>&) {}).then_fast([event = std::move(event)](future<void>&) {
     event->set();
-  });
+  }));
 }
 
 } // namespace est::detail

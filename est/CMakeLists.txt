@@ -29,6 +29,7 @@ target_sources(est
       src/when_any_succeeds.cppm
       src/with_stop.cppm
       src/with_timeout.cppm
+      src/spawn.cppm
 )
 
 target_compile_features(est PUBLIC cxx_std_23)

@@ -102,8 +102,10 @@ TEST_CASE("an unwrapped then() receives a reference into the stored value, not a
 
   const int* first_address = nullptr;
   const int* second_address = nullptr;
-  future.then([&](const int& value) { first_address = &value; });
-  future.then([&](const int& value) { second_address = &value; });
+  // (void): each then()'s own downstream future<void> is never read - the
+  // side effect (capturing an address) is the whole point of this test.
+  (void)future.then([&](const int& value) { first_address = &value; });
+  (void)future.then([&](const int& value) { second_address = &value; });
   loop.run_until_idle();
 
   REQUIRE(first_address != nullptr);
@@ -466,7 +468,7 @@ TEST_CASE("a registered continuation is freed even if never invoked (broken prom
     est::loop loop{&resource};
     const auto loop_guard = est::make_current_loop(loop);
     auto [promise, future] = est::make_promise_future<int>();
-    future.then([](est::future<int>&) { return 0; });
+    (void)future.then([](est::future<int>&) { return 0; });
     // promise, future and loop all destroyed here, never completed - the
     // continuation never even reaches est::loop's own ready-queue.
   }
@@ -1085,7 +1087,7 @@ TEST_CASE("an unwrapped then() taking const T& observes a move-only value withou
   int observed = 0;
   // const T&, not by value - see this section's own top comment for why a
   // move-only T requires this shape.
-  std::move(future).then([&](const std::unique_ptr<int>& value) { observed = *value; });
+  (void)std::move(future).then([&](const std::unique_ptr<int>& value) { observed = *value; });
   loop.run_until_idle();
 
   REQUIRE(observed == 1);
@@ -1106,7 +1108,7 @@ TEST_CASE("an unwrapped then() taking const T& observes a move-only value withou
   promise.set_value(std::make_unique<int>(2));
 
   int observed = 0;
-  future.then([&](const std::unique_ptr<int>& value) { observed = *value; });
+  (void)future.then([&](const std::unique_ptr<int>& value) { observed = *value; });
   loop.run_until_idle();
 
   REQUIRE(observed == 2);
@@ -1135,7 +1137,7 @@ TEST_CASE("then_fast() taking const T& observes a move-only value without copyin
   promise.set_value(std::make_unique<int>(7));
 
   int observed = 0;
-  std::move(future).then_fast([&](const std::unique_ptr<int>& value) { observed = *value; });
+  (void)std::move(future).then_fast([&](const std::unique_ptr<int>& value) { observed = *value; });
 
   REQUIRE(observed == 7); // then_fast() on an already-ready future runs inline, no loop drain
 }

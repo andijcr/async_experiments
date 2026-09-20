@@ -76,11 +76,11 @@ struct when_all_state {
 // no loop round trip at all - exactly like counting_event<Mode>::wait()'s
 // own already-signaled fast path, the precedent then_fast() itself cites.
 template <class T> void when_all_track(future<T>& input, shared_ptr<when_all_state> state) {
-  input.then_fast([](future<T>&) {}).then_fast([state = std::move(state)](future<void>&) {
+  discard(input.then_fast([](future<T>&) {}).then_fast([state = std::move(state)](future<void>&) {
     if (--state->remaining == 0) {
       state->event.set();
     }
-  });
+  }));
 }
 
 // Builds the when_all_state its constituent hooks share - `count == 0`

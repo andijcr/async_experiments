@@ -125,25 +125,29 @@ auto main() -> int {
     // whatever round is in flight to resolve on its own. Unwrapped (no
     // captured future<void>&, per then()'s own dispatch rules), so it's
     // skipped entirely - not run with a stale/cancelled result - if
-    // session_timer_stop cancels this timer first, below.
-    est::sleep_for(session_time_limit, session_timer_stop.get_token()).then([&session_stop] {
-      session_stop.request_stop();
-    });
+    // session_timer_stop cancels this timer first, below. est::spawn()
+    // (issue #58): explicit, loop-owned ownership of this chain's own
+    // downstream future<void> instead of a bare discarded handle.
+    est::spawn(
+        est::sleep_for(session_time_limit, session_timer_stop.get_token()).then([&session_stop] {
+          session_stop.request_stop();
+        }));
 
-    // Deliberately discarded, matching run_server()'s own handle in
-    // examples/spreadsheet/main.cpp - the coroutine stays alive via its
-    // own registered continuations, not via this variable.
+    // session itself is kept (not spawn()ed): the block below registers a
+    // further .then() on it, so it has to stay a live handle, not
+    // something handed off to spawn()'s own tracking.
     auto session = play_session(&session_stop);
     // Once the session itself ends (quit, a wrong/timed-out round, or the
     // session time limit already firing) the session-length timer above is
     // moot - eagerly reclaim it (loop::cancel_timer(), the same mechanism
     // the fast path above already relies on) and ask the loop to stop,
     // rather than leaving loop.run() blocked on a real timer that no
-    // longer matters.
-    session.then([&loop, &session_timer_stop](est::future<void>&) {
+    // longer matters. est::spawn() again for this chain's own downstream
+    // future<void>, same reasoning as above.
+    est::spawn(session.then([&loop, &session_timer_stop](est::future<void>&) {
       session_timer_stop.request_stop();
       loop.stop();
-    });
+    }));
     loop.run();
   } catch (...) {
     return EXIT_FAILURE;

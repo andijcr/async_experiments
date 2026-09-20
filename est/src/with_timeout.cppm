@@ -175,7 +175,7 @@ template <class T>
   state->id = loop_ref.schedule_timer(*timer_node_guard, platform::instance().now() + timeout);
   timer_node_guard.release();
 
-  std::move(operation).then_fast([state](future<T>& op) {
+  detail::discard(std::move(operation).then_fast([state](future<T>& op) {
     if (state->done) {
       return;
     }
@@ -199,7 +199,7 @@ template <class T>
       // with_timeout().
       state->result.set_value(std::move(op).get());
     }
-  });
+  }));
   return std::move(fut);
 }
 

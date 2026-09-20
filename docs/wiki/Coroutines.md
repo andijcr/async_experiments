@@ -868,3 +868,104 @@ scoped limitation as `with_stop<T>()`/`when_any()`/`when_all()`/
 `when_any_succeeds()`: losing the race only stops the *caller* from
 waiting on `operation` further, it keeps running in the background until
 it completes on its own.
+
+## `est::spawn()`: explicit ownership for fire-and-forget dispatch
+
+Dispatching a coroutine without awaiting it used to mean discarding the
+returned `future<T>` and relying on a fact that had to be re-explained in
+a comment at every call site: a `.then()` continuation registered on that
+future keeps its `future_state<T>` alive on its own, independent of
+whether the caller's own handle survives. Issue #58's own investigation
+found that invariant *overstates* the real hazard - `promise_type`'s
+`initial_suspend()`/`final_suspend()` are both `std::suspend_never`
+(above), so a coroutine runs to completion correctly whether or not
+anything ever references its returned future at all. The actual gap is
+narrower: an **unobserved failure** was silently dropped -
+`future_state<T>::then()`'s unwrapped-mode auto-propagate path just routes
+it into a downstream `future_state` that's *also* discarded, so a genuine
+bug (a `bad_alloc`, a logic error) produced total silence instead of a
+diagnostic.
+
+```cpp
+template <class T> void spawn(future<T> task, Priority prio = current_priority());
+template <class Fn> void spawn(Fn&& fn, Priority prio = current_priority());
+```
+
+`spawn()` (`est/src/spawn.cppm`, issue #58) registers a `then_fast()`
+continuation on `task` that reports an unhandled exception - the same
+`Priority prio = current_priority()` trailing, inheriting default
+`then()`/`then_fast()` themselves use (issue #31/#106), stamped on that
+same continuation. The callable overload just invokes `fn()` (eagerly, at
+the call site, not deferred) and forwards the resulting `future<T>` to the
+first overload - sugar for `spawn(some_coroutine(args...))` when writing
+`spawn([&] { return some_coroutine(args...); })` reads better at a given
+call site.
+
+**No explicit `loop&` parameter.** A `then_fast()` continuation dispatches
+through whatever loop already owns `task`'s own `future_state` (established
+when `task` was created, not by `spawn()`), so `spawn()` never needed a
+`loop&` to do its own job - plain `est::make_current_loop(loop&)`
+(`:util.current_loop`) is all a caller needs, nothing spawn-specific.
+
+**Pure sugar over `then_fast()`, no separate tracking collection.**
+`spawn()` registers exactly one continuation and relies on the same
+implicit keep-alive every other combinator here already depends on: the
+continuation node's own `owner_` reference (`est:future`) keeps
+`future_state<T>` alive until it completes, exactly like
+`with_stop()`/`with_timeout()`/`when_all()`/`when_any()`/
+`when_any_succeeds()` - none of which track anything extra either. An
+earlier version of `spawn()` added a `loop`-owned tracking collection
+mirroring `loop::pending_timers_`'s own shape ([Loop and
+Timers](Loop-And-Timers.md)), on the theory that fire-and-forget dispatch
+deserved an "explicit, loop-owned reason to stay alive" distinct from that
+implicit one. That turned out not to be a real distinction - correctness
+never depended on it, since `promise_type`'s `suspend_never` initial/final
+suspend (above) already means a coroutine runs regardless, and the
+continuation's own `owner_` reference already keeps a non-coroutine
+`future<T>` alive. The tracking collection's only real payoff was an
+in-flight-task count nothing in this codebase reads except tests, so it
+was removed rather than kept for a hypothetical future consumer -
+revisit if issue #103's own central waiter registry ever lands and wants
+`spawn()` as a real consumer of it.
+
+**The exception hook is `thread_local`, not tied to any one `loop`.**
+`spawn()`'s default behavior - unless a caller installs their own via
+`est::set_spawn_exception_hook(hook)` - prints a diagnostic via
+`platform::printdbg()` for an unhandled exception, except
+`est::operation_cancelled` and `detail::abandoned_exception`: both are
+routine, expected outcomes of normal cancellation/shutdown, not bugs, so
+warning about them by default would spam every ordinary teardown. A
+caller-installed hook sees every exception unfiltered - it decides for
+itself what counts as routine.
+
+Reporting an unhandled exception is a per-thread policy, not a property
+of any one `loop` object - this codebase already has exactly one
+thread_local "current loop" per thread/core (`:util.current_loop`)
+to begin with, so tying the hook to a specific `loop` instance bought
+nothing. An earlier version stored the hook on `est::loop` itself and
+needed a registration wrapper (`est::make_current_loop_with_spawn()`)
+plus a `spawn()`-side `est::check()` precondition just to keep it
+non-empty; storing it `thread_local` in `est/src/spawn.cppm` instead
+means it's statically initialized to `default_spawn_exception_hook` once
+per thread, for free - never empty, no registration step, nothing to
+self-heal or guard against. `est::set_spawn_exception_hook(nullptr)`
+resets to the default rather than leaving the slot empty, the same
+invariant the static initialization itself already keeps.
+
+**`future<T>` is `[[nodiscard]]`, making `spawn()` the one sanctioned
+discard.** Without this, nothing stopped a caller from bypassing `spawn()`
+entirely and just discarding a coroutine call or a `.then()` chain's tail
+as before. `[[nodiscard]]` is on the `future<T>` *class itself*, not on
+individual producer functions like `make_ready_future<T>()` - the only
+mechanism that also catches a user's own coroutine call being discarded,
+since a per-function attribute can only ever reach functions this module
+declares. Assigning to a variable, chaining further, or passing to
+`spawn()` all count as "used," same as any other `[[nodiscard]]` type; an
+explicit `(void)` cast remains the standard, always-available escape hatch
+for a genuinely deliberate discard. A handful of this codebase's own
+combinators (`with_stop.cppm`, `with_timeout.cppm`, `when_all.cppm`,
+`when_any.cppm`, `when_any_succeeds.cppm`, `spawn.cppm` itself) register a
+bookkeeping continuation whose own downstream future nothing will ever
+read - those route through `est::detail::discard(future<T>)` instead, a
+non-exported internal escape hatch that can't double as a second, quieter
+way for external code to bypass `spawn()`.

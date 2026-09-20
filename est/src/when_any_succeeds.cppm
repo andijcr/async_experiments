@@ -47,26 +47,26 @@ struct when_any_succeeds_state {
 // from here on.
 template <class T>
 void when_any_succeeds_track(future<T>& input, shared_ptr<when_any_succeeds_state> state) {
-  input
-      .then_fast([](future<T>& in) {
-        if (in.ready_with_failure()) {
-          std::rethrow_exception(in.get_exception());
-        }
-      })
-      .then_fast([state = std::move(state)](future<void>& completed) {
-        if (state->done) {
-          return;
-        }
-        if (completed.ready_with_failure()) {
-          if (--state->remaining == 0) {
-            state->done = true;
-            state->result.set_value(false);
-          }
-        } else {
-          state->done = true;
-          state->result.set_value(true);
-        }
-      });
+  discard(input
+              .then_fast([](future<T>& in) {
+                if (in.ready_with_failure()) {
+                  std::rethrow_exception(in.get_exception());
+                }
+              })
+              .then_fast([state = std::move(state)](future<void>& completed) {
+                if (state->done) {
+                  return;
+                }
+                if (completed.ready_with_failure()) {
+                  if (--state->remaining == 0) {
+                    state->done = true;
+                    state->result.set_value(false);
+                  }
+                } else {
+                  state->done = true;
+                  state->result.set_value(true);
+                }
+              }));
 }
 
 } // namespace est::detail

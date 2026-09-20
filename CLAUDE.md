@@ -142,9 +142,12 @@ that make that possible).
   consumer/producer pair over a module-private `future_state<T>`, created
   only via `make_promise_future<T>(loop&)`. `.then()` chains defer through
   `est::loop` instead of running inline; `future<T>` is also the coroutine
-  return type (no separate `task<T>`). See `docs/wiki/Continuation-Node-Mechanism.md`
-  and `docs/wiki/Allocation-Patterns.md` for the node hierarchy and the
-  exact allocation cost of chains.
+  return type (no separate `task<T>`). `future<T>` is `[[nodiscard]]` -
+  `est::spawn()` (below), assigning to a variable, or an explicit `(void)`
+  cast are the ways to acknowledge a discard. See
+  `docs/wiki/Continuation-Node-Mechanism.md` and
+  `docs/wiki/Allocation-Patterns.md` for the node hierarchy and the exact
+  allocation cost of chains.
 - `est::counting_event<Mode>` / `est::mutex` — an intrusive waiter list +
   count/lock word (not OS-backed); `wait()`/`lock()` are awaitable,
   guarding a critical section across a coroutine suspension point, and
@@ -157,6 +160,13 @@ that make that possible).
   `when_any_succeeds()`, `est::with_timeout()` — the other future
   combinators, all the same "shared state + racing `then_fast()`
   continuations, first one wins" shape.
+- `est::spawn(future<T> | callable, Priority prio = current_priority())`
+  — explicit ownership for fire-and-forget dispatch; no `loop&` parameter,
+  since a `then_fast()` continuation dispatches through whatever loop
+  already owns the task's own `future_state`. Reports an unhandled
+  exception through a `thread_local` hook (default: `platform::printdbg()`,
+  exempting routine cancellation/shutdown; override via
+  `est::set_spawn_exception_hook()`) instead of silently dropping it.
 - `est::shared_ptr<T>` / `est::intrusive_list<T>` (`est/src/util/`) — the
   generic, non-atomic reference-counted pointer and intrusive list every
   owned/queued object above is built on.

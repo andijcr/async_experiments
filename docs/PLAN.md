@@ -7188,6 +7188,113 @@ additions: 317/317 (`default`), clean `clang-format`/`clang-tidy`,
 
 ---
 
+### Issue #58: `est::spawn()` - explicit ownership for fire-and-forget dispatch, and `future<T>` becomes `[[nodiscard]]`
+
+Investigated the issue's own two claims before implementing anything.
+Re-reading `future<T>::promise_type`'s `initial_suspend()`/
+`final_suspend()` (both `std::suspend_never`) confirmed the issue's own
+later "correction": an unobserved coroutine already runs to completion
+correctly today, independent of whether anything keeps its returned
+`future<T>` alive - that invariant needed no fixing. The real, narrower
+gap: an unobserved *failure* was silently dropped, since
+`future_state<T>::then()`'s unwrapped-mode auto-propagate path just routes
+it into a downstream `future_state` that's also typically discarded.
+
+Also checked #58's stated dependency, issue #103 (a central, id-keyed
+waiter registry) - still open, still just a design pass with no
+implementation and no decision among its own four candidate shapes
+(synthetic-id + linear scan, address-as-id, generational slot map,
+in-place tagging). Decided not to block on it: `spawn()`'s actual need is
+narrower than what #103 solves (retrofitting eager cancellation into
+*existing*, shared waiter lists) - just a *new*, loop-owned collection of
+in-flight tasks, each removed by its own completion continuation, with
+none of #103's harder cases. Built as its own small mechanism mirroring
+`loop::pending_timers_`'s already-proven shape (#103's own "option A"),
+scoped to `spawn()` alone - reconcile with #103's registry later if that
+ever lands.
+
+**`est::spawn()`** (new, `est/src/spawn.cppm`): `spawn(loop&, future<T>,
+Priority prio = current_priority())` and a callable overload that invokes
+`fn()` eagerly and forwards to the first. Registers a `then_fast()`
+continuation reporting an unhandled exception (via
+`loop::spawn_exception_hook()` if installed,
+`default_spawn_exception_hook()` otherwise - exempting
+`operation_cancelled`/`detail::abandoned_exception` as routine
+cancellation/shutdown outcomes, not bugs) and reclaiming its own tracking
+entry. `est/src/loop.cppm` gained the generic primitive this needs:
+`detail::spawned_entry` (type-erased base, mirroring `ready_node`/
+`timer_node` - `:loop` still never names `future<T>`),
+`track_spawned()`/`untrack_spawned()`/`spawned_count()`, and a nullable
+`exception_hook_type` customization point. `drain_pending()` now also
+unconditionally clears `spawned_`, since an abandoned (never `run()`)
+completion continuation never reaches `untrack_spawned()` on its own.
+
+**`future<T>` is now `[[nodiscard]]`** - a deliberate follow-up decided
+mid-implementation, not part of the original issue text: without it,
+nothing stopped a caller from bypassing `spawn()` entirely and just
+discarding a coroutine call or a `.then()` chain's tail as before,
+undermining the whole point of giving `spawn()` a sanctioned place to
+apply an exception policy. `[[nodiscard]]` on the `future<T>` class
+itself, not on individual producer functions (`make_ready_future<T>()`,
+etc.) - the only mechanism that also catches a user's own coroutine call
+being discarded, since a per-function attribute can only ever reach
+functions this module declares. `est::detail::discard(future<T>)` (new,
+`future.cppm`) is the internal escape hatch for this module's own
+genuinely deliberate discards - not exported, so it can't double as a
+second, quieter way for external code to bypass `spawn()`. Updated every
+site this touched: `with_stop.cppm` (x3), `with_timeout.cppm`,
+`when_all.cppm`, `when_any.cppm`, `when_any_succeeds.cppm` (x2),
+`spawn.cppm`'s own `then_fast()` call - all wrapped in `discard()`;
+`examples/sleep_sort/main.cpp`, `examples/digit_recall/main.cpp` (x2)
+routed through `est::spawn()` instead, consistent with
+`examples/spreadsheet/main.cpp`'s own `run_server()` (already
+`spawn()`-based, and the original motivating case for this issue); a
+handful of genuinely deliberate test-only discards (`mutex_tests.cpp`,
+`loop_tests.cpp`, `future_tests.cpp` x6) `(void)`-cast, the standard
+escape hatch for code outside the `est` module itself.
+
+Caught a real, previously-unnoticed bug the moment this landed:
+`mutex_tests.cpp`'s own `holder(loop, m, std::move(release_future));`
+was silently discarding a coroutine's future - exactly the pattern this
+change exists to catch. Fixed the same way as the other test-only sites.
+
+Two rounds of clang-tidy fixes on the way here:
+`NOLINTNEXTLINE(bugprone-empty-catch)` on `default_spawn_exception_hook()`'s
+two deliberate empty catches (the `operation_cancelled`/
+`abandoned_exception` exemptions); a coroutine test helper switched from
+a `bool&` to a `bool*` parameter
+(`cppcoreguidelines-avoid-reference-coroutine-parameters`); exception-hook
+lambda parameters switched from `std::exception_ptr` to `const
+std::exception_ptr&` (`performance-unnecessary-value-param`, also applied
+to `loop::exception_hook_type`'s own signature for consistency); and
+`last_diagnostic.value_or("").contains(...)` instead of `->find()` after a
+`has_value()` `REQUIRE()` (`bugprone-unchecked-optional-access` doesn't
+recognize that as a narrowing guard - `spsc_ring_tests.cpp`'s own doc
+comment already established this exact pattern).
+
+One more real bug caught by the full pipeline, not just review:
+`examples/multicolor_larson_scanner/web/CMakeLists.txt` hardcodes its own
+copy of `est`'s source list (a separate CMake project, separate toolchain
+- doesn't reuse `est/CMakeLists.txt`'s `FILE_SET`) and was missing the new
+`spawn.cppm` partition, breaking that build with "module 'est:spawn' not
+found" until added there too.
+
+10 new `TEST_CASE`s in `est/tests/spawn_tests.cpp`: successful completion
++ untracking, the default hook firing/being suppressed for
+`operation_cancelled` and an already-abandoned future (produced via
+`with_timeout()` + `loop.drain_pending()`, since `detail::abandoned_exception`
+isn't nameable from outside the module), a custom hook seeing everything
+unfiltered, the callable overload's eager invocation, `Priority` stamping
+and default-inheritance, a genuinely-suspending coroutine with no other
+observer, and teardown reclaiming a never-completed entry.
+
+Full pipeline: `default` build + 327/327 `ctest` passed, `clang-format`
+clean, `ci` build + `clang-tidy` clean (0 warnings), coverage 97% diff
+coverage, `sanitize` 270/270 (ASan+UBSan clean), wasm32 build + Node
+smoke test clean.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):
@@ -7226,3 +7333,219 @@ see "Known open items"):
 None of this is a substitute for testing against the actual pinned
 toolchain once it exists, but it means the scaffolding isn't untested
 guesswork either.
+
+---
+
+### Issue #58 revisited (PR #122 review): `set_spawn_exception_hook()` keeps the hook non-empty
+
+A PR review comment on `spawn.cppm` pointed out a gap: `loop`'s hook slot
+started genuinely empty until a caller (or `spawn()` itself) touched it,
+so `loop::set_spawn_exception_hook(loop_ref, nullptr)` could leave it
+empty instead of resetting to the default - the invariant should be that
+the hook always points at something, so a reset means "back to the
+default," not "back to nothing." `:loop` itself can't provide this
+directly - it has no way to name `default_spawn_exception_hook` (the
+module DAG forbids `:loop` importing `:spawn`) - so the fix lives at the
+layer that can: `est::set_spawn_exception_hook(loop&, hook)` (new, in
+`:spawn`) is now the preferred entry point, translating a null/empty
+`hook` into installing `default_spawn_exception_hook` explicitly instead
+of forwarding the empty value through. `spawn()` itself also self-heals a
+still-untouched hook to the default the first time it's read, so its
+completion continuation can call `loop.spawn_exception_hook()`
+unconditionally with no empty-vs-installed branch. Added a test asserting
+the invariant directly at the storage level (`loop.spawn_exception_hook()`
+is truthy right after a `nullptr` reset), not just observed indirectly
+through `spawn()`'s own behavior. Replied on the review thread and
+resolved it.
+
+### Issue #58 revisited: dropped `spawn()`'s tracking collection
+
+Pushback on the implementation's complexity (a suggestion to look at
+`intrusive_list` + a new `remove()` method) led to re-examining the
+tracking layer added in the original #58 change
+(`detail::spawned_entry`/`detail::spawn_entry<T>`,
+`loop::track_spawned()`/`untrack_spawned()`/`spawned_count()`). Reading
+`intrusive_list.cppm`'s actual source first: it's deliberately
+singly-linked (only `next`, matching FIFO enqueue/dequeue in O(1)) and
+purely a non-owning linkage structure - removing an arbitrary non-head
+node still needs an O(n) predecessor walk, no better than the tracking
+collection's existing `find_if` over a `std::pmr::vector`. So the
+suggested change wouldn't have simplified anything on its own.
+
+The actual simplification was different: drop the tracking collection
+entirely. `spawn()`'s `then_fast()` continuation already keeps
+`future_state<T>` alive via its own `owner_` reference (`est:future`) -
+exactly like `with_stop()`/`with_timeout()`/`when_all()`/`when_any()`/
+`when_any_succeeds()` already rely on, none of which track anything
+extra. Correctness never depended on the tracking layer either:
+`future<T>::promise_type`'s `suspend_never` initial/final suspend (the
+original #58 investigation's own finding) already means a coroutine runs
+to completion regardless of whether anything observes its returned
+future. The tracking layer's only real, distinct payoff was
+`loop::spawned_count()`, an in-flight-task count nothing in this codebase
+reads except its own tests - not worth ~60 lines of type-erased base
+class, concrete wrapper, and `find_if`-based bookkeeping kept around
+speculatively (`loop::pending_timers_`'s own doc comment already makes
+the same call for timer tracking, for the same reason: "nothing needs to
+walk them... beyond what [the underlying structure] already provides").
+
+Removed: `detail::spawned_entry` (`loop.cppm`), `detail::spawn_entry<T>`
+(`spawn.cppm`), `loop::track_spawned()`/`untrack_spawned()`/
+`spawned_count()`, the `spawned_` member and its unconditional
+`drain_pending()` clear, and `spawn.cppm`'s now-unused
+`:util.current_loop` import (`current_allocator_new_delete` was only used
+by the removed `spawn_entry<T>`). `spawn()`'s future<T> overload is now
+~10 lines: self-heal the hook, then `detail::discard(std::move(task)
+.then_fast(...))`. `spawn_tests.cpp` dropped every `spawned_count()`
+assertion; the teardown test (spawn a never-completed future, tear the
+loop down, confirm no leak) now asserts allocation/deallocation balance
+via a `counting_resource`, the same pattern `future_tests.cpp`/
+`loop_tests.cpp`/`with_timeout_tests.cpp` already use, instead of an
+in-flight count before/after.
+
+Full pipeline re-run clean: `default` build + 328/328 `ctest` passed,
+`clang-format` clean, `ci` build + `clang-tidy` clean (0 warnings from
+this codebase's own files), 95% diff coverage, `sanitize` 271/271
+(ASan+UBSan clean), wasm32 build + Node smoke test clean.
+
+---
+
+### Issue #58 revisited (PR #122 review): `spawn()` resolves `current_loop()`, no explicit `loop&`
+
+Two more review comments on the same PR: `spawn(loop&, ...)`'s explicit
+`loop&` parameter should instead be read from "the tls global variable"
+(`est::current_loop()`, `:util.current_loop` - the same thread_local
+ambient mechanism `make_promise_future()`/`sleep_for()`/`sleep_until()`/
+`yield_execution()`/`est::mutex`/`est::counting_event<Mode>` already
+resolve through when called without an explicit loop); and the exception
+hook's per-call self-heal check (`if (!loop_ref.spawn_exception_hook())`
+inside every `spawn()` call, added in the previous review round) "should
+be a global initialization" instead.
+
+Checked existing call sites before implementing: `examples/spreadsheet/
+main.cpp`'s `run_server()` was already writing `est::spawn(est::current_loop(),
+...)` - fetching the ambient loop by hand just to pass it back in - and
+every other call site (`spawn_tests.cpp`, `examples/sleep_sort`,
+`examples/digit_recall`) already wraps its whole body in
+`est::make_current_loop(loop)` before ever calling `spawn()`. Confirmed
+the parameter was genuinely redundant everywhere it's used today, not
+just in the abstract.
+
+Both comments turned out to describe one coherent change. `spawn()`
+(both overloads) dropped its `loop&` parameter entirely and now resolves
+`current_loop()` internally. Since that's the only thing spawn() reads a
+loop through, "global initialization" of the exception hook became: a
+new `est::make_current_loop_with_spawn(loop&)` (`est/src/spawn.cppm`) -
+a thin wrapper around `est::make_current_loop()` (`:util.current_loop`)
+that also installs the default hook (if nothing has already set a
+different one) before returning the same RAII guard. Registration is now
+the one place this check runs, not every `spawn()` call. Plain
+`est::make_current_loop()` is untouched and still correct for a loop that
+never calls `spawn()` at all - every other `current_loop()`-based entry
+point ignores this hook regardless.
+
+Considered leaving `spawn()` silently trusting a hook that might still be
+empty (a loop registered via plain `make_current_loop()` by mistake,
+without the wrapper) rather than adding anything back to spawn()'s own
+body - rejected: an empty `std::function` call fails as an opaque
+`std::bad_function_call` (or worse, UB under `-fno-exceptions`) exactly
+when a genuine bug is what the hook exists to report, the opposite of
+this feature's own purpose. Added one `est::check()` precondition inside
+`spawn()` instead - checked, not self-healing - naming the fix
+(`est::make_current_loop_with_spawn()`) in its failure message, the same
+"checked precondition, clear message" idiom `current_loop()`/
+`current_allocator()` themselves already use for their own "nothing
+registered" case. `:spawn` gained `import :check;` and
+`import :util.current_loop;` for this - no new cycle, `:util.current_loop`
+already sits below `:spawn` in the DAG (it imports `:loop`, not the
+reverse).
+
+Updated every call site: `spawn_tests.cpp` (all `make_current_loop()` →
+`make_current_loop_with_spawn()`, all `spawn(loop, ...)` → `spawn(...)`),
+plus a new test case asserting `make_current_loop_with_spawn()` preserves
+a hook set before registration rather than clobbering it; `examples/
+spreadsheet/main.cpp`'s `run_server()` lost its now-redundant
+`est::current_loop()` argument entirely; `examples/sleep_sort/main.cpp`,
+`examples/digit_recall/main.cpp` (x2) dropped their `loop,` arguments and
+switched their one registration call to the `_with_spawn` variant.
+`est::check()`'s own failure path (`platform::assert_failure()`,
+`[[noreturn]]`, calls `std::abort()`) isn't unit-testable without
+process-isolation tooling this project doesn't have (`check_tests.cpp`'s
+own doc comment already establishes this) - only the pass-through
+(hook-installed) path is covered, matching that file's own precedent.
+
+One clang-tidy fix on the way here: `bool(loop_ref.spawn_exception_hook())`
+→ `static_cast<bool>(...)` (`modernize-avoid-c-style-cast`).
+
+Full pipeline re-run clean: `default` build + 329/329 `ctest` passed,
+`clang-format` clean, `ci` build + `clang-tidy` clean (0 warnings from
+this codebase's own files), 96% diff coverage, `sanitize` 272/272
+(ASan+UBSan clean), wasm32 build + Node smoke test clean.
+
+---
+
+### Issue #58 revisited (PR #122 review): spawn()'s exception hook moves to a `thread_local` in `:spawn`, decoupled from `loop`
+
+A third review comment on the same PR, on `loop.cppm`'s now-removed
+`spawn_exception_hook_` member: "I think the Hook should be thread local
+global hook in the spawn module, for now it doesn't need to be connected
+to the loop at all."
+
+Correct, and it dissolves both pieces of machinery the previous two
+review rounds had just added. Reporting an unhandled exception from a
+spawned task is a per-thread policy (which `platform::printdbg()` to
+call, which exceptions are routine) - not a property of any one `loop`
+object, and this codebase already has exactly one `thread_local` "current
+loop" per thread/core (`:util.current_loop`'s own `tls_context`) to begin
+with, so tying the hook to a specific `loop` instance bought nothing.
+Moved the hook into `est/src/spawn.cppm` itself as
+`detail::spawn_exception_hook_storage`, `thread_local`, statically
+initialized directly to `default_spawn_exception_hook` - mirroring
+`:util.current_loop`'s own `tls_context` shape (a `namespace est::detail`
+block for the storage, sandwiched between two `export namespace est`
+blocks for the public accessors, same as that file).
+
+Static initialization to a real value from the moment the thread starts
+is strictly stronger than the previous round's "installed once at
+registration time" - there's no registration step at all now, and no
+"not yet installed" state to guard against, so both `est::
+make_current_loop_with_spawn()` (the registration wrapper the *previous*
+round added) and `spawn()`'s own `est::check()` precondition (added for
+the same reason) are gone. `spawn()` itself no longer touches `current_loop()`
+at all either: a `then_fast()` continuation already dispatches through
+whatever loop owns `task`'s own `future_state`, established when `task`
+was created - `spawn()` never actually needed a loop reference for its
+own job, only for the hook it no longer stores there. `loop.cppm` loses
+`exception_hook_type`, `set_spawn_exception_hook()`,
+`spawn_exception_hook()`, and the `spawn_exception_hook_` member entirely
+- it goes back to knowing nothing about spawn() at all, the same "`:loop`
+never names `future<T>`" purity this file's own top comment already
+established for everything else.
+
+One real test-isolation hazard this surfaced: a `thread_local` hook
+persists across `TEST_CASE`s in the same binary, unlike the old
+per-`loop` storage where each test's own fresh `est::loop` gave it a
+clean slate implicitly. A test that installs a custom hook and never
+resets it would otherwise leak into whichever test Catch2 happens to run
+next. Added `hook_reset_guard` (`spawn_tests.cpp`, anonymous namespace) -
+saves `est::spawn_exception_hook()` on construction, restores it on
+destruction - and put one in every `TEST_CASE` that could observe or
+change the hook. Verified with `est_tests '[spawn]' --order rand
+--rng-seed <n>` across several seeds: passes regardless of run order,
+confirming the guard actually does its job rather than happening to pass
+under Catch2's default (file/declaration) order.
+
+One clang-tidy fix: `bugprone-throwing-static-initialization` flagged the
+`thread_local` initializer (`std::function`'s constructor is
+conservatively treated as potentially-throwing in general) -
+`NOLINTNEXTLINE`, since the actual target is a plain, captureless
+function pointer, always within `std::function`'s guaranteed small-object
+buffer, so this specific construction can't allocate and can't throw.
+
+Full pipeline re-run clean: `default` build + 328/328 `ctest` passed (one
+fewer than the previous round - the "make_current_loop_with_spawn()
+preserves a hook set before registration" test no longer applies to
+anything and was removed, not replaced), `clang-format` clean, `ci`
+build + `clang-tidy` clean (0 warnings from this codebase's own files),
+95% diff coverage, `sanitize` 271/271 (ASan+UBSan clean), wasm32 build +
+Node smoke test clean.

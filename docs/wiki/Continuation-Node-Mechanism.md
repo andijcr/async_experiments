@@ -633,13 +633,18 @@ The fix is a two-stage `then_fast()` chain, not a single hook:
 
 ```cpp
 template <class T> void when_all_track(future<T>& input, shared_ptr<when_all_state> state) {
-  input.then_fast([](future<T>&) {}).then_fast([state = std::move(state)](future<void>&) {
+  discard(input.then_fast([](future<T>&) {}).then_fast([state = std::move(state)](future<void>&) {
     if (--state->remaining == 0) {
       state->event.set();
     }
-  });
+  }));
 }
 ```
+
+(`discard()` - `est::detail::discard(future<T>)`, `est/src/future.cppm` -
+acknowledges that this chain's own downstream `future<void>` is a
+deliberate discard: `future<T>` is `[[nodiscard]]`, issue #58, see
+[Coroutines](Coroutines.md#estspawn-explicit-ownership-for-fire-and-forget-dispatch).)
 
 The first stage is a pure no-op, typed on `future<T>&` for the same
 wrapped-mode reason as trap one - its only job is to produce a
@@ -713,11 +718,13 @@ apart from what its second stage does), and the identical
 ```cpp
 template <class T>
 void when_any_track(future<T>& input, shared_ptr<one_shot_event<EventResetMode::manual>> event) {
-  input.then_fast([](future<T>&) {}).then_fast([event = std::move(event)](future<void>&) {
+  discard(input.then_fast([](future<T>&) {}).then_fast([event = std::move(event)](future<void>&) {
     event->set();
-  });
+  }));
 }
 ```
+
+(`discard()`, again - see `when_all_track()`'s own note above.)
 
 The one real difference: `when_all_state` needs a `remaining` counter
 alongside its event, decremented by every input, because *every one* of
@@ -777,28 +784,30 @@ struct when_any_succeeds_state {
 
 template <class T>
 void when_any_succeeds_track(future<T>& input, shared_ptr<when_any_succeeds_state> state) {
-  input
-      .then_fast([](future<T>& in) {
-        if (in.ready_with_failure()) {
-          std::rethrow_exception(in.get_exception());
-        }
-      })
-      .then_fast([state = std::move(state)](future<void>& completed) {
-        if (state->done) {
-          return;
-        }
-        if (completed.ready_with_failure()) {
-          if (--state->remaining == 0) {
-            state->done = true;
-            state->result.set_value(false);
-          }
-        } else {
-          state->done = true;
-          state->result.set_value(true);
-        }
-      });
+  discard(input
+              .then_fast([](future<T>& in) {
+                if (in.ready_with_failure()) {
+                  std::rethrow_exception(in.get_exception());
+                }
+              })
+              .then_fast([state = std::move(state)](future<void>& completed) {
+                if (state->done) {
+                  return;
+                }
+                if (completed.ready_with_failure()) {
+                  if (--state->remaining == 0) {
+                    state->done = true;
+                    state->result.set_value(false);
+                  }
+                } else {
+                  state->done = true;
+                  state->result.set_value(true);
+                }
+              }));
 }
 ```
+
+(`discard()`, again - see `when_all_track()`'s own note above.)
 
 The first stage's callback rethrows `input`'s own stored exception when
 `input` failed. That's not a new mechanism - it's the exact same

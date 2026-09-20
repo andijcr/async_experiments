@@ -45,12 +45,11 @@ auto main() -> int {
 
     constexpr auto unit = 100ms;
     for (const int n : numbers) {
-      // The returned future<void> is deliberately discarded: nothing
-      // needs to observe completion beyond the print itself, and the
-      // chain stays alive on its own - the timer node's own promise (not
-      // this handle) is what keeps the underlying future_state alive
-      // until it fires (see docs/wiki/Allocation-Patterns.md).
-      est::sleep_for(n * unit).then([n] { std::println("{}", n); });
+      // est::spawn() (issue #58): explicit, loop-owned ownership of this
+      // fire-and-forget chain instead of a discarded future<void> handle
+      // relying on the timer node's own promise to keep the chain alive
+      // on its own (docs/wiki/Allocation-Patterns.md).
+      est::spawn(est::sleep_for(n * unit).then([n] { std::println("{}", n); }));
     }
 
     loop.run_until_idle();

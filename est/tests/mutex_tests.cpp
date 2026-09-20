@@ -195,7 +195,11 @@ TEST_CASE("unlock() resumes queued waiters in FIFO order", "[mutex]") {
   };
   // NOLINTEND(cppcoreguidelines-avoid-reference-coroutine-parameters)
 
-  holder(loop, m, std::move(release_future));
+  // (void): future<T> is [[nodiscard]] (issue #58) - this coroutine stays
+  // alive via its own suspension point regardless (future<T>::promise_type's
+  // suspend_never initial/final suspend, future.cppm), so there's nothing
+  // for est::spawn() to add here; the discard is deliberate.
+  (void)holder(loop, m, std::move(release_future));
   loop.run_until_idle(); // holder acquires, then suspends on `release`
 
   // Each waiter is created and run to its own suspension point one at a
