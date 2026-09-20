@@ -92,7 +92,9 @@ inline void default_spawn_exception_hook(const std::exception_ptr& eptr) noexcep
 #ifdef __cpp_exceptions
   try {
     std::rethrow_exception(eptr);
+    // NOLINTNEXTLINE(bugprone-empty-catch)
   } catch (const operation_cancelled&) {
+    // NOLINTNEXTLINE(bugprone-empty-catch)
   } catch (const detail::abandoned_exception&) {
   } catch (const std::exception& e) {
     platform::printdbg("est::spawn(): unhandled exception: {}", e.what());
@@ -134,7 +136,7 @@ inline void default_spawn_exception_hook(const std::exception_ptr& eptr) noexcep
 template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = current_priority()) {
   auto* entry = static_cast<detail::spawn_entry<T>*>(
       loop_ref.track_spawned(std::make_unique<detail::spawn_entry<T>>(std::move(task))));
-  entry->task().then_fast(
+  detail::discard(entry->task().then_fast(
       [&loop_ref, entry](future<T>& f) {
         if (f.ready_with_failure()) {
           const auto& hook = loop_ref.spawn_exception_hook();
@@ -146,7 +148,7 @@ template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = cu
         }
         loop_ref.untrack_spawned(entry);
       },
-      prio);
+      prio));
 }
 
 // Same, for a caller that would rather hand spawn() a callable to invoke

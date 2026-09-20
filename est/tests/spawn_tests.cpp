@@ -46,10 +46,15 @@ public:
   mutable std::optional<std::string> last_diagnostic;
 };
 
-auto suspending_coro(bool& completed) -> est::future<void> {
+// Pointer, not a coroutine reference parameter (cppcoreguidelines-avoid-
+// reference-coroutine-parameters - a reference parameter's own copy into
+// the coroutine frame does nothing to stop it dangling past the
+// referent's lifetime; matching examples/spreadsheet/main.cpp's own
+// run_server() convention).
+auto suspending_coro(bool* completed) -> est::future<void> {
   using namespace std::chrono_literals;
   co_await est::sleep_for(10s);
-  completed = true;
+  *completed = true;
 }
 
 } // namespace
@@ -86,8 +91,13 @@ TEST_CASE("spawn() reports an unhandled exception via the default hook", "[spawn
 
   REQUIRE(loop.spawned_count() == 0);
   REQUIRE(fake.diagnostic_count == 1);
-  REQUIRE(fake.last_diagnostic.has_value());
-  REQUIRE(fake.last_diagnostic->find("boom") != std::string::npos);
+  // .value_or(""), not .value()/->: clang-tidy's bugprone-unchecked-
+  // optional-access doesn't recognize a preceding has_value() check as a
+  // narrowing guard (spsc_ring_tests.cpp's own doc comment has the same
+  // reasoning) - value_or() sidesteps the question by never being UB
+  // regardless of engaged state, and still fails this assertion correctly
+  // if last_diagnostic ended up empty.
+  REQUIRE(fake.last_diagnostic.value_or("").contains("boom"));
 }
 
 TEST_CASE("spawn()'s default hook suppresses operation_cancelled", "[spawn]") {
@@ -143,7 +153,7 @@ TEST_CASE("spawn() lets a caller install a custom exception hook that sees every
   const auto loop_guard = est::make_current_loop(loop);
 
   int hook_calls = 0;
-  loop.set_spawn_exception_hook([&hook_calls](std::exception_ptr) { ++hook_calls; });
+  loop.set_spawn_exception_hook([&hook_calls](const std::exception_ptr&) { ++hook_calls; });
 
   auto [prom, fut] = est::make_promise_future<int>();
   est::spawn(loop, std::move(fut));
@@ -183,7 +193,7 @@ TEST_CASE("spawn() stamps the given Priority on its own completion continuation 
 
   std::vector<est::Priority> order;
   loop.set_spawn_exception_hook(
-      [&order](std::exception_ptr) { order.push_back(est::current_priority()); });
+      [&order](const std::exception_ptr&) { order.push_back(est::current_priority()); });
 
   auto [prom_low, fut_low] = est::make_promise_future<int>();
   auto [prom_high, fut_high] = est::make_promise_future<int>();
@@ -210,7 +220,7 @@ TEST_CASE("spawn() defaults its Priority to current_priority() at the call site"
 
   std::optional<est::Priority> observed;
   loop.set_spawn_exception_hook(
-      [&observed](std::exception_ptr) { observed = est::current_priority(); });
+      [&observed](const std::exception_ptr&) { observed = est::current_priority(); });
 
   auto [prom, fut] = est::make_promise_future<int>();
   {
@@ -231,7 +241,7 @@ TEST_CASE("spawn() lets an unobserved coroutine run to completion via an explici
   const auto loop_guard = est::make_current_loop(loop);
   bool completed = false;
 
-  est::spawn(loop, [&completed] { return suspending_coro(completed); });
+  est::spawn(loop, [&completed] { return suspending_coro(&completed); });
   REQUIRE(loop.spawned_count() == 1);
   REQUIRE_FALSE(completed);
 

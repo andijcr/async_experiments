@@ -57,7 +57,7 @@ template <class T>
   auto [prom, fut] = make_promise_future<T>();
   auto state = shared_ptr<detail::with_stop_state<T>>::make(current_allocator(), std::move(prom));
 
-  std::move(operation).then_fast([state](future<T>& op) {
+  detail::discard(std::move(operation).then_fast([state](future<T>& op) {
     if (state->done) {
       return;
     }
@@ -85,14 +85,14 @@ template <class T>
       // being pursued).
       state->result.set_value(std::move(op).get());
     }
-  });
-  token.stopped().then_fast([state](future<void>&) {
+  }));
+  detail::discard(token.stopped().then_fast([state](future<void>&) {
     if (state->done) {
       return;
     }
     state->done = true;
     state->result.set_exception(std::make_exception_ptr(operation_cancelled()));
-  });
+  }));
   return std::move(fut);
 }
 
@@ -213,14 +213,14 @@ export namespace est {
   state->id = loop_ref.schedule_timer(*timer_node_guard, deadline);
   timer_node_guard.release();
 
-  token.stopped().then_fast([state](future<void>&) {
+  detail::discard(token.stopped().then_fast([state](future<void>&) {
     if (state->done) {
       return;
     }
     state->done = true;
     [[maybe_unused]] const bool cancelled = current_loop().cancel_timer(state->id);
     state->result.set_exception(std::make_exception_ptr(operation_cancelled()));
-  });
+  }));
   return std::move(fut);
 }
 

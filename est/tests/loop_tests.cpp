@@ -452,7 +452,7 @@ TEST_CASE("then()/then_fast() default to inheriting current_priority() at the ca
     // then_fast() runs inline, right here, so the callback observes
     // current_priority() still raised - proving the default argument
     // resolved to priority::high at this call site, not priority::normal.
-    future.then_fast(
+    (void)future.then_fast(
         [&](est::future<int>&) { REQUIRE(est::current_priority() == est::Priority::high); });
   }
   REQUIRE(est::current_priority() == est::Priority::normal);

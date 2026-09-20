@@ -1019,7 +1019,26 @@ export namespace est {
 // future_state if something else - a still-live est::promise, or a
 // continuation node already handed off to est::loop's ready-queue (see
 // continuation_node<T>::bind_owner()) - still references it.
-template <class T> class future {
+//
+// [[nodiscard]] on the class itself, not on individual functions that
+// return one (issue #58): the whole point is to catch a *user's own*
+// coroutine call being discarded, not just framework-authored entry
+// points like make_ready_future() - a per-function attribute can only
+// ever cover functions this module itself declares. This makes
+// est::spawn() (est:spawn) the one sanctioned way to dispatch a
+// fire-and-forget future<T>/coroutine and have that discard be
+// legitimate; assigning to a variable or chaining further also count as
+// "used," same as any other [[nodiscard]] type. A handful of genuinely
+// deliberate internal discards (a combinator's own bookkeeping
+// continuation whose downstream future<T> nothing will ever read) route
+// through est::detail::discard() (below) instead of a bare `;` - not a
+// public escape hatch (not exported), so external code past this
+// module's own boundary has exactly two ways out: est::spawn(), or an
+// explicit (void) cast acknowledging the discard is deliberate.
+template <class T>
+class [[nodiscard("fire-and-forget dispatch must go through est::spawn(); assign to a variable, "
+                  "chain further, or (void)-cast if this discard is genuinely intentional")]]
+future {
 public:
   explicit future(shared_ptr<future_state<T>> state) noexcept : state_(std::move(state)) {}
   future(const future&) = delete;
@@ -1280,6 +1299,20 @@ private:
 } // namespace est
 
 namespace est::detail {
+
+// The internal escape hatch for future<T>'s own [[nodiscard]] (above,
+// issue #58), for a genuinely deliberate discard inside this module's own
+// combinators - a bookkeeping continuation's own downstream future<T>/
+// future<void> that nothing will ever read (est:with_stop, est:with_timeout,
+// est:when_all, est:when_any, est:when_any_succeeds, est:spawn). Not
+// exported: unlike a plain (void) cast (always available, everywhere),
+// this spelling only exists for code inside the est module itself, so it
+// can't double as a second, quieter way for external code to bypass
+// est::spawn() - the point of making future<T> nodiscard in the first
+// place. Takes `future<T>` by value and does nothing with it - the value
+// itself was never the point, only converting the discard from "unused
+// expression result" into "used as a function argument."
+template <class T> void discard(future<T> /*unused*/) noexcept {}
 
 // A plain resumption trampoline for a coroutine awaiting an est::future<T>,
 // used only on the genuinely-not-ready path (future_awaiter<T>::

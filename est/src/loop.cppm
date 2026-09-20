@@ -428,7 +428,7 @@ public:
   // operation_cancelled isn't something this file can name either. An
   // empty std::function (the default) means "no override installed" -
   // est::spawn() falls back to its own built-in default in that case.
-  using exception_hook_type = std::function<void(std::exception_ptr)>;
+  using exception_hook_type = std::function<void(const std::exception_ptr&)>;
 
   void set_spawn_exception_hook(exception_hook_type hook) noexcept {
     spawn_exception_hook_ = std::move(hook);
