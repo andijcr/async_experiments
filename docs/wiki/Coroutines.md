@@ -892,35 +892,35 @@ template <class Fn> void spawn(loop& loop_ref, Fn&& fn, Priority prio = current_
 ```
 
 `spawn()` (`est/src/spawn.cppm`, issue #58) registers a `then_fast()`
-continuation on `task` that reports an unhandled exception and then
-reclaims its own tracking entry - the same `Priority prio =
-current_priority()` trailing, inheriting default `then()`/`then_fast()`
-themselves use (issue #31/#106), stamped on that same continuation. The
-callable overload just invokes `fn()` (eagerly, at the call site, not
-deferred) and forwards the resulting `future<T>` to the first overload -
-sugar for `spawn(loop, some_coroutine(args...))` when writing
-`spawn(loop, [&] { return some_coroutine(args...); })` reads better at a
-given call site.
+continuation on `task` that reports an unhandled exception - the same
+`Priority prio = current_priority()` trailing, inheriting default
+`then()`/`then_fast()` themselves use (issue #31/#106), stamped on that
+same continuation. The callable overload just invokes `fn()` (eagerly, at
+the call site, not deferred) and forwards the resulting `future<T>` to the
+first overload - sugar for `spawn(loop, some_coroutine(args...))` when
+writing `spawn(loop, [&] { return some_coroutine(args...); })` reads
+better at a given call site.
 
-**Explicit, loop-owned ownership, not just the implicit continuation-node
-invariant.** `est::loop` gets a small, generic tracking primitive
-mirroring `loop::pending_timers_`'s own already-proven shape ([Loop and
-Timers](Loop-And-Timers.md)): `detail::spawned_entry` is a type-erased
-base (:loop still never names `future<T>` - `est/src/spawn.cppm` defines
-the one concrete `detail::spawn_entry<T>` that actually holds one),
-tracked in a `loop`-owned `std::pmr::vector<std::unique_ptr<
-detail::spawned_entry>>` via `loop::track_spawned()`/`untrack_spawned()`,
-queryable via `loop::spawned_count()`. This is deliberately *not* built on
-issue #103's proposed central, id-keyed waiter registry - #103 is still a
-design pass with no implementation and no decision among its own four
-candidate shapes, and `spawn()`'s actual need is narrower than what it
-solves: a *new* collection of in-flight tasks, each removed by its own
-completion continuation, with none of #103's harder cases (external
-cancellation, aliasing, generational safety). `loop::drain_pending()`
-unconditionally clears this collection too, since an abandoned (never
-`run()`) completion continuation never reaches `untrack_spawned()` on its
-own (`concrete_continuation<Fn, U>::abandon()` doesn't call `fn_` at all -
-[Continuation Node Mechanism](Continuation-Node-Mechanism.md)).
+**Pure sugar over `then_fast()`, no separate tracking collection.**
+`spawn()` registers exactly one continuation and relies on the same
+implicit keep-alive every other combinator here already depends on: the
+continuation node's own `owner_` reference (`est:future`) keeps
+`future_state<T>` alive until it completes, exactly like
+`with_stop()`/`with_timeout()`/`when_all()`/`when_any()`/
+`when_any_succeeds()` - none of which track anything extra either. An
+earlier version of `spawn()` added a `loop`-owned tracking collection
+mirroring `loop::pending_timers_`'s own shape ([Loop and
+Timers](Loop-And-Timers.md)), on the theory that fire-and-forget dispatch
+deserved an "explicit, loop-owned reason to stay alive" distinct from that
+implicit one. That turned out not to be a real distinction - correctness
+never depended on it, since `promise_type`'s `suspend_never` initial/final
+suspend (above) already means a coroutine runs regardless, and the
+continuation's own `owner_` reference already keeps a non-coroutine
+`future<T>` alive. The tracking collection's only real payoff was an
+in-flight-task count nothing in this codebase reads except tests, so it
+was removed rather than kept for a hypothetical future consumer -
+revisit if issue #103's own central waiter registry ever lands and wants
+`spawn()` as a real consumer of it.
 
 **The exception hook.** `spawn()`'s default behavior - unless a caller
 installs their own via `loop::set_spawn_exception_hook()` - prints a

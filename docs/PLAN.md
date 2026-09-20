@@ -7333,3 +7333,77 @@ see "Known open items"):
 None of this is a substitute for testing against the actual pinned
 toolchain once it exists, but it means the scaffolding isn't untested
 guesswork either.
+
+---
+
+### Issue #58 revisited (PR #122 review): `set_spawn_exception_hook()` keeps the hook non-empty
+
+A PR review comment on `spawn.cppm` pointed out a gap: `loop`'s hook slot
+started genuinely empty until a caller (or `spawn()` itself) touched it,
+so `loop::set_spawn_exception_hook(loop_ref, nullptr)` could leave it
+empty instead of resetting to the default - the invariant should be that
+the hook always points at something, so a reset means "back to the
+default," not "back to nothing." `:loop` itself can't provide this
+directly - it has no way to name `default_spawn_exception_hook` (the
+module DAG forbids `:loop` importing `:spawn`) - so the fix lives at the
+layer that can: `est::set_spawn_exception_hook(loop&, hook)` (new, in
+`:spawn`) is now the preferred entry point, translating a null/empty
+`hook` into installing `default_spawn_exception_hook` explicitly instead
+of forwarding the empty value through. `spawn()` itself also self-heals a
+still-untouched hook to the default the first time it's read, so its
+completion continuation can call `loop.spawn_exception_hook()`
+unconditionally with no empty-vs-installed branch. Added a test asserting
+the invariant directly at the storage level (`loop.spawn_exception_hook()`
+is truthy right after a `nullptr` reset), not just observed indirectly
+through `spawn()`'s own behavior. Replied on the review thread and
+resolved it.
+
+### Issue #58 revisited: dropped `spawn()`'s tracking collection
+
+Pushback on the implementation's complexity (a suggestion to look at
+`intrusive_list` + a new `remove()` method) led to re-examining the
+tracking layer added in the original #58 change
+(`detail::spawned_entry`/`detail::spawn_entry<T>`,
+`loop::track_spawned()`/`untrack_spawned()`/`spawned_count()`). Reading
+`intrusive_list.cppm`'s actual source first: it's deliberately
+singly-linked (only `next`, matching FIFO enqueue/dequeue in O(1)) and
+purely a non-owning linkage structure - removing an arbitrary non-head
+node still needs an O(n) predecessor walk, no better than the tracking
+collection's existing `find_if` over a `std::pmr::vector`. So the
+suggested change wouldn't have simplified anything on its own.
+
+The actual simplification was different: drop the tracking collection
+entirely. `spawn()`'s `then_fast()` continuation already keeps
+`future_state<T>` alive via its own `owner_` reference (`est:future`) -
+exactly like `with_stop()`/`with_timeout()`/`when_all()`/`when_any()`/
+`when_any_succeeds()` already rely on, none of which track anything
+extra. Correctness never depended on the tracking layer either:
+`future<T>::promise_type`'s `suspend_never` initial/final suspend (the
+original #58 investigation's own finding) already means a coroutine runs
+to completion regardless of whether anything observes its returned
+future. The tracking layer's only real, distinct payoff was
+`loop::spawned_count()`, an in-flight-task count nothing in this codebase
+reads except its own tests - not worth ~60 lines of type-erased base
+class, concrete wrapper, and `find_if`-based bookkeeping kept around
+speculatively (`loop::pending_timers_`'s own doc comment already makes
+the same call for timer tracking, for the same reason: "nothing needs to
+walk them... beyond what [the underlying structure] already provides").
+
+Removed: `detail::spawned_entry` (`loop.cppm`), `detail::spawn_entry<T>`
+(`spawn.cppm`), `loop::track_spawned()`/`untrack_spawned()`/
+`spawned_count()`, the `spawned_` member and its unconditional
+`drain_pending()` clear, and `spawn.cppm`'s now-unused
+`:util.current_loop` import (`current_allocator_new_delete` was only used
+by the removed `spawn_entry<T>`). `spawn()`'s future<T> overload is now
+~10 lines: self-heal the hook, then `detail::discard(std::move(task)
+.then_fast(...))`. `spawn_tests.cpp` dropped every `spawned_count()`
+assertion; the teardown test (spawn a never-completed future, tear the
+loop down, confirm no leak) now asserts allocation/deallocation balance
+via a `counting_resource`, the same pattern `future_tests.cpp`/
+`loop_tests.cpp`/`with_timeout_tests.cpp` already use, instead of an
+in-flight count before/after.
+
+Full pipeline re-run clean: `default` build + 328/328 `ctest` passed,
+`clang-format` clean, `ci` build + `clang-tidy` clean (0 warnings from
+this codebase's own files), 95% diff coverage, `sanitize` 271/271
+(ASan+UBSan clean), wasm32 build + Node smoke test clean.

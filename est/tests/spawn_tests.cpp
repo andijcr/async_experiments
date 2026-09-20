@@ -46,6 +46,31 @@ public:
   mutable std::optional<std::string> last_diagnostic;
 };
 
+// Same helper as future_tests.cpp/loop_tests.cpp/with_timeout_tests.cpp -
+// counts allocate()/deallocate() calls so a test can assert every
+// allocation was balanced after loop teardown.
+class counting_resource : public std::pmr::memory_resource {
+public:
+  int allocations = 0;
+  int deallocations = 0;
+
+private:
+  auto do_allocate(std::size_t bytes, std::size_t alignment) -> void* override {
+    ++allocations;
+    return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+  }
+
+  void do_deallocate(void* ptr, std::size_t bytes, std::size_t alignment) override {
+    ++deallocations;
+    std::pmr::new_delete_resource()->deallocate(ptr, bytes, alignment);
+  }
+
+  [[nodiscard]] auto do_is_equal(const std::pmr::memory_resource& other) const noexcept
+      -> bool override {
+    return this == &other;
+  }
+};
+
 // Pointer, not a coroutine reference parameter (cppcoreguidelines-avoid-
 // reference-coroutine-parameters - a reference parameter's own copy into
 // the coroutine frame does nothing to stop it dangling past the
@@ -59,9 +84,7 @@ auto suspending_coro(bool* completed) -> est::future<void> {
 
 } // namespace
 
-TEST_CASE("spawn() dispatches a future<T> that completes successfully and reclaims its tracking "
-          "entry",
-          "[spawn]") {
+TEST_CASE("spawn() dispatches a future<T> that completes successfully", "[spawn]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
   est::loop loop;
@@ -69,12 +92,9 @@ TEST_CASE("spawn() dispatches a future<T> that completes successfully and reclai
   auto [prom, fut] = est::make_promise_future<int>();
 
   est::spawn(loop, std::move(fut));
-  REQUIRE(loop.spawned_count() == 1);
-
   prom.set_value(42);
   loop.run_until_idle();
 
-  REQUIRE(loop.spawned_count() == 0);
   REQUIRE(fake.diagnostic_count == 0); // success - no diagnostic
 }
 
@@ -89,7 +109,6 @@ TEST_CASE("spawn() reports an unhandled exception via the default hook", "[spawn
   prom.set_exception(std::make_exception_ptr(std::runtime_error("boom")));
   loop.run_until_idle();
 
-  REQUIRE(loop.spawned_count() == 0);
   REQUIRE(fake.diagnostic_count == 1);
   // .value_or(""), not .value()/->: clang-tidy's bugprone-unchecked-
   // optional-access doesn't recognize a preceding has_value() check as a
@@ -111,7 +130,6 @@ TEST_CASE("spawn()'s default hook suppresses operation_cancelled", "[spawn]") {
   prom.set_exception(std::make_exception_ptr(est::operation_cancelled()));
   loop.run_until_idle();
 
-  REQUIRE(loop.spawned_count() == 0);
   REQUIRE(fake.diagnostic_count == 0);
 }
 
@@ -140,7 +158,6 @@ TEST_CASE("spawn()'s default hook suppresses an already-abandoned future's excep
   // needed.
   est::spawn(loop, std::move(timed));
 
-  REQUIRE(loop.spawned_count() == 0);
   REQUIRE(fake.diagnostic_count == 0);
 }
 
@@ -207,7 +224,6 @@ TEST_CASE("spawn() accepts a callable, invoking it synchronously at the call sit
 
   REQUIRE(invoked); // called eagerly, not deferred to a later drain
   loop.run_until_idle();
-  REQUIRE(loop.spawned_count() == 0);
 }
 
 TEST_CASE("spawn() stamps the given Priority on its own completion continuation (issue #31/#106)",
@@ -259,8 +275,7 @@ TEST_CASE("spawn() defaults its Priority to current_priority() at the call site"
   REQUIRE(observed == est::Priority::high);
 }
 
-TEST_CASE("spawn() lets an unobserved coroutine run to completion via an explicit tracking entry",
-          "[spawn][coroutine]") {
+TEST_CASE("spawn() lets an unobserved coroutine run to completion", "[spawn][coroutine]") {
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
   est::loop loop;
@@ -268,32 +283,32 @@ TEST_CASE("spawn() lets an unobserved coroutine run to completion via an explici
   bool completed = false;
 
   est::spawn(loop, [&completed] { return suspending_coro(&completed); });
-  REQUIRE(loop.spawned_count() == 1);
   REQUIRE_FALSE(completed);
 
   loop.run_until_idle(); // advances the fake clock to the sleep's deadline
   REQUIRE(completed);
-  REQUIRE(loop.spawned_count() == 0);
 }
 
-TEST_CASE("spawn()'s tracking entry is reclaimed on loop teardown even if the task never "
-          "completes",
+TEST_CASE("spawn()'s completion continuation is reclaimed on loop teardown even if the task "
+          "never completes",
           "[spawn]") {
   using namespace std::chrono_literals;
   recording_platform fake;
   const auto platform_guard = est::platform::override_instance(fake);
+  counting_resource resource;
   {
-    est::loop loop;
+    est::loop loop{&resource};
     const auto loop_guard = est::make_current_loop(loop);
     auto [prom, fut] = est::make_promise_future<int>();
 
     est::spawn(loop, std::move(fut));
-    REQUIRE(loop.spawned_count() == 1);
     // Never completed - loop teardown below (make_current_loop()'s own
-    // guard calls drain_pending()) must still reclaim the tracking entry.
+    // guard calls drain_pending()) must still free the then_fast()
+    // continuation spawn() registered, via the same abandon()-then-
+    // destroy path every other still-pending continuation in this
+    // codebase already goes through - spawn() adds no tracking of its
+    // own that could leak independently of that.
   }
-  // No crash, no leaked spawn_entry<T> - loop::drain_pending()'s own
-  // unconditional spawned_.clear() (est:loop) is what guarantees this even
-  // though the completion continuation itself was abandoned rather than
-  // run, and so never reached untrack_spawned() on its own.
+  REQUIRE(resource.allocations > 0);
+  REQUIRE(resource.allocations == resource.deallocations);
 }

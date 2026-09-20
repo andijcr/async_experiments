@@ -185,30 +185,6 @@ public:
   virtual void abandon() noexcept {}
 };
 
-// The type-erased base for est::spawn()'s (est:spawn) own tracked-task
-// entries, in loop::spawned_ below - exactly like ready_node/timer_node
-// above, :loop itself never names est::future<T> (this file's own top
-// comment), so the only thing loop needs to know about a spawned task is
-// that something owns it and it can be destroyed through this base's
-// virtual destructor; est:spawn defines the one concrete derived type
-// that actually holds a future<T>. No run()/fire() to override here -
-// unlike ready_node/timer_node, loop never invokes anything on a
-// spawned_entry directly, it's purely a keep-alive: tracked so a spawned
-// task has an explicit, loop-owned reason to stay alive independent of
-// whatever else might (or might not) reference it, and so loop can
-// report how many are currently in flight (loop::spawned_count() below) -
-// see est::spawn()'s own doc comment (est:spawn) for the full reasoning
-// (issue #58).
-class spawned_entry {
-public:
-  spawned_entry() = default;
-  spawned_entry(const spawned_entry&) = delete;
-  auto operator=(const spawned_entry&) -> spawned_entry& = delete;
-  spawned_entry(spawned_entry&&) = delete;
-  auto operator=(spawned_entry&&) -> spawned_entry& = delete;
-  virtual ~spawned_entry() = default;
-};
-
 // The "this node never ran/fired - complete it however abandon() does
 // that, then free it" pattern every drain-without-running call site
 // needs: loop::drain_pending() (below, for both containers it drains),
@@ -332,7 +308,7 @@ public:
 
   explicit loop(allocator_type allocator = {}, scheduler_type scheduler = eager_scheduler)
       : allocator_(allocator), scheduler_(std::move(scheduler)), timers_(allocator),
-        pending_timers_(allocator), spawned_(allocator) {}
+        pending_timers_(allocator) {}
   loop(const loop&) = delete;
   auto operator=(const loop&) -> loop& = delete;
   loop(loop&&) = delete;
@@ -449,41 +425,6 @@ public:
     return spawn_exception_hook_;
   }
 
-  // Takes ownership of a spawn()-tracked task (est:spawn), giving its
-  // future_state<T> an explicit, loop-owned reason to stay alive - see
-  // detail::spawned_entry's own doc comment above. Returns the raw
-  // pointer so the caller can hand it back to untrack_spawned() below once
-  // the task's own completion continuation observes it finishing - stable
-  // across any later track_spawned() call reallocating spawned_'s own
-  // backing storage, since what moves on a vector reallocation is the
-  // unique_ptr, never the heap object it owns.
-  auto track_spawned(std::unique_ptr<detail::spawned_entry> entry) -> detail::spawned_entry* {
-    spawned_.push_back(std::move(entry));
-    return spawned_.back().get();
-  }
-
-  // Removes and destroys a still-tracked entry from track_spawned() above.
-  // Safe to call from inside the very completion continuation that
-  // observed the task finishing, even though this frees the entry
-  // (dropping its own future<T>, one of that future_state's several live
-  // references while this call executes): that continuation's own node
-  // (est:future's concrete_continuation<Fn, U>) is a separate heap
-  // allocation, freed by loop::run_one() only after run() itself returns -
-  // destroying the entry here can't free anything still on this call
-  // stack.
-  void untrack_spawned(detail::spawned_entry* entry) noexcept {
-    const auto it =
-        std::ranges::find_if(spawned_, [entry](const auto& owned) { return owned.get() == entry; });
-    check(it != spawned_.end(), "loop: untrack_spawned() entry not tracked");
-    spawned_.erase(it);
-  }
-
-  // How many est::spawn()-dispatched tasks (est:spawn) are currently
-  // tracked/in flight - mainly for tests to assert "everything spawned
-  // during this run actually completed and was reclaimed," not a value
-  // loop itself makes any scheduling decision from.
-  [[nodiscard]] auto spawned_count() const noexcept -> std::size_t { return spawned_.size(); }
-
   // Runs until both the ready-queue and the timer queue are empty - for
   // tests/examples that shouldn't block forever.
   void run_until_idle() { run_impl(); }
@@ -561,19 +502,6 @@ public:
     for (auto& level : ready_) {
       level.drain(detail::abandon_ready_node);
     }
-    // spawned_ itself needs no abandon() pass of its own: every entry's
-    // underlying future_state<T> is completed (or abandoned) through
-    // whatever already-drained mechanism it was actually suspended on
-    // above (a resume node in pending_timers_/ready_, or some other
-    // object's own waiters_ list drained by its own destructor) -
-    // spawned_'s only job is holding a future<T> handle alive alongside
-    // that, so once everything above has run its course there's nothing
-    // left to do here but release those handles. A spawn()-registered
-    // completion continuation that got abandoned rather than run above
-    // never reaches untrack_spawned() itself (concrete_continuation<Fn,
-    // U>::abandon(), est:future, doesn't call fn_ at all on that path) -
-    // this unconditional clear() is what reclaims that entry instead.
-    spawned_.clear();
   }
 
 private:
@@ -694,7 +622,6 @@ private:
   ready_queues ready_;
   timer_queue<allocator_type> timers_;
   std::pmr::vector<pending_entry> pending_timers_;
-  std::pmr::vector<std::unique_ptr<detail::spawned_entry>> spawned_;
   exception_hook_type spawn_exception_hook_;
   bool stop_requested_ = false;
   bool running_ = false;

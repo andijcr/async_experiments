@@ -5,7 +5,6 @@ import :future;
 import :loop;
 import :platform;
 import :sync.stop_token;
-import :util.current_loop;
 
 // Issue #58: dispatching a coroutine without awaiting it (fire-and-forget,
 // letting a later .then() continuation observe the result) used to mean
@@ -25,51 +24,27 @@ import :util.current_loop;
 // also discarded, so a genuine bug (a bad_alloc, a logic error) produced
 // total silence instead of a diagnostic.
 //
-// Not built on issue #103's central, id-keyed waiter registry - that issue
-// is still a design pass with no implementation and no decision yet among
-// its own four candidate shapes, not something to block this on. What
-// spawn() needs is narrower than what #103 is solving anyway: #103 is
-// about retrofitting eager, external cancellation into *existing*, shared
-// waiter lists (mutex, counting_event, future_state<T>'s own waiters_).
-// spawn() just needs a *new*, loop-owned collection of in-flight tasks,
-// each removed by its own completion continuation - no external
-// cancellation, no aliasing hazard, none of #103's harder cases
-// (generational safety, pointer tagging). That's the exact shape
-// loop::pending_timers_ already uses (#103's own "option A": a synthetic
-// registry + linear scan on removal) - detail::spawned_entry/
-// loop::track_spawned()/untrack_spawned() (est:loop) mirror it directly,
-// scoped to spawn() alone rather than generalized to every waiter list.
-// Worth reconciling with #103's registry later if that ever lands; not
-// worth waiting for it now.
-
-namespace est::detail {
-
-// The concrete counterpart to detail::spawned_entry (est:loop): :loop
-// itself never names future<T> (that file's own top comment), so the
-// type-erased base lives there and this - the only thing that actually
-// needs to know T - lives here instead. Purely a keep-alive: holding
-// future_ here is what gives the spawned task's future_state<T> an
-// explicit, loop-owned reason to stay alive, independent of whatever else
-// might (or might not) reference it - see est::spawn()'s own doc comment
-// below for the full reasoning. current_allocator_new_delete<spawn_entry<T>>
-// (est:util.current_loop), not a bare `new`: the same allocator-aware
-// operator new/delete every other node type tracked via a unique_ptr in an
-// est::loop-owned collection already uses (est:loop's own ready_node/
-// timer_node doc comment has the full reasoning for why that mixin exists
-// instead of living on the type-erased base itself).
-template <class T>
-class spawn_entry final : public spawned_entry,
-                          public current_allocator_new_delete<spawn_entry<T>> {
-public:
-  explicit spawn_entry(future<T> task) noexcept : future_(std::move(task)) {}
-
-  [[nodiscard]] auto task() noexcept -> future<T>& { return future_; }
-
-private:
-  future<T> future_;
-};
-
-} // namespace est::detail
+// spawn() is deliberately just sugar over then_fast() - no separate
+// loop-owned tracking collection. An earlier version of this file did add
+// one (detail::spawned_entry/loop::track_spawned()/untrack_spawned(),
+// mirroring loop::pending_timers_'s own shape), on the theory that
+// fire-and-forget dispatch deserved an "explicit, loop-owned reason to
+// stay alive" distinct from the implicit one every other combinator here
+// already relies on. That turned out not to be a real distinction: the
+// then_fast() continuation registered below already keeps future_state<T>
+// alive via its own owner_ reference, exactly like with_stop()/
+// with_timeout()/when_all()/when_any()/when_any_succeeds() already do -
+// none of them track anything extra either, and the coroutine's own
+// suspend_never initial/final suspend (above) means correctness never
+// depended on the tracking layer in the first place. Its only real
+// payoff was loop::spawned_count(), a "how many spawned tasks are
+// currently in flight" diagnostic nothing in this codebase reads except
+// tests - not worth ~60 lines of type-erased base class, concrete
+// wrapper, and find_if-based bookkeeping to keep around speculatively
+// (CLAUDE.md's own "don't design for hypothetical future requirements").
+// Revisit if issue #103's own central waiter registry ever lands and
+// wants spawn() as a real consumer of it, rather than reintroducing this
+// same tracking shape ad hoc.
 
 export namespace est {
 
@@ -126,48 +101,38 @@ inline void set_spawn_exception_hook(loop& loop_ref, loop::exception_hook_type h
                                          : loop::exception_hook_type(default_spawn_exception_hook));
 }
 
-// Dispatches `task` as an explicitly loop-owned fire-and-forget operation
-// (issue #58): registers a then_fast() continuation that observes the
-// result, reports an unhandled exception through loop's own installed
-// hook, and reclaims the tracking entry loop::track_spawned() (est:loop)
-// created for it - giving `task`'s future_state<T> an explicit,
-// unambiguous reason to stay alive until it completes rather than the
-// previous, implicit "stays alive because a continuation happens to
-// reference it" convention every call site had to explain on its own.
-// `prio` matches then()/then_fast()'s own trailing, inheriting Priority
-// parameter (issue #31/#106) - stamped on this same completion
-// continuation, the one node this task's own dispatch actually owns.
+// Dispatches `task` as a fire-and-forget operation (issue #58): registers
+// a then_fast() continuation that reports an unhandled exception through
+// loop's own installed hook. `prio` matches then()/then_fast()'s own
+// trailing, inheriting Priority parameter (issue #31/#106) - stamped on
+// this same completion continuation, the one node this task's own
+// dispatch actually owns.
+//
+// Pure sugar over std::move(task).then_fast(...) - no separate tracking
+// of `task` beyond the continuation this registers on it (this file's own
+// top comment explains why that's not needed): the continuation node's
+// own owner_ reference (est:future) is what keeps future_state<T> alive
+// until it completes, exactly like every other combinator in this
+// codebase (with_stop(), with_timeout(), when_all(), when_any(),
+// when_any_succeeds()) already relies on for the futures they register
+// continuations on.
 //
 // Self-heals loop's hook to the default before ever reading it, if
 // nothing has installed one yet (a loop nobody has called
 // set_spawn_exception_hook() on at all) - together with
 // set_spawn_exception_hook() above always installing a real value instead
-// of forwarding an empty one through, this keeps the completion
-// continuation below able to call the hook unconditionally, no
-// empty-vs-installed branch needed at the one place that actually reads
-// it every time a spawned task completes.
-//
-// entry->task().then_fast(...), not std::move(task).then_fast(...)
-// directly: the continuation has to be registered on the *same* future<T>
-// handle spawn_entry<T> goes on to store (loop::track_spawned() below
-// takes ownership of `task` first), not a second, independent one - a
-// non-scalar T's future<T> can't be clone()d (future<T>::clone(), est:
-// future), so there is only ever one handle to register on. Calling
-// then_fast() on that stored handle as an lvalue (its & overload,
-// future.cppm) registers the continuation without consuming the handle,
-// leaving spawn_entry<T> holding it for as long as the task is tracked.
+// of forwarding an empty one through, this lets the completion
+// continuation below call the hook unconditionally, no empty-vs-installed
+// branch needed at the one place that actually reads it.
 template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = current_priority()) {
   if (!loop_ref.spawn_exception_hook()) {
     set_spawn_exception_hook(loop_ref, nullptr);
   }
-  auto* entry = static_cast<detail::spawn_entry<T>*>(
-      loop_ref.track_spawned(std::make_unique<detail::spawn_entry<T>>(std::move(task))));
-  detail::discard(entry->task().then_fast(
-      [&loop_ref, entry](future<T>& f) {
+  detail::discard(std::move(task).then_fast(
+      [&loop_ref](future<T>& f) {
         if (f.ready_with_failure()) {
           loop_ref.spawn_exception_hook()(f.get_exception());
         }
-        loop_ref.untrack_spawned(entry);
       },
       prio));
 }
