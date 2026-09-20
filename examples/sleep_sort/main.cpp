@@ -40,7 +40,7 @@ auto main() -> int {
     std::println("input: {}", numbers);
 
     est::loop loop;
-    const auto loop_guard = est::make_current_loop(loop);
+    const auto loop_guard = est::make_current_loop_with_spawn(loop);
     using namespace std::chrono_literals;
 
     constexpr auto unit = 100ms;
@@ -49,7 +49,7 @@ auto main() -> int {
       // fire-and-forget chain instead of a discarded future<void> handle
       // relying on the timer node's own promise to keep the chain alive
       // on its own (docs/wiki/Allocation-Patterns.md).
-      est::spawn(loop, est::sleep_for(n * unit).then([n] { std::println("{}", n); }));
+      est::spawn(est::sleep_for(n * unit).then([n] { std::println("{}", n); }));
     }
 
     loop.run_until_idle();

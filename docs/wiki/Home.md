@@ -124,4 +124,4 @@ constructs one, and `platform::override_instance()`s it
 | `est::stop_source`, `est::stop_token`, `est::operation_cancelled` | `est/src/sync/stop_token.cppm` |
 | `est::with_stop<T>()`, token-aware `sleep_for()`/`sleep_until()` overloads | `est/src/with_stop.cppm` |
 | `est::with_timeout<T>()`, `est::operation_timed_out` | `est/src/with_timeout.cppm` |
-| `est::spawn()`, `default_spawn_exception_hook()`, `est::set_spawn_exception_hook()` | `est/src/spawn.cppm` |
+| `est::spawn()` (`current_loop()`-based, no `loop&` parameter), `default_spawn_exception_hook()`, `est::set_spawn_exception_hook()`, `est::make_current_loop_with_spawn()` | `est/src/spawn.cppm` |

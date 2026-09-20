@@ -1,10 +1,12 @@
 export module est:spawn;
 
 import std;
+import :check;
 import :future;
 import :loop;
 import :platform;
 import :sync.stop_token;
+import :util.current_loop;
 
 // Issue #58: dispatching a coroutine without awaiting it (fire-and-forget,
 // letting a later .then() continuation observe the result) used to mean
@@ -45,6 +47,17 @@ import :sync.stop_token;
 // Revisit if issue #103's own central waiter registry ever lands and
 // wants spawn() as a real consumer of it, rather than reintroducing this
 // same tracking shape ad hoc.
+//
+// spawn() also no longer takes an explicit loop& (PR #122 review): it
+// resolves est::current_loop() (:util.current_loop) instead, the same
+// ambient mechanism make_promise_future()/sleep_for()/sleep_until()/
+// yield_execution()/est::mutex/est::counting_event<Mode> already resolve
+// through. A caller registers a loop once via
+// est::make_current_loop_with_spawn() (below) - a thin wrapper around
+// est::make_current_loop() (:util.current_loop) that also installs the
+// default exception hook if nothing has set one yet. Doing this once, at
+// registration time, replaces an earlier version of spawn() that
+// self-healed a still-empty hook lazily on every call.
 
 export namespace est {
 
@@ -101,11 +114,29 @@ inline void set_spawn_exception_hook(loop& loop_ref, loop::exception_hook_type h
                                          : loop::exception_hook_type(default_spawn_exception_hook));
 }
 
+// Registers loop_ref as the current loop (est::make_current_loop(),
+// :util.current_loop) and makes sure it has a spawn exception hook
+// installed - the default one, unless something has already set a
+// different one via set_spawn_exception_hook() above. Doing this once,
+// here, at registration time is what lets spawn() below read
+// loop_ref.spawn_exception_hook() unconditionally instead of re-checking
+// on every call - the preferred way to bring up a loop for any program
+// that uses est::spawn(). Plain est::make_current_loop() still works for
+// a loop that never calls spawn() at all (every other current_loop()-based
+// entry point - make_promise_future(), sleep_for(), est::mutex, ... -
+// doesn't touch this hook either way).
+[[nodiscard]] auto make_current_loop_with_spawn(loop& loop_ref) {
+  if (!loop_ref.spawn_exception_hook()) {
+    set_spawn_exception_hook(loop_ref, nullptr);
+  }
+  return make_current_loop(loop_ref);
+}
+
 // Dispatches `task` as a fire-and-forget operation (issue #58): registers
 // a then_fast() continuation that reports an unhandled exception through
-// loop's own installed hook. `prio` matches then()/then_fast()'s own
-// trailing, inheriting Priority parameter (issue #31/#106) - stamped on
-// this same completion continuation, the one node this task's own
+// current_loop()'s own installed hook. `prio` matches then()/then_fast()'s
+// own trailing, inheriting Priority parameter (issue #31/#106) - stamped
+// on this same completion continuation, the one node this task's own
 // dispatch actually owns.
 //
 // Pure sugar over std::move(task).then_fast(...) - no separate tracking
@@ -117,20 +148,25 @@ inline void set_spawn_exception_hook(loop& loop_ref, loop::exception_hook_type h
 // when_any_succeeds()) already relies on for the futures they register
 // continuations on.
 //
-// Self-heals loop's hook to the default before ever reading it, if
-// nothing has installed one yet (a loop nobody has called
-// set_spawn_exception_hook() on at all) - together with
-// set_spawn_exception_hook() above always installing a real value instead
-// of forwarding an empty one through, this lets the completion
-// continuation below call the hook unconditionally, no empty-vs-installed
-// branch needed at the one place that actually reads it.
-template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = current_priority()) {
-  if (!loop_ref.spawn_exception_hook()) {
-    set_spawn_exception_hook(loop_ref, nullptr);
-  }
+// Resolves current_loop() rather than taking a loop& parameter, matching
+// every other ambient-aware entry point here (make_promise_future(),
+// sleep_for()/sleep_until(), est::mutex, est::counting_event<Mode>) -
+// register the loop first via est::make_current_loop_with_spawn() above.
+// The check() below is this function's own precondition, distinct from
+// current_loop()'s: it catches a loop registered via plain
+// est::make_current_loop() instead of the spawn-aware wrapper, which
+// would otherwise leave the hook empty and turn a genuine unhandled
+// exception into an opaque std::bad_function_call instead of a clear
+// diagnostic naming the fix.
+template <class T> void spawn(future<T> task, Priority prio = current_priority()) {
+  loop& loop_ref = current_loop();
   detail::discard(std::move(task).then_fast(
       [&loop_ref](future<T>& f) {
         if (f.ready_with_failure()) {
+          check(static_cast<bool>(loop_ref.spawn_exception_hook()),
+                "est::spawn(): the current loop has no exception hook installed - "
+                "register it via est::make_current_loop_with_spawn() instead of "
+                "est::make_current_loop()");
           loop_ref.spawn_exception_hook()(f.get_exception());
         }
       },
@@ -138,7 +174,7 @@ template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = cu
 }
 
 // Same, for a caller that would rather hand spawn() a callable to invoke
-// than a future<T> already in flight (e.g. `est::spawn(loop, [&] { return
+// than a future<T> already in flight (e.g. `est::spawn([&] { return
 // some_coroutine(args...); })` when the caller wants the call itself, not
 // just the await, deferred to this point) - forwards straight to the
 // future<T> overload above once invoked. Constrained on std::invocable<Fn&>
@@ -147,8 +183,8 @@ template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = cu
 // operator(), so it never satisfies this constraint in the first place.
 template <class Fn>
   requires(std::invocable<Fn&>)
-void spawn(loop& loop_ref, Fn&& fn, Priority prio = current_priority()) {
-  spawn(loop_ref, std::forward<Fn>(fn)(), prio);
+void spawn(Fn&& fn, Priority prio = current_priority()) {
+  spawn(std::forward<Fn>(fn)(), prio);
 }
 
 } // namespace est

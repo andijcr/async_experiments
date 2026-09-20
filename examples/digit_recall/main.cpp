@@ -109,7 +109,7 @@ auto main() -> int {
   // NOLINTEND(cppcoreguidelines-pro-type-vararg)
 
   est::loop loop;
-  const auto loop_guard = est::make_current_loop(loop);
+  const auto loop_guard = est::make_current_loop_with_spawn(loop);
 
   est::stop_source session_stop;       // fires once the session's overall time
                                        // budget elapses - see below
@@ -129,7 +129,6 @@ auto main() -> int {
     // (issue #58): explicit, loop-owned ownership of this chain's own
     // downstream future<void> instead of a bare discarded handle.
     est::spawn(
-        loop,
         est::sleep_for(session_time_limit, session_timer_stop.get_token()).then([&session_stop] {
           session_stop.request_stop();
         }));
@@ -145,7 +144,7 @@ auto main() -> int {
     // rather than leaving loop.run() blocked on a real timer that no
     // longer matters. est::spawn() again for this chain's own downstream
     // future<void>, same reasoning as above.
-    est::spawn(loop, session.then([&loop, &session_timer_stop](est::future<void>&) {
+    est::spawn(session.then([&loop, &session_timer_stop](est::future<void>&) {
       session_timer_stop.request_stop();
       loop.stop();
     }));

@@ -407,14 +407,14 @@ public:
   // :loop has no way to know what est:spawn's own default hook even is,
   // so it can't enforce "never empty" on its own. est::set_spawn_exception_hook()
   // (est:spawn) is the higher-level entry point that actually keeps the
-  // invariant this class's own spawn_exception_hook() below relies on
-  // (never empty once est::spawn() has run at least once on this loop):
-  // it installs est::default_spawn_exception_hook() in place of a
-  // null/empty `hook` instead of forwarding the empty one through -
-  // prefer that one so "reset to default" and "install a real hook" are
-  // both spelled the same way. est::spawn() itself also self-heals a
-  // still-empty hook (e.g. a loop nobody has ever called either setter
-  // on) the first time it actually needs to read one.
+  // invariant this class's own spawn_exception_hook() below relies on: it
+  // installs est::default_spawn_exception_hook() in place of a null/empty
+  // `hook` instead of forwarding the empty one through - prefer that one
+  // so "reset to default" and "install a real hook" are both spelled the
+  // same way. est::make_current_loop_with_spawn() (est:spawn) installs it
+  // once, at loop-registration time, for any loop that will call
+  // est::spawn() - the preferred way to bring one up instead of calling
+  // this raw setter (or plain est::make_current_loop()) directly.
   using exception_hook_type = std::function<void(const std::exception_ptr&)>;
 
   void set_spawn_exception_hook(exception_hook_type hook) noexcept {

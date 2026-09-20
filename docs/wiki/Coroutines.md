@@ -887,8 +887,8 @@ bug (a `bad_alloc`, a logic error) produced total silence instead of a
 diagnostic.
 
 ```cpp
-template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = current_priority());
-template <class Fn> void spawn(loop& loop_ref, Fn&& fn, Priority prio = current_priority());
+template <class T> void spawn(future<T> task, Priority prio = current_priority());
+template <class Fn> void spawn(Fn&& fn, Priority prio = current_priority());
 ```
 
 `spawn()` (`est/src/spawn.cppm`, issue #58) registers a `then_fast()`
@@ -897,9 +897,24 @@ continuation on `task` that reports an unhandled exception - the same
 `then()`/`then_fast()` themselves use (issue #31/#106), stamped on that
 same continuation. The callable overload just invokes `fn()` (eagerly, at
 the call site, not deferred) and forwards the resulting `future<T>` to the
-first overload - sugar for `spawn(loop, some_coroutine(args...))` when
-writing `spawn(loop, [&] { return some_coroutine(args...); })` reads
-better at a given call site.
+first overload - sugar for `spawn(some_coroutine(args...))` when writing
+`spawn([&] { return some_coroutine(args...); })` reads better at a given
+call site.
+
+**No explicit `loop&` parameter.** `spawn()` resolves `est::current_loop()`
+(`:util.current_loop`) itself, matching every other ambient-aware entry
+point here (`make_promise_future()`, `sleep_for()`/`sleep_until()`,
+`est::mutex`, `est::counting_event<Mode>`). A caller registers a loop once
+via `est::make_current_loop_with_spawn(loop&)` instead of plain
+`est::make_current_loop(loop&)` - a thin wrapper that also installs the
+default exception hook (below) if nothing has set one yet, replacing an
+earlier version of `spawn()` that self-healed a still-empty hook lazily
+on every call (a PR review comment on issue #58 pointed out that
+installation belonged at registration time, not inside `spawn()`'s own
+hot path). `spawn()` itself carries a `check()` precondition that fires
+with a clear message - naming the fix - if a loop was registered via
+plain `make_current_loop()` instead, rather than crashing opaquely on an
+empty hook the first time a spawned task actually fails.
 
 **Pure sugar over `then_fast()`, no separate tracking collection.**
 `spawn()` registers exactly one continuation and relies on the same
@@ -923,13 +938,17 @@ revisit if issue #103's own central waiter registry ever lands and wants
 `spawn()` as a real consumer of it.
 
 **The exception hook.** `spawn()`'s default behavior - unless a caller
-installs their own via `loop::set_spawn_exception_hook()` - prints a
-diagnostic via `platform::printdbg()` for an unhandled exception, except
-`est::operation_cancelled` and `detail::abandoned_exception`: both are
-routine, expected outcomes of normal cancellation/shutdown, not bugs, so
-warning about them by default would spam every ordinary teardown. A
+installs their own via `est::set_spawn_exception_hook(loop&, hook)` -
+prints a diagnostic via `platform::printdbg()` for an unhandled exception,
+except `est::operation_cancelled` and `detail::abandoned_exception`: both
+are routine, expected outcomes of normal cancellation/shutdown, not bugs,
+so warning about them by default would spam every ordinary teardown. A
 caller-installed hook sees every exception unfiltered - it decides for
-itself what counts as routine.
+itself what counts as routine. Prefer `est::set_spawn_exception_hook()`
+over `loop::set_spawn_exception_hook()` (the raw, `est:loop`-level setter)
+directly: the free function keeps the invariant a `null`/empty `hook`
+resets to the default rather than leaving the slot empty, since `:loop`
+itself has no way to name `default_spawn_exception_hook`.
 
 **`future<T>` is `[[nodiscard]]`, making `spawn()` the one sanctioned
 discard.** Without this, nothing stopped a caller from bypassing `spawn()`

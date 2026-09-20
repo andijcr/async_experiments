@@ -59,14 +59,11 @@ auto run_server(spreadsheet::sheet* sheet_instance) -> est::future<void> {
     // spawn() gives it an explicit, loop-owned reason to stay alive
     // instead, and reports an unhandled exception (a genuine bug, not a
     // normal response) via its default diagnostic hook rather than
-    // silently dropping it. current_loop(), not a coroutine reference
-    // parameter on run_server() itself: main() installs this loop as
-    // current for run_server()'s entire lifetime (est::make_current_loop()'s
-    // own guard, below), so resolving it fresh here is exactly the "no
-    // loop& threaded through explicitly" convention every other
-    // current_loop()-based entry point in this codebase already follows.
-    est::spawn(est::current_loop(),
-               spreadsheet::execute(sheet_instance, std::move(parsed))
+    // silently dropping it. No loop& argument: spawn() resolves
+    // est::current_loop() itself, the loop main() installed as current
+    // for run_server()'s entire lifetime (est::make_current_loop_with_spawn()'s
+    // own guard, below).
+    est::spawn(spreadsheet::execute(sheet_instance, std::move(parsed))
                    .then([](const std::string& response) { std::println("{}", response); }));
   }
 }
@@ -106,7 +103,7 @@ auto main() -> int {
   // NOLINTEND(cppcoreguidelines-pro-type-vararg)
 
   est::loop loop;
-  const auto loop_guard = est::make_current_loop(loop);
+  const auto loop_guard = est::make_current_loop_with_spawn(loop);
   spreadsheet::sheet sheet_instance;
 
   try {

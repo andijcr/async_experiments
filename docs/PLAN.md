@@ -7407,3 +7407,77 @@ Full pipeline re-run clean: `default` build + 328/328 `ctest` passed,
 `clang-format` clean, `ci` build + `clang-tidy` clean (0 warnings from
 this codebase's own files), 95% diff coverage, `sanitize` 271/271
 (ASan+UBSan clean), wasm32 build + Node smoke test clean.
+
+---
+
+### Issue #58 revisited (PR #122 review): `spawn()` resolves `current_loop()`, no explicit `loop&`
+
+Two more review comments on the same PR: `spawn(loop&, ...)`'s explicit
+`loop&` parameter should instead be read from "the tls global variable"
+(`est::current_loop()`, `:util.current_loop` - the same thread_local
+ambient mechanism `make_promise_future()`/`sleep_for()`/`sleep_until()`/
+`yield_execution()`/`est::mutex`/`est::counting_event<Mode>` already
+resolve through when called without an explicit loop); and the exception
+hook's per-call self-heal check (`if (!loop_ref.spawn_exception_hook())`
+inside every `spawn()` call, added in the previous review round) "should
+be a global initialization" instead.
+
+Checked existing call sites before implementing: `examples/spreadsheet/
+main.cpp`'s `run_server()` was already writing `est::spawn(est::current_loop(),
+...)` - fetching the ambient loop by hand just to pass it back in - and
+every other call site (`spawn_tests.cpp`, `examples/sleep_sort`,
+`examples/digit_recall`) already wraps its whole body in
+`est::make_current_loop(loop)` before ever calling `spawn()`. Confirmed
+the parameter was genuinely redundant everywhere it's used today, not
+just in the abstract.
+
+Both comments turned out to describe one coherent change. `spawn()`
+(both overloads) dropped its `loop&` parameter entirely and now resolves
+`current_loop()` internally. Since that's the only thing spawn() reads a
+loop through, "global initialization" of the exception hook became: a
+new `est::make_current_loop_with_spawn(loop&)` (`est/src/spawn.cppm`) -
+a thin wrapper around `est::make_current_loop()` (`:util.current_loop`)
+that also installs the default hook (if nothing has already set a
+different one) before returning the same RAII guard. Registration is now
+the one place this check runs, not every `spawn()` call. Plain
+`est::make_current_loop()` is untouched and still correct for a loop that
+never calls `spawn()` at all - every other `current_loop()`-based entry
+point ignores this hook regardless.
+
+Considered leaving `spawn()` silently trusting a hook that might still be
+empty (a loop registered via plain `make_current_loop()` by mistake,
+without the wrapper) rather than adding anything back to spawn()'s own
+body - rejected: an empty `std::function` call fails as an opaque
+`std::bad_function_call` (or worse, UB under `-fno-exceptions`) exactly
+when a genuine bug is what the hook exists to report, the opposite of
+this feature's own purpose. Added one `est::check()` precondition inside
+`spawn()` instead - checked, not self-healing - naming the fix
+(`est::make_current_loop_with_spawn()`) in its failure message, the same
+"checked precondition, clear message" idiom `current_loop()`/
+`current_allocator()` themselves already use for their own "nothing
+registered" case. `:spawn` gained `import :check;` and
+`import :util.current_loop;` for this - no new cycle, `:util.current_loop`
+already sits below `:spawn` in the DAG (it imports `:loop`, not the
+reverse).
+
+Updated every call site: `spawn_tests.cpp` (all `make_current_loop()` →
+`make_current_loop_with_spawn()`, all `spawn(loop, ...)` → `spawn(...)`),
+plus a new test case asserting `make_current_loop_with_spawn()` preserves
+a hook set before registration rather than clobbering it; `examples/
+spreadsheet/main.cpp`'s `run_server()` lost its now-redundant
+`est::current_loop()` argument entirely; `examples/sleep_sort/main.cpp`,
+`examples/digit_recall/main.cpp` (x2) dropped their `loop,` arguments and
+switched their one registration call to the `_with_spawn` variant.
+`est::check()`'s own failure path (`platform::assert_failure()`,
+`[[noreturn]]`, calls `std::abort()`) isn't unit-testable without
+process-isolation tooling this project doesn't have (`check_tests.cpp`'s
+own doc comment already establishes this) - only the pass-through
+(hook-installed) path is covered, matching that file's own precedent.
+
+One clang-tidy fix on the way here: `bool(loop_ref.spawn_exception_hook())`
+→ `static_cast<bool>(...)` (`modernize-avoid-c-style-cast`).
+
+Full pipeline re-run clean: `default` build + 329/329 `ctest` passed,
+`clang-format` clean, `ci` build + `clang-tidy` clean (0 warnings from
+this codebase's own files), 96% diff coverage, `sanitize` 272/272
+(ASan+UBSan clean), wasm32 build + Node smoke test clean.
