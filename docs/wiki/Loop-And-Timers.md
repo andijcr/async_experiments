@@ -390,12 +390,15 @@ traffic can starve a lower level indefinitely.
 
 **Explicitly out of scope so far** (documented, not built): a
 fairness-oriented "proportionate" scheduler alternative that bounds how
-long a level can starve (issue #108); starvation *detection* itself,
+long a level can starve (issue #108); and starvation *detection* itself,
 proposed to mirror `reset_loop_stall_detection()`/`detect_loop_stall()`
 above exactly (per-level head-pointer-hasn't-advanced-in-N-ms, delegated
-to `platform::interface` the same way - issue #109); and priority support
-on `spawn()` (issue #58, not implemented yet either) - real, deliberate
-follow-ups rather than gaps nobody noticed. The flatten/monadic path
+to `platform::interface` the same way - issue #109) - real, deliberate
+follow-ups rather than gaps nobody noticed. `est::spawn()`
+(`est/src/spawn.cppm`, issue #58) *does* take the same trailing, inheriting
+`Priority prio = current_priority()` parameter `then()`/`then_fast()` do,
+stamped on the completion continuation it registers - see
+[Coroutines](Coroutines.md) for `spawn()` itself. The flatten/monadic path
 (`detail::flatten_forwarder<T>`) was briefly in this same state - it
 missed the two bypass-path fixes above - but is now fixed too (issue
 #110): `fulfill()` (`est/src/future.cppm`) stamps `priority_level =

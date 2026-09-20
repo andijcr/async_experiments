@@ -7188,6 +7188,113 @@ additions: 317/317 (`default`), clean `clang-format`/`clang-tidy`,
 
 ---
 
+### Issue #58: `est::spawn()` - explicit ownership for fire-and-forget dispatch, and `future<T>` becomes `[[nodiscard]]`
+
+Investigated the issue's own two claims before implementing anything.
+Re-reading `future<T>::promise_type`'s `initial_suspend()`/
+`final_suspend()` (both `std::suspend_never`) confirmed the issue's own
+later "correction": an unobserved coroutine already runs to completion
+correctly today, independent of whether anything keeps its returned
+`future<T>` alive - that invariant needed no fixing. The real, narrower
+gap: an unobserved *failure* was silently dropped, since
+`future_state<T>::then()`'s unwrapped-mode auto-propagate path just routes
+it into a downstream `future_state` that's also typically discarded.
+
+Also checked #58's stated dependency, issue #103 (a central, id-keyed
+waiter registry) - still open, still just a design pass with no
+implementation and no decision among its own four candidate shapes
+(synthetic-id + linear scan, address-as-id, generational slot map,
+in-place tagging). Decided not to block on it: `spawn()`'s actual need is
+narrower than what #103 solves (retrofitting eager cancellation into
+*existing*, shared waiter lists) - just a *new*, loop-owned collection of
+in-flight tasks, each removed by its own completion continuation, with
+none of #103's harder cases. Built as its own small mechanism mirroring
+`loop::pending_timers_`'s already-proven shape (#103's own "option A"),
+scoped to `spawn()` alone - reconcile with #103's registry later if that
+ever lands.
+
+**`est::spawn()`** (new, `est/src/spawn.cppm`): `spawn(loop&, future<T>,
+Priority prio = current_priority())` and a callable overload that invokes
+`fn()` eagerly and forwards to the first. Registers a `then_fast()`
+continuation reporting an unhandled exception (via
+`loop::spawn_exception_hook()` if installed,
+`default_spawn_exception_hook()` otherwise - exempting
+`operation_cancelled`/`detail::abandoned_exception` as routine
+cancellation/shutdown outcomes, not bugs) and reclaiming its own tracking
+entry. `est/src/loop.cppm` gained the generic primitive this needs:
+`detail::spawned_entry` (type-erased base, mirroring `ready_node`/
+`timer_node` - `:loop` still never names `future<T>`),
+`track_spawned()`/`untrack_spawned()`/`spawned_count()`, and a nullable
+`exception_hook_type` customization point. `drain_pending()` now also
+unconditionally clears `spawned_`, since an abandoned (never `run()`)
+completion continuation never reaches `untrack_spawned()` on its own.
+
+**`future<T>` is now `[[nodiscard]]`** - a deliberate follow-up decided
+mid-implementation, not part of the original issue text: without it,
+nothing stopped a caller from bypassing `spawn()` entirely and just
+discarding a coroutine call or a `.then()` chain's tail as before,
+undermining the whole point of giving `spawn()` a sanctioned place to
+apply an exception policy. `[[nodiscard]]` on the `future<T>` class
+itself, not on individual producer functions (`make_ready_future<T>()`,
+etc.) - the only mechanism that also catches a user's own coroutine call
+being discarded, since a per-function attribute can only ever reach
+functions this module declares. `est::detail::discard(future<T>)` (new,
+`future.cppm`) is the internal escape hatch for this module's own
+genuinely deliberate discards - not exported, so it can't double as a
+second, quieter way for external code to bypass `spawn()`. Updated every
+site this touched: `with_stop.cppm` (x3), `with_timeout.cppm`,
+`when_all.cppm`, `when_any.cppm`, `when_any_succeeds.cppm` (x2),
+`spawn.cppm`'s own `then_fast()` call - all wrapped in `discard()`;
+`examples/sleep_sort/main.cpp`, `examples/digit_recall/main.cpp` (x2)
+routed through `est::spawn()` instead, consistent with
+`examples/spreadsheet/main.cpp`'s own `run_server()` (already
+`spawn()`-based, and the original motivating case for this issue); a
+handful of genuinely deliberate test-only discards (`mutex_tests.cpp`,
+`loop_tests.cpp`, `future_tests.cpp` x6) `(void)`-cast, the standard
+escape hatch for code outside the `est` module itself.
+
+Caught a real, previously-unnoticed bug the moment this landed:
+`mutex_tests.cpp`'s own `holder(loop, m, std::move(release_future));`
+was silently discarding a coroutine's future - exactly the pattern this
+change exists to catch. Fixed the same way as the other test-only sites.
+
+Two rounds of clang-tidy fixes on the way here:
+`NOLINTNEXTLINE(bugprone-empty-catch)` on `default_spawn_exception_hook()`'s
+two deliberate empty catches (the `operation_cancelled`/
+`abandoned_exception` exemptions); a coroutine test helper switched from
+a `bool&` to a `bool*` parameter
+(`cppcoreguidelines-avoid-reference-coroutine-parameters`); exception-hook
+lambda parameters switched from `std::exception_ptr` to `const
+std::exception_ptr&` (`performance-unnecessary-value-param`, also applied
+to `loop::exception_hook_type`'s own signature for consistency); and
+`last_diagnostic.value_or("").contains(...)` instead of `->find()` after a
+`has_value()` `REQUIRE()` (`bugprone-unchecked-optional-access` doesn't
+recognize that as a narrowing guard - `spsc_ring_tests.cpp`'s own doc
+comment already established this exact pattern).
+
+One more real bug caught by the full pipeline, not just review:
+`examples/multicolor_larson_scanner/web/CMakeLists.txt` hardcodes its own
+copy of `est`'s source list (a separate CMake project, separate toolchain
+- doesn't reuse `est/CMakeLists.txt`'s `FILE_SET`) and was missing the new
+`spawn.cppm` partition, breaking that build with "module 'est:spawn' not
+found" until added there too.
+
+10 new `TEST_CASE`s in `est/tests/spawn_tests.cpp`: successful completion
++ untracking, the default hook firing/being suppressed for
+`operation_cancelled` and an already-abandoned future (produced via
+`with_timeout()` + `loop.drain_pending()`, since `detail::abandoned_exception`
+isn't nameable from outside the module), a custom hook seeing everything
+unfiltered, the callable overload's eager invocation, `Priority` stamping
+and default-inheritance, a genuinely-suspending coroutine with no other
+observer, and teardown reclaiming a never-completed entry.
+
+Full pipeline: `default` build + 327/327 `ctest` passed, `clang-format`
+clean, `ci` build + `clang-tidy` clean (0 warnings), coverage 97% diff
+coverage, `sanitize` 270/270 (ASan+UBSan clean), wasm32 build + Node
+smoke test clean.
+
+---
+
 ## Verification for M0
 
 Once the Dockerfile's toolchain pins are filled in (see "Known open items"):

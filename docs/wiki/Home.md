@@ -38,8 +38,10 @@ than duplicating it. The same file is also mirrored here as
   coroutine return type (no separate `task<T>`), the `promise_type`/
   `operator co_await()` machinery behind it, why a resume node must be
   separately heap-allocated rather than embedded in the coroutine frame
-  it resumes, and how `est::mutex::lock()` is awaitable on the same
-  pieces.
+  it resumes, how `est::mutex::lock()` is awaitable on the same pieces,
+  cancellation (`stop_token` vs. abandonment), and `est::spawn()` -
+  explicit, loop-owned ownership for fire-and-forget dispatch, and why
+  `future<T>` is `[[nodiscard]]`.
 - **[Global Lookup Codegen](Global-Lookup-Codegen.md)** — what
   `est::current_loop()`/`.allocator()` actually compile to under LTO:
   real disassembly, instruction counts, and pointer-chase counts, plus
@@ -111,10 +113,10 @@ constructs one, and `platform::override_instance()`s it
 | `est::spsc_ring<T>` | `est/src/sync/spsc_ring.cppm` |
 | `est::mutex`, `mutex::lock_guard` (built on `est::binary_event<EventResetMode::automatic>`) | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
-| `est::loop` (incl. `timer_id`/`cancel_timer()`), `ready_node`, `timer_node`, `detail::abandoned_exception`, `est::Priority`, `current_priority()`/`set_priority()` | `est/src/loop.cppm` |
+| `est::loop` (incl. `timer_id`/`cancel_timer()`, `track_spawned()`/`untrack_spawned()`/`spawned_count()`/`set_spawn_exception_hook()`), `ready_node`, `timer_node`, `detail::spawned_entry`, `detail::abandoned_exception`, `est::Priority`, `current_priority()`/`set_priority()` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::schedule_periodic()`, `est::periodic_timer_handle`, `detail::periodic_timer_node<Fn>` | `est/src/timer_periodic.cppm` |
-| `est::future_state<T>`, `est::future<T>` (incl. `clone()`), `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
+| `est::future_state<T>`, `est::future<T>` (incl. `clone()`; `[[nodiscard]]`, issue #58), `est::detail::discard()`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `make_failed_future()`, `sleep_for()`/`sleep_until()`, `detail::promise_resume_node<T>` | `est/src/promise.cppm` |
 | `est::when_all()` (fixed-arity and `std::span` overloads), `detail::when_all_state` | `est/src/when_all.cppm` |
 | `est::when_any()` (fixed-arity and `std::span` overloads) | `est/src/when_any.cppm` |
@@ -122,3 +124,4 @@ constructs one, and `platform::override_instance()`s it
 | `est::stop_source`, `est::stop_token`, `est::operation_cancelled` | `est/src/sync/stop_token.cppm` |
 | `est::with_stop<T>()`, token-aware `sleep_for()`/`sleep_until()` overloads | `est/src/with_stop.cppm` |
 | `est::with_timeout<T>()`, `est::operation_timed_out` | `est/src/with_timeout.cppm` |
+| `est::spawn()`, `default_spawn_exception_hook()`, `detail::spawn_entry<T>` | `est/src/spawn.cppm` |
