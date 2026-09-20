@@ -418,16 +418,27 @@ public:
   }
 
   // The installable hook for est::spawn()'s (est:spawn) own unhandled-
-  // exception diagnostic (issue #58) - stored here as a generic, nullable
+  // exception diagnostic (issue #58) - stored here as a generic
   // customization point (mirroring scheduler_type above; see its own doc
   // comment for why std::function, not std::move_only_function) rather
   // than hard-coding any particular policy, exactly as :loop never names
   // est::future<T>/est::promise<T> (this file's own top comment). The
   // exemption logic for routine outcomes like cancellation lives in
   // est:spawn's own default hook, not here, since :sync.stop_token's
-  // operation_cancelled isn't something this file can name either. An
-  // empty std::function (the default) means "no override installed" -
-  // est::spawn() falls back to its own built-in default in that case.
+  // operation_cancelled isn't something this file can name either.
+  //
+  // This raw setter allows an empty std::function through unchanged -
+  // :loop has no way to know what est:spawn's own default hook even is,
+  // so it can't enforce "never empty" on its own. est::set_spawn_exception_hook()
+  // (est:spawn) is the higher-level entry point that actually keeps the
+  // invariant this class's own spawn_exception_hook() below relies on
+  // (never empty once est::spawn() has run at least once on this loop):
+  // it installs est::default_spawn_exception_hook() in place of a
+  // null/empty `hook` instead of forwarding the empty one through -
+  // prefer that one so "reset to default" and "install a real hook" are
+  // both spelled the same way. est::spawn() itself also self-heals a
+  // still-empty hook (e.g. a loop nobody has ever called either setter
+  // on) the first time it actually needs to read one.
   using exception_hook_type = std::function<void(const std::exception_ptr&)>;
 
   void set_spawn_exception_hook(exception_hook_type hook) noexcept {

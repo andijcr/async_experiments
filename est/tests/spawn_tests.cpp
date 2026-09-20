@@ -153,7 +153,7 @@ TEST_CASE("spawn() lets a caller install a custom exception hook that sees every
   const auto loop_guard = est::make_current_loop(loop);
 
   int hook_calls = 0;
-  loop.set_spawn_exception_hook([&hook_calls](const std::exception_ptr&) { ++hook_calls; });
+  est::set_spawn_exception_hook(loop, [&hook_calls](const std::exception_ptr&) { ++hook_calls; });
 
   auto [prom, fut] = est::make_promise_future<int>();
   est::spawn(loop, std::move(fut));
@@ -165,6 +165,32 @@ TEST_CASE("spawn() lets a caller install a custom exception hook that sees every
 
   REQUIRE(hook_calls == 1);
   REQUIRE(fake.diagnostic_count == 0); // the default printer never ran
+}
+
+TEST_CASE("est::set_spawn_exception_hook(loop, nullptr) resets to the default hook, not to empty",
+          "[spawn]") {
+  recording_platform fake;
+  const auto platform_guard = est::platform::override_instance(fake);
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  int hook_calls = 0;
+  est::set_spawn_exception_hook(loop, [&hook_calls](const std::exception_ptr&) { ++hook_calls; });
+  est::set_spawn_exception_hook(loop, nullptr); // reset - back to the default, exemptions and all
+
+  // The invariant itself, checked directly at the storage level (not just
+  // observed indirectly through spawn()'s own behavior below): resetting
+  // via nullptr installs a real value, it doesn't just leave the slot
+  // empty for spawn()'s own self-heal to paper over later.
+  REQUIRE(loop.spawn_exception_hook());
+
+  auto [prom, fut] = est::make_promise_future<int>();
+  est::spawn(loop, std::move(fut));
+  prom.set_exception(std::make_exception_ptr(est::operation_cancelled()));
+  loop.run_until_idle();
+
+  REQUIRE(hook_calls == 0);            // the previously-installed custom hook is gone
+  REQUIRE(fake.diagnostic_count == 0); // and the default's own exemption applies again
 }
 
 TEST_CASE("spawn() accepts a callable, invoking it synchronously at the call site", "[spawn]") {
@@ -192,8 +218,8 @@ TEST_CASE("spawn() stamps the given Priority on its own completion continuation 
   const auto loop_guard = est::make_current_loop(loop);
 
   std::vector<est::Priority> order;
-  loop.set_spawn_exception_hook(
-      [&order](const std::exception_ptr&) { order.push_back(est::current_priority()); });
+  est::set_spawn_exception_hook(
+      loop, [&order](const std::exception_ptr&) { order.push_back(est::current_priority()); });
 
   auto [prom_low, fut_low] = est::make_promise_future<int>();
   auto [prom_high, fut_high] = est::make_promise_future<int>();
@@ -219,8 +245,8 @@ TEST_CASE("spawn() defaults its Priority to current_priority() at the call site"
   const auto loop_guard = est::make_current_loop(loop);
 
   std::optional<est::Priority> observed;
-  loop.set_spawn_exception_hook(
-      [&observed](const std::exception_ptr&) { observed = est::current_priority(); });
+  est::set_spawn_exception_hook(
+      loop, [&observed](const std::exception_ptr&) { observed = est::current_priority(); });
 
   auto [prom, fut] = est::make_promise_future<int>();
   {

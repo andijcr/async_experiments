@@ -74,13 +74,13 @@ private:
 export namespace est {
 
 // The default hook spawn() installs when a caller hasn't set their own via
-// loop::set_spawn_exception_hook() (est:loop): a best-effort diagnostic via
+// est::set_spawn_exception_hook() (below): a best-effort diagnostic via
 // platform::instance()'s own sink (platform::printdbg()) - loud enough
 // that a genuine bug in a fire-and-forget coroutine doesn't vanish in
 // total silence (issue #58), but not a hard est::check() failure, since a
 // caller may legitimately want different behavior (structured logging,
 // metrics, or even to treat this as fatal) - install a different hook via
-// loop::set_spawn_exception_hook() instead of editing this one.
+// est::set_spawn_exception_hook() instead of editing this one.
 //
 // operation_cancelled (est:sync.stop_token) and detail::abandoned_exception
 // (est:loop) are deliberately exempt: both are routine, expected outcomes
@@ -111,18 +111,41 @@ inline void default_spawn_exception_hook(const std::exception_ptr& eptr) noexcep
 #endif
 }
 
+// The preferred way to install (or reset) loop's spawn() exception hook -
+// prefer this over calling loop::set_spawn_exception_hook() (est:loop)
+// directly. Keeps the invariant spawn() itself (below) relies on: once
+// anything has touched loop's hook through this entry point, it's never
+// empty again. Passing an empty/null `hook` explicitly resets to
+// default_spawn_exception_hook() above, rather than forwarding the empty
+// value through and leaving loop with nothing installed -
+// loop::set_spawn_exception_hook() itself can't provide this guarantee on
+// its own, since :loop has no way to name default_spawn_exception_hook
+// (this file's own top comment on why :loop can't import :spawn).
+inline void set_spawn_exception_hook(loop& loop_ref, loop::exception_hook_type hook) {
+  loop_ref.set_spawn_exception_hook(hook ? std::move(hook)
+                                         : loop::exception_hook_type(default_spawn_exception_hook));
+}
+
 // Dispatches `task` as an explicitly loop-owned fire-and-forget operation
 // (issue #58): registers a then_fast() continuation that observes the
-// result, reports an unhandled exception (loop::spawn_exception_hook() if
-// installed, default_spawn_exception_hook() above otherwise), and reclaims
-// the tracking entry loop::track_spawned() (est:loop) created for it -
-// giving `task`'s future_state<T> an explicit, unambiguous reason to stay
-// alive until it completes rather than the previous, implicit "stays alive
-// because a continuation happens to reference it" convention every call
-// site had to explain on its own. `prio` matches then()/then_fast()'s own
-// trailing, inheriting Priority parameter (issue #31/#106) - stamped on
-// this same completion continuation, the one node this task's own
-// dispatch actually owns.
+// result, reports an unhandled exception through loop's own installed
+// hook, and reclaims the tracking entry loop::track_spawned() (est:loop)
+// created for it - giving `task`'s future_state<T> an explicit,
+// unambiguous reason to stay alive until it completes rather than the
+// previous, implicit "stays alive because a continuation happens to
+// reference it" convention every call site had to explain on its own.
+// `prio` matches then()/then_fast()'s own trailing, inheriting Priority
+// parameter (issue #31/#106) - stamped on this same completion
+// continuation, the one node this task's own dispatch actually owns.
+//
+// Self-heals loop's hook to the default before ever reading it, if
+// nothing has installed one yet (a loop nobody has called
+// set_spawn_exception_hook() on at all) - together with
+// set_spawn_exception_hook() above always installing a real value instead
+// of forwarding an empty one through, this keeps the completion
+// continuation below able to call the hook unconditionally, no
+// empty-vs-installed branch needed at the one place that actually reads
+// it every time a spawned task completes.
 //
 // entry->task().then_fast(...), not std::move(task).then_fast(...)
 // directly: the continuation has to be registered on the *same* future<T>
@@ -134,17 +157,15 @@ inline void default_spawn_exception_hook(const std::exception_ptr& eptr) noexcep
 // future.cppm) registers the continuation without consuming the handle,
 // leaving spawn_entry<T> holding it for as long as the task is tracked.
 template <class T> void spawn(loop& loop_ref, future<T> task, Priority prio = current_priority()) {
+  if (!loop_ref.spawn_exception_hook()) {
+    set_spawn_exception_hook(loop_ref, nullptr);
+  }
   auto* entry = static_cast<detail::spawn_entry<T>*>(
       loop_ref.track_spawned(std::make_unique<detail::spawn_entry<T>>(std::move(task))));
   detail::discard(entry->task().then_fast(
       [&loop_ref, entry](future<T>& f) {
         if (f.ready_with_failure()) {
-          const auto& hook = loop_ref.spawn_exception_hook();
-          if (hook) {
-            hook(f.get_exception());
-          } else {
-            default_spawn_exception_hook(f.get_exception());
-          }
+          loop_ref.spawn_exception_hook()(f.get_exception());
         }
         loop_ref.untrack_spawned(entry);
       },
