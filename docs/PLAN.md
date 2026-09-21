@@ -8036,3 +8036,32 @@ benefit past correctness: the same run's host-side CPU time (`user` in
 `time`'s own output) dropped from ~6.6s to ~0.18s - `wfi` is genuinely
 idling the emulated CPU between events under QEMU's own TCG, not just a
 correctness no-op.
+
+**PR #124 review, round 4: one shared source list instead of three
+hand-copied ones.** A fourth review comment, this time on the build
+system rather than estpico itself: `est/CMakeLists.txt`,
+`examples/multicolor_larson_scanner/web/CMakeLists.txt`, and
+`.../mps2an385/CMakeLists.txt` each declare their own `add_library(est
+STATIC)` (none of the three standalone cross-compile projects can
+`add_subdirectory()` the real `est/CMakeLists.txt` - see those two
+files' own top comments) - but all three had been hand-copying the
+exact same 23-entry `FILE_SET CXX_MODULES` file list verbatim, a real
+maintenance hazard every time a `.cppm` file gets added to `est/src/`.
+
+Fixed with `cmake/EstSources.cmake`: a single `EST_CXX_MODULE_SOURCES`
+list, paths bare (relative to `est/src`, no project-specific prefix),
+`include()`-d by all three consumers, each then `list(TRANSFORM ...
+PREPEND ...)`-ing its own correct absolute base path before handing the
+result to `target_sources()` - the one thing that genuinely differs
+between the root build and the two standalone projects. Everything else
+(warnings/coverage/sanitizers for the root build; the deliberate absence
+of them for the two cross-compiles) stays exactly as it already was in
+each file.
+
+Verified by a fresh `rm -rf build/*` + reconfigure + full build (not an
+incremental one, to actually exercise `include()`/`list(TRANSFORM)`
+running from scratch) in all three: hosted `default` preset (329/329
+tests), `web`'s wasm32 project (smoke test still passing), and
+`mps2an385` (1113 assertions/260 cases under QEMU, `larson_scanner`
+still exit 0) - all unchanged from before the refactor, confirming this
+touched only where the file list lives, not what gets built.

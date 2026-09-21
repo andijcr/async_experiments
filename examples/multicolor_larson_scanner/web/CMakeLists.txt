@@ -25,39 +25,20 @@ set(CMAKE_CXX_MODULE_STD ON)
 set(EST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
 # --- est itself, cross-compiled for wasm32-wasip1-threads - same source
-# files est/CMakeLists.txt's own FILE_SET lists, just no est_set_warnings()/
-# est_enable_coverage()/est_enable_sanitizers() calls here (see this file's
-# own top comment).
+# files est/CMakeLists.txt's own FILE_SET lists (cmake/EstSources.cmake,
+# the single shared list all three CMake projects needing an est target
+# include() rather than each hand-maintaining a copy), just no
+# est_set_warnings()/est_enable_coverage()/est_enable_sanitizers() calls
+# here (see this file's own top comment).
+include("${EST_ROOT}/cmake/EstSources.cmake")
+list(TRANSFORM EST_CXX_MODULE_SOURCES PREPEND "${EST_ROOT}/est/src/")
+
 add_library(est STATIC)
 target_sources(est
   PUBLIC
     FILE_SET CXX_MODULES
     BASE_DIRS "${EST_ROOT}/est/src"
-    FILES
-      "${EST_ROOT}/est/src/est.cppm"
-      "${EST_ROOT}/est/src/util/intrusive_list.cppm"
-      "${EST_ROOT}/est/src/util/scope_exit.cppm"
-      "${EST_ROOT}/est/src/util/shared_ptr.cppm"
-      "${EST_ROOT}/est/src/platform/platform.cppm"
-      "${EST_ROOT}/est/src/check.cppm"
-      "${EST_ROOT}/est/src/util/jitter.cppm"
-      "${EST_ROOT}/est/src/sync/mutex.cppm"
-      "${EST_ROOT}/est/src/sync/event.cppm"
-      "${EST_ROOT}/est/src/sync/external_event.cppm"
-      "${EST_ROOT}/est/src/sync/spsc_ring.cppm"
-      "${EST_ROOT}/est/src/sync/stop_token.cppm"
-      "${EST_ROOT}/est/src/timer.cppm"
-      "${EST_ROOT}/est/src/loop.cppm"
-      "${EST_ROOT}/est/src/util/current_loop.cppm"
-      "${EST_ROOT}/est/src/timer_periodic.cppm"
-      "${EST_ROOT}/est/src/future.cppm"
-      "${EST_ROOT}/est/src/promise.cppm"
-      "${EST_ROOT}/est/src/when_all.cppm"
-      "${EST_ROOT}/est/src/when_any.cppm"
-      "${EST_ROOT}/est/src/when_any_succeeds.cppm"
-      "${EST_ROOT}/est/src/with_stop.cppm"
-      "${EST_ROOT}/est/src/with_timeout.cppm"
-      "${EST_ROOT}/est/src/spawn.cppm"
+    FILES ${EST_CXX_MODULE_SOURCES}
 )
 target_compile_features(est PUBLIC cxx_std_23)
 
