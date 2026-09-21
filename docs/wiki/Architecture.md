@@ -329,11 +329,15 @@ every individual test file.
   interrupt-context protection gets added when a backend that actually
   needs it exists, not speculatively. `estpico` is that case now: its
   SysTick-driven clock is read from mainline/loop code and written from a
-  real interrupt handler, so `estpico::detail::interrupt_guard` (a short
-  `PRIMASK` mask/restore) genuinely guards state an ISR can preempt at any
-  point - a different, real hazard from the single-core "two coroutines
-  interleaving at a `co_await`" case below, scoped to `estpico` itself
-  rather than added to `est` generally. `est::mutex::lock()` *is* real
+  real interrupt handler, and its UART TX is likewise driven by a real
+  interrupt (`vprintdbg()`'s own output queues through
+  `est::intrusive_list<T>`/`est::spsc_ring<char>`, drained a byte at a
+  time by the TX-complete interrupt), so `estpico::detail::interrupt_guard`
+  (a short `PRIMASK` mask/restore) genuinely guards state an ISR can
+  preempt at any point - a different, real hazard from the single-core
+  "two coroutines interleaving at a `co_await`" case below, scoped to
+  `estpico` itself rather than added to `est` generally. `est::mutex::lock()`
+  *is* real
   protection against that other, still-single-threaded hazard though
   ([Coroutines](Coroutines.md)): two coroutines interleaving at a
   `co_await` while both hold a reference to the same structure.

@@ -69,17 +69,18 @@ void Default_Handler(void) {
   }
 }
 
-// Defined in estpico's own platform_mps2an385.cppm (extern "C", so this
-// declaration and that definition agree on linkage) - this backend's own
-// clock state (SysTick's wrap-count extension) belongs to that module,
-// not to this file, the same split _exit()/gettimeofday() below already
-// have with picolibc/libc++.
+// Defined in estpico's own platform_mps2an385.cppm (extern "C", so these
+// declarations and those definitions agree on linkage) - this backend's
+// own clock/UART-TX state belongs to that module, not to this file, the
+// same split _exit()/gettimeofday() below already have with
+// picolibc/libc++.
 void SysTick_Handler(void);
+void UART0_TX_Handler(void); // IRQ1 - confirmed empirically, see that module's own comment
 
 // picolibcpp.ld's .boot_flash output section collects .text.init.enter
 // (among others) at ORIGIN(boot_flash) - exactly where a Cortex-M
 // expects its vector table (word0 = initial SP, word1 = reset vector).
-__attribute__((section(".text.init.enter"))) void (*const vector_table[16])(void) = {
+__attribute__((section(".text.init.enter"))) void (*const vector_table[16 + 2])(void) = {
     (void (*)(void))&__stack,
     Reset_Handler,
     Default_Handler, // NMI
@@ -96,6 +97,8 @@ __attribute__((section(".text.init.enter"))) void (*const vector_table[16])(void
     0,               // reserved
     Default_Handler, // PendSV
     SysTick_Handler,
+    Default_Handler,  // IRQ0 - UART0 RX (unused)
+    UART0_TX_Handler, // IRQ1
 };
 
 // ARM semihosting SYS_EXIT_EXTENDED (op 0x20) - the only semihosting

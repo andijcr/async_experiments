@@ -7824,3 +7824,110 @@ hardware with no debug host attached, a failed `est::check()` would now
 fault at that `bkpt` instead of exiting cleanly - unchanged by this
 work, and out of scope for a backend that already documents itself as
 QEMU-only.
+
+**Issue #123 follow-up 2: `estpico`'s UART output becomes asynchronous
+and interrupt-driven.** Raised alongside the clock fix above, same
+session: `vprintdbg()`'s old implementation (`detail::uart_write()`,
+straight busy-wait polling one character at a time) blocks its caller
+for however long the whole message takes to physically leave the UART -
+fine for the rare, fatal `assert_failure()` message, wrong for a debug
+diagnostic that might fire from inside a hot continuation. Asked for
+specifically: a fixed-capacity queue an interrupt drains, fed by a
+buffer manager tying queued messages together in a list, pumped by an
+`est::spawn()`'d task at `Priority::high` (not `critical`).
+
+Before writing any of it, two real hardware facts needed confirming
+empirically, the same methodology the clock fix used - neither is
+documented anywhere this project trusts blindly:
+
+- **Which NVIC line UART0's TX-complete interrupt uses.** Found by
+  wiring every external IRQ slot (0-31) in a temporary vector table to
+  one shared handler that reports its own exception number (read via
+  `mrs %0, ipsr`, external IRQs start at 16) back through a global,
+  enabling every candidate line via `NVIC_ISER0 = 0xFFFFFFFF`, then
+  writing one byte to `UART0_DATA` and observing which line actually
+  fired. Answer: **IRQ1** (confirmed twice - once with every UART CTRL
+  interrupt-enable bit set, once with only `TX_EN`/`TX_INT_EN`, ruling
+  out RX/overrun as the real source).
+- **How the interrupt actually behaves.** Two things weren't obvious
+  from the register layout alone: whether enabling `TX_INT_EN` on an
+  already-idle UART fires it immediately (it does not - confirmed by
+  enabling it with zero prior writes to `UART0_DATA` and seeing no
+  interrupt until software wrote the first byte itself, meaning the
+  interrupt is edge-latched on "a transmission just completed," not a
+  sustained level on "buffer currently empty"), and whether it needs
+  explicit acknowledgement (it does - `UART0_INTSTATUS` at offset `0xC`,
+  write 1 to bit 0 to clear; *not* acking it produced a real storm, 21+
+  re-fires from a single byte before a safety valve kicked in; acking it
+  produced exactly one fire per byte). Confirmed together with a
+  temporary test string streamed entirely by the ISR itself, one byte
+  per interrupt, no further mainline writes after the first.
+
+That same temporary test also demonstrated a real hazard the design
+already needed to account for: the test's own mainline diagnostic print
+(polled, uncoordinated) and the ISR both writing `UART0_DATA`
+concurrently produced visibly garbled, interleaved output - direct,
+reproduced evidence for the "ISR can preempt mainline at any point"
+hazard `estpico::detail::interrupt_guard` (the clock fix's own addition,
+above) exists to close, now needed for a second piece of shared state.
+
+**Design landed:**
+- `estpico::detail::tx_buffer : est::intrusive_list_node` - one queued,
+  formatted message; `pending_buffers` (an `est::intrusive_list<tx_buffer>`)
+  and `draining_buffer` (the one currently being fed into the ring,
+  tracking its own partial-drain offset) are both mainline-only - the TX
+  ISR never touches either, only the ring below.
+- `est::spsc_ring<char>` (64 bytes, a function-local `static` rather than
+  a plain global so its constructor's real `pmr` allocation defers until
+  well after `main()` starts, not during static init before the heap is
+  necessarily live) is the one genuine ISR/mainline boundary -
+  `est::spsc_ring<T>`'s own doc comment already named "a future
+  bare-metal interrupt handler" as a design target for this exact shape.
+- `pump_uart_hardware()` (ack INTSTATUS, pop one byte if TX isn't full)
+  is called from *both* the real ISR and, wrapped in `interrupt_guard`,
+  from mainline to prime a cold start (the interrupt only ever fires on
+  a completed transmission, never spontaneously - the empirical finding
+  above) - one function, never running concurrently with itself either
+  way (the ISR can't be preempted by mainline; the guard blocks the
+  reverse), keeping `uart_tx_ring` down to one logical consumer despite
+  two call sites.
+- `pump_some()` (drain `pending_buffers`/`draining_buffer` into the ring
+  until either caught up or the ring fills) is the one piece of logic
+  both `enqueue_output()`'s synchronous fast path and `pump_task()`'s
+  spawned, yielding loop share - most messages are short enough to
+  fully drain in the first call, needing no coroutine at all.
+- `pump_task()` is only `est::spawn()`'d (at `Priority::high`, exactly
+  as asked) when `pump_some()` reports genuine backlog *and*
+  `est::has_current_loop()` - a small, new, non-asserting query added to
+  `est:util.current_loop` (`current_loop()`/`current_allocator()` both
+  assert if nothing is registered, which `vprintdbg()` can't risk: it's
+  called with no loop current at all by
+  `est/tests/platform_tests.cpp`'s own existing "vprintdbg() writes...
+  without throwing" test, run unchanged against this exact backend under
+  QEMU - confirmed still passing, its message short enough to never need
+  the coroutine path).
+- `assert_failure()` deliberately does *not* go through this queue - it
+  calls `drain_uart_tx_synchronously()` first (flushing anything
+  `vprintdbg()` already had in flight, so earlier debug context isn't
+  silently lost right before the process halts), then writes its own
+  message through the same synchronous `uart_write()` as before,
+  unconditionally, since there's no later point after `terminate()` at
+  which a merely-queued message would ever reach the wire.
+- `uart_putc()`/`uart_write()` (still assert_failure()'s and the drain
+  function's own byte-level primitive) now wrap in `interrupt_guard`
+  too - without that, any code still using the plain synchronous writer
+  (this backend's own `test_main.cpp`, whose `uart_streambuf` redirects
+  *all* of Catch2's own console output through the identical `UART0_DATA`/
+  `STATE` registers) would race the new TX ISR exactly the way the
+  temporary discovery firmware demonstrated.
+
+Verified end to end: `est`'s own QEMU test suite (1110 assertions, 259
+cases, including the vprintdbg-with-no-loop test above) and
+`larson_scanner_mps2an385` (200 rendered frames) both still pass, with
+completely clean, non-garbled UART output despite Catch2's own console
+reporter and the new interrupt-driven diagnostic path sharing the same
+wire throughout the run. Full hosted pipeline (clang-format, `ci`
+build+tidy, tests, new-code coverage gate, `sanitize` build+test) also
+green - `has_current_loop()` picked up its own direct unit test
+(`est/tests/loop_tests.cpp`) once diff-cover flagged it as the one
+genuinely uncovered line the `est` core change added.

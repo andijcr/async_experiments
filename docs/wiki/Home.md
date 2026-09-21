@@ -115,7 +115,7 @@ constructs one, and `platform::override_instance()`s it
 | `est::mutex`, `mutex::lock_guard` (built on `est::binary_event<EventResetMode::automatic>`) | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
 | `est::loop` (incl. `timer_id`/`cancel_timer()`/`set_spawn_exception_hook()`), `ready_node`, `timer_node`, `detail::abandoned_exception`, `est::Priority`, `current_priority()`/`set_priority()` | `est/src/loop.cppm` |
-| `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()` | `est/src/util/current_loop.cppm` |
+| `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()`, `est::has_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::schedule_periodic()`, `est::periodic_timer_handle`, `detail::periodic_timer_node<Fn>` | `est/src/timer_periodic.cppm` |
 | `est::future_state<T>`, `est::future<T>` (incl. `clone()`; `[[nodiscard]]`, issue #58), `est::detail::discard()`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |
 | `est::promise<T>`, `make_promise_future()`, `make_ready_future()`, `make_failed_future()`, `sleep_for()`/`sleep_until()`, `detail::promise_resume_node<T>` | `est/src/promise.cppm` |

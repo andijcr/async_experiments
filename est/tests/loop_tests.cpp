@@ -132,6 +132,17 @@ TEST_CASE("allocator() returns the resource the loop was built with", "[loop]") 
   REQUIRE(loop.allocator().resource() == &resource);
 }
 
+TEST_CASE("has_current_loop() reflects whether make_current_loop() is currently in scope",
+          "[loop]") {
+  REQUIRE_FALSE(est::has_current_loop());
+  est::loop loop;
+  {
+    const auto loop_guard = est::make_current_loop(loop);
+    REQUIRE(est::has_current_loop());
+  }
+  REQUIRE_FALSE(est::has_current_loop());
+}
+
 TEST_CASE("run_until_idle() returns immediately when there is no ready work or pending timer",
           "[loop]") {
   est::loop loop;

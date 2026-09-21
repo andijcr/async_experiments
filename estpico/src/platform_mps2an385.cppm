@@ -27,20 +27,91 @@ import std;
 // replaced, and why: a firmware whose basic sense of time only works
 // under an attached debug host isn't "real firmware" in any useful
 // sense).
+//
+// vprintdbg()'s own UART output is asynchronous, interrupt-driven, and
+// bounded (est::intrusive_list<T> queues whole formatted messages;
+// est::spsc_ring<char> is the fixed-capacity queue a real UART0 TX
+// interrupt actually drains) rather than the old plain busy-wait
+// uart_write() every character - see enqueue_output()'s own doc comment
+// for the full design and why assert_failure() deliberately does *not*
+// use it.
 namespace estpico::detail {
 
 constexpr std::uint32_t uart0_base = 0x40004000U;
 constexpr std::uint32_t uart0_data = uart0_base + 0x00U;
 constexpr std::uint32_t uart0_state = uart0_base + 0x04U;
 constexpr std::uint32_t uart0_ctrl = uart0_base + 0x08U;
+constexpr std::uint32_t uart0_intstatus = uart0_base + 0x0CU;
 constexpr std::uint32_t uart_state_tx_full = 0x1U;
 constexpr std::uint32_t uart_ctrl_tx_en = 0x1U;
+constexpr std::uint32_t uart_ctrl_tx_int_en = 1U << 2U;
+constexpr std::uint32_t uart_intstatus_tx = 0x1U; // write 1 to ack/clear (confirmed empirically)
+
+// NVIC: UART0's TX-complete line is IRQ1 - confirmed empirically (not
+// found in any doc this project trusts blindly), by wiring every
+// external IRQ slot to a shared handler that reports its own IPSR and
+// observing which one fires after a single UART0_DATA write. Also
+// confirmed empirically: the interrupt is edge-latched on "a
+// transmission just completed" (not a sustained level tied to "TX
+// buffer currently empty" - enabling TX_INT_EN on an already-idle,
+// never-transmitted UART does *not* fire it on its own), and is acked by
+// writing 1 to INTSTATUS - a real storm (dozens of re-fires) resulted
+// from *not* acking it, and exactly one fire per completed byte resulted
+// from acking it (issue #123's PR design comment has the full
+// methodology and both results). Software must write the first byte to
+// create that first edge; the interrupt then chains subsequent bytes on
+// its own.
+constexpr std::uint32_t nvic_iser0 = 0xE000E100U;
+constexpr std::uint32_t nvic_icer0 = 0xE000E180U;
+constexpr std::uint32_t uart0_tx_irqn = 1U;
 
 [[nodiscard]] auto mmio32(std::uint32_t address) noexcept -> volatile std::uint32_t& {
   return *reinterpret_cast<volatile std::uint32_t*>(address); // NOLINT(*-reinterpret-cast)
 }
 
+// A short critical section - PRIMASK save/restore ("cpsid i" masks every
+// exception below priority 0, "msr primask" restores whatever the caller
+// had) - around anything shared between mainline/spawned code and an ISR.
+// This is a genuinely new hazard class on this backend specifically: an
+// interrupt really does preempt mainline code asynchronously, even on one
+// core, which is a different, real concurrency problem from the "two
+// coroutines interleaved at a co_await" case est::mutex exists for
+// (CLAUDE.md's "single-threaded, no atomics... don't add locking/atomics
+// speculatively" doesn't cover this - it isn't speculative here).
+// estpico::detail-local, not part of est itself: this is a
+// platform-specific hazard, not a framework-wide one. Safe to nest (the
+// inner guard's destructor restores "still masked," not "unmasked") -
+// several call sites below rely on that rather than each having to know
+// whether an outer guard is already held.
+class interrupt_guard {
+public:
+  interrupt_guard() noexcept {
+    __asm__ volatile("mrs %0, primask" : "=r"(saved_primask_)); // NOLINT(*-avoid-c-arrays)
+    __asm__ volatile("cpsid i" ::: "memory");
+  }
+  interrupt_guard(const interrupt_guard&) = delete;
+  auto operator=(const interrupt_guard&) -> interrupt_guard& = delete;
+  interrupt_guard(interrupt_guard&&) = delete;
+  auto operator=(interrupt_guard&&) -> interrupt_guard& = delete;
+  ~interrupt_guard() { __asm__ volatile("msr primask, %0" : : "r"(saved_primask_) : "memory"); }
+
+private:
+  std::uint32_t saved_primask_;
+};
+
+// Synchronous, busy-wait UART writer - used only for assert_failure()'s
+// own fatal diagnostic (never for vprintdbg(), which is asynchronous;
+// see enqueue_output() below) and drain_uart_tx_synchronously()'s own
+// final byte-by-byte flush. Wrapped in interrupt_guard: without it, this
+// racing the TX ISR's own DATA/STATE access is exactly the corruption
+// issue #123's PR design comment demonstrated empirically (two
+// uncoordinated writers of the same MMIO registers). Safe to busy-wait
+// on uart_state_tx_full while interrupts are masked: that bit clears via
+// autonomous UART hardware completing a transmission, not via any
+// software/interrupt action - masking only stops software from being
+// *told* about it, not the hardware event itself.
 void uart_putc(char c) noexcept {
+  const interrupt_guard guard;
   while ((mmio32(uart0_state) & uart_state_tx_full) != 0U) {
   }
   mmio32(uart0_data) = static_cast<std::uint32_t>(c);
@@ -96,33 +167,6 @@ void start_systick() noexcept {
   mmio32(syst_csr) = syst_csr_enable | syst_csr_tickint | syst_csr_clksource;
 }
 
-// A short critical section - PRIMASK save/restore ("cpsid i" masks every
-// exception below priority 0, "msr primask" restores whatever the caller
-// had) - around anything shared between mainline/spawned code and an ISR.
-// This is a genuinely new hazard class on this backend specifically: an
-// interrupt really does preempt mainline code asynchronously, even on one
-// core, which is a different, real concurrency problem from the "two
-// coroutines interleaved at a co_await" case est::mutex exists for
-// (CLAUDE.md's "single-threaded, no atomics... don't add locking/atomics
-// speculatively" doesn't cover this - it isn't speculative here).
-// estpico::detail-local, not part of est itself: this is a
-// platform-specific hazard, not a framework-wide one.
-class interrupt_guard {
-public:
-  interrupt_guard() noexcept {
-    __asm__ volatile("mrs %0, primask" : "=r"(saved_primask_)); // NOLINT(*-avoid-c-arrays)
-    __asm__ volatile("cpsid i" ::: "memory");
-  }
-  interrupt_guard(const interrupt_guard&) = delete;
-  auto operator=(const interrupt_guard&) -> interrupt_guard& = delete;
-  interrupt_guard(interrupt_guard&&) = delete;
-  auto operator=(interrupt_guard&&) -> interrupt_guard& = delete;
-  ~interrupt_guard() { __asm__ volatile("msr primask, %0" : : "r"(saved_primask_) : "memory"); }
-
-private:
-  std::uint32_t saved_primask_;
-};
-
 // Pairs systick_wrap_count with SYST_CVR atomically against
 // SysTick_Handler - without the critical section, a read landing in the
 // tiny window between hardware auto-reloading SYST_CVR (on the count-to-
@@ -144,6 +188,190 @@ private:
 [[nodiscard]] auto ticks_to_time_point(std::uint64_t ticks) noexcept
     -> est::platform::clock::time_point {
   return est::platform::clock::time_point{std::chrono::nanoseconds{ticks * ns_per_tick}};
+}
+
+// --- Asynchronous, interrupt-driven UART TX (vprintdbg() only) ---
+//
+// One queued chunk of formatted output text - the est::intrusive_list<T>
+// "buffer manager" half of the design. Entirely mainline-only: both
+// enqueue_output() (below) and pump_some() (below, whether called
+// directly or from pump_task()'s own spawned coroutine) run on the
+// ordinary call stack - the TX ISR never touches pending_buffers or
+// draining_buffer at all, only uart_tx_ring itself. Heap-allocated via
+// std::make_unique (not est::current_allocator()): enqueue_output() can
+// run before any est::loop is current at all (a debug diagnostic emitted
+// while still bootstrapping, or est/tests/platform_tests.cpp's own
+// "vprintdbg() writes... without throwing" test, which exercises this
+// backend directly with no loop registered) - current_allocator() would
+// assert in exactly that case, the same reason has_current_loop() is
+// checked below rather than current_loop() called unconditionally.
+struct tx_buffer : est::intrusive_list_node {
+  explicit tx_buffer(std::string text) noexcept : data(std::move(text)) {}
+  std::string data;
+  std::size_t offset = 0;
+};
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline est::intrusive_list<tx_buffer> pending_buffers;
+// The buffer currently being fed into uart_tx_ring, held outside
+// pending_buffers itself since intrusive_list<T> only supports FIFO
+// enqueue/dequeue - a buffer only partially drained (larger than the
+// ring's current free space) needs somewhere to keep its own offset
+// between pump_some() calls.
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline std::unique_ptr<tx_buffer> draining_buffer;
+
+// The fixed-capacity queue the TX ISR actually drains, one byte per
+// completed-transmission interrupt - the one genuine ISR/mainline
+// boundary in this design. est::spsc_ring<T>'s own doc comment already
+// names "a future bare-metal interrupt handler" as a design target for
+// this exact shape (just with producer/consumer reversed from its own
+// doc wording there: here mainline/the pump task produces, the ISR
+// consumes). A function-local static, not a plain inline global: its
+// constructor allocates (via est::spsc_ring<T>'s own pmr allocator),
+// and deferring that until first use (well after main() has started,
+// once the heap is definitely live) avoids relying on global static
+// initialization order before main() the way systick_wrap_count (a
+// plain POD) never needed to.
+constexpr std::size_t uart_tx_ring_capacity = 64;
+[[nodiscard]] auto uart_tx_ring() noexcept -> est::spsc_ring<char>& {
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+  static est::spsc_ring<char> ring(uart_tx_ring_capacity);
+  return ring;
+}
+
+// Drains up to one byte from uart_tx_ring into UART0_DATA if the UART is
+// currently idle - called both from the real TX-complete interrupt
+// (UART0_TX_Handler, extern "C" below) and, wrapped in interrupt_guard,
+// from mainline (uart_tx_kick(), to prime a cold start: the interrupt
+// itself only ever fires on a completed transmission, never
+// spontaneously on an idle bus - this file's own UART0 register comment
+// above). Never runs concurrently with itself: the real ISR can't be
+// preempted by mainline code, and interrupt_guard blocks the reverse
+// direction - so despite the two call sites, uart_tx_ring only ever has
+// one logical consumer at a time, preserving est::spsc_ring<T>'s
+// single-consumer contract.
+void pump_uart_hardware() noexcept {
+  mmio32(uart0_intstatus) = uart_intstatus_tx; // ack - harmless if nothing was pending
+  if ((mmio32(uart0_state) & uart_state_tx_full) != 0U) {
+    return; // already mid-transmission; the real interrupt drives the next byte
+  }
+  if (const auto c = uart_tx_ring().try_pop()) {
+    mmio32(uart0_data) = static_cast<std::uint32_t>(*c);
+  }
+}
+
+void uart_tx_kick() noexcept {
+  const interrupt_guard guard;
+  pump_uart_hardware();
+}
+
+// Pushes as many bytes as fit right now from draining_buffer (pulling a
+// fresh one from pending_buffers whenever it's null/exhausted) into
+// uart_tx_ring, then kicks the hardware. Returns true once genuinely
+// caught up (pending_buffers empty and draining_buffer consumed), false
+// if uart_tx_ring filled up first and there's more left for a later
+// call. The one piece of logic both enqueue_output()'s synchronous fast
+// path and pump_task()'s spawned, yielding loop share.
+[[nodiscard]] auto pump_some() noexcept -> bool {
+  while (true) {
+    if (!draining_buffer) {
+      draining_buffer.reset(pending_buffers.dequeue());
+      if (!draining_buffer) {
+        uart_tx_kick();
+        return true;
+      }
+    }
+    while (draining_buffer->offset < draining_buffer->data.size()) {
+      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+      if (!uart_tx_ring().try_push(char{draining_buffer->data[draining_buffer->offset]})) {
+        uart_tx_kick();
+        return false;
+      }
+      ++draining_buffer->offset;
+    }
+    draining_buffer.reset(); // fully queued - move on to the next buffer, if any
+  }
+}
+
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline bool pump_task_running = false; // mainline-only, no ISR access - no guard needed
+
+// est::spawn()'d at Priority::high (not critical) only once pending_buffers
+// has more queued than fit in uart_tx_ring in one shot - urgent enough to
+// keep debug output flowing promptly, but never allowed to starve
+// Priority::critical work the way monopolizing the ready-queue would
+// (yield_execution()'s own doc comment). Drains pending_buffers a chunk
+// at a time, yielding to est::loop between chunks rather than spinning.
+auto pump_task() -> est::future<void> {
+  while (!pump_some()) {
+    co_await est::yield_execution();
+  }
+  pump_task_running = false;
+}
+
+// vprintdbg()'s entry point: queues `text` for asynchronous UART output
+// instead of blocking the caller until every character has physically
+// transmitted (the old uart_write()-based vprintdbg() did exactly that -
+// fine for a rare, fatal assert_failure() message, but not for a debug
+// diagnostic that might fire from inside a hot continuation). Always
+// enqueues to pending_buffers first (not "try the ring directly, only
+// queue on overflow"): pump_some() already handles "fits in one shot"
+// and "needs more than one call" identically, so there's no separate
+// fast path to maintain - the only real cost either way is the one
+// std::string + tx_buffer allocation every vprintdbg() call already
+// pays for by formatting into a std::string in the first place.
+//
+// Only spawns pump_task() when pump_some() reports genuine backlog
+// (uart_tx_ring filled up before pending_buffers was drained) *and* a
+// loop is actually current (has_current_loop(), est:util.current_loop) -
+// most messages are short enough to fully drain in that first
+// pump_some() call, needing no coroutine at all. When no loop is current
+// and a backlog remains, this deliberately does not block or drop
+// anything: the text stays queued in pending_buffers, exactly matching
+// interface::vprintdbg()'s own documented "must swallow its own
+// failures... best-effort" contract - it'll flush whenever a later call
+// happens to run with a loop available (or, on the fatal path, whenever
+// drain_uart_tx_synchronously() below runs).
+void enqueue_output(std::string text) {
+  auto node = std::make_unique<tx_buffer>(std::move(text));
+  pending_buffers.enqueue(*node);
+  node.release();
+  const bool caught_up = pump_some();
+  if (!caught_up && !pump_task_running && est::has_current_loop()) {
+    pump_task_running = true;
+    est::spawn(pump_task(), est::Priority::high);
+  }
+}
+
+// assert_failure()'s own preamble: flushes anything still queued in
+// pending_buffers/draining_buffer/uart_tx_ring *before* writing the
+// fatal message itself, so earlier debug context isn't silently lost
+// just because terminate() is about to halt everything permanently
+// right after. Holds one interrupt_guard for the whole flush (not
+// per-iteration): about to terminate() anyway, so there's no cost to
+// paying for it, and holding it makes this function the ring's sole
+// popper for its entire duration - no race possible against the real
+// ISR, which pump_some()/uart_tx_kick()'s own per-call guards only
+// prevent one call at a time against.
+void drain_uart_tx_synchronously() noexcept {
+  const interrupt_guard guard;
+  while (!pump_some()) {
+  }
+  while (true) {
+    while ((mmio32(uart0_state) & uart_state_tx_full) != 0U) {
+    } // safe under the mask - see uart_putc()'s own identical reasoning above
+    const auto c = uart_tx_ring().try_pop();
+    if (!c) {
+      break;
+    }
+    mmio32(uart0_data) = static_cast<std::uint32_t>(*c);
+  }
+}
+
+void start_uart_tx_interrupt() noexcept {
+  mmio32(uart0_ctrl) = uart_ctrl_tx_en | uart_ctrl_tx_int_en;
+  mmio32(nvic_iser0) = 1U << uart0_tx_irqn;
 }
 
 // ARM semihosting (`bkpt 0xab`, r0 = operation, r1 = parameter) - kept
@@ -201,13 +429,21 @@ extern "C" void SysTick_Handler() noexcept { // NOLINT(readability-identifier-na
   estpico::detail::systick_wrap_count = estpico::detail::systick_wrap_count + 1U;
 }
 
+// startup.c's own vector table references this by name too, at slot
+// 16+1 (IRQ1 - the UART0 TX interrupt, confirmed empirically; see this
+// module's own UART0 register comment above), the same extern "C"
+// linkage split SysTick_Handler above already has.
+extern "C" void UART0_TX_Handler() noexcept { // NOLINT(readability-identifier-naming)
+  estpico::detail::pump_uart_hardware();
+}
+
 export namespace estpico {
 
 class platform_mps2an385 final : public est::platform::interface {
 public:
   platform_mps2an385() noexcept {
-    detail::mmio32(detail::uart0_ctrl) = detail::uart_ctrl_tx_en;
     detail::start_systick();
+    detail::start_uart_tx_interrupt();
   }
 
   [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
@@ -246,22 +482,32 @@ public:
     return detail::systick_ticks();
   }
 
+  // Asynchronous, interrupt-driven (detail::enqueue_output()'s own doc
+  // comment has the full design) - unlike the fatal assert_failure()
+  // path below, a debug diagnostic has no reason to block its caller
+  // until every character has physically left the UART.
   void vprintdbg(std::string_view fmt, std::format_args args) const noexcept override {
 #ifdef __cpp_exceptions
     try {
-      detail::uart_write(std::vformat(fmt, args));
-      detail::uart_write("\n");
+      detail::enqueue_output(std::vformat(fmt, args) + "\n");
       // NOLINTNEXTLINE(bugprone-empty-catch)
     } catch (...) {
     }
 #else
-    detail::uart_write(std::vformat(fmt, args));
-    detail::uart_write("\n");
+    detail::enqueue_output(std::vformat(fmt, args) + "\n");
 #endif
   }
 
+  // Deliberately synchronous, not routed through enqueue_output(): about
+  // to terminate() unconditionally right after, so there's no later
+  // point at which a queued-but-not-yet-transmitted message would ever
+  // actually reach the wire - drain_uart_tx_synchronously() first
+  // flushes anything vprintdbg() already had in flight (so earlier debug
+  // context isn't lost), then this writes its own message the same
+  // guaranteed way.
   [[noreturn]] void assert_failure(std::string_view message,
                                    std::source_location location) const noexcept override {
+    detail::drain_uart_tx_synchronously();
 #ifdef __cpp_exceptions
     try {
       detail::uart_write(std::format("{}:{}: assertion failed: {} (in {})\n",
