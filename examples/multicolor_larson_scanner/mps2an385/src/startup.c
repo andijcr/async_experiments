@@ -75,12 +75,13 @@ void Default_Handler(void) {
 // same split _exit()/gettimeofday() below already have with
 // picolibc/libc++.
 void SysTick_Handler(void);
-void UART0_TX_Handler(void); // IRQ1 - confirmed empirically, see that module's own comment
+void UART0_TX_Handler(void);  // IRQ1 - confirmed empirically, see that module's own comment
+void DualTimer_Handler(void); // IRQ10 - confirmed empirically, see that module's own comment
 
 // picolibcpp.ld's .boot_flash output section collects .text.init.enter
 // (among others) at ORIGIN(boot_flash) - exactly where a Cortex-M
 // expects its vector table (word0 = initial SP, word1 = reset vector).
-__attribute__((section(".text.init.enter"))) void (*const vector_table[16 + 2])(void) = {
+__attribute__((section(".text.init.enter"))) void (*const vector_table[16 + 11])(void) = {
     (void (*)(void))&__stack,
     Reset_Handler,
     Default_Handler, // NMI
@@ -99,6 +100,15 @@ __attribute__((section(".text.init.enter"))) void (*const vector_table[16 + 2])(
     SysTick_Handler,
     Default_Handler,  // IRQ0 - UART0 RX (unused)
     UART0_TX_Handler, // IRQ1
+    Default_Handler,  // IRQ2 - UART1 RX (unused)
+    Default_Handler,  // IRQ3 - UART1 TX (unused)
+    Default_Handler,  // IRQ4 - UART2 RX (unused)
+    Default_Handler,  // IRQ5 - UART2 TX (unused)
+    Default_Handler,  // IRQ6 - GPIO0 (unused)
+    Default_Handler,  // IRQ7 - GPIO1 (unused)
+    Default_Handler,  // IRQ8 - GPIO2 (unused)
+    Default_Handler,  // IRQ9 - GPIO3 (unused)
+    DualTimer_Handler, // IRQ10
 };
 
 // ARM semihosting SYS_EXIT_EXTENDED (op 0x20) - the only semihosting

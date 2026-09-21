@@ -7976,3 +7976,63 @@ Verified again end to end: mps2an385 QEMU test suite (1113 assertions,
 260 cases, including the vprintdbg-with-no-loop test) and
 `larson_scanner_mps2an385` both still pass, same real-time behavior as
 before either round of this review.
+
+**PR #124 review, round 3: `sleep_until()` gets a real `wfi` + a second
+timer, not just a busy-poll.** A third review comment, this time on
+`sleep_until()`'s own plain `while (uptime() < deadline) {}` loop: use
+`wfi` (Wait For Interrupt), "a standard arm32 function," to actually
+halt the CPU between checks instead of spinning it.
+
+The real complication, surfaced before writing any code: `wfi` wakes on
+*any* enabled interrupt, and the only periodic one wired up (SysTick)
+only fires once per ~671ms wrap - but `larson_scanner`'s own
+`tick_interval`/`render_interval`/`command_poll_interval` are all
+20-33ms. A naive `wfi` with nothing else providing a closer wakeup would
+have meant waiting up to ~671ms past every real deadline - not a
+rounding error, a ~20x frame-rate collapse. Fixing it for real needed a
+*second*, independent timer that could be armed per-deadline: SysTick's
+own reload is load-bearing for `systick_ticks()`'s own tick accounting
+(its formula assumes every wrap represents exactly one full
+`systick_cycle_length`), so temporarily shortening it to align with an
+arbitrary sleep deadline would desynchronize the clock itself - not
+something worth risking for a wakeup mechanism.
+
+The board's second CMSDK APB timer peripheral (the "dual-timer," at
+`0x40002000` - confirmed via `info mtree`, same as every other
+peripheral base in this project) was sitting there unused. Its own
+register layout (a standard ARM SP804-shaped block: `LOAD`/`VALUE`/
+`CONTROL`/`INTCLR` per sub-timer, `CONTROL` bits for `ONESHOT`/`SIZE`/
+`INTEN`/`ENABLE`) and its NVIC wiring for this specific board
+(`IRQ10`) came from QEMU 8.2.2's own device model source
+(`hw/timer/cmsdk-apb-dualtimer.c`, `hw/arm/mps2.c`) - fetched as a
+starting hypothesis, then run through the identical two-step discipline
+every other piece of hardware in this file got: confirmed empirically
+against the real binary, not trusted from the source alone. `IRQ10`
+checked out via the same shared-handler/IPSR technique used for UART0
+TX; acking via `T1INTCLR` turned out to be required the same way UART0's
+own interrupt was - a real 200+-fire storm resulted from *not* acking
+it, exactly one fire from acking it. `TIMCLK` (the timer's own input
+clock) was calibrated directly against SysTick's own already-trusted
+`uptime()` rather than semihosting this time - both derive from the
+same board clock, and it came out to the identical clean 25 MHz, so the
+same 40ns/tick integer math applies.
+
+`sleep_until()`'s new shape: recompute the remaining time each loop
+iteration, arm the dual-timer for a one-shot interrupt at (approximately)
+that remaining duration, `wfi`, recheck `uptime()` against the real
+deadline (since `wfi` could have woken on an unrelated interrupt - a
+UART TX completion, say), and repeat if not actually there yet. A
+deadline already in the past never touches the timer at all.
+
+Verified two ways: `est/tests/platform_tests.cpp`'s own "sleep_until()
+returns once the deadline has passed" test already exercises the real
+(not faked) `platform_mps2an385::sleep_until()` with a genuine 1ms
+deadline, unmodified, still passing. More tellingly,
+`larson_scanner_mps2an385`'s 200-frame run stayed at the identical
+~6.7s real time as every prior measurement in this file - had the
+naive-`wfi` oversleep problem actually landed, 200 frames at up to
+~671ms each would run for minutes, not seconds. One concrete, measured
+benefit past correctness: the same run's host-side CPU time (`user` in
+`time`'s own output) dropped from ~6.6s to ~0.18s - `wfi` is genuinely
+idling the emulated CPU between events under QEMU's own TCG, not just a
+correctness no-op.

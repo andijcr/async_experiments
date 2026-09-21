@@ -14,8 +14,10 @@ import std;
 // Every method below routes through a real, memory-mapped piece of
 // hardware - CMSDK APB UART0 (0x40004000, confirmed via `info mtree` in
 // Findings 1-2 of issue #123) for output, the Cortex-M3 core's own SysTick
-// timer for uptime()/get_random_seed() - never through ARM semihosting
-// (`bkpt 0xab`), with one deliberate exception: terminate()'s exit-code
+// timer for uptime()/get_random_seed(), and a second CMSDK APB dual-timer
+// (0x40002000) sleep_until() arms per call to back a real `wfi` low-power
+// wait - never through ARM semihosting (`bkpt 0xab`), with one deliberate
+// exception: terminate()'s exit-code
 // report. That's the only place this backend still talks to whatever's
 // running it, and it's not part of "functioning" - a real, flashed
 // firmware never calls it at all (nothing here returns from main() or
@@ -64,6 +66,38 @@ constexpr std::uint32_t uart_intstatus_tx = 0x1U; // write 1 to ack/clear (confi
 constexpr std::uint32_t nvic_iser0 = 0xE000E100U;
 constexpr std::uint32_t nvic_icer0 = 0xE000E180U;
 constexpr std::uint32_t uart0_tx_irqn = 1U;
+
+// CMSDK APB dual-timer (0x40002000, confirmed via `info mtree` the same
+// way UART0's base was) - Timer1's own register block, the only one of
+// its two independent sub-timers this backend uses. Register offsets,
+// control-register bit positions, and the ack-via-INTCLR requirement
+// were all cross-checked against QEMU 8.2.2's own device model source
+// (hw/timer/cmsdk-apb-dualtimer.c) and then confirmed empirically
+// against this exact build, the same two-step methodology (a documented
+// hypothesis, verified against the real binary) issue #123's PR design
+// comment already used for SysTick's clock frequency: NVIC IRQ10 (found
+// via the identical shared-handler/IPSR technique used for UART0 TX),
+// and - like the UART TX interrupt - a real storm (200+ re-fires before
+// a safety valve tripped) resulted from *not* acking T1INTCLR, exactly
+// one fire resulted from acking it.
+constexpr std::uint32_t dualtimer_base = 0x40002000U;
+constexpr std::uint32_t t1_load = dualtimer_base + 0x00U;
+constexpr std::uint32_t t1_control = dualtimer_base + 0x08U;
+constexpr std::uint32_t t1_intclr = dualtimer_base + 0x0CU;
+constexpr std::uint32_t t1_ctrl_oneshot = 1U << 0U;
+constexpr std::uint32_t t1_ctrl_size_32bit = 1U << 1U;
+constexpr std::uint32_t t1_ctrl_inten = 1U << 5U;
+constexpr std::uint32_t t1_ctrl_enable = 1U << 7U;
+constexpr std::uint32_t dualtimer_irqn = 10U;
+
+// TIMCLK (the dual-timer's own input clock) measured empirically at
+// ~24.98 MHz, calibrated against SysTick's own already-trusted uptime()
+// rather than semihosting - both derive from the same board clock
+// (QEMU's `mps.sysclk`), so this is the same clean 25 MHz SysTick itself
+// measured at, and the same 40ns/tick.
+constexpr std::uint32_t dualtimer_hz = 25'000'000U;
+constexpr std::uint64_t ns_per_dt_tick = 1'000'000'000ULL / dualtimer_hz;
+static_assert(1'000'000'000ULL % dualtimer_hz == 0, "must divide 1e9 evenly for exact ns");
 
 [[nodiscard]] auto mmio32(std::uint32_t address) noexcept -> volatile std::uint32_t& {
   return *reinterpret_cast<volatile std::uint32_t*>(address); // NOLINT(*-reinterpret-cast)
@@ -401,6 +435,52 @@ void start_uart_tx_interrupt() noexcept {
   mmio32(nvic_iser0) = 1U << uart0_tx_irqn;
 }
 
+// Enables IRQ10 in the NVIC once, at construction - unlike the UART TX
+// interrupt (whose CTRL enable and NVIC enable both happen once, up
+// front, since it free-runs from then on), the dual-timer's own
+// countdown is armed fresh by arm_dualtimer_oneshot() below on every
+// sleep_until() call, not started here.
+void start_dualtimer_irq() noexcept {
+  mmio32(nvic_iser0) = 1U << dualtimer_irqn;
+}
+
+// Arms Timer1 for a single interrupt roughly `remaining` from now, then
+// halts (ONESHOT) - sleep_until() below WFIs right after calling this,
+// so this is what actually wakes it back up at (approximately) the
+// right time instead of leaving WFI to wait for SysTick's own ~671ms
+// wrap or an unrelated UART interrupt. Disables and re-acks before
+// reloading regardless of whether a previous countdown is still
+// in-flight (a WFI woken early by some other interrupt re-arms this
+// mid-countdown; harmless to restart it with the freshly recomputed
+// remaining time) - cheaper than tracking whether one is already
+// running and only conditionally touching it.
+//
+// Deliberately not SysTick: SysTick's own reload value is load-bearing
+// for uptime()'s own tick accounting (systick_ticks()'s formula assumes
+// every wrap represents exactly one full systick_cycle_length) -
+// temporarily shortening it to align with an arbitrary deadline would
+// desynchronize the clock itself. A second, genuinely independent timer
+// avoids that class of bug entirely, at the cost of the one MMIO
+// peripheral this backend hadn't needed before.
+void arm_dualtimer_oneshot(est::platform::clock::duration remaining) noexcept {
+  const auto remaining_ns = static_cast<std::uint64_t>(remaining.count());
+  std::uint64_t ticks = remaining_ns / ns_per_dt_tick;
+  // A 0-tick countdown may never fire (SP804-style semantics don't
+  // define what happens from an already-elapsed load) - round up to 1
+  // rather than risk WFI never waking at all. The upper clamp is purely
+  // defensive: sleep_until()'s own real deadlines are milliseconds, many
+  // orders of magnitude under the ~171s a 32-bit counter at 25MHz holds.
+  if (ticks == 0U) {
+    ticks = 1U;
+  } else if (ticks > 0xFFFF'FFFFULL) {
+    ticks = 0xFFFF'FFFFULL;
+  }
+  mmio32(t1_control) = 0U; // stop and disable before reprogramming
+  mmio32(t1_intclr) = 1U;  // ack any stale pending status (value is irrelevant)
+  mmio32(t1_load) = static_cast<std::uint32_t>(ticks);
+  mmio32(t1_control) = t1_ctrl_oneshot | t1_ctrl_size_32bit | t1_ctrl_inten | t1_ctrl_enable;
+}
+
 // ARM semihosting (`bkpt 0xab`, r0 = operation, r1 = parameter) - kept
 // only for terminate() below (SYS_EXIT_EXTENDED), not for anything this
 // backend needs to actually function (see this module's own top
@@ -464,6 +544,16 @@ extern "C" void UART0_TX_Handler() noexcept { // NOLINT(readability-identifier-n
   estpico::detail::pump_uart_hardware();
 }
 
+// startup.c's own vector table references this at slot 16+10 (IRQ10 -
+// the dual-timer's own interrupt line, confirmed empirically; see this
+// module's own dual-timer register comment above). Only job is to ack
+// (so ONESHOT mode's single fire doesn't storm the same way an unacked
+// UART TX interrupt did) and, by virtue of being serviced at all, wake
+// sleep_until()'s own `wfi` - nothing else needs to happen here.
+extern "C" void DualTimer_Handler() noexcept { // NOLINT(readability-identifier-naming)
+  estpico::detail::mmio32(estpico::detail::t1_intclr) = 1U;
+}
+
 export namespace estpico {
 
 class platform_mps2an385 final : public est::platform::interface {
@@ -471,30 +561,36 @@ public:
   platform_mps2an385() noexcept {
     detail::start_systick();
     detail::start_uart_tx_interrupt();
+    detail::start_dualtimer_irq();
   }
 
   [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return detail::ticks_to_time_point(detail::systick_ticks());
   }
 
-  // No real low-power wait: a plain busy-poll until `deadline`. QEMU has
-  // no meaningful power draw to save, and this machine's timer-IRQ wakeup
-  // wiring isn't something this backend needs yet (est::loop's own run
-  // loop already only calls this when it has genuinely nothing else to
-  // do) - a real hardware backend targeting actual power-sensitive
-  // silicon would replace this with a WFI + timer-interrupt wakeup
-  // instead, without anything above this interface needing to change.
+  // A real low-power wait: `wfi` (Wait For Interrupt, the standard
+  // Cortex-M mechanism) halts the CPU until the next interrupt, backed by
+  // detail::arm_dualtimer_oneshot() so that "next interrupt" is
+  // (approximately) the actual deadline, not whatever unrelated interrupt
+  // happens to fire next. WFI can wake on *any* enabled interrupt though
+  // (SysTick's own ~671ms wrap, a UART TX completion, ...), so this still
+  // rechecks uptime() against `deadline` in a loop rather than trusting a
+  // single wake - re-arming the dual-timer with the freshly recomputed
+  // remaining time each time it loops. A deadline already in the past
+  // returns immediately without ever touching the timer at all.
   //
-  // Unlike the old semihosting-based uptime() (a real trap out to
-  // whatever's running the CPU on every call, expensive enough that a
-  // plain polling loop cost tens of real seconds per simulated second -
-  // see docs/PLAN.md's estpico entry), systick_ticks() is a couple of
-  // MMIO reads behind a short interrupt mask - cheap enough that polling
-  // it directly needs no calibrated busy-spin estimate to cover the bulk
-  // of the wait first. This is a straight simplification the SysTick
-  // switch enabled, not a design carried over from before.
+  // Not SysTick-based: arm_dualtimer_oneshot()'s own doc comment has the
+  // reasoning (SysTick's reload is load-bearing for uptime()'s own tick
+  // accounting; a second, independent timer avoids desynchronizing the
+  // clock to align a wakeup to an arbitrary deadline).
   void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
-    while (uptime() < deadline) {
+    while (true) {
+      const auto current = uptime();
+      if (current >= deadline) {
+        return;
+      }
+      detail::arm_dualtimer_oneshot(deadline - current);
+      __asm__ volatile("wfi");
     }
   }
 
