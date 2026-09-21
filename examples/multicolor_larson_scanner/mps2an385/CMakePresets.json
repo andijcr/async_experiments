@@ -1,0 +1,14 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 4, "minor": 4, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "mps2an385",
+      "displayName": "armv7m-none-eabi (QEMU mps2-an385 bare-metal build)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/mps2an385",
+      "toolchainFile": "${sourceDir}/../../../cmake/toolchain-mps2an385.cmake"
+    }
+  ],
+  "buildPresets": [{ "name": "mps2an385", "configurePreset": "mps2an385" }]
+}

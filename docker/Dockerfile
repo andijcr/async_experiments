@@ -36,6 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ninja-build \
         python3 \
         python3-pip \
+        xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # --- Pinned Clang/LLVM snapshot from apt.llvm.org ---
@@ -136,6 +137,39 @@ RUN mkdir -p /opt/wasi-sysroot /opt/wasi-resource-wasm32 \
     && tar xzf /tmp/libclang_rt.tar.gz -C /opt/wasi-resource-wasm32/lib --strip-components=1 \
     && rm -f /tmp/libclang_rt.tar.gz \
     && chmod -R a+rX /opt/wasi-sysroot /opt/wasi-resource-wasm32
+
+# --- Pinned ARM bare-metal sysroot, for
+# examples/multicolor_larson_scanner/mps2an385's armv7m-none-eabi build
+# (cmake/toolchain-mps2an385.cmake) - same shape as the wasi-sysroot block
+# above: this image's own pinned Clang ${LLVM_VERSION} does the actual
+# compiling, cross-compiling via --target=/-isystem=/-L= against this
+# sysroot; ARM's own bundled Clang from the release tarball below is
+# never installed or used at all (issue #123's PR-design comment has the
+# full story: ARM's own older, toolchain-bundled Clang 19.1.5 genuinely
+# can't compile `import std;` alongside a textual #include of the same
+# header in one TU - a real bug reproduced with nothing but `import std;
+# #include <string>;` - while this image's newer Clang handles the exact
+# same combination correctly, and Catch2's C++20 TEST_CASE macros need
+# that combination in every one of est's own test files).
+#
+# Only one of the ~40 variants the release ships (armv7m_soft_nofp_exn_rtti -
+# soft-float armv7-M, real exceptions/RTTI enabled) is kept; the release's
+# own bundled bin/ (its Clang/lld, ~300MB, unused per above) and every
+# other variant are discarded after extracting - the one variant actually
+# needed is ~20MB (headers, prebuilt libc++.a/libc++abi.a/libunwind.a/
+# libc.a/libclang_rt.builtins.a, and picolibcpp.ld - see
+# examples/multicolor_larson_scanner/mps2an385/src/link.ld's own comment
+# for why the linker script matters here too).
+ARG ARM_TOOLCHAIN_VERSION=19.1.5
+ARG ARM_TOOLCHAIN_VARIANT=armv7m_soft_nofp_exn_rtti
+RUN mkdir -p /opt/arm-none-eabi-sysroot \
+    && wget --inet4-only -O /tmp/arm-toolchain.tar.xz \
+        "https://github.com/ARM-software/LLVM-embedded-toolchain-for-Arm/releases/download/release-${ARM_TOOLCHAIN_VERSION}/LLVM-ET-Arm-${ARM_TOOLCHAIN_VERSION}-Linux-x86_64.tar.xz" \
+    && tar xJf /tmp/arm-toolchain.tar.xz \
+        -C /opt/arm-none-eabi-sysroot --strip-components=5 \
+        "LLVM-ET-Arm-${ARM_TOOLCHAIN_VERSION}-Linux-x86_64/lib/clang-runtimes/arm-none-eabi/${ARM_TOOLCHAIN_VARIANT}" \
+    && rm -f /tmp/arm-toolchain.tar.xz \
+    && chmod -R a+rX /opt/arm-none-eabi-sysroot
 
 # --- Non-root user for local bind-mount ergonomics ---
 RUN groupadd --gid "${USER_GID}" est \

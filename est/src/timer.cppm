@@ -11,7 +11,7 @@ export namespace est {
 // and is what actually fires deadlines as continuations.
 template <class Allocator = std::allocator<std::byte>> class timer_queue {
 public:
-  using clock = std::chrono::steady_clock;
+  using clock = platform::clock;
   using time_point = clock::time_point;
   using duration = clock::duration;
   using id = std::size_t;

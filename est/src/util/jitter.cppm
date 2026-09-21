@@ -22,7 +22,7 @@ export namespace est {
 // undemanding.
 class jitter {
 public:
-  using duration = std::chrono::steady_clock::duration;
+  using duration = platform::clock::duration;
 
   // max_jitter must be non-negative - checked. A zero max_jitter is a
   // legitimate, if pointless, way to say "no jitter": every draw is then

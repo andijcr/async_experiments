@@ -12,16 +12,41 @@ import std;
 // consumer that wants a working, ready-to-use backend opts in with a
 // second import: `import est; import estext;`. A future bare-metal
 // backend would be its own similarly separate module.
+namespace estext::detail {
+
+// est::platform::clock (est/src/platform/platform.cppm's own doc comment
+// has the full reasoning) shares std::chrono::steady_clock's
+// representation and epoch by construction - every value this backend
+// ever hands out comes directly from steady_clock::now() below, so
+// converting between the two is a pure reinterpretation of the same
+// nanosecond count, never a real unit/epoch conversion.
+[[nodiscard]] auto to_platform_clock(std::chrono::steady_clock::time_point tp) noexcept
+    -> est::platform::clock::time_point {
+  return est::platform::clock::time_point{tp.time_since_epoch()};
+}
+
+[[nodiscard]] auto to_steady_clock(est::platform::clock::time_point tp) noexcept
+    -> std::chrono::steady_clock::time_point {
+  return std::chrono::steady_clock::time_point{tp.time_since_epoch()};
+}
+
+} // namespace estext::detail
+
 export namespace estext {
 
 class hosted_stdcpp final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
-    return std::chrono::steady_clock::now();
+  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+    return detail::to_platform_clock(std::chrono::steady_clock::now());
   }
 
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
-    std::this_thread::sleep_until(deadline);
+  // std::this_thread::sleep_until() needs a real std::chrono clock (one
+  // with its own working now(), used internally to retry past spurious
+  // wakeups) - est::platform::clock deliberately isn't one (its own doc
+  // comment), so this converts back to the real steady_clock this
+  // backend actually sources every value from.
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+    std::this_thread::sleep_until(detail::to_steady_clock(deadline));
   }
 
   // std::random_device itself can throw (implementation-defined, if no
@@ -100,7 +125,7 @@ public:
   // backend can just implement the same way.
   void reset_loop_stall_detection() noexcept override { stall_start_ = now(); }
 
-  void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+  void detect_loop_stall(est::platform::clock::duration threshold) const noexcept override {
     const auto elapsed = now() - stall_start_;
     if (elapsed > threshold) {
       est::platform::printdbg(
@@ -111,7 +136,7 @@ public:
   }
 
 private:
-  std::chrono::steady_clock::time_point stall_start_;
+  est::platform::clock::time_point stall_start_;
 };
 
 } // namespace estext

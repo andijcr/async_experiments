@@ -13,11 +13,11 @@ namespace {
 // run_until_idle() call).
 class recording_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     current = std::max(current, deadline);
   }
 
@@ -38,10 +38,9 @@ public:
   }
 
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
-  mutable std::chrono::steady_clock::time_point current;
+  mutable est::platform::clock::time_point current;
   mutable int diagnostic_count = 0;
   mutable std::optional<std::string> last_diagnostic;
 };

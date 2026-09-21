@@ -10,14 +10,14 @@ namespace {
 // recognizable now(). Never triggers assert_failure() in these tests.
 class stub_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
     return epoch;
   }
 
   // Records the last deadline it was asked to sleep until, so a test can
   // confirm override_instance() actually retargets sleep_until() too -
   // never actually blocks.
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     last_sleep_until = deadline;
   }
 
@@ -51,12 +51,11 @@ public:
   // shared default for these, so every concrete backend, this stub
   // included, must answer them itself.
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
-  static constexpr std::chrono::steady_clock::time_point epoch{};
+  static constexpr est::platform::clock::time_point epoch{};
   static constexpr std::uint64_t random_seed = 0xC0FFEE;
-  mutable std::optional<std::chrono::steady_clock::time_point> last_sleep_until;
+  mutable std::optional<est::platform::clock::time_point> last_sleep_until;
   mutable std::optional<std::string> last_vprintdbg_message;
 };
 

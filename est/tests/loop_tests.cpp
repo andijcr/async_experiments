@@ -39,11 +39,11 @@ private:
 // pattern est/tests/timer_tests.cpp already established.
 class fake_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     current = std::max(current, deadline);
   }
 
@@ -66,10 +66,9 @@ public:
   // inherit a shared implementation from, so every concrete backend,
   // this fake included, must answer these itself.
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
-  mutable std::chrono::steady_clock::time_point current;
+  mutable est::platform::clock::time_point current;
 };
 
 // A platform whose now() advances by `step` on every single call - used
@@ -83,13 +82,13 @@ public:
 // loop::run_one() itself triggers via these two calls.
 class jumping_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
     const auto result = current;
     current += step;
     return result;
   }
 
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     current = std::max(current, deadline);
   }
 
@@ -112,7 +111,7 @@ public:
 
   void reset_loop_stall_detection() noexcept override { stall_start = now(); }
 
-  void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+  void detect_loop_stall(est::platform::clock::duration threshold) const noexcept override {
     const auto elapsed = now() - stall_start;
     if (elapsed > threshold) {
       est::platform::printdbg(
@@ -120,9 +119,9 @@ public:
     }
   }
 
-  mutable std::chrono::steady_clock::time_point current;
-  std::chrono::steady_clock::duration step = std::chrono::milliseconds(100);
-  mutable std::chrono::steady_clock::time_point stall_start;
+  mutable est::platform::clock::time_point current;
+  est::platform::clock::duration step = std::chrono::milliseconds(100);
+  mutable est::platform::clock::time_point stall_start;
 };
 
 } // namespace
@@ -219,7 +218,7 @@ TEST_CASE("sleep_for() resolves once run_until_idle() advances past the deadline
 TEST_CASE("sleep_until() resolves once run_until_idle() advances past the deadline", "[loop]") {
   using namespace std::chrono_literals;
   fake_platform fake;
-  fake.current = std::chrono::steady_clock::time_point{} + 1000s;
+  fake.current = est::platform::clock::time_point{} + 1000s;
   const auto guard = est::platform::override_instance(fake);
 
   est::loop loop;

@@ -32,6 +32,37 @@ import :util.scope_exit;
 
 export namespace est::platform {
 
+// A framework-owned vocabulary clock, deliberately not
+// std::chrono::steady_clock itself: no variant of the ARM bare-metal
+// toolchain estpico builds against (arm-none-eabi's own prebuilt libc++)
+// provides it at all - every one is built with
+// _LIBCPP_HAS_NO_MONOTONIC_CLOCK, which removes std::chrono::steady_clock's
+// class declaration entirely, not just its implementation, so there's no
+// way to make it exist by supplying a working clock underneath. Same
+// shape as std::chrono::steady_clock (nanosecond resolution, marked
+// steady) so every existing use of steady_clock::time_point/duration
+// throughout est's own source (loop.cppm/timer.cppm/jitter.cppm) becomes
+// a type-tag swap rather than a semantic rewrite - the underlying
+// representation (a signed 64-bit nanosecond count) is unchanged.
+//
+// No now() static member: unlike std::chrono::steady_clock, nothing in
+// est ever calls clock::now() directly - every actual "what time is it"
+// question already goes through interface::now() below (virtual
+// dispatch to whichever backend is installed), and each backend's own
+// now() override is free to source the value however it likes (real
+// std::chrono::steady_clock::now() for hosted_stdcpp, a JS import for
+// platform_wasm, ARM semihosting's SYS_ELAPSED for estpico) - clock
+// itself is purely a vocabulary type identifying "the time_point/
+// duration platform::interface speaks in," not a working clock any code
+// calls into on its own.
+struct clock {
+  using duration = std::chrono::nanoseconds;
+  using rep = duration::rep;
+  using period = duration::period;
+  using time_point = std::chrono::time_point<clock, duration>;
+  static constexpr bool is_steady = true;
+};
+
 class interface;
 
 // Declared here (defined later, once detail::current_instance exists for
@@ -74,7 +105,7 @@ public:
   auto operator=(interface&&) -> interface& = delete;
   virtual ~interface() = default;
 
-  [[nodiscard]] virtual auto now() const noexcept -> std::chrono::steady_clock::time_point = 0;
+  [[nodiscard]] virtual auto now() const noexcept -> clock::time_point = 0;
 
   // Blocks the calling thread until `deadline`, or returns immediately if
   // it has already passed - est::loop's answer to "how do I wait for the
@@ -83,7 +114,7 @@ public:
   // advance its own fake clock instead of actually blocking, so a loop
   // test exercising real timer-driven wakeups runs instantly instead of
   // for real wall-clock seconds (est/tests/loop_tests.cpp).
-  virtual void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept = 0;
+  virtual void sleep_until(clock::time_point deadline) const noexcept = 0;
 
   // Returns a fresh, best-effort-random seed value for anything in est
   // that needs one (est::jitter, :util.jitter, the only caller today) -
@@ -138,7 +169,7 @@ public:
   // reset_loop_stall_detection(), so est::loop's own
   // long_running_threshold stays the single source of truth for the
   // value, unchanged by which backend is installed.
-  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
+  virtual void detect_loop_stall(clock::duration threshold) const noexcept = 0;
 };
 
 // The actual body, deferred until here (see the forward declaration's own

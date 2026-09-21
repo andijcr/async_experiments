@@ -72,13 +72,13 @@ __attribute__((import_module("env"), import_name("js_report"))) void js_report(s
 // NOLINTEND(readability-identifier-naming)
 } // extern "C"
 
-[[nodiscard]] auto ms_to_time_point(double ms) noexcept -> std::chrono::steady_clock::time_point {
-  return std::chrono::steady_clock::time_point{
-      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+[[nodiscard]] auto ms_to_time_point(double ms) noexcept -> est::platform::clock::time_point {
+  return est::platform::clock::time_point{
+      std::chrono::duration_cast<est::platform::clock::duration>(
           std::chrono::duration<double, std::milli>(ms))};
 }
 
-[[nodiscard]] auto time_point_to_ms(std::chrono::steady_clock::time_point tp) noexcept -> double {
+[[nodiscard]] auto time_point_to_ms(est::platform::clock::time_point tp) noexcept -> double {
   return std::chrono::duration<double, std::milli>(tp.time_since_epoch()).count();
 }
 
@@ -97,7 +97,7 @@ export namespace estwasm {
 
 class platform_wasm final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
     return detail::ms_to_time_point(detail::js_now_ms());
   }
 
@@ -108,7 +108,7 @@ public:
   // thread's own instantiation of the same compiled module never calls
   // est::loop::run() at all (docs/PLAN.md's Issue #99 entry), so it never
   // reaches this method regardless.
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     detail::js_sleep_until_ms(detail::time_point_to_ms(deadline));
   }
 
@@ -166,7 +166,7 @@ public:
 
   void reset_loop_stall_detection() noexcept override { stall_start_ = now(); }
 
-  void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept override {
+  void detect_loop_stall(est::platform::clock::duration threshold) const noexcept override {
     const auto elapsed = now() - stall_start_;
     if (elapsed > threshold) {
       est::platform::printdbg(
@@ -177,7 +177,7 @@ public:
   }
 
 private:
-  std::chrono::steady_clock::time_point stall_start_;
+  est::platform::clock::time_point stall_start_;
 };
 
 } // namespace estwasm

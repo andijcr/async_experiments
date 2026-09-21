@@ -37,11 +37,11 @@ private:
 // to est/tests/loop_tests.cpp's own fake_platform.
 class fake_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     current = std::max(current, deadline);
   }
 
@@ -59,10 +59,9 @@ public:
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
 
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
-  mutable std::chrono::steady_clock::time_point current;
+  mutable est::platform::clock::time_point current;
 };
 
 } // namespace
@@ -104,7 +103,7 @@ TEST_CASE("schedule_periodic() is fixed-rate: a slow fn() doesn't drift later de
   constexpr auto slow_work = 400ms; // < interval, so it never pushes a
                                     // period past the next one entirely
 
-  std::vector<std::chrono::steady_clock::time_point> call_times;
+  std::vector<est::platform::clock::time_point> call_times;
   int calls = 0;
   std::optional<est::periodic_timer_handle> handle;
   handle = est::schedule_periodic(interval, [&] {

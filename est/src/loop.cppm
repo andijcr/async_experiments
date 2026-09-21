@@ -255,7 +255,7 @@ export namespace est {
 class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
-  using clock = std::chrono::steady_clock;
+  using clock = platform::clock;
   using timer_id = timer_queue<allocator_type>::id;
 
   // One FIFO ready-queue per priority level (est::Priority, above) -
