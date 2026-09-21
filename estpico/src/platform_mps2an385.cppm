@@ -271,8 +271,9 @@ void uart_tx_kick() noexcept {
 // uart_tx_ring, then kicks the hardware. Returns true once genuinely
 // caught up (pending_buffers empty and draining_buffer consumed), false
 // if uart_tx_ring filled up first and there's more left for a later
-// call. The one piece of logic both enqueue_output()'s synchronous fast
-// path and pump_task()'s spawned, yielding loop share.
+// call. Shared by three callers: enqueue_output()'s own no-loop-current
+// fallback, pump_task_loop()'s spawned, yielding loop, and
+// drain_uart_tx_synchronously()'s fatal-path flush (all below).
 [[nodiscard]] auto pump_some() noexcept -> bool {
   while (true) {
     if (!draining_buffer) {
@@ -294,27 +295,41 @@ void uart_tx_kick() noexcept {
   }
 }
 
-// A clone of the currently in-flight pump_task()'s own future<void>, if
-// any - std::nullopt (never spawned yet) or ready() (its coroutine has
-// already returned) both mean "not running." Holding this instead of a
-// separate bool flag means there's nothing to manually reset on
-// completion: future_state<T> already tracks that, and clone() is exactly
-// the tool for a second, independent observer of it (future<T>::clone()'s
-// own doc comment) - est::spawn() itself takes the other clone and moves
-// it away, so this is the only handle left to ask later. Mainline-only,
-// no ISR access - no interrupt_guard needed.
+// Rings once per enqueue_output() call while a loop is current - the
+// persistent pump_task_loop() below (est::spawn()'d exactly once, the
+// first time a loop becomes available) co_await-s this instead of being
+// re-spawned per backlog episode. automatic mode + max_count = 1
+// (est::binary_event) is the right shape for "wake up and check for
+// work," not a counted resource: several enqueue_output() calls while
+// the pump task is already busy just keep the single unit saturated
+// (set()'s own doc comment - a no-op past the first, harmless) rather
+// than queuing up N wakeups for M buffers pump_some() already drains
+// all of in one pass regardless of how many set() calls contributed to
+// the backlog. Constructible with no loop current at all (its own
+// constructor, est:sync.event) - safe as a plain module-level global,
+// like systick_wrap_count above, just not a POD this time.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-inline std::optional<est::future<void>> pump_task_handle;
+inline est::binary_event<est::EventResetMode::automatic> pump_wake_event;
 
-// est::spawn()'d at Priority::high (not critical) only once pending_buffers
-// has more queued than fit in uart_tx_ring in one shot - urgent enough to
-// keep debug output flowing promptly, but never allowed to starve
-// Priority::critical work the way monopolizing the ready-queue would
-// (yield_execution()'s own doc comment). Drains pending_buffers a chunk
-// at a time, yielding to est::loop between chunks rather than spinning.
-auto pump_task() -> est::future<void> {
-  while (!pump_some()) {
-    co_await est::yield_execution();
+// Mainline-only, no ISR access - no interrupt_guard needed. Only ever
+// transitions false -> true, once, in enqueue_output() below; nothing
+// ever needs to reset it back (pump_task_loop() never returns).
+// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+inline bool pump_task_started = false;
+
+// est::spawn()'d once, at Priority::high (not critical - urgent enough
+// to keep debug output flowing promptly, but never allowed to starve
+// Priority::critical work the way monopolizing the ready-queue would,
+// yield_execution()'s own doc comment) - not per backlog episode. Just
+// waits for pump_wake_event, drains everything pump_some() can reach
+// (yielding to est::loop between chunks rather than spinning), then
+// goes back to waiting - runs for the rest of the program once started.
+auto pump_task_loop() -> est::future<void> {
+  while (true) {
+    co_await pump_wake_event.wait();
+    while (!pump_some()) {
+      co_await est::yield_execution();
+    }
   }
 }
 
@@ -322,36 +337,38 @@ auto pump_task() -> est::future<void> {
 // instead of blocking the caller until every character has physically
 // transmitted (the old uart_write()-based vprintdbg() did exactly that -
 // fine for a rare, fatal assert_failure() message, but not for a debug
-// diagnostic that might fire from inside a hot continuation). Always
-// enqueues to pending_buffers first (not "try the ring directly, only
-// queue on overflow"): pump_some() already handles "fits in one shot"
-// and "needs more than one call" identically, so there's no separate
-// fast path to maintain - the only real cost either way is the one
-// std::string + tx_buffer allocation every vprintdbg() call already
-// pays for by formatting into a std::string in the first place.
+// diagnostic that might fire from inside a hot continuation).
 //
-// Only spawns pump_task() when pump_some() reports genuine backlog
-// (uart_tx_ring filled up before pending_buffers was drained) *and* a
-// loop is actually current (has_current_loop(), est:util.current_loop) -
-// most messages are short enough to fully drain in that first
-// pump_some() call, needing no coroutine at all. When no loop is current
-// and a backlog remains, this deliberately does not block or drop
-// anything: the text stays queued in pending_buffers, exactly matching
-// interface::vprintdbg()'s own documented "must swallow its own
-// failures... best-effort" contract - it'll flush whenever a later call
-// happens to run with a loop available (or, on the fatal path, whenever
-// drain_uart_tx_synchronously() below runs).
+// With no loop current at all (has_current_loop(), est:util.current_loop)
+// - a debug diagnostic emitted while still bootstrapping, or
+// est/tests/platform_tests.cpp's own "vprintdbg() writes... without
+// throwing" test, which exercises this backend directly with no loop
+// registered - pump_task_loop() could never be spawned (est::spawn()
+// itself needs a loop) and pump_wake_event.set() would never be
+// consumed either, so this drains whatever fits synchronously right
+// now instead, matching interface::vprintdbg()'s own documented "must
+// swallow its own failures... best-effort" contract rather than queuing
+// text nothing will ever come back to send.
+//
+// Once a loop is current, every call defers to pump_task_loop() instead
+// of also trying a synchronous fast path here: pump_wake_event.set() is
+// safe to call even before the task has ever run (it only resolves
+// current_loop() once a waiter is actually queued, its own doc comment)
+// and pump_some() already handles "fits in one shot" - most messages -
+// exactly as well from inside the coroutine as it would inline here.
 void enqueue_output(std::string text) {
   auto node = std::make_unique<tx_buffer>(std::move(text));
   pending_buffers.enqueue(*node);
   node.release();
-  const bool caught_up = pump_some();
-  const bool pump_already_running = pump_task_handle && !pump_task_handle->ready();
-  if (!caught_up && !pump_already_running && est::has_current_loop()) {
-    auto task = pump_task();
-    pump_task_handle = task.clone();
-    est::spawn(std::move(task), est::Priority::high);
+  if (!est::has_current_loop()) {
+    (void)pump_some(); // caught-up/not caught-up both mean the same thing here: best effort
+    return;
   }
+  if (!pump_task_started) {
+    pump_task_started = true;
+    est::spawn(pump_task_loop(), est::Priority::high);
+  }
+  pump_wake_event.set();
 }
 
 // assert_failure()'s own preamble: flushes anything still queued in

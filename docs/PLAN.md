@@ -7931,3 +7931,48 @@ build+tidy, tests, new-code coverage gate, `sanitize` build+test) also
 green - `has_current_loop()` picked up its own direct unit test
 (`est/tests/loop_tests.cpp`) once diff-cover flagged it as the one
 genuinely uncovered line the `est` core change added.
+
+**PR #124 review, round 2: the pump task becomes a persistent,
+event-woken loop.** Two review comments on `pump_task_running` (the
+manual bool tracking "is a pump episode currently in flight"): first,
+replace it with a held `future<void>` clone (`future<T>::clone()`'s own
+doc comment already names this exact use) - `nullopt`/`ready()` both
+mean "not running," nothing to reset on completion. Landed as a2fddd5.
+Then a second, larger suggestion: skip the per-episode spawn entirely -
+one persistent `pump_task_loop()`, spawned once, `co_await`ing an
+`est::binary_event<EventResetMode::automatic>` in an infinite loop,
+rather than a fresh coroutine per backlog episode.
+
+Landed the second version. `est::binary_event<Mode>` (a `counting_event<Mode>`
+saturated at `max_count = 1`) turned out to fit cleanly: its constructor
+needs no loop at all (safe as a plain module-level global, like
+`systick_wrap_count` above, just not a POD this time), and `set()`
+itself only resolves `current_loop()` once a waiter is actually queued
+(its own doc comment) - meaning `enqueue_output()` can ring the event
+unconditionally once a loop is current, with no separate "has the task
+ever run" gate needed on that side either, beyond the one
+`pump_task_started` bool guarding the single, one-time `est::spawn()`
+call itself (a real bootstrap flag, not the same "per-episode" state the
+first review comment removed). `automatic` mode (not `manual`): the
+single unit saturates harmlessly across however many `enqueue_output()`
+calls land while the task is already busy, since `pump_some()` drains
+everything currently queued in one pass regardless of how many separate
+`set()` calls contributed to the backlog - `manual` mode's "every future
+wait() also takes the fast path until reset()" isn't needed here.
+
+One behavioral simplification came with it: `enqueue_output()` no longer
+tries a synchronous fast path once a loop is current at all - every call
+just enqueues and rings the event, fully deferring to
+`pump_task_loop()`, since `pump_some()` already handles "fits in one
+shot" (the common case) exactly as well from inside the coroutine. The
+no-loop-current fallback (`vprintdbg()` called before any loop exists,
+or `est/tests/platform_tests.cpp`'s own test exercising this directly)
+still calls `pump_some()` synchronously though - nothing would ever wake
+a task that can't be spawned in the first place, and losing that path
+would mean a diagnostic emitted before `main()`'s own loop starts is
+silently queued forever instead of reaching the wire.
+
+Verified again end to end: mps2an385 QEMU test suite (1113 assertions,
+260 cases, including the vprintdbg-with-no-loop test) and
+`larson_scanner_mps2an385` both still pass, same real-time behavior as
+before either round of this review.
