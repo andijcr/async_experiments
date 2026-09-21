@@ -36,14 +36,15 @@ export namespace estext {
 
 class hosted_stdcpp final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return detail::to_platform_clock(std::chrono::steady_clock::now());
   }
 
   // std::this_thread::sleep_until() needs a real std::chrono clock (one
   // with its own working now(), used internally to retry past spurious
-  // wakeups) - est::platform::clock deliberately isn't one (its own doc
-  // comment), so this converts back to the real steady_clock this
+  // wakeups - std::chrono::steady_clock::now() itself, not this backend's
+  // own uptime()) - est::platform::clock deliberately isn't one (its own
+  // doc comment), so this converts back to the real steady_clock this
   // backend actually sources every value from.
   void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     std::this_thread::sleep_until(detail::to_steady_clock(deadline));
@@ -52,7 +53,7 @@ public:
   // std::random_device itself can throw (implementation-defined, if no
   // entropy source is available) - caught the same way assert_failure()/
   // vprintdbg() below already guard their own fallible std:: calls,
-  // falling back to now()'s own bit pattern (never truly random, but at
+  // falling back to uptime()'s own bit pattern (never truly random, but at
   // least not identical across process runs) rather than letting this
   // noexcept method terminate the program over something only ever used
   // for jitter.
@@ -61,7 +62,7 @@ public:
       std::random_device dev;
       return (static_cast<std::uint64_t>(dev()) << 32) | dev();
     } catch (...) {
-      return static_cast<std::uint64_t>(now().time_since_epoch().count());
+      return static_cast<std::uint64_t>(uptime().time_since_epoch().count());
     }
   }
 
@@ -123,10 +124,10 @@ public:
   // interface::reset_loop_stall_detection()'s own doc comment explains
   // the "why" - this is that method's one sensible default nearly every
   // backend can just implement the same way.
-  void reset_loop_stall_detection() noexcept override { stall_start_ = now(); }
+  void reset_loop_stall_detection() noexcept override { stall_start_ = uptime(); }
 
   void detect_loop_stall(est::platform::clock::duration threshold) const noexcept override {
-    const auto elapsed = now() - stall_start_;
+    const auto elapsed = uptime() - stall_start_;
     if (elapsed > threshold) {
       est::platform::printdbg(
           "est::loop: a continuation took {}ms (> {}ms threshold) to run",

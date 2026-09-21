@@ -38,7 +38,7 @@ private:
 // (real wall-clock seconds otherwise) resolve instantly in a test.
 class fake_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 

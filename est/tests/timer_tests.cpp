@@ -6,11 +6,11 @@ import std;
 namespace {
 
 // Fake platform with a controllable clock, so deadline ordering can be
-// tested deterministically without real sleeps. Only now() needs a real
+// tested deterministically without real sleeps. Only uptime() needs a real
 // implementation - nothing in these tests triggers assert_failure().
 class fake_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 

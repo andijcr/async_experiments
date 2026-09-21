@@ -32,7 +32,7 @@ import std;
 // __cpp_exceptions the same way est's own future.cppm/platform.cppm do.
 namespace estwasm::detail {
 
-// now()/sleep_until() both need a monotonic millisecond clock; JS's
+// uptime()/sleep_until() both need a monotonic millisecond clock; JS's
 // performance.now() is exactly that (unlike Date.now(), which isn't
 // guaranteed monotonic) - one shared import rather than duplicating the
 // declaration.
@@ -97,7 +97,7 @@ export namespace estwasm {
 
 class platform_wasm final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return detail::ms_to_time_point(detail::js_now_ms());
   }
 
@@ -164,10 +164,10 @@ public:
     __builtin_trap();
   }
 
-  void reset_loop_stall_detection() noexcept override { stall_start_ = now(); }
+  void reset_loop_stall_detection() noexcept override { stall_start_ = uptime(); }
 
   void detect_loop_stall(est::platform::clock::duration threshold) const noexcept override {
-    const auto elapsed = now() - stall_start_;
+    const auto elapsed = uptime() - stall_start_;
     if (elapsed > threshold) {
       est::platform::printdbg(
           "estwasm: a continuation took {}ms (> {}ms threshold) to run",

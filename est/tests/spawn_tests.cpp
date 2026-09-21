@@ -13,7 +13,7 @@ namespace {
 // run_until_idle() call).
 class recording_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 

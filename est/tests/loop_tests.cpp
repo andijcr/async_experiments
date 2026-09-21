@@ -35,11 +35,11 @@ private:
 // A fake platform with a controllable clock whose sleep_until() advances
 // that same fake clock instead of actually blocking - the seam
 // est::loop's own timer-driven tests need to run instantly rather than
-// for real wall-clock seconds, extending the now()-only fake_platform
+// for real wall-clock seconds, extending the uptime()-only fake_platform
 // pattern est/tests/timer_tests.cpp already established.
 class fake_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
@@ -71,18 +71,18 @@ public:
   mutable est::platform::clock::time_point current;
 };
 
-// A platform whose now() advances by `step` on every single call - used
+// A platform whose uptime() advances by `step` on every single call - used
 // to make a continuation's runtime appear to exceed the long-running-
 // callback threshold without an actual real delay, so that code path gets
 // exercised. Its own reset_loop_stall_detection()/detect_loop_stall()
 // below duplicate hosted_stdcpp's own implementation (platform.cppm)
 // rather than inheriting a shared default - platform::interface holds no
 // state of its own to back one - but the shape is unchanged: still calls
-// now() exactly twice bracketing node.run(), the same measurement
+// uptime() exactly twice bracketing node.run(), the same measurement
 // loop::run_one() itself triggers via these two calls.
 class jumping_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> est::platform::clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     const auto result = current;
     current += step;
     return result;
@@ -109,10 +109,10 @@ public:
   // anything.
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
 
-  void reset_loop_stall_detection() noexcept override { stall_start = now(); }
+  void reset_loop_stall_detection() noexcept override { stall_start = uptime(); }
 
   void detect_loop_stall(est::platform::clock::duration threshold) const noexcept override {
-    const auto elapsed = now() - stall_start;
+    const auto elapsed = uptime() - stall_start;
     if (elapsed > threshold) {
       est::platform::printdbg(
           "stall of {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());

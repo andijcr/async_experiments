@@ -6,7 +6,7 @@ import std;
 // No platform::override_instance() needed in this file: test_main.cpp
 // already installs estext::hosted_stdcpp for the whole binary, and
 // est::jitter only ever calls platform::instance().get_random_seed()
-// once, at construction - never now()/sleep_until(), so the real
+// once, at construction - never uptime()/sleep_until(), so the real
 // hosted_stdcpp backend is fine to exercise directly here.
 
 TEST_CASE("jitter() stays within [-max_jitter, +max_jitter]", "[jitter]") {

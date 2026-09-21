@@ -13,7 +13,7 @@ import :util.scope_exit;
 //
 // This is virtual dispatch through a `thread_local` object, not a
 // compile-time template parameter - est::timer_queue has no Platform
-// template parameter, at the cost of one indirect call per now()/
+// template parameter, at the cost of one indirect call per uptime()/
 // assert_failure() instead of a direct one. `thread_local` (not a single
 // process-global) so a multi-core, no-MMU target can give each core its
 // own installed backend independently, without any of them synchronizing
@@ -47,14 +47,18 @@ export namespace est::platform {
 //
 // No now() static member: unlike std::chrono::steady_clock, nothing in
 // est ever calls clock::now() directly - every actual "what time is it"
-// question already goes through interface::now() below (virtual
+// question already goes through interface::uptime() below (virtual
 // dispatch to whichever backend is installed), and each backend's own
-// now() override is free to source the value however it likes (real
+// uptime() override is free to source the value however it likes (real
 // std::chrono::steady_clock::now() for hosted_stdcpp, a JS import for
-// platform_wasm, ARM semihosting's SYS_ELAPSED for estpico) - clock
-// itself is purely a vocabulary type identifying "the time_point/
-// duration platform::interface speaks in," not a working clock any code
-// calls into on its own.
+// platform_wasm, a hardware timer for estpico) - clock itself is purely a
+// vocabulary type identifying "the time_point/duration platform::interface
+// speaks in," not a working clock any code calls into on its own. The name
+// deliberately isn't now(): every implementation of this method returns a
+// value relative to an arbitrary, backend-chosen epoch (this process/
+// board's own start, not wall-clock "the current time") - the same
+// contract std::chrono::steady_clock::now() itself has, just spelled to
+// say so instead of inviting the wall-clock reading "now()" suggests.
 struct clock {
   using duration = std::chrono::nanoseconds;
   using rep = duration::rep;
@@ -105,11 +109,11 @@ public:
   auto operator=(interface&&) -> interface& = delete;
   virtual ~interface() = default;
 
-  [[nodiscard]] virtual auto now() const noexcept -> clock::time_point = 0;
+  [[nodiscard]] virtual auto uptime() const noexcept -> clock::time_point = 0;
 
   // Blocks the calling thread until `deadline`, or returns immediately if
   // it has already passed - est::loop's answer to "how do I wait for the
-  // next timer" without a busy-loop, same reasoning as now()/
+  // next timer" without a busy-loop, same reasoning as uptime()/
   // assert_failure() being platform hooks: a test fake overrides this to
   // advance its own fake clock instead of actually blocking, so a loop
   // test exercising real timer-driven wakeups runs instantly instead of
@@ -119,7 +123,7 @@ public:
   // Returns a fresh, best-effort-random seed value for anything in est
   // that needs one (est::jitter, :util.jitter, the only caller today) -
   // "where does randomness come from" is a platform decision the same way
-  // now()/assert_failure() are: hosted_stdcpp answers via
+  // uptime()/assert_failure() are: hosted_stdcpp answers via
   // std::random_device (estext), a future bare-metal backend from
   // whatever hardware entropy source it has. Not required to be
   // cryptographically secure, or even high-quality - jitter only needs to
@@ -128,7 +132,8 @@ public:
 
   // Reports a failed est::check() and terminates - the platform's answer
   // to "what actually happens when a check fails," same reasoning as
-  // now() being the answer to "what time is it": a bare-metal backend,
+  // uptime() being the answer to "how long have I been running": a
+  // bare-metal backend,
   // or a test fake, gets to answer this differently (halt, trigger a
   // debug break, ...) without est::check() itself changing.
   [[noreturn]] virtual void assert_failure(std::string_view message,
@@ -148,11 +153,11 @@ public:
   // Marks the start of a fresh "how long does the next node/timer
   // callback take" measurement window - est::loop::run_one() calls this
   // immediately before running one, and detect_loop_stall() below
-  // immediately after. Moved onto platform for the same reason now()/
+  // immediately after. Moved onto platform for the same reason uptime()/
   // sleep_until() are platform hooks rather than est::loop calling
   // std::chrono/std::this_thread directly: "how do we know a callback
   // ran long" is a policy a backend should get to answer for itself.
-  // hosted_stdcpp's own override just records now() into a member for
+  // hosted_stdcpp's own override just records uptime() into a member for
   // its detect_loop_stall() to compare against - the only strategy that
   // makes sense for a single-threaded, synchronous-checkpoint backend. A
   // future backend could run a watchdog on a background thread instead.

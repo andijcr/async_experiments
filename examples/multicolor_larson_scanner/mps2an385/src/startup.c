@@ -69,6 +69,13 @@ void Default_Handler(void) {
   }
 }
 
+// Defined in estpico's own platform_mps2an385.cppm (extern "C", so this
+// declaration and that definition agree on linkage) - this backend's own
+// clock state (SysTick's wrap-count extension) belongs to that module,
+// not to this file, the same split _exit()/gettimeofday() below already
+// have with picolibc/libc++.
+void SysTick_Handler(void);
+
 // picolibcpp.ld's .boot_flash output section collects .text.init.enter
 // (among others) at ORIGIN(boot_flash) - exactly where a Cortex-M
 // expects its vector table (word0 = initial SP, word1 = reset vector).
@@ -88,7 +95,7 @@ __attribute__((section(".text.init.enter"))) void (*const vector_table[16])(void
     Default_Handler, // DebugMonitor
     0,               // reserved
     Default_Handler, // PendSV
-    Default_Handler, // SysTick
+    SysTick_Handler,
 };
 
 // ARM semihosting SYS_EXIT_EXTENDED (op 0x20) - the only semihosting

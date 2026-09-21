@@ -7724,3 +7724,103 @@ this project builds inside the pinned devenv image, which has no reason
 to also carry `qemu-system-arm`, the same "build in docker, verify with
 a runner-native tool" split `ci.yml`'s own `wasm` job already
 established for its Node-based smoke test.
+
+**Issue #123 follow-up: `estpico`'s clock stops depending on the host to
+function; `platform::interface::now()` becomes `uptime()`.** The
+`estpico` backend above still had its monotonic clock (and, downstream
+of it, `get_random_seed()`) sourced entirely from ARM semihosting's
+`SYS_ELAPSED`/`SYS_TICKFREQ` - a real trap out to whatever's actually
+running the CPU on every single call. Under QEMU (with `-semihosting`,
+as every invocation in this project already passes) that's QEMU's own
+process servicing the trap in software, not a real debug host - but the
+underlying mechanism is the same one a real board would need an actual
+attached debug probe for, meaning this "bare-metal" backend's basic
+sense of time only worked with a host attached. Raised directly by the
+user: a real firmware shouldn't need a host just to know how long it's
+been running.
+
+Ruled out one alternative before building the other: keeping the
+semihosting *instruction* convention but adding our own fault handler to
+answer it directly (so the same `bkpt 0xab` call site works whether or
+not a host is listening) was rejected - that's solving a privilege-
+boundary problem (why `SVC`/similar traps exist at all: so unprivileged
+code can ask privileged code to do something on its behalf), and this
+Cortex-M3 target has no privilege separation to cross in the first
+place. Rigging a trap-and-decode path to reach the exact register read a
+plain function call already reaches is indirection with no payoff here.
+
+Built directly on real hardware instead: the Cortex-M3 core's own
+SysTick timer (`0xE000E010`, core-internal - no board-specific address
+lookup needed, unlike the CMSDK peripherals). `CLKSOURCE=1` (the
+processor clock)'s actual frequency under this exact QEMU
+version/machine isn't documented anywhere this project trusts blindly -
+measured empirically instead, the same methodology `SYS_TICKFREQ`'s own
+1e9 figure was confirmed with earlier: a temporary firmware enabled
+SysTick with max reload and `CLKSOURCE=1`, busy-polled `COUNTFLAG` across
+30 full wraps, and bracketed the whole loop with `SYS_ELAPSED` reads as
+an already-trusted independent ground truth (the temporary firmware was
+deleted once the number was in hand; the technique is in this module's
+own doc comment for the next person who needs to re-verify it against a
+different QEMU version). Result: **24,998,930 Hz**, i.e. a clean 25 MHz -
+matching the commonly documented MPS2 AN385 default HCLK, and letting
+`ticks_to_time_point()` become exact 64-bit integer multiplication (40ns/
+tick) instead of the old `long double` frequency conversion. The same
+30-wrap loop's own real wall-clock duration (~20.1s for 20.13s of
+computed SysTick time) also confirmed SysTick is tied to QEMU's real/
+virtual clock the same way the semihosting counter was, not raw
+instruction-count throughput - timing behavior carries over unchanged.
+
+SysTick's 24-bit counter wraps every ~671ms at 25MHz, so a real
+`SysTick_Handler` (wired into `startup.c`'s vector table at slot 15,
+defined in `platform_mps2an385.cppm` with `extern "C"` linkage so the C
+startup file's forward declaration resolves it at link time) extends it
+into the 64-bit tick count `platform::clock` promises, incrementing a
+`volatile std::uint64_t` wrap counter once per wrap. Reading that counter
+back alongside the hardware's own current-value register needed real
+thought: naively reading both separately races the ISR (interrupt
+latency means there's a real, if tiny, window after the hardware
+auto-reloads but before `SysTick_Handler` has actually run, during which
+a naive read would undercount by a full wrap). This is the first place
+`estpico` has ever needed genuine interrupt-context protection -
+different from, and not covered by, the "two coroutines interleaving at
+a `co_await`" hazard `est::mutex` exists for (`docs/wiki/
+Architecture.md`'s "single-threaded, no atomics" section now says so
+explicitly) - so `systick_ticks()` wraps the paired read in a new
+`estpico::detail::interrupt_guard` (a short `PRIMASK` mask/restore RAII
+guard), cheap enough (a handful of cycles) to pay on every call, unlike
+the semihosting trap it replaced.
+
+That cost drop had a second, unplanned payoff: the old `now()` was
+expensive enough (a real host round-trip) that a plain `while (now() <
+deadline) {}` `sleep_until()` cost tens of real seconds per simulated
+second, which is why the previous entry's `calibrated_ns_per_spin_
+iteration()`/`busy_spin()` machinery existed at all. `systick_ticks()`
+is cheap enough that `sleep_until()` goes back to a plain polling loop -
+deleting that whole calibration apparatus rather than adapting it.
+Measured effect: `est`'s own QEMU test suite (1110 assertions, 259
+cases) dropped from ~1.6s real to ~0.67s real; `larson_scanner_mps2an385`
+(200 rendered frames) stayed at ~6.7s real for ~6.6s simulated, matching
+its pre-change behavior exactly, confirming the swap changed *how* time
+is measured without changing what it measures.
+
+`platform::interface::now()` is renamed to `uptime()` across every
+backend (`estext`/`estwasm`/`estpico`) and every call site
+(`loop.cppm`/`timer.cppm`/`timer_periodic.cppm`/`promise.cppm`/
+`with_timeout.cppm`/`with_stop.cppm`, every test fake) - a
+purely mechanical rename, but a meaningful one: the contract was always
+"monotonic time since this backend's own arbitrary epoch" (process/board
+start, the same contract `std::chrono::steady_clock::now()` itself
+carries), never wall-clock "the current time," and `now()` invited the
+wrong reading.
+
+The one place semihosting is still used at all: `terminate()`'s
+`SYS_EXIT_EXTENDED` call, which `assert_failure()` also reaches. Kept
+deliberately - it's not part of "functioning," it's "tell whatever's
+running me the process outcome," which only matters for the QEMU/CI use
+case this backend is explicitly scoped to (real flashed firmware never
+calls it: nothing here returns from `main()` or asserts under normal
+operation). One accepted, pre-existing gap worth naming plainly: on real
+hardware with no debug host attached, a failed `est::check()` would now
+fault at that `bkpt` instead of exiting cleanly - unchanged by this
+work, and out of scope for a backend that already documents itself as
+QEMU-only.
