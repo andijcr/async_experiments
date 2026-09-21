@@ -51,7 +51,8 @@ than duplicating it. The same file is also mirrored here as
 
 ```
 est::platform   — a monotonic clock + "what happens when a check fails" seam,
-                   swappable per backend (hosted Linux today; bare metal later)
+                   swappable per backend (hosted Linux, a browser's WebAssembly
+                   sandbox, or bare-metal ARM under QEMU today)
 est::shared_ptr — a single-allocation, non-atomic reference-counted pointer
 est::counting_event —
                    an intrusive waiter list + count; wait() is awaitable,

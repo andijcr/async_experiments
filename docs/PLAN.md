@@ -7549,3 +7549,178 @@ anything and was removed, not replaced), `clang-format` clean, `ci`
 build + `clang-tidy` clean (0 warnings from this codebase's own files),
 95% diff coverage, `sanitize` 271/271 (ASan+UBSan clean), wasm32 build +
 Node smoke test clean.
+
+---
+
+### Issue #123: `estpico`, a fourth `platform::interface` backend for bare-metal ARM under QEMU
+
+The framework's first genuinely bare-metal backend - no OS, no libc in
+the usual sense, a real hardware exception model instead of `SIGABRT`.
+Target: QEMU's `mps2-an385` machine (an emulated ARM MPS2 FPGA image,
+single Cortex-M3) - not a Raspberry Pi Pico/RP2040 as originally scoped;
+RP2040 has no mainline QEMU support (an unmerged RFC and a third-party
+fork are the only options), while `mps2-an385` is a real, maintained
+QEMU machine with a documented memory map and a UART peripheral. The
+module kept its original `estpico` name rather than being renamed for
+the new target - a cosmetic mismatch, not a functional one.
+
+**Toolchain**: ARM's own prebuilt "LLVM Embedded Toolchain for Arm"
+release supplies the sysroot (picolibc-based libc/libc++/libc++abi/
+libunwind for `armv7m-none-eabi`, real exceptions/RTTI enabled via its
+`_exn_rtti` variant) - building this from source ourselves is a project
+this repo doesn't take on. That release's own bundled Clang 19.1.5 is
+*not* installed anywhere, though: it can't compile `import std;`
+alongside a textual `#include` of the same standard header in one
+translation unit (reproduces with nothing but `import std; #include
+<string>;` - a real `requires clause differs in template redeclaration`
+bug, not a project misconfiguration), and every one of `est`'s own test
+files needs exactly that combination (Catch2's `TEST_CASE` macros need a
+textual `#include`; `est::` needs `import est;`, which itself does
+`import std;`). This image's own newer, pinned Clang handles the
+identical combination correctly against the same sysroot - confirmed
+empirically before committing to the design - so `cmake/
+toolchain-mps2an385.cmake` cross-compiles with *this* image's Clang
+against ARM's prebuilt headers/libraries, the same shape
+`toolchain-wasm32.cmake` already uses for a third-party sysroot.
+`docker/Dockerfile` downloads the release tarball, extracts only the one
+variant actually needed (~20MB out of a ~1.1GB extracted release, mostly
+that unused bundled Clang), and discards the rest.
+
+**Exceptions work, given the right linker setup.** Real C++ exceptions
+(including typed catch, not just `catch(...)`) function correctly on
+this target, contrary to an unverified `-fno-exceptions` assumption
+carried through the project's own early spiking. Two real gaps, found
+and fixed:
+1. The EHABI unwind tables (`.ARM.exidx`/`.ARM.extab`) need explicit
+   linker-script placement - missing initially, which is exactly why
+   `-fno-exceptions` looked necessary rather than untested.
+2. Typed catch specifically (not `catch(...)`, which never reads the
+   type-matching table) needs `-Wl,--target2=rel`: `.ARM.extab`'s action
+   table encodes each catch clause's `type_info*` via an
+   `R_ARM_TARGET2` relocation, whose *meaning* is deliberately
+   platform-defined by the ARM EABI. `ld.lld`'s default for this target
+   is GOT-indirected, but the EHABI unwinder always decodes this field
+   as a direct PREL31 offset - confirmed at the byte level (the decoded
+   pointer landed on the `.got` slot's own address, one indirection away
+   from the real `type_info`), and fixed by forcing the encoding the
+   unwinder actually expects.
+
+Rather than a hand-rolled linker script (Spikes A-D's own approach, and
+exactly how the `--target2=rel` gap went unnoticed for as long as it
+did - a link-time flag isn't a section, so diffing hand-rolled section
+*shapes* against a reference script never would have caught it), `src/
+link.ld` builds on picolibc's own `picolibcpp.ld` directly (`INCLUDE
+picolibcpp.ld`, the same pattern the toolchain's own sample board files
+use) - the board file only sets memory-region symbols, and `Reset_Handler`
+uses picolibc's own provided symbol names for `.data`/`.bss`/`.tdata`/
+`.tbss` init instead of reinventing them.
+
+**`est::platform::clock` replaces `std::chrono::steady_clock` in
+`platform::interface`'s own signature.** A real, previously-undiscovered
+blocker, found only once actually compiling `est.cppm` itself against
+this toolchain (every earlier spike tested the toolchain/exceptions/
+Catch2 in isolation, never `est`'s own source): every variant of this
+ARM toolchain - all 40, checked - is built with
+`_LIBCPP_HAS_NO_MONOTONIC_CLOCK`, which removes `std::chrono::
+steady_clock`'s class declaration entirely, not just its
+implementation. Since `platform::interface::now()`/`sleep_until()`/
+`detect_loop_stall()` name this type directly, and `est::loop`/
+`timer_queue`/`jitter` all alias it as their own `clock`, this blocked
+compiling the framework's core at all, not just this one backend.
+Fixed with a framework-owned vocabulary clock (`est::platform::clock` -
+same representation as `steady_clock`, nanosecond resolution, no working
+`now()` of its own since nothing ever calls `clock::now()` directly,
+only `platform::interface::now()`) and a mechanical type-tag swap
+everywhere `std::chrono::steady_clock::time_point`/`::duration` appeared
+in `est`'s own source, both existing backends, and every test file that
+implements a fake `platform::interface`. Same representation throughout
+means this is a rename, not a semantic rewrite - confirmed by the full
+hosted `ctest` suite (328/328) passing unchanged after the swap.
+
+**No OS threads at all** (`_LIBCPP_HAS_NO_THREADS` - `<thread>`/
+`std::this_thread` don't exist on this target, unlike `estwasm`'s
+genuinely-threaded WebAssembly target). `EST_NO_THREADS` (a
+project-owned macro, set in the toolchain file) gates
+`larson_scanner_app.cppm`'s one `std::this_thread::yield()` backoff
+hint out; `est/tests/spsc_ring_tests.cpp` (spawns a real `std::jthread`
+producer to test `spsc_ring<T>` under genuine concurrent access -
+meaningless without real concurrency) is excluded from this target's
+test binary entirely, not worked around.
+
+**`sleep_until()`'s naive busy-poll was a real performance bug**, found
+only once a real application (three `est::schedule_periodic()` timers)
+exercised it - `est`'s own test suite never does, since every test fakes
+`platform::interface` rather than using the real backend. ARM
+semihosting's `SYS_ELAPSED`/`SYS_TICKFREQ` (used for `now()`, since it's
+a portable, verified monotonic clock with zero board-specific timer
+register knowledge needed - see the issue's own comment for how this was
+chosen over a hand-rolled CMSDK timer or DWT cycle-counter driver) are
+each a real trap out to the host QEMU process; polling `now()` on every
+iteration of `sleep_until()`'s busy-wait turned three timers each waking
+every few tens of milliseconds into tens of real seconds per few
+simulated seconds. Fixed with a runtime-calibrated spin (one `now()`/
+busy-loop round-trip, measured once and cached) that covers the bulk of
+a wait without any semihosting calls at all, falling back to the same
+`now()`-polling loop only to correct whatever the estimate under/
+overshot by - a handful of iterations at most, not thousands.
+
+**mps2-an385 has no working general-purpose GPIO** (QEMU's 4
+`cmsdk-ahb-gpio` blocks are present in the device tree but stubbed as
+`unimplemented-device` - confirmed via `-d guest_errors,unimp`, writes
+are silently discarded) - but does model 8 real LEDs on its System
+Control block (`mps2-scc`, register `CFG1` at `0x4002f004`, bits
+`[7:0]`, active-high, verified via write-then-readback with zero
+guest-errors). The ported `examples/multicolor_larson_scanner/
+mps2an385` drives these directly (`app_config{.width = 8}` - not a
+downscaled approximation of some larger strip, the animation is
+configured for the hardware it actually has), thresholding each pixel's
+brightest channel into an on/off bit since the SCC's LEDs have no PWM/
+analog output. No button/switch input is modeled at all (the SCC's own
+DIP-switch register is a read-only stub, always zero), so unlike the
+terminal/wasm ports there's no input thread - bare-metal single-core has
+no real OS thread to run one on regardless - the app instead runs for a
+fixed frame budget then exits via semihosting, a deterministic shape
+suited to a QEMU-driven CI smoke test rather than a demo someone drives
+by hand.
+
+One more bug worth naming, found only by tracing all the way through:
+after fixing `sleep_until()`'s performance and confirming (via temporary
+UART tracing) that `drain_commands()` correctly processed the quit
+command and called `loop_.stop()`, the program *still* never exited.
+Cause: `main()`'s own `return 0;` at the end - a bare-metal `main()`
+returning doesn't terminate anything, it falls into `Reset_Handler`'s
+own trailing `for(;;){}` (which exists precisely because there's no OS
+to return *to*). `std::exit(0)` (routing through picolibc's normal
+`_exit()` chain, which this board's `startup.c` wires to the same
+semihosting `SYS_EXIT_EXTENDED` call every other termination path uses)
+was the fix - the same thing `src/test_main.cpp` already did correctly
+from having been modeled on the spike work's own proven pattern.
+
+**Real Catch2 v3.7.1, with real exceptions enabled** (not
+`CATCH_CONFIG_DISABLE_EXCEPTIONS` - that mode's failing-`REQUIRE`-aborts-
+the-whole-binary limitation no longer applies once exceptions genuinely
+work), patched at build time for the handful of things this target can't
+provide - no filesystem (`--output-file`/`-f`/Bazel sharding all fail
+loudly if ever reached, which this project's own fixed `argv` never
+does), no monotonic clock for Catch2's own internal timing (cosmetic
+only - doesn't affect `REQUIRE`/pass-fail reporting), no
+`std::random_device` (falls back to `std::time(nullptr)` seeding, the
+same bar `jitter`'s own `get_random_seed()` documents). The user's own
+preference over a hand-maintained fork: a checked-in unified-diff patch
+(`third_party/catch2-baremetal.patch`) applied to a `FetchContent`-fetched
+checkout via `PATCH_COMMAND`, verified to apply cleanly against a fresh
+upstream `v3.7.1` clone. `tests/CMakeLists.txt` deliberately doesn't run
+Catch2's own top-level `CMakeLists.txt` (which assumes a hosted build
+throughout) - it reuses just `CMake/CatchConfigOptions.cmake` (Catch2's
+own option-default script) before building the (patched) library itself
+from the fetched source directly.
+
+Result: `est`'s own full test suite runs for real under QEMU - 1110
+assertions, 259 test cases, all passing (`spsc_ring_tests.cpp` excluded,
+per above) - not just a toolchain smoke test. `run_under_qemu.sh` turns
+a built ELF's real QEMU exit code (via `SYS_EXIT_EXTENDED`) into a
+checkable result; deliberately not wired through `ctest`/`add_test()` -
+this project builds inside the pinned devenv image, which has no reason
+to also carry `qemu-system-arm`, the same "build in docker, verify with
+a runner-native tool" split `ci.yml`'s own `wasm` job already
+established for its Node-based smoke test.

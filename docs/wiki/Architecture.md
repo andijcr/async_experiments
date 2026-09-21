@@ -271,17 +271,28 @@ complete framework with *zero* trace of any concrete backend - no
 partition silently re-exporting `hosted_stdcpp`, nothing `std::chrono`/
 `std::cerr`-shaped for a linker to even consider pulling in. A consumer
 that wants a working, ready-to-use backend opts in with a second,
-separate import: `import est; import estext;`. A future bare-metal
-backend would be its own similarly separate module, never touching
-`estext` - `est` itself stays the one thing every backend module depends
-on, never the reverse.
+separate import: `import est; import estext;`. Two other backends follow
+this exact same shape, each its own similarly separate module, never
+touching `estext`: `estwasm` (`estwasm/src/platform_wasm.cppm`, a
+browser's WebAssembly sandbox - routes through `import_module("env")` JS
+imports instead of `std::chrono`/`std::this_thread`/`std::cerr`) and
+`estpico` (`estpico/src/platform_mps2an385.cppm`, QEMU's mps2-an385
+bare-metal ARM machine - routes through ARM semihosting and a UART
+peripheral instead). `est` itself stays the one thing every backend
+module depends on, never the reverse.
 
 `hosted_stdcpp` needing real hosted-OS/libc++ facilities (`std::chrono`,
 `std::this_thread`, `std::cerr`) `est` itself has no business depending
 on is why it can't be one of `est`'s own partitions in the first place -
-`est` stays usable on a future bare-metal target that has none of those.
-`estext` isn't a partition of `est` at all - it's a wholly separate
-module that simply `import est;`s the finished product. `:platform`
+`est` stays usable on a bare-metal target that has none of those (proven
+by `estpico`: no variant of the ARM toolchain it builds against even
+provides `std::chrono::steady_clock` at all -
+`est::platform::clock`, `platform.cppm`'s own doc comment, is the
+framework-owned vocabulary type that made that possible without
+`platform::interface`'s own signature depending on a concrete
+`std::chrono` clock existing). `estext` isn't a partition of `est` at
+all - it's a wholly separate module that simply `import est;`s the
+finished product. `:platform`
 itself (`est`'s own partition) no longer names `est::loop` at all: an
 earlier version routed `est::loop`'s "current loop" registration through
 `platform::interface`'s own virtual methods (needing an exported forward
@@ -325,8 +336,8 @@ every individual test file.
   [Allocation Patterns](Allocation-Patterns.md) for what that buys a caller
   in practice.
 - **`est::platform` is the one runtime-polymorphic seam.** Everything that
-  differs between a hosted-Linux program and a hypothetical future bare-metal
-  target — the monotonic clock (`now()`), how to wait for a deadline
+  differs between a hosted-Linux program, a browser's WebAssembly sandbox, and
+  a bare-metal ARM target — the monotonic clock (`now()`), how to wait for a deadline
   (`sleep_until()`), what happens when a precondition check fails
   (`assert_failure()`) — goes through `est::platform::interface`, a virtual
   base swapped via a single global pointer (`instance()`/

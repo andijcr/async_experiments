@@ -209,3 +209,63 @@ jobs:
         run: >
           node examples/multicolor_larson_scanner/web/tests/smoke_test.mjs
           examples/multicolor_larson_scanner/web/build/wasm32/larson_scanner_wasm
+
+  # Independent of "gate"/"wasm" above, same shape as "wasm": a fully
+  # separate CMake project (cmake/toolchain-mps2an385.cmake's own top
+  # comment) targeting armv7m-none-eabi. Unlike "wasm", this still uses
+  # the devenv image's own Clang as the actual compiler (not a
+  # third-party bundled one - that file's own comment has the full
+  # story) - what's genuinely separate here is the sysroot
+  # (docker/Dockerfile's /opt/arm-none-eabi-sysroot block) and the
+  # runner-native qemu-system-arm this job needs to actually execute the
+  # resulting ARM binaries, neither of which "gate" has any reason to
+  # carry. See issue #123 for the full investigation.
+  mps2an385:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build devenv image (local only, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.DEVENV_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: configure (mps2an385)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace/examples/multicolor_larson_scanner/mps2an385
+          ${{ env.DEVENV_IMAGE }}
+          cmake --preset mps2an385
+
+      - name: build (mps2an385)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace/examples/multicolor_larson_scanner/mps2an385
+          ${{ env.DEVENV_IMAGE }}
+          cmake --build --preset mps2an385
+
+      # qemu-system-arm, not the devenv image, for the same reason Node
+      # isn't in it for "wasm"'s own smoke test: this repo's pinned
+      # toolchain has no reason to also carry a full-system ARM emulator,
+      # and running the actual firmware under it is what turns a
+      # successful cross-compile into a real correctness signal.
+      - name: install qemu-system-arm
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-system-arm
+
+      - name: est test suite under QEMU (mps2-an385)
+        run: >
+          examples/multicolor_larson_scanner/mps2an385/run_under_qemu.sh
+          examples/multicolor_larson_scanner/mps2an385/build/mps2an385/tests/est_mps2an385_tests
+
+      - name: larson_scanner smoke test under QEMU (mps2-an385)
+        run: >
+          examples/multicolor_larson_scanner/mps2an385/run_under_qemu.sh
+          examples/multicolor_larson_scanner/mps2an385/build/mps2an385/larson_scanner_mps2an385
