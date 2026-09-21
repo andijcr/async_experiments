@@ -294,8 +294,17 @@ void uart_tx_kick() noexcept {
   }
 }
 
+// A clone of the currently in-flight pump_task()'s own future<void>, if
+// any - std::nullopt (never spawned yet) or ready() (its coroutine has
+// already returned) both mean "not running." Holding this instead of a
+// separate bool flag means there's nothing to manually reset on
+// completion: future_state<T> already tracks that, and clone() is exactly
+// the tool for a second, independent observer of it (future<T>::clone()'s
+// own doc comment) - est::spawn() itself takes the other clone and moves
+// it away, so this is the only handle left to ask later. Mainline-only,
+// no ISR access - no interrupt_guard needed.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-inline bool pump_task_running = false; // mainline-only, no ISR access - no guard needed
+inline std::optional<est::future<void>> pump_task_handle;
 
 // est::spawn()'d at Priority::high (not critical) only once pending_buffers
 // has more queued than fit in uart_tx_ring in one shot - urgent enough to
@@ -307,7 +316,6 @@ auto pump_task() -> est::future<void> {
   while (!pump_some()) {
     co_await est::yield_execution();
   }
-  pump_task_running = false;
 }
 
 // vprintdbg()'s entry point: queues `text` for asynchronous UART output
@@ -338,9 +346,11 @@ void enqueue_output(std::string text) {
   pending_buffers.enqueue(*node);
   node.release();
   const bool caught_up = pump_some();
-  if (!caught_up && !pump_task_running && est::has_current_loop()) {
-    pump_task_running = true;
-    est::spawn(pump_task(), est::Priority::high);
+  const bool pump_already_running = pump_task_handle && !pump_task_handle->ready();
+  if (!caught_up && !pump_already_running && est::has_current_loop()) {
+    auto task = pump_task();
+    pump_task_handle = task.clone();
+    est::spawn(std::move(task), est::Priority::high);
   }
 }
 
