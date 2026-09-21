@@ -31,7 +31,7 @@ constexpr std::uint32_t uart0_state = uart0_base + 0x04U;
 // interface's own diagnostic channel) since Catch2's output is a much
 // higher-volume, unrelated stream that has nothing to do with
 // est::platform::printdbg().
-class UartStreambuf final : public std::streambuf {
+class uart_streambuf final : public std::streambuf {
 protected:
   auto overflow(int_type ch) -> int_type override {
     if (ch != traits_type::eof()) {
@@ -43,7 +43,14 @@ protected:
   }
 };
 
-UartStreambuf g_uart_streambuf;
+// Both have trivial, non-throwing constructors in practice
+// (std::streambuf's default constructor and std::ostream's
+// streambuf-pointer constructor are both noexcept per the standard) -
+// the check is conservative about static storage duration generally,
+// not about these two specific types.
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
+uart_streambuf g_uart_streambuf;
+// NOLINTNEXTLINE(bugprone-throwing-static-initialization)
 std::ostream g_uart_stream(&g_uart_streambuf);
 
 } // namespace
@@ -77,7 +84,7 @@ auto main() -> int {
   // runs before anything below could write through g_uart_stream.
   estpico::platform_mps2an385 platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
-  const char* argv[] = {"est_mps2an385_tests"};
-  const int result = Catch::Session().run(1, argv);
+  const std::array<const char*, 1> argv{"est_mps2an385_tests"};
+  const int result = Catch::Session().run(1, argv.data());
   std::exit(result);
 }

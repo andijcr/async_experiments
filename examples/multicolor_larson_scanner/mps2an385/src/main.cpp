@@ -19,7 +19,9 @@ namespace {
 constexpr std::uint32_t scc_cfg1 = 0x4002f004U; // issue #123 Finding 11
 
 [[nodiscard]] auto scc_led_reg() noexcept -> volatile std::uint32_t& {
-  return *reinterpret_cast<volatile std::uint32_t*>(scc_cfg1); // NOLINT(*-reinterpret-cast)
+  // NOLINTNEXTLINE(*-reinterpret-cast,performance-no-int-to-ptr) - a
+  // fixed-address MMIO register, not an accidental int/pointer mixup.
+  return *reinterpret_cast<volatile std::uint32_t*>(scc_cfg1);
 }
 
 // The SCC's 8 LEDs are plain on/off (Finding 11 - CFG1 is a bitmask, not
@@ -34,6 +36,9 @@ constexpr float led_on_threshold = 0.3F;
   const auto green = buffer.green.intensities();
   const auto blue = buffer.blue.intensities();
   for (std::size_t i = 0; i < buffer.width; ++i) {
+    // i < buffer.width, and red/green/blue are each buffer.width-sized
+    // (led_buffer's own invariant) - provably in range by construction.
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
     const float brightest = std::max({red[i], green[i], blue[i]});
     if (brightest > led_on_threshold) {
       mask |= (1U << i);

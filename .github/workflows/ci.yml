@@ -99,23 +99,24 @@ jobs:
           ${{ env.DEVENV_IMAGE }}
           cmake --build --preset ci
 
-      # estwasm/ isn't included here (unlike the clang-format check above),
-      # and examples/multicolor_larson_scanner/web is explicitly pruned:
-      # both are only ever compiled under the wasm32 cross-toolchain (the
-      # "wasm" job below), which produces its own, separate
-      # compile_commands.json that clang-tidy -p build/ci can't use - the
-      # hosted build's own database has no entry for them at all (a bare
-      # `find est examples` would otherwise reach wasm_exports.cpp, since
-      # it's nested under examples/, and fail hard on `import estwasm`
+      # estwasm/estpico aren't included here (unlike the clang-format check
+      # above), and examples/multicolor_larson_scanner/web and .../mps2an385
+      # are explicitly pruned: all are only ever compiled under their own
+      # cross-toolchain (the "wasm"/"mps2an385" jobs below), which each
+      # produce their own, separate compile_commands.json that
+      # clang-tidy -p build/ci can't use - the hosted build's own database
+      # has no entry for them at all (a bare `find est examples` would
+      # otherwise reach wasm_exports.cpp/main.cpp, since they're nested
+      # under examples/, and fail hard on `import estwasm`/`import estpico`
       # never resolving). Left as a known, documented gap (docs/PLAN.md's
-      # "Issue #99" entry) rather than papering over it with a synthetic
-      # host-compiled stand-in target.
+      # "Issue #99"/"Issue #123" entries) rather than papering over it with
+      # a synthetic host-compiled stand-in target.
       - name: clang-tidy check
         run: >
           docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
           -v ${{ github.workspace }}:/workspace -w /workspace
           ${{ env.DEVENV_IMAGE }}
-          bash -c 'find est examples -path "*/multicolor_larson_scanner/web" -prune -o -type f \( -name "*.cpp" -o -name "*.cppm" \) -print0 | xargs -0 -n1 clang-tidy -p build/ci'
+          bash -c 'find est examples \( -path "*/multicolor_larson_scanner/web" -o -path "*/multicolor_larson_scanner/mps2an385" \) -prune -o -type f \( -name "*.cpp" -o -name "*.cppm" \) -print0 | xargs -0 -n1 clang-tidy -p build/ci'
 
       - name: test
         run: >
