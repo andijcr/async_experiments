@@ -8182,3 +8182,91 @@ cases) and firmware smoke test, and the wasm32 project - `spawn()` is
 core `est`, shared by every backend, so every target that links it needed
 re-verifying, not just the one estpico had originally surfaced the gap
 in.
+
+**Reworking the UART TX pump again: `refill_ring()` was doing a heap
+deallocation from ISR context.** Flagged directly: `pump_uart_hardware()`
+(the real `UART0_TX_Handler`) calling `refill_ring()`, which calls
+`draining_buffer.reset()` once a buffer is fully drained - a real
+deallocation (frees the `tx_buffer`'s own `std::string data`, then the
+node itself) through whatever general-purpose heap allocator
+`std::unique_ptr` uses here, from inside an ISR. Nothing documents that
+allocator as safe to reenter while mainline might already be
+mid-allocation/mid-free on the same heap - a genuine, silent
+heap-corruption hazard distinct from (and worse than) the non-atomic
+`intrusive_list` mutation hazard `interrupt_guard` already existed to
+rule out; masking interrupts around the *call* does nothing about the
+call itself being unsafe to make from an ISR in the first place. Missed
+in the previous round's own review of this exact design.
+
+Reworked to keep `pending_buffers`/`draining_buffer` strictly
+mainline-only again (matching round 2's original shape) - the real ISR
+(`pump_uart_hardware()`) goes back to only ever popping one byte and
+writing it to `UART0_DATA`, no refilling, no allocation, nothing beyond
+raw MMIO and `uart_tx_ring`'s own lock-free `try_pop()`. All the actual
+byte-shoveling work (`pump_some()`, restored to its round-2 shape) moves
+back to `pump_task_loop()`, a persistent coroutine `est::spawn()`'d once
+- now via the `Fn&&` overload specifically (the previous entry's own
+fix), so `Priority::high` actually reaches its ongoing work this time,
+not just a never-reached completion continuation.
+
+The part that actually changed from round 2: what happens when the ring
+fills before a buffer is fully queued. Round 2 retried via
+`co_await est::yield_execution()` - a real busy-poll, no actual "ring has
+space" signal backing it (this session's earlier finding). Signaling that
+from the ISR directly was considered and rejected - `est::loop`'s
+ready-queue and `est::counting_event`'s waiter list are exactly the kind
+of non-atomic structure an ISR can't safely touch either, the same class
+of hazard as the deallocation above, just at the coroutine layer instead
+of the allocator layer (issue #125 sketches what a real ISR-safe wake
+primitive would need). Replaced with a real, non-busy backoff instead:
+`co_await est::sleep_for(1ms * queued_buffer_count)`, `queued_buffer_count`
+being a plain mainline-only counter (`tx_buffer` isn't kept in anything
+with an O(1) `size()`) tracking how many buffers are currently
+backlogged. Not a precise wait - a deliberate heuristic, scaling the
+sleep with how much is queued rather than retrying at a fixed interval
+regardless of backlog size.
+
+Verified: the mps2an385 QEMU test suite (1116 assertions, 262 cases,
+including the existing 96-byte long-message case, still passing) and the
+`larson_scanner_mps2an385` firmware smoke test, plus the full hosted
+pipeline (`platform_tests.cpp`'s own long-message test is shared across
+backends).
+
+**A second, more serious bug found in the course of that verification,
+not yet fixed**: `pump_task_loop()` never terminates and is spawned
+exactly once, against whichever `est::loop` is current the first time
+it's needed - but nothing ever tells it to stop before that loop goes
+away. Confirmed with a throwaway instrumented build of
+`larson_scanner_mps2an385` (a `printdbg()` call injected into the first
+rendered frame, so a real message is enqueued against the program's one
+real loop): the message drains correctly in full, but the program then
+crashes on exit with `est::current_loop(): no loop is current`. Sequence:
+the coroutine finishes draining and goes back to
+`co_await pump_wake_event.wait()`, parked in `pump_wake_event`'s own
+`waiters_` list - not `est::loop`'s `ready_`/`pending_timers_`, so
+nothing drains it when the owning loop is destroyed normally at the end
+of `app::loop()`. `pump_wake_event` itself is a process-lifetime global,
+so it only gets destroyed later, at `std::exit()`'s static-destruction
+phase - by which point no loop is registered at all, and completing the
+still-parked coroutine's own `future_state<void>` (to abandon it) needs
+`current_loop()` to hand off its resume node. This is exactly the
+documented `future_state<T>` precondition
+("callers are responsible for not interleaving distinct est::loop
+registrations across the lifetime of a single future_state/promise/future
+chain" - its own doc comment, `est/src/future.cppm`), violated by a
+process-lifetime coroutine parked on a process-lifetime event outliving
+the one loop it was ever actually spawned against. The exact same
+`platform_tests.cpp` long-message test hit a narrower version of this
+too (a per-`TEST_CASE` loop, constructed and destroyed within one test,
+corrupting a *later* test's own printdbg() call) - fixed there by not
+constructing a loop in that shared test at all (this file's own updated
+comment on that test has the reasoning), which avoids triggering it but
+doesn't fix the underlying gap.
+
+Not fixed in this round - needs a real answer for "who tells the pump
+task to stop, and when," which this codebase doesn't have a hook for yet
+(`platform::interface` has no "the loop is about to go away" callback,
+and `platform_mps2an385`'s own destructor never runs in the actual
+`std::exit()`-based shutdown path `main.cpp`/`test_main.cpp` both use).
+Local commit only, not pushed - flagged for discussion before deciding
+which direction to take it.

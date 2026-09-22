@@ -134,13 +134,25 @@ TEST_CASE("hosted_stdcpp's vprintdbg() writes via std::vprint_unicode without th
 TEST_CASE("vprintdbg() handles a message longer than any fixed-size internal buffer",
           "[platform]") {
   // 96 chars > estpico's own 64-byte uart_tx_ring capacity
-  // (estpico/src/platform_mps2an385.cppm) - the one backend where a
-  // message this long exercises more than a single refill of that ring
-  // (several real TX-complete interrupts draining and refilling it in
-  // turn, entirely on their own) rather than fitting in one shot.
-  // Backend-agnostic like the test above: hosted_stdcpp/estwasm have no
-  // such bound and just format and write the whole thing in one call
-  // either way.
+  // (estpico/src/platform_mps2an385.cppm). Deliberately *not* exercised
+  // with a real est::loop constructed here: estpico's pump_task_loop() is
+  // a process-lifetime coroutine, spawned once against whichever loop is
+  // current the first time it's needed and never re-spawned afterward
+  // (pump_task_started's own doc comment) - a short-lived, per-TEST_CASE
+  // loop constructed and destroyed here would bind that coroutine to a
+  // loop this one test case then tears down, corrupting every *later*
+  // test in this same binary that also calls printdbg() - a real, if
+  // narrow, "cross-loop binding hazard" worth its own follow-up rather
+  // than worked around in a shared, backend-agnostic test file.
+  // With no loop current, enqueue_output() instead takes its documented
+  // best-effort synchronous path (a single pump_some() call, own doc
+  // comment) - for a message this size on estpico specifically, that
+  // means only the first ring's worth actually reaches the wire, the
+  // rest silently dropped; verified separately, empirically, against a
+  // real whole-program loop (docs/PLAN.md's entry for this change).
+  // What this test actually guards: the oversized/truncated path itself
+  // doesn't throw, crash, or corrupt state - same bar the test above
+  // holds hosted_stdcpp's own vprintdbg() to.
   const std::string long_value(96, 'x');
   est::platform::printdbg("long message: {}", long_value);
   SUCCEED("printdbg() returned without throwing");
