@@ -8329,3 +8329,35 @@ pump task's own internal behavior, not a regression in anything already
 working. The shutdown crash itself remains open, same as the previous
 entry. Local commit only, not pushed - per the same instruction as
 before.
+
+**Code review pass before pushing: one real bug, one comment-placement
+fix.** Requested once the two local commits above were ready to go out.
+
+1. `enqueue_output()` set `pump_task_started = true` *before* calling
+   `est::spawn(...)`, not after. `spawn()`'s own argument evaluation can
+   throw (coroutine frame allocation, `pump_stop_source()`'s own lazy
+   construction, `pump_wake_event.wait()`'s waiter-node allocation) -
+   since `vprintdbg()` wraps the whole call in `catch (...)`, such a
+   throw is silently swallowed, but `pump_task_started` stayed latched
+   `true` regardless, so every *later* `enqueue_output()` call (loop
+   still current) would only ever append to `pending_buffers` and ring
+   an event nobody's waiting on - async debug output would silently and
+   permanently stop after one transient allocation failure, contradicting
+   this file's own stated "best-effort" contract. Fixed by moving the
+   flag write to *after* `spawn()` returns, so a throw leaves it `false`
+   and the next call retries.
+2. Two doc comments (`pump_stop_source()`'s and
+   `request_uart_tx_pump_stop()`'s) had drifted into narrating the
+   specific debugging session that produced them - "an attempt... was
+   tried and pulled back out," "confirmed... with an instrumented
+   build" - duplicating, in the source itself, exactly the story this
+   file's own PLAN.md entries already tell. Trimmed to state only what's
+   true of the code *now* (the precondition, why a destructor-based hook
+   doesn't work, that nothing calls the stop function yet), per CLAUDE.md's
+   own "comments reflect current state, not narrated history" rule -
+   the removed narrative isn't lost, it's already recorded above,
+   unchanged.
+
+Verified again: mps2an385 QEMU test suite (1116 assertions, 262 cases)
+and `larson_scanner_mps2an385`'s normal run both still pass; `clang-format`
+clean. Pushed.

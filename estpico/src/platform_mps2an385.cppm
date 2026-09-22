@@ -381,9 +381,8 @@ inline bool pump_task_started = false;
 // "KNOWN HAZARD" doc comment, est/src/future.cppm: "callers are
 // responsible for not interleaving distinct est::loop registrations
 // across the lifetime of a single future_state/promise/future chain") -
-// confirmed to actually crash (`current_loop(): no loop is current`) with
-// an instrumented build that enqueues one message from inside a real,
-// running loop and lets that loop finish normally afterward.
+// a real, reachable crash (`current_loop(): no loop is current`), not
+// merely a theoretical precondition violation.
 //
 // request_stop() only helps if something calls it *while a valid loop is
 // still current* - future_state<T>::complete() (reached from
@@ -399,17 +398,12 @@ inline bool pump_task_started = false;
 // destructors entirely, making a destructor-based hook here dead code in
 // both of them.
 //
-// NOT YET WIRED UP ANYWHERE: an attempt to call request_uart_tx_pump_stop()
-// (below) from inside main.cpp's own render callback, a few frames before
-// requesting the loop itself stop, was tried and pulled back out - it
-// resolved the crash in some runs and not others depending on unrelated
-// code changes (e.g. adding an unrelated diagnostic printdbg() call
-// nearby flipped the outcome), which means the actual mechanism at play
-// there isn't understood yet, not that a large enough margin fixes it.
-// Shipping that without understanding why would be worse than leaving
-// the gap open and documented. request_uart_tx_pump_stop() itself is
-// still exposed as a real, correct building block for whoever solves
-// this next - just not proven safe to call from any specific place yet.
+// Nothing in this codebase calls request_uart_tx_pump_stop() (below)
+// yet - finding a call site that's both reachable and guaranteed to run
+// while a valid loop is current is still open (docs/PLAN.md's entry for
+// this change has the investigation so far).
+// request_uart_tx_pump_stop() itself is exposed as a real, correct
+// building block for whoever solves that next.
 //
 // A function-local static, not a plain inline global, for the identical
 // reason uart_tx_ring() above is one: est::stop_source's constructor
@@ -507,8 +501,15 @@ void enqueue_output(std::string text) {
     return;
   }
   if (!pump_task_started) {
-    pump_task_started = true;
+    // Set *after* spawn() returns, not before: spawn()'s own argument
+    // evaluation can throw (coroutine frame allocation, pump_stop_source()'s
+    // own lazy construction, pump_wake_event.wait()'s waiter node) - since
+    // vprintdbg() wraps this whole call in catch(...), such a throw would
+    // otherwise be silently swallowed while leaving pump_task_started
+    // latched true forever, permanently disabling the async pump after one
+    // transient allocation failure instead of retrying on the next call.
     est::spawn([] { return pump_task_loop(pump_stop_source().get_token()); }, est::Priority::high);
+    pump_task_started = true;
   }
   pump_wake_event.set();
 }
@@ -780,11 +781,9 @@ private:
 // still genuinely current (detail::pump_stop_source()'s own doc comment
 // has the full reasoning for why: est::future_state<T>::complete(),
 // reached from here via est::stop_source::request_stop(), asserts
-// otherwise). Nothing in this codebase calls this yet -
-// pump_stop_source()'s own doc comment has the honest accounting of why
-// (an attempted call site in main.cpp's own render callback didn't
-// reliably fix the crash it was meant to, for reasons not yet
-// understood). A no-op if the pump task was never actually spawned
+// otherwise). Nothing in this codebase calls this yet - finding such a
+// call site is still open (pump_stop_source()'s own doc comment).
+// A no-op if the pump task was never actually spawned
 // (est::stop_source::request_stop() is itself idempotent, and a
 // stop_token nothing ever awaits is simply never observed).
 inline void request_uart_tx_pump_stop() noexcept {
