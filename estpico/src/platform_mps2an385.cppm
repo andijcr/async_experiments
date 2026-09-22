@@ -266,18 +266,6 @@ inline est::intrusive_list<tx_buffer> pending_buffers;
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 inline std::unique_ptr<tx_buffer> draining_buffer;
 
-// How many buffers are currently backlogged (enqueued but not yet fully
-// drained into uart_tx_ring), including the one draining_buffer currently
-// holds - mainline-only, same as pending_buffers/draining_buffer
-// themselves, incremented in enqueue_output() and decremented in
-// pump_some() once a buffer is fully consumed. Exists purely to size
-// pump_task_loop()'s own backoff sleep (below) - not needed for
-// correctness, just a plain std::size_t rather than walking
-// pending_buffers (intrusive_list<T> has no O(1) size() of its own) every
-// time that sleep needs a duration.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-inline std::size_t queued_buffer_count = 0;
-
 // The fixed-capacity queue the TX ISR actually drains, one byte per
 // completed-transmission interrupt - the one genuine ISR/mainline
 // boundary in this design. est::spsc_ring<T>'s own doc comment already
@@ -357,7 +345,6 @@ void uart_tx_kick() noexcept {
       ++draining_buffer->offset;
     }
     draining_buffer.reset(); // fully queued - move on to the next buffer, if any
-    --queued_buffer_count;
   }
 }
 
@@ -379,9 +366,78 @@ inline est::binary_event<est::EventResetMode::automatic> pump_wake_event;
 
 // Mainline-only, no ISR access - no interrupt_guard needed. Only ever
 // transitions false -> true, once, in enqueue_output() below; nothing
-// ever needs to reset it back (pump_task_loop() never returns).
+// ever needs to reset it back (pump_task_loop() runs until request_stop()
+// below, not indefinitely).
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 inline bool pump_task_started = false;
+
+// Lets a caller ask the pump task to actually stop, rather than leaving
+// it suspended forever on pump_wake_event - a coroutine parked on a
+// process-lifetime est::binary_event, itself bound (via whatever
+// future_state<T> its own co_await last registered a continuation on) to
+// whichever est::loop happened to be current when it last suspended,
+// violates that class's own documented precondition the moment that loop
+// goes away while the coroutine is still parked (future_state<T>'s own
+// "KNOWN HAZARD" doc comment, est/src/future.cppm: "callers are
+// responsible for not interleaving distinct est::loop registrations
+// across the lifetime of a single future_state/promise/future chain") -
+// confirmed to actually crash (`current_loop(): no loop is current`) with
+// an instrumented build that enqueues one message from inside a real,
+// running loop and lets that loop finish normally afterward.
+//
+// request_stop() only helps if something calls it *while a valid loop is
+// still current* - future_state<T>::complete() (reached from
+// est::promise<T>::set_value(), which request_stop() calls) resolves
+// current_loop() unconditionally, before it even checks whether anything
+// is registered to hand off, so calling this with no loop current at all
+// asserts too, just at a different call site. A caller's own destructor
+// is *not* automatically that moment: both of this backend's own entry
+// points (examples/multicolor_larson_scanner/mps2an385/src/main.cpp,
+// this project's own src/test_main.cpp) call std::exit() rather than
+// returning normally from main() (their own doc comments explain why -
+// routing through the real semihosting exit code), which skips local
+// destructors entirely, making a destructor-based hook here dead code in
+// both of them.
+//
+// NOT YET WIRED UP ANYWHERE: an attempt to call request_uart_tx_pump_stop()
+// (below) from inside main.cpp's own render callback, a few frames before
+// requesting the loop itself stop, was tried and pulled back out - it
+// resolved the crash in some runs and not others depending on unrelated
+// code changes (e.g. adding an unrelated diagnostic printdbg() call
+// nearby flipped the outcome), which means the actual mechanism at play
+// there isn't understood yet, not that a large enough margin fixes it.
+// Shipping that without understanding why would be worse than leaving
+// the gap open and documented. request_uart_tx_pump_stop() itself is
+// still exposed as a real, correct building block for whoever solves
+// this next - just not proven safe to call from any specific place yet.
+//
+// A function-local static, not a plain inline global, for the identical
+// reason uart_tx_ring() above is one: est::stop_source's constructor
+// defaults to current_allocator(), which asserts with no loop current -
+// deferring construction to first use (always from inside
+// enqueue_output()'s own has_current_loop() branch, below) keeps that
+// safe.
+[[nodiscard]] auto pump_stop_source() noexcept -> est::stop_source& {
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
+  static est::stop_source source;
+  return source;
+}
+
+// How long pump_task_loop() (below) backs off once uart_tx_ring fills
+// before a buffer is fully queued, rather than retrying immediately.
+// There's no safe way for uart_tx_ring draining (the real ISR,
+// pump_uart_hardware() above) to signal "space freed up" back into the
+// coroutine/event system without either the ISR touching est::loop's own
+// non-atomic ready-queue (unsafe - see issue #125) or pending_buffers/
+// draining_buffer becoming ISR-reachable again (unsafe - tx_buffer's own
+// doc comment), so this backs off for roughly how long it takes the
+// *entire* ring to drain via real transmission instead of polling
+// tightly: uart_tx_ring_capacity bytes, ~1ms/byte at this board's UART
+// baud rate (10 bits/byte including start/stop, ~10kbaud) - a fixed
+// estimate of "the ring is probably not full anymore by then," not tied
+// to how much is actually backlogged (a much larger backlog just means
+// more retries at this same interval, not a longer one).
+constexpr auto pump_backoff_delay = std::chrono::milliseconds(uart_tx_ring_capacity);
 
 // est::spawn()'d once, at Priority::high (not critical - urgent enough
 // to keep debug output flowing promptly, but never allowed to starve
@@ -396,26 +452,26 @@ inline bool pump_task_started = false;
 // its completion continuation, never reached by a while(true) loop.
 //
 // Waits for pump_wake_event, then drains everything pump_some() can
-// reach. When the ring fills before a buffer is fully queued, backs off
-// with a real, non-busy sleep - est::sleep_for(1ms * queued_buffer_count)
-// - rather than retrying immediately: there's no safe way for
-// uart_tx_ring draining (the real ISR, pump_uart_hardware() above) to
-// signal "space freed up" back into the coroutine/event system without
-// either the ISR touching est::loop's own non-atomic ready-queue (unsafe
-// - see issue #125) or pending_buffers/draining_buffer becoming ISR-
-// reachable again (unsafe - tx_buffer's own doc comment). Scaling the
-// sleep by the current backlog is a deliberate heuristic, not a precise
-// wait: more queued data means the ring will take proportionally longer
-// to drain via real transmission, so a fixed short sleep would just
-// retry-and-fail more often under a large backlog, while a fixed long
-// one would add needless latency under a small one.
-auto pump_task_loop() -> est::future<void> {
-  using namespace std::chrono_literals;
-  while (true) {
-    co_await pump_wake_event.wait();
-    while (!pump_some()) {
-      co_await est::sleep_for(queued_buffer_count * 1ms);
+// reach, backing off for pump_backoff_delay (above) whenever the ring
+// fills mid-buffer. Both awaits are raced against `token` - a plain
+// try/catch around the whole loop, not a per-await ready_with_failure()
+// check (est::future<T>::get(), reached via co_await, rethrows on
+// failure - digit_recall's own play_round() avoids that by checking
+// est::when_any()'s losing racers afterward instead, needed there to
+// tell timeout/cancellation apart; here there's only one outcome to
+// react to either way, so a single catch suffices) - once request_stop()
+// fires, either await fails with operation_cancelled and this simply
+// returns, ending the coroutine normally instead of staying parked.
+auto pump_task_loop(est::stop_token token) -> est::future<void> {
+  try {
+    while (true) {
+      co_await est::with_stop(pump_wake_event.wait(), token);
+      while (!pump_some()) {
+        co_await est::sleep_for(pump_backoff_delay, token);
+      }
     }
+  } catch (const est::operation_cancelled&) {
+    // request_stop() fired - exit cleanly, no more work to pick up.
   }
 }
 
@@ -446,14 +502,13 @@ void enqueue_output(std::string text) {
   auto node = std::make_unique<tx_buffer>(std::move(text));
   pending_buffers.enqueue(*node);
   node.release();
-  ++queued_buffer_count;
   if (!est::has_current_loop()) {
     (void)pump_some(); // caught-up/not caught-up both mean the same thing here: best effort
     return;
   }
   if (!pump_task_started) {
     pump_task_started = true;
-    est::spawn([] { return pump_task_loop(); }, est::Priority::high);
+    est::spawn([] { return pump_task_loop(pump_stop_source().get_token()); }, est::Priority::high);
   }
   pump_wake_event.set();
 }
@@ -719,5 +774,21 @@ public:
 private:
   est::platform::clock::time_point stall_start_;
 };
+
+// Asks the async UART TX pump task (detail::pump_task_loop(), above) to
+// stop - a caller must make this call from somewhere a real est::loop is
+// still genuinely current (detail::pump_stop_source()'s own doc comment
+// has the full reasoning for why: est::future_state<T>::complete(),
+// reached from here via est::stop_source::request_stop(), asserts
+// otherwise). Nothing in this codebase calls this yet -
+// pump_stop_source()'s own doc comment has the honest accounting of why
+// (an attempted call site in main.cpp's own render callback didn't
+// reliably fix the crash it was meant to, for reasons not yet
+// understood). A no-op if the pump task was never actually spawned
+// (est::stop_source::request_stop() is itself idempotent, and a
+// stop_token nothing ever awaits is simply never observed).
+inline void request_uart_tx_pump_stop() noexcept {
+  detail::pump_stop_source().request_stop();
+}
 
 } // namespace estpico

@@ -8270,3 +8270,62 @@ and `platform_mps2an385`'s own destructor never runs in the actual
 `std::exit()`-based shutdown path `main.cpp`/`test_main.cpp` both use).
 Local commit only, not pushed - flagged for discussion before deciding
 which direction to take it.
+
+**Two corrections to the backoff/stop design, and a first (incomplete)
+attempt at the shutdown gap.** Two direct corrections to the previous
+entry's design:
+
+1. The backoff sleep should scale with `uart_tx_ring`'s own fixed
+   capacity, not the current backlog - `1ms * uart_tx_ring_capacity`
+   (~64ms: roughly how long the *whole* ring takes to drain via real
+   UART transmission, not tied to how much is actually queued), not
+   `1ms * queued_buffer_count`. Simpler too: `queued_buffer_count` (a
+   counter added purely to size the old formula) is gone entirely, along
+   with its increment/decrement in `enqueue_output()`/`pump_some()`.
+2. `pump_task_loop()` now takes an `est::stop_token` and races both of
+   its awaits against it (`est::with_stop(pump_wake_event.wait(), token)`,
+   `est::sleep_for(pump_backoff_delay, token)`), inside one `try`/`catch`
+   for `est::operation_cancelled` around the whole loop - a real, tested
+   way for the coroutine to actually exit instead of staying parked
+   forever, directly addressing the previous entry's crash. A new
+   `pump_stop_source()` (lazily-constructed, same `est::spsc_ring`-style
+   reason as `uart_tx_ring()`) backs it, with `estpico::
+   request_uart_tx_pump_stop()` exported as the public way to fire it.
+
+The "who calls it, and when" half is still open, and turned out
+harder than it looked. `est::future_state<T>::complete()` (reached from
+`est::promise<T>::set_value()`, which `request_stop()` calls) resolves
+`current_loop()` *unconditionally*, before it even checks whether
+anything is registered to hand off - so `request_stop()` itself asserts
+if called with no loop current, not just the coroutine it's meant to
+wake. `platform_mps2an385`'s own destructor - the first place this looked
+for a hook - turned out to be dead code for this purpose: both
+`main.cpp` and `test_main.cpp` call `std::exit()` rather than returning
+normally from `main()`, which skips local destructors entirely,
+confirmed by adding (then removing) a diagnostic `printdbg()` at the top
+of the destructor that never printed in either binary's own output.
+
+Tried calling `request_uart_tx_pump_stop()` from *inside* `main.cpp`'s
+own render callback instead - the one place a real loop is genuinely
+current - a few frames before requesting the loop itself stop (leaving
+room for the resulting wake/cancel cascade to actually run before
+`est::loop::stop()`, which only returns after finishing whichever single
+ready continuation is *currently* running, cuts it short). This didn't
+reliably fix the crash: it passed or failed depending on unrelated code
+changes nearby (an unrelated diagnostic `printdbg()` call flipped a
+consistently-reproducing failure to a consistently-reproducing pass, and
+neither a 5-frame nor a 20-frame margin changed that on its own) -
+meaning the actual mechanism still isn't understood, not that more
+margin would fix it. Pulled the whole attempt back out of `main.cpp`
+rather than ship something whose correctness depends on unrelated code
+nearby. `request_uart_tx_pump_stop()` itself stays exported as a real,
+correct building block - just not proven safe to call from any specific
+place in this codebase yet.
+
+Verified: mps2an385 QEMU test suite (1116 assertions, 262 cases) and
+`larson_scanner_mps2an385`'s own normal (non-instrumented) 200-frame run
+both still pass - this round's changes are additive/corrective to the
+pump task's own internal behavior, not a regression in anything already
+working. The shutdown crash itself remains open, same as the previous
+entry. Local commit only, not pushed - per the same instruction as
+before.
