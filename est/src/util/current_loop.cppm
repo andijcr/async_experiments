@@ -114,6 +114,22 @@ export namespace est {
   return *detail::tls_context.loop_ptr;
 }
 
+// A safe, non-asserting peek at whether a loop is current - for a caller
+// that wants to *opportunistically* use current_loop()-dependent
+// machinery (spawn a task, schedule through the ready-queue) when one
+// happens to be available, without crashing when it isn't. Every other
+// consumer of current_loop() above is unconditional by design (a
+// documented precondition, not a runtime fallback) - this exists
+// specifically for callers that can't make that same assumption, e.g. a
+// platform::interface::vprintdbg() override that may run before any
+// loop exists yet (a debug diagnostic emitted while still bootstrapping,
+// or a unit test exercising the backend directly with no loop at all -
+// est/tests/platform_tests.cpp's own "vprintdbg() writes... without
+// throwing" test is exactly such a caller).
+[[nodiscard]] inline auto has_current_loop() noexcept -> bool {
+  return detail::tls_context.loop_ptr != nullptr;
+}
+
 // current_loop().allocator(), without the loop-pointer dereference in
 // between: the memory_resource* make_current_loop() cached is read
 // directly out of thread-local storage instead. Every internal caller

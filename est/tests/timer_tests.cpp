@@ -6,11 +6,11 @@ import std;
 namespace {
 
 // Fake platform with a controllable clock, so deadline ordering can be
-// tested deterministically without real sleeps. Only now() needs a real
+// tested deterministically without real sleeps. Only uptime() needs a real
 // implementation - nothing in these tests triggers assert_failure().
 class fake_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
@@ -19,7 +19,7 @@ public:
   // est::platform::interface implementation must still provide one.
   // See est/tests/loop_tests.cpp's own fake_platform for an
   // implementation that actually advances a fake clock instead.
-  void sleep_until(std::chrono::steady_clock::time_point /*deadline*/) const noexcept override {}
+  void sleep_until(est::platform::clock::time_point /*deadline*/) const noexcept override {}
 
   // A fixed, deterministic value: nothing in these tests exercises
   // est::jitter.
@@ -39,14 +39,13 @@ public:
   // default for it, so every concrete backend, this fake included, must
   // still answer it itself.
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
   // No `{}` needed: std::chrono::time_point's default constructor is a
   // real, user-provided constructor (time_point() : __d_(duration::zero())
   // {} in libc++'s <chrono>) that always zero-initializes, not a defaulted
   // one that would leave an automatic-storage member indeterminate.
-  std::chrono::steady_clock::time_point current;
+  est::platform::clock::time_point current;
 };
 
 } // namespace
@@ -100,7 +99,7 @@ TEST_CASE("cancel removes a pending entry and is idempotent-false on a second ca
 TEST_CASE("schedule_after uses the platform clock's current time", "[timer]") {
   using namespace std::chrono_literals;
   fake_platform fake;
-  fake.current = std::chrono::steady_clock::time_point{} + 1000s;
+  fake.current = est::platform::clock::time_point{} + 1000s;
   const auto guard = est::platform::override_instance(fake);
 
   est::timer_queue<> q;

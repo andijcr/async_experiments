@@ -6,7 +6,7 @@ import std;
 // No platform::override_instance() needed in this file: test_main.cpp
 // already installs estext::hosted_stdcpp for the whole binary, and
 // est::jitter only ever calls platform::instance().get_random_seed()
-// once, at construction - never now()/sleep_until(), so the real
+// once, at construction - never uptime()/sleep_until(), so the real
 // hosted_stdcpp backend is fine to exercise directly here.
 
 TEST_CASE("jitter() stays within [-max_jitter, +max_jitter]", "[jitter]") {
@@ -20,16 +20,16 @@ TEST_CASE("jitter() stays within [-max_jitter, +max_jitter]", "[jitter]") {
 }
 
 TEST_CASE("jitter() with a zero max_jitter always returns zero", "[jitter]") {
-  est::jitter jit(std::chrono::steady_clock::duration::zero());
+  est::jitter jit(est::platform::clock::duration::zero());
   for (int i = 0; i < 10; ++i) {
-    REQUIRE(jit() == std::chrono::steady_clock::duration::zero());
+    REQUIRE(jit() == est::platform::clock::duration::zero());
   }
 }
 
 TEST_CASE("jitter() draws more than one distinct value across many calls", "[jitter]") {
   using namespace std::chrono_literals;
   est::jitter jit(50ms);
-  std::set<std::chrono::steady_clock::duration::rep> seen;
+  std::set<est::platform::clock::duration::rep> seen;
   for (int i = 0; i < 100; ++i) {
     seen.insert(jit().count());
   }

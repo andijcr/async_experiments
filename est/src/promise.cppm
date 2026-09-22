@@ -255,10 +255,10 @@ export namespace est {
 }
 
 // Returns a future<void> that becomes ready once `delay` elapses from
-// now (est::platform::instance().now(), the same clock est::timer_queue
+// now (est::platform::instance().uptime(), the same clock est::timer_queue
 // itself is built on) - sugar over sleep_until() above.
 [[nodiscard]] inline auto sleep_for(loop::clock::duration delay) -> future<void> {
-  return sleep_until(platform::instance().now() + delay);
+  return sleep_until(platform::instance().uptime() + delay);
 }
 
 // Gives est::current_loop() the opportunity to run whatever else is

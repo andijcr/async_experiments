@@ -13,10 +13,10 @@ namespace {
 // deterministically rather than depending on real wall-clock timing.
 class fake_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     current = std::max(current, deadline);
   }
   [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 7; }
@@ -26,10 +26,9 @@ public:
   }
   void vprintdbg(std::string_view /*fmt*/, std::format_args /*args*/) const noexcept override {}
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
-  mutable std::chrono::steady_clock::time_point current;
+  mutable est::platform::clock::time_point current;
 };
 
 } // namespace

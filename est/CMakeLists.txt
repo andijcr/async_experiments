@@ -1,3 +1,6 @@
+include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/EstSources.cmake")
+list(TRANSFORM EST_CXX_MODULE_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/src/")
+
 add_library(est STATIC)
 add_library(est::est ALIAS est)
 
@@ -5,31 +8,7 @@ target_sources(est
   PUBLIC
     FILE_SET CXX_MODULES
     BASE_DIRS src
-    FILES
-      src/est.cppm
-      src/util/intrusive_list.cppm
-      src/util/scope_exit.cppm
-      src/util/shared_ptr.cppm
-      src/platform/platform.cppm
-      src/check.cppm
-      src/util/jitter.cppm
-      src/sync/mutex.cppm
-      src/sync/event.cppm
-      src/sync/external_event.cppm
-      src/sync/spsc_ring.cppm
-      src/sync/stop_token.cppm
-      src/timer.cppm
-      src/loop.cppm
-      src/util/current_loop.cppm
-      src/timer_periodic.cppm
-      src/future.cppm
-      src/promise.cppm
-      src/when_all.cppm
-      src/when_any.cppm
-      src/when_any_succeeds.cppm
-      src/with_stop.cppm
-      src/with_timeout.cppm
-      src/spawn.cppm
+    FILES ${EST_CXX_MODULE_SOURCES}
 )
 
 target_compile_features(est PUBLIC cxx_std_23)

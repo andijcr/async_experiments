@@ -230,7 +230,7 @@ export namespace est {
 // est::sleep_until().
 [[nodiscard]] inline auto sleep_for(loop::clock::duration delay, const stop_token& token)
     -> future<void> {
-  return sleep_until(platform::instance().now() + delay, token);
+  return sleep_until(platform::instance().uptime() + delay, token);
 }
 
 } // namespace est

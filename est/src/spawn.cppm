@@ -165,6 +165,22 @@ inline void set_spawn_exception_hook(spawn_exception_hook_type hook) {
 // on this same completion continuation, the one node this task's own
 // dispatch actually owns.
 //
+// `prio` here can *only* ever reach that one completion continuation, not
+// `task`'s own ongoing work - by the time a caller has a future<T> to pass
+// this overload, `task`'s synchronous prefix (everything up to its own
+// first co_await, since promise_type::initial_suspend() is
+// std::suspend_never, est:future) has already run, at whatever priority
+// was ambient at its own call site, and that priority already self-
+// propagated to its first suspension point (future_awaiter<T>::
+// await_suspend()'s own doc comment, est:future) before this function was
+// ever entered. For a task that completes promptly, that's rarely worth
+// noticing; for one that runs indefinitely (a persistent event-driven
+// loop, say) it means this overload's `prio` has no observable effect at
+// all - a real, easy-to-miss trap the Fn&& overload below exists
+// specifically to avoid. Use that overload instead of this one whenever
+// the created task's own priority - not just its unhandled-exception
+// report - needs to be something other than whatever's already ambient.
+//
 // Pure sugar over std::move(task).then_fast(...) - no separate tracking
 // of `task` beyond the continuation this registers on it (this file's own
 // top comment explains why that's not needed): the continuation node's
@@ -193,9 +209,25 @@ template <class T> void spawn(future<T> task, Priority prio = current_priority()
 // specifically (not, say, a "not a future" trait) so a future<T> argument
 // unambiguously resolves to the overload above instead: future<T> has no
 // operator(), so it never satisfies this constraint in the first place.
+//
+// Unlike the overload above, this one raises current_priority() to prio
+// for the call to fn() itself (restored once it returns) - the one place
+// this function can still influence the created task's own priority
+// rather than just its eventual completion report. fn()'s return -
+// typically a coroutine call - runs its synchronous prefix right here, on
+// this call stack (the future<T> overload's own doc comment has the
+// reasoning), and that prefix's first suspension point is what actually
+// gets prio stamped onto it; every later co_await then inherits it in
+// turn (issue #31's own priority-propagation behavior, est:loop). A
+// caller that only wants prio applied to the one-time unhandled-exception
+// report, not the task's own ongoing work, should pass an already-built
+// future<T> to the overload above instead - constructing it themselves,
+// at whatever priority is already ambient there, makes that choice
+// explicit rather than incidental.
 template <class Fn>
   requires(std::invocable<Fn&>)
 void spawn(Fn&& fn, Priority prio = current_priority()) {
+  const auto priority_guard = set_priority(prio);
   spawn(std::forward<Fn>(fn)(), prio);
 }
 

@@ -271,17 +271,30 @@ complete framework with *zero* trace of any concrete backend - no
 partition silently re-exporting `hosted_stdcpp`, nothing `std::chrono`/
 `std::cerr`-shaped for a linker to even consider pulling in. A consumer
 that wants a working, ready-to-use backend opts in with a second,
-separate import: `import est; import estext;`. A future bare-metal
-backend would be its own similarly separate module, never touching
-`estext` - `est` itself stays the one thing every backend module depends
-on, never the reverse.
+separate import: `import est; import estext;`. Two other backends follow
+this exact same shape, each its own similarly separate module, never
+touching `estext`: `estwasm` (`estwasm/src/platform_wasm.cppm`, a
+browser's WebAssembly sandbox - routes through `import_module("env")` JS
+imports instead of `std::chrono`/`std::this_thread`/`std::cerr`) and
+`estpico` (`estpico/src/platform_mps2an385.cppm`, QEMU's mps2-an385
+bare-metal ARM machine - routes through the Cortex-M3 core's own SysTick
+timer and a UART peripheral instead; ARM semihosting is kept only for
+reporting a process exit code to whatever's running it, not for anything
+the firmware needs to actually function). `est` itself stays the one
+thing every backend module depends on, never the reverse.
 
 `hosted_stdcpp` needing real hosted-OS/libc++ facilities (`std::chrono`,
 `std::this_thread`, `std::cerr`) `est` itself has no business depending
 on is why it can't be one of `est`'s own partitions in the first place -
-`est` stays usable on a future bare-metal target that has none of those.
-`estext` isn't a partition of `est` at all - it's a wholly separate
-module that simply `import est;`s the finished product. `:platform`
+`est` stays usable on a bare-metal target that has none of those (proven
+by `estpico`: no variant of the ARM toolchain it builds against even
+provides `std::chrono::steady_clock` at all -
+`est::platform::clock`, `platform.cppm`'s own doc comment, is the
+framework-owned vocabulary type that made that possible without
+`platform::interface`'s own signature depending on a concrete
+`std::chrono` clock existing). `estext` isn't a partition of `est` at
+all - it's a wholly separate module that simply `import est;`s the
+finished product. `:platform`
 itself (`est`'s own partition) no longer names `est::loop` at all: an
 earlier version routed `est::loop`'s "current loop" registration through
 `platform::interface`'s own virtual methods (needing an exported forward
@@ -309,13 +322,23 @@ every individual test file.
 
 ## Design philosophy
 
-- **Single-threaded, no atomics, no OS-level concurrency protection — yet.**
-  `est::shared_ptr`'s ref count is a plain `int`, and `est::loop` is driven
-  from exactly one call stack. This isn't an oversight to fix later; it's a
-  deliberate scope boundary — real interrupt-context protection gets added
-  when a backend that actually needs it exists (bare-metal interrupts, or a
-  future multi-loop), not speculatively. `est::mutex::lock()` *is* real
-  protection against a different, still-single-threaded hazard though
+- **Single-threaded, no atomics, no OS-level concurrency protection — except
+  where a backend genuinely needs it.** `est::shared_ptr`'s ref count is a
+  plain `int`, and `est::loop` is driven from exactly one call stack. This
+  isn't an oversight to fix later; it's a deliberate scope boundary — real
+  interrupt-context protection gets added when a backend that actually
+  needs it exists, not speculatively. `estpico` is that case now: its
+  SysTick-driven clock is read from mainline/loop code and written from a
+  real interrupt handler, and its UART TX is likewise driven by a real
+  interrupt (`vprintdbg()`'s own output queues through
+  `est::intrusive_list<T>`/`est::spsc_ring<char>`, drained a byte at a
+  time by the TX-complete interrupt), so `estpico::detail::interrupt_guard`
+  (a short `PRIMASK` mask/restore) genuinely guards state an ISR can
+  preempt at any point - a different, real hazard from the single-core
+  "two coroutines interleaving at a `co_await`" case below, scoped to
+  `estpico` itself rather than added to `est` generally. `est::mutex::lock()`
+  *is* real
+  protection against that other, still-single-threaded hazard though
   ([Coroutines](Coroutines.md)): two coroutines interleaving at a
   `co_await` while both hold a reference to the same structure.
 - **Allocator-first.** Every owned object — `shared_ptr<T>`'s control block,
@@ -325,8 +348,8 @@ every individual test file.
   [Allocation Patterns](Allocation-Patterns.md) for what that buys a caller
   in practice.
 - **`est::platform` is the one runtime-polymorphic seam.** Everything that
-  differs between a hosted-Linux program and a hypothetical future bare-metal
-  target — the monotonic clock (`now()`), how to wait for a deadline
+  differs between a hosted-Linux program, a browser's WebAssembly sandbox, and
+  a bare-metal ARM target — the monotonic clock (`uptime()`), how to wait for a deadline
   (`sleep_until()`), what happens when a precondition check fails
   (`assert_failure()`) — goes through `est::platform::interface`, a virtual
   base swapped via a single global pointer (`instance()`/

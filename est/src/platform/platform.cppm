@@ -13,7 +13,7 @@ import :util.scope_exit;
 //
 // This is virtual dispatch through a `thread_local` object, not a
 // compile-time template parameter - est::timer_queue has no Platform
-// template parameter, at the cost of one indirect call per now()/
+// template parameter, at the cost of one indirect call per uptime()/
 // assert_failure() instead of a direct one. `thread_local` (not a single
 // process-global) so a multi-core, no-MMU target can give each core its
 // own installed backend independently, without any of them synchronizing
@@ -31,6 +31,41 @@ import :util.scope_exit;
 // more.
 
 export namespace est::platform {
+
+// A framework-owned vocabulary clock, deliberately not
+// std::chrono::steady_clock itself: no variant of the ARM bare-metal
+// toolchain estpico builds against (arm-none-eabi's own prebuilt libc++)
+// provides it at all - every one is built with
+// _LIBCPP_HAS_NO_MONOTONIC_CLOCK, which removes std::chrono::steady_clock's
+// class declaration entirely, not just its implementation, so there's no
+// way to make it exist by supplying a working clock underneath. Same
+// shape as std::chrono::steady_clock (nanosecond resolution, marked
+// steady) so every existing use of steady_clock::time_point/duration
+// throughout est's own source (loop.cppm/timer.cppm/jitter.cppm) becomes
+// a type-tag swap rather than a semantic rewrite - the underlying
+// representation (a signed 64-bit nanosecond count) is unchanged.
+//
+// No now() static member: unlike std::chrono::steady_clock, nothing in
+// est ever calls clock::now() directly - every actual "what time is it"
+// question already goes through interface::uptime() below (virtual
+// dispatch to whichever backend is installed), and each backend's own
+// uptime() override is free to source the value however it likes (real
+// std::chrono::steady_clock::now() for hosted_stdcpp, a JS import for
+// platform_wasm, a hardware timer for estpico) - clock itself is purely a
+// vocabulary type identifying "the time_point/duration platform::interface
+// speaks in," not a working clock any code calls into on its own. The name
+// deliberately isn't now(): every implementation of this method returns a
+// value relative to an arbitrary, backend-chosen epoch (this process/
+// board's own start, not wall-clock "the current time") - the same
+// contract std::chrono::steady_clock::now() itself has, just spelled to
+// say so instead of inviting the wall-clock reading "now()" suggests.
+struct clock {
+  using duration = std::chrono::nanoseconds;
+  using rep = duration::rep;
+  using period = duration::period;
+  using time_point = std::chrono::time_point<clock, duration>;
+  static constexpr bool is_steady = true;
+};
 
 class interface;
 
@@ -74,21 +109,21 @@ public:
   auto operator=(interface&&) -> interface& = delete;
   virtual ~interface() = default;
 
-  [[nodiscard]] virtual auto now() const noexcept -> std::chrono::steady_clock::time_point = 0;
+  [[nodiscard]] virtual auto uptime() const noexcept -> clock::time_point = 0;
 
   // Blocks the calling thread until `deadline`, or returns immediately if
   // it has already passed - est::loop's answer to "how do I wait for the
-  // next timer" without a busy-loop, same reasoning as now()/
+  // next timer" without a busy-loop, same reasoning as uptime()/
   // assert_failure() being platform hooks: a test fake overrides this to
   // advance its own fake clock instead of actually blocking, so a loop
   // test exercising real timer-driven wakeups runs instantly instead of
   // for real wall-clock seconds (est/tests/loop_tests.cpp).
-  virtual void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept = 0;
+  virtual void sleep_until(clock::time_point deadline) const noexcept = 0;
 
   // Returns a fresh, best-effort-random seed value for anything in est
   // that needs one (est::jitter, :util.jitter, the only caller today) -
   // "where does randomness come from" is a platform decision the same way
-  // now()/assert_failure() are: hosted_stdcpp answers via
+  // uptime()/assert_failure() are: hosted_stdcpp answers via
   // std::random_device (estext), a future bare-metal backend from
   // whatever hardware entropy source it has. Not required to be
   // cryptographically secure, or even high-quality - jitter only needs to
@@ -97,7 +132,8 @@ public:
 
   // Reports a failed est::check() and terminates - the platform's answer
   // to "what actually happens when a check fails," same reasoning as
-  // now() being the answer to "what time is it": a bare-metal backend,
+  // uptime() being the answer to "how long have I been running": a
+  // bare-metal backend,
   // or a test fake, gets to answer this differently (halt, trigger a
   // debug break, ...) without est::check() itself changing.
   [[noreturn]] virtual void assert_failure(std::string_view message,
@@ -117,11 +153,11 @@ public:
   // Marks the start of a fresh "how long does the next node/timer
   // callback take" measurement window - est::loop::run_one() calls this
   // immediately before running one, and detect_loop_stall() below
-  // immediately after. Moved onto platform for the same reason now()/
+  // immediately after. Moved onto platform for the same reason uptime()/
   // sleep_until() are platform hooks rather than est::loop calling
   // std::chrono/std::this_thread directly: "how do we know a callback
   // ran long" is a policy a backend should get to answer for itself.
-  // hosted_stdcpp's own override just records now() into a member for
+  // hosted_stdcpp's own override just records uptime() into a member for
   // its detect_loop_stall() to compare against - the only strategy that
   // makes sense for a single-threaded, synchronous-checkpoint backend. A
   // future backend could run a watchdog on a background thread instead.
@@ -138,7 +174,7 @@ public:
   // reset_loop_stall_detection(), so est::loop's own
   // long_running_threshold stays the single source of truth for the
   // value, unchanged by which backend is installed.
-  virtual void detect_loop_stall(std::chrono::steady_clock::duration threshold) const noexcept = 0;
+  virtual void detect_loop_stall(clock::duration threshold) const noexcept = 0;
 };
 
 // The actual body, deferred until here (see the forward declaration's own

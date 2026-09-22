@@ -7549,3 +7549,815 @@ anything and was removed, not replaced), `clang-format` clean, `ci`
 build + `clang-tidy` clean (0 warnings from this codebase's own files),
 95% diff coverage, `sanitize` 271/271 (ASan+UBSan clean), wasm32 build +
 Node smoke test clean.
+
+---
+
+### Issue #123: `estpico`, a fourth `platform::interface` backend for bare-metal ARM under QEMU
+
+The framework's first genuinely bare-metal backend - no OS, no libc in
+the usual sense, a real hardware exception model instead of `SIGABRT`.
+Target: QEMU's `mps2-an385` machine (an emulated ARM MPS2 FPGA image,
+single Cortex-M3) - not a Raspberry Pi Pico/RP2040 as originally scoped;
+RP2040 has no mainline QEMU support (an unmerged RFC and a third-party
+fork are the only options), while `mps2-an385` is a real, maintained
+QEMU machine with a documented memory map and a UART peripheral. The
+module kept its original `estpico` name rather than being renamed for
+the new target - a cosmetic mismatch, not a functional one.
+
+**Toolchain**: ARM's own prebuilt "LLVM Embedded Toolchain for Arm"
+release supplies the sysroot (picolibc-based libc/libc++/libc++abi/
+libunwind for `armv7m-none-eabi`, real exceptions/RTTI enabled via its
+`_exn_rtti` variant) - building this from source ourselves is a project
+this repo doesn't take on. That release's own bundled Clang 19.1.5 is
+*not* installed anywhere, though: it can't compile `import std;`
+alongside a textual `#include` of the same standard header in one
+translation unit (reproduces with nothing but `import std; #include
+<string>;` - a real `requires clause differs in template redeclaration`
+bug, not a project misconfiguration), and every one of `est`'s own test
+files needs exactly that combination (Catch2's `TEST_CASE` macros need a
+textual `#include`; `est::` needs `import est;`, which itself does
+`import std;`). This image's own newer, pinned Clang handles the
+identical combination correctly against the same sysroot - confirmed
+empirically before committing to the design - so `cmake/
+toolchain-mps2an385.cmake` cross-compiles with *this* image's Clang
+against ARM's prebuilt headers/libraries, the same shape
+`toolchain-wasm32.cmake` already uses for a third-party sysroot.
+`docker/Dockerfile` downloads the release tarball, extracts only the one
+variant actually needed (~20MB out of a ~1.1GB extracted release, mostly
+that unused bundled Clang), and discards the rest.
+
+**Exceptions work, given the right linker setup.** Real C++ exceptions
+(including typed catch, not just `catch(...)`) function correctly on
+this target, contrary to an unverified `-fno-exceptions` assumption
+carried through the project's own early spiking. Two real gaps, found
+and fixed:
+1. The EHABI unwind tables (`.ARM.exidx`/`.ARM.extab`) need explicit
+   linker-script placement - missing initially, which is exactly why
+   `-fno-exceptions` looked necessary rather than untested.
+2. Typed catch specifically (not `catch(...)`, which never reads the
+   type-matching table) needs `-Wl,--target2=rel`: `.ARM.extab`'s action
+   table encodes each catch clause's `type_info*` via an
+   `R_ARM_TARGET2` relocation, whose *meaning* is deliberately
+   platform-defined by the ARM EABI. `ld.lld`'s default for this target
+   is GOT-indirected, but the EHABI unwinder always decodes this field
+   as a direct PREL31 offset - confirmed at the byte level (the decoded
+   pointer landed on the `.got` slot's own address, one indirection away
+   from the real `type_info`), and fixed by forcing the encoding the
+   unwinder actually expects.
+
+Rather than a hand-rolled linker script (Spikes A-D's own approach, and
+exactly how the `--target2=rel` gap went unnoticed for as long as it
+did - a link-time flag isn't a section, so diffing hand-rolled section
+*shapes* against a reference script never would have caught it), `src/
+link.ld` builds on picolibc's own `picolibcpp.ld` directly (`INCLUDE
+picolibcpp.ld`, the same pattern the toolchain's own sample board files
+use) - the board file only sets memory-region symbols, and `Reset_Handler`
+uses picolibc's own provided symbol names for `.data`/`.bss`/`.tdata`/
+`.tbss` init instead of reinventing them.
+
+**`est::platform::clock` replaces `std::chrono::steady_clock` in
+`platform::interface`'s own signature.** A real, previously-undiscovered
+blocker, found only once actually compiling `est.cppm` itself against
+this toolchain (every earlier spike tested the toolchain/exceptions/
+Catch2 in isolation, never `est`'s own source): every variant of this
+ARM toolchain - all 40, checked - is built with
+`_LIBCPP_HAS_NO_MONOTONIC_CLOCK`, which removes `std::chrono::
+steady_clock`'s class declaration entirely, not just its
+implementation. Since `platform::interface::now()`/`sleep_until()`/
+`detect_loop_stall()` name this type directly, and `est::loop`/
+`timer_queue`/`jitter` all alias it as their own `clock`, this blocked
+compiling the framework's core at all, not just this one backend.
+Fixed with a framework-owned vocabulary clock (`est::platform::clock` -
+same representation as `steady_clock`, nanosecond resolution, no working
+`now()` of its own since nothing ever calls `clock::now()` directly,
+only `platform::interface::now()`) and a mechanical type-tag swap
+everywhere `std::chrono::steady_clock::time_point`/`::duration` appeared
+in `est`'s own source, both existing backends, and every test file that
+implements a fake `platform::interface`. Same representation throughout
+means this is a rename, not a semantic rewrite - confirmed by the full
+hosted `ctest` suite (328/328) passing unchanged after the swap.
+
+**No OS threads at all** (`_LIBCPP_HAS_NO_THREADS` - `<thread>`/
+`std::this_thread` don't exist on this target, unlike `estwasm`'s
+genuinely-threaded WebAssembly target). `EST_NO_THREADS` (a
+project-owned macro, set in the toolchain file) gates
+`larson_scanner_app.cppm`'s one `std::this_thread::yield()` backoff
+hint out; `est/tests/spsc_ring_tests.cpp` (spawns a real `std::jthread`
+producer to test `spsc_ring<T>` under genuine concurrent access -
+meaningless without real concurrency) is excluded from this target's
+test binary entirely, not worked around.
+
+**`sleep_until()`'s naive busy-poll was a real performance bug**, found
+only once a real application (three `est::schedule_periodic()` timers)
+exercised it - `est`'s own test suite never does, since every test fakes
+`platform::interface` rather than using the real backend. ARM
+semihosting's `SYS_ELAPSED`/`SYS_TICKFREQ` (used for `now()`, since it's
+a portable, verified monotonic clock with zero board-specific timer
+register knowledge needed - see the issue's own comment for how this was
+chosen over a hand-rolled CMSDK timer or DWT cycle-counter driver) are
+each a real trap out to the host QEMU process; polling `now()` on every
+iteration of `sleep_until()`'s busy-wait turned three timers each waking
+every few tens of milliseconds into tens of real seconds per few
+simulated seconds. Fixed with a runtime-calibrated spin (one `now()`/
+busy-loop round-trip, measured once and cached) that covers the bulk of
+a wait without any semihosting calls at all, falling back to the same
+`now()`-polling loop only to correct whatever the estimate under/
+overshot by - a handful of iterations at most, not thousands.
+
+**mps2-an385 has no working general-purpose GPIO** (QEMU's 4
+`cmsdk-ahb-gpio` blocks are present in the device tree but stubbed as
+`unimplemented-device` - confirmed via `-d guest_errors,unimp`, writes
+are silently discarded) - but does model 8 real LEDs on its System
+Control block (`mps2-scc`, register `CFG1` at `0x4002f004`, bits
+`[7:0]`, active-high, verified via write-then-readback with zero
+guest-errors). The ported `examples/multicolor_larson_scanner/
+mps2an385` drives these directly (`app_config{.width = 8}` - not a
+downscaled approximation of some larger strip, the animation is
+configured for the hardware it actually has), thresholding each pixel's
+brightest channel into an on/off bit since the SCC's LEDs have no PWM/
+analog output. No button/switch input is modeled at all (the SCC's own
+DIP-switch register is a read-only stub, always zero), so unlike the
+terminal/wasm ports there's no input thread - bare-metal single-core has
+no real OS thread to run one on regardless - the app instead runs for a
+fixed frame budget then exits via semihosting, a deterministic shape
+suited to a QEMU-driven CI smoke test rather than a demo someone drives
+by hand.
+
+One more bug worth naming, found only by tracing all the way through:
+after fixing `sleep_until()`'s performance and confirming (via temporary
+UART tracing) that `drain_commands()` correctly processed the quit
+command and called `loop_.stop()`, the program *still* never exited.
+Cause: `main()`'s own `return 0;` at the end - a bare-metal `main()`
+returning doesn't terminate anything, it falls into `Reset_Handler`'s
+own trailing `for(;;){}` (which exists precisely because there's no OS
+to return *to*). `std::exit(0)` (routing through picolibc's normal
+`_exit()` chain, which this board's `startup.c` wires to the same
+semihosting `SYS_EXIT_EXTENDED` call every other termination path uses)
+was the fix - the same thing `src/test_main.cpp` already did correctly
+from having been modeled on the spike work's own proven pattern.
+
+**Real Catch2 v3.7.1, with real exceptions enabled** (not
+`CATCH_CONFIG_DISABLE_EXCEPTIONS` - that mode's failing-`REQUIRE`-aborts-
+the-whole-binary limitation no longer applies once exceptions genuinely
+work), patched at build time for the handful of things this target can't
+provide - no filesystem (`--output-file`/`-f`/Bazel sharding all fail
+loudly if ever reached, which this project's own fixed `argv` never
+does), no monotonic clock for Catch2's own internal timing (cosmetic
+only - doesn't affect `REQUIRE`/pass-fail reporting), no
+`std::random_device` (falls back to `std::time(nullptr)` seeding, the
+same bar `jitter`'s own `get_random_seed()` documents). The user's own
+preference over a hand-maintained fork: a checked-in unified-diff patch
+(`third_party/catch2-baremetal.patch`) applied to a `FetchContent`-fetched
+checkout via `PATCH_COMMAND`, verified to apply cleanly against a fresh
+upstream `v3.7.1` clone. `tests/CMakeLists.txt` deliberately doesn't run
+Catch2's own top-level `CMakeLists.txt` (which assumes a hosted build
+throughout) - it reuses just `CMake/CatchConfigOptions.cmake` (Catch2's
+own option-default script) before building the (patched) library itself
+from the fetched source directly.
+
+Result: `est`'s own full test suite runs for real under QEMU - 1110
+assertions, 259 test cases, all passing (`spsc_ring_tests.cpp` excluded,
+per above) - not just a toolchain smoke test. `run_under_qemu.sh` turns
+a built ELF's real QEMU exit code (via `SYS_EXIT_EXTENDED`) into a
+checkable result; deliberately not wired through `ctest`/`add_test()` -
+this project builds inside the pinned devenv image, which has no reason
+to also carry `qemu-system-arm`, the same "build in docker, verify with
+a runner-native tool" split `ci.yml`'s own `wasm` job already
+established for its Node-based smoke test.
+
+**Issue #123 follow-up: `estpico`'s clock stops depending on the host to
+function; `platform::interface::now()` becomes `uptime()`.** The
+`estpico` backend above still had its monotonic clock (and, downstream
+of it, `get_random_seed()`) sourced entirely from ARM semihosting's
+`SYS_ELAPSED`/`SYS_TICKFREQ` - a real trap out to whatever's actually
+running the CPU on every single call. Under QEMU (with `-semihosting`,
+as every invocation in this project already passes) that's QEMU's own
+process servicing the trap in software, not a real debug host - but the
+underlying mechanism is the same one a real board would need an actual
+attached debug probe for, meaning this "bare-metal" backend's basic
+sense of time only worked with a host attached. Raised directly by the
+user: a real firmware shouldn't need a host just to know how long it's
+been running.
+
+Ruled out one alternative before building the other: keeping the
+semihosting *instruction* convention but adding our own fault handler to
+answer it directly (so the same `bkpt 0xab` call site works whether or
+not a host is listening) was rejected - that's solving a privilege-
+boundary problem (why `SVC`/similar traps exist at all: so unprivileged
+code can ask privileged code to do something on its behalf), and this
+Cortex-M3 target has no privilege separation to cross in the first
+place. Rigging a trap-and-decode path to reach the exact register read a
+plain function call already reaches is indirection with no payoff here.
+
+Built directly on real hardware instead: the Cortex-M3 core's own
+SysTick timer (`0xE000E010`, core-internal - no board-specific address
+lookup needed, unlike the CMSDK peripherals). `CLKSOURCE=1` (the
+processor clock)'s actual frequency under this exact QEMU
+version/machine isn't documented anywhere this project trusts blindly -
+measured empirically instead, the same methodology `SYS_TICKFREQ`'s own
+1e9 figure was confirmed with earlier: a temporary firmware enabled
+SysTick with max reload and `CLKSOURCE=1`, busy-polled `COUNTFLAG` across
+30 full wraps, and bracketed the whole loop with `SYS_ELAPSED` reads as
+an already-trusted independent ground truth (the temporary firmware was
+deleted once the number was in hand; the technique is in this module's
+own doc comment for the next person who needs to re-verify it against a
+different QEMU version). Result: **24,998,930 Hz**, i.e. a clean 25 MHz -
+matching the commonly documented MPS2 AN385 default HCLK, and letting
+`ticks_to_time_point()` become exact 64-bit integer multiplication (40ns/
+tick) instead of the old `long double` frequency conversion. The same
+30-wrap loop's own real wall-clock duration (~20.1s for 20.13s of
+computed SysTick time) also confirmed SysTick is tied to QEMU's real/
+virtual clock the same way the semihosting counter was, not raw
+instruction-count throughput - timing behavior carries over unchanged.
+
+SysTick's 24-bit counter wraps every ~671ms at 25MHz, so a real
+`SysTick_Handler` (wired into `startup.c`'s vector table at slot 15,
+defined in `platform_mps2an385.cppm` with `extern "C"` linkage so the C
+startup file's forward declaration resolves it at link time) extends it
+into the 64-bit tick count `platform::clock` promises, incrementing a
+`volatile std::uint64_t` wrap counter once per wrap. Reading that counter
+back alongside the hardware's own current-value register needed real
+thought: naively reading both separately races the ISR (interrupt
+latency means there's a real, if tiny, window after the hardware
+auto-reloads but before `SysTick_Handler` has actually run, during which
+a naive read would undercount by a full wrap). This is the first place
+`estpico` has ever needed genuine interrupt-context protection -
+different from, and not covered by, the "two coroutines interleaving at
+a `co_await`" hazard `est::mutex` exists for (`docs/wiki/
+Architecture.md`'s "single-threaded, no atomics" section now says so
+explicitly) - so `systick_ticks()` wraps the paired read in a new
+`estpico::detail::interrupt_guard` (a short `PRIMASK` mask/restore RAII
+guard), cheap enough (a handful of cycles) to pay on every call, unlike
+the semihosting trap it replaced.
+
+That cost drop had a second, unplanned payoff: the old `now()` was
+expensive enough (a real host round-trip) that a plain `while (now() <
+deadline) {}` `sleep_until()` cost tens of real seconds per simulated
+second, which is why the previous entry's `calibrated_ns_per_spin_
+iteration()`/`busy_spin()` machinery existed at all. `systick_ticks()`
+is cheap enough that `sleep_until()` goes back to a plain polling loop -
+deleting that whole calibration apparatus rather than adapting it.
+Measured effect: `est`'s own QEMU test suite (1110 assertions, 259
+cases) dropped from ~1.6s real to ~0.67s real; `larson_scanner_mps2an385`
+(200 rendered frames) stayed at ~6.7s real for ~6.6s simulated, matching
+its pre-change behavior exactly, confirming the swap changed *how* time
+is measured without changing what it measures.
+
+`platform::interface::now()` is renamed to `uptime()` across every
+backend (`estext`/`estwasm`/`estpico`) and every call site
+(`loop.cppm`/`timer.cppm`/`timer_periodic.cppm`/`promise.cppm`/
+`with_timeout.cppm`/`with_stop.cppm`, every test fake) - a
+purely mechanical rename, but a meaningful one: the contract was always
+"monotonic time since this backend's own arbitrary epoch" (process/board
+start, the same contract `std::chrono::steady_clock::now()` itself
+carries), never wall-clock "the current time," and `now()` invited the
+wrong reading.
+
+The one place semihosting is still used at all: `terminate()`'s
+`SYS_EXIT_EXTENDED` call, which `assert_failure()` also reaches. Kept
+deliberately - it's not part of "functioning," it's "tell whatever's
+running me the process outcome," which only matters for the QEMU/CI use
+case this backend is explicitly scoped to (real flashed firmware never
+calls it: nothing here returns from `main()` or asserts under normal
+operation). One accepted, pre-existing gap worth naming plainly: on real
+hardware with no debug host attached, a failed `est::check()` would now
+fault at that `bkpt` instead of exiting cleanly - unchanged by this
+work, and out of scope for a backend that already documents itself as
+QEMU-only.
+
+**Issue #123 follow-up 2: `estpico`'s UART output becomes asynchronous
+and interrupt-driven.** Raised alongside the clock fix above, same
+session: `vprintdbg()`'s old implementation (`detail::uart_write()`,
+straight busy-wait polling one character at a time) blocks its caller
+for however long the whole message takes to physically leave the UART -
+fine for the rare, fatal `assert_failure()` message, wrong for a debug
+diagnostic that might fire from inside a hot continuation. Asked for
+specifically: a fixed-capacity queue an interrupt drains, fed by a
+buffer manager tying queued messages together in a list, pumped by an
+`est::spawn()`'d task at `Priority::high` (not `critical`).
+
+Before writing any of it, two real hardware facts needed confirming
+empirically, the same methodology the clock fix used - neither is
+documented anywhere this project trusts blindly:
+
+- **Which NVIC line UART0's TX-complete interrupt uses.** Found by
+  wiring every external IRQ slot (0-31) in a temporary vector table to
+  one shared handler that reports its own exception number (read via
+  `mrs %0, ipsr`, external IRQs start at 16) back through a global,
+  enabling every candidate line via `NVIC_ISER0 = 0xFFFFFFFF`, then
+  writing one byte to `UART0_DATA` and observing which line actually
+  fired. Answer: **IRQ1** (confirmed twice - once with every UART CTRL
+  interrupt-enable bit set, once with only `TX_EN`/`TX_INT_EN`, ruling
+  out RX/overrun as the real source).
+- **How the interrupt actually behaves.** Two things weren't obvious
+  from the register layout alone: whether enabling `TX_INT_EN` on an
+  already-idle UART fires it immediately (it does not - confirmed by
+  enabling it with zero prior writes to `UART0_DATA` and seeing no
+  interrupt until software wrote the first byte itself, meaning the
+  interrupt is edge-latched on "a transmission just completed," not a
+  sustained level on "buffer currently empty"), and whether it needs
+  explicit acknowledgement (it does - `UART0_INTSTATUS` at offset `0xC`,
+  write 1 to bit 0 to clear; *not* acking it produced a real storm, 21+
+  re-fires from a single byte before a safety valve kicked in; acking it
+  produced exactly one fire per byte). Confirmed together with a
+  temporary test string streamed entirely by the ISR itself, one byte
+  per interrupt, no further mainline writes after the first.
+
+That same temporary test also demonstrated a real hazard the design
+already needed to account for: the test's own mainline diagnostic print
+(polled, uncoordinated) and the ISR both writing `UART0_DATA`
+concurrently produced visibly garbled, interleaved output - direct,
+reproduced evidence for the "ISR can preempt mainline at any point"
+hazard `estpico::detail::interrupt_guard` (the clock fix's own addition,
+above) exists to close, now needed for a second piece of shared state.
+
+**Design landed:**
+- `estpico::detail::tx_buffer : est::intrusive_list_node` - one queued,
+  formatted message; `pending_buffers` (an `est::intrusive_list<tx_buffer>`)
+  and `draining_buffer` (the one currently being fed into the ring,
+  tracking its own partial-drain offset) are both mainline-only - the TX
+  ISR never touches either, only the ring below.
+- `est::spsc_ring<char>` (64 bytes, a function-local `static` rather than
+  a plain global so its constructor's real `pmr` allocation defers until
+  well after `main()` starts, not during static init before the heap is
+  necessarily live) is the one genuine ISR/mainline boundary -
+  `est::spsc_ring<T>`'s own doc comment already named "a future
+  bare-metal interrupt handler" as a design target for this exact shape.
+- `pump_uart_hardware()` (ack INTSTATUS, pop one byte if TX isn't full)
+  is called from *both* the real ISR and, wrapped in `interrupt_guard`,
+  from mainline to prime a cold start (the interrupt only ever fires on
+  a completed transmission, never spontaneously - the empirical finding
+  above) - one function, never running concurrently with itself either
+  way (the ISR can't be preempted by mainline; the guard blocks the
+  reverse), keeping `uart_tx_ring` down to one logical consumer despite
+  two call sites.
+- `pump_some()` (drain `pending_buffers`/`draining_buffer` into the ring
+  until either caught up or the ring fills) is the one piece of logic
+  both `enqueue_output()`'s synchronous fast path and `pump_task()`'s
+  spawned, yielding loop share - most messages are short enough to
+  fully drain in the first call, needing no coroutine at all.
+- `pump_task()` is only `est::spawn()`'d (at `Priority::high`, exactly
+  as asked) when `pump_some()` reports genuine backlog *and*
+  `est::has_current_loop()` - a small, new, non-asserting query added to
+  `est:util.current_loop` (`current_loop()`/`current_allocator()` both
+  assert if nothing is registered, which `vprintdbg()` can't risk: it's
+  called with no loop current at all by
+  `est/tests/platform_tests.cpp`'s own existing "vprintdbg() writes...
+  without throwing" test, run unchanged against this exact backend under
+  QEMU - confirmed still passing, its message short enough to never need
+  the coroutine path).
+- `assert_failure()` deliberately does *not* go through this queue - it
+  calls `drain_uart_tx_synchronously()` first (flushing anything
+  `vprintdbg()` already had in flight, so earlier debug context isn't
+  silently lost right before the process halts), then writes its own
+  message through the same synchronous `uart_write()` as before,
+  unconditionally, since there's no later point after `terminate()` at
+  which a merely-queued message would ever reach the wire.
+- `uart_putc()`/`uart_write()` (still assert_failure()'s and the drain
+  function's own byte-level primitive) now wrap in `interrupt_guard`
+  too - without that, any code still using the plain synchronous writer
+  (this backend's own `test_main.cpp`, whose `uart_streambuf` redirects
+  *all* of Catch2's own console output through the identical `UART0_DATA`/
+  `STATE` registers) would race the new TX ISR exactly the way the
+  temporary discovery firmware demonstrated.
+
+Verified end to end: `est`'s own QEMU test suite (1110 assertions, 259
+cases, including the vprintdbg-with-no-loop test above) and
+`larson_scanner_mps2an385` (200 rendered frames) both still pass, with
+completely clean, non-garbled UART output despite Catch2's own console
+reporter and the new interrupt-driven diagnostic path sharing the same
+wire throughout the run. Full hosted pipeline (clang-format, `ci`
+build+tidy, tests, new-code coverage gate, `sanitize` build+test) also
+green - `has_current_loop()` picked up its own direct unit test
+(`est/tests/loop_tests.cpp`) once diff-cover flagged it as the one
+genuinely uncovered line the `est` core change added.
+
+**PR #124 review, round 2: the pump task becomes a persistent,
+event-woken loop.** Two review comments on `pump_task_running` (the
+manual bool tracking "is a pump episode currently in flight"): first,
+replace it with a held `future<void>` clone (`future<T>::clone()`'s own
+doc comment already names this exact use) - `nullopt`/`ready()` both
+mean "not running," nothing to reset on completion. Landed as a2fddd5.
+Then a second, larger suggestion: skip the per-episode spawn entirely -
+one persistent `pump_task_loop()`, spawned once, `co_await`ing an
+`est::binary_event<EventResetMode::automatic>` in an infinite loop,
+rather than a fresh coroutine per backlog episode.
+
+Landed the second version. `est::binary_event<Mode>` (a `counting_event<Mode>`
+saturated at `max_count = 1`) turned out to fit cleanly: its constructor
+needs no loop at all (safe as a plain module-level global, like
+`systick_wrap_count` above, just not a POD this time), and `set()`
+itself only resolves `current_loop()` once a waiter is actually queued
+(its own doc comment) - meaning `enqueue_output()` can ring the event
+unconditionally once a loop is current, with no separate "has the task
+ever run" gate needed on that side either, beyond the one
+`pump_task_started` bool guarding the single, one-time `est::spawn()`
+call itself (a real bootstrap flag, not the same "per-episode" state the
+first review comment removed). `automatic` mode (not `manual`): the
+single unit saturates harmlessly across however many `enqueue_output()`
+calls land while the task is already busy, since `pump_some()` drains
+everything currently queued in one pass regardless of how many separate
+`set()` calls contributed to the backlog - `manual` mode's "every future
+wait() also takes the fast path until reset()" isn't needed here.
+
+One behavioral simplification came with it: `enqueue_output()` no longer
+tries a synchronous fast path once a loop is current at all - every call
+just enqueues and rings the event, fully deferring to
+`pump_task_loop()`, since `pump_some()` already handles "fits in one
+shot" (the common case) exactly as well from inside the coroutine. The
+no-loop-current fallback (`vprintdbg()` called before any loop exists,
+or `est/tests/platform_tests.cpp`'s own test exercising this directly)
+still calls `pump_some()` synchronously though - nothing would ever wake
+a task that can't be spawned in the first place, and losing that path
+would mean a diagnostic emitted before `main()`'s own loop starts is
+silently queued forever instead of reaching the wire.
+
+Verified again end to end: mps2an385 QEMU test suite (1113 assertions,
+260 cases, including the vprintdbg-with-no-loop test) and
+`larson_scanner_mps2an385` both still pass, same real-time behavior as
+before either round of this review.
+
+**PR #124 review, round 3: `sleep_until()` gets a real `wfi` + a second
+timer, not just a busy-poll.** A third review comment, this time on
+`sleep_until()`'s own plain `while (uptime() < deadline) {}` loop: use
+`wfi` (Wait For Interrupt), "a standard arm32 function," to actually
+halt the CPU between checks instead of spinning it.
+
+The real complication, surfaced before writing any code: `wfi` wakes on
+*any* enabled interrupt, and the only periodic one wired up (SysTick)
+only fires once per ~671ms wrap - but `larson_scanner`'s own
+`tick_interval`/`render_interval`/`command_poll_interval` are all
+20-33ms. A naive `wfi` with nothing else providing a closer wakeup would
+have meant waiting up to ~671ms past every real deadline - not a
+rounding error, a ~20x frame-rate collapse. Fixing it for real needed a
+*second*, independent timer that could be armed per-deadline: SysTick's
+own reload is load-bearing for `systick_ticks()`'s own tick accounting
+(its formula assumes every wrap represents exactly one full
+`systick_cycle_length`), so temporarily shortening it to align with an
+arbitrary sleep deadline would desynchronize the clock itself - not
+something worth risking for a wakeup mechanism.
+
+The board's second CMSDK APB timer peripheral (the "dual-timer," at
+`0x40002000` - confirmed via `info mtree`, same as every other
+peripheral base in this project) was sitting there unused. Its own
+register layout (a standard ARM SP804-shaped block: `LOAD`/`VALUE`/
+`CONTROL`/`INTCLR` per sub-timer, `CONTROL` bits for `ONESHOT`/`SIZE`/
+`INTEN`/`ENABLE`) and its NVIC wiring for this specific board
+(`IRQ10`) came from QEMU 8.2.2's own device model source
+(`hw/timer/cmsdk-apb-dualtimer.c`, `hw/arm/mps2.c`) - fetched as a
+starting hypothesis, then run through the identical two-step discipline
+every other piece of hardware in this file got: confirmed empirically
+against the real binary, not trusted from the source alone. `IRQ10`
+checked out via the same shared-handler/IPSR technique used for UART0
+TX; acking via `T1INTCLR` turned out to be required the same way UART0's
+own interrupt was - a real 200+-fire storm resulted from *not* acking
+it, exactly one fire from acking it. `TIMCLK` (the timer's own input
+clock) was calibrated directly against SysTick's own already-trusted
+`uptime()` rather than semihosting this time - both derive from the
+same board clock, and it came out to the identical clean 25 MHz, so the
+same 40ns/tick integer math applies.
+
+`sleep_until()`'s new shape: recompute the remaining time each loop
+iteration, arm the dual-timer for a one-shot interrupt at (approximately)
+that remaining duration, `wfi`, recheck `uptime()` against the real
+deadline (since `wfi` could have woken on an unrelated interrupt - a
+UART TX completion, say), and repeat if not actually there yet. A
+deadline already in the past never touches the timer at all.
+
+Verified two ways: `est/tests/platform_tests.cpp`'s own "sleep_until()
+returns once the deadline has passed" test already exercises the real
+(not faked) `platform_mps2an385::sleep_until()` with a genuine 1ms
+deadline, unmodified, still passing. More tellingly,
+`larson_scanner_mps2an385`'s 200-frame run stayed at the identical
+~6.7s real time as every prior measurement in this file - had the
+naive-`wfi` oversleep problem actually landed, 200 frames at up to
+~671ms each would run for minutes, not seconds. One concrete, measured
+benefit past correctness: the same run's host-side CPU time (`user` in
+`time`'s own output) dropped from ~6.6s to ~0.18s - `wfi` is genuinely
+idling the emulated CPU between events under QEMU's own TCG, not just a
+correctness no-op.
+
+**PR #124 review, round 4: one shared source list instead of three
+hand-copied ones.** A fourth review comment, this time on the build
+system rather than estpico itself: `est/CMakeLists.txt`,
+`examples/multicolor_larson_scanner/web/CMakeLists.txt`, and
+`.../mps2an385/CMakeLists.txt` each declare their own `add_library(est
+STATIC)` (none of the three standalone cross-compile projects can
+`add_subdirectory()` the real `est/CMakeLists.txt` - see those two
+files' own top comments) - but all three had been hand-copying the
+exact same 23-entry `FILE_SET CXX_MODULES` file list verbatim, a real
+maintenance hazard every time a `.cppm` file gets added to `est/src/`.
+
+Fixed with `cmake/EstSources.cmake`: a single `EST_CXX_MODULE_SOURCES`
+list, paths bare (relative to `est/src`, no project-specific prefix),
+`include()`-d by all three consumers, each then `list(TRANSFORM ...
+PREPEND ...)`-ing its own correct absolute base path before handing the
+result to `target_sources()` - the one thing that genuinely differs
+between the root build and the two standalone projects. Everything else
+(warnings/coverage/sanitizers for the root build; the deliberate absence
+of them for the two cross-compiles) stays exactly as it already was in
+each file.
+
+Verified by a fresh `rm -rf build/*` + reconfigure + full build (not an
+incremental one, to actually exercise `include()`/`list(TRANSFORM)`
+running from scratch) in all three: hosted `default` preset (329/329
+tests), `web`'s wasm32 project (smoke test still passing), and
+`mps2an385` (1113 assertions/260 cases under QEMU, `larson_scanner`
+still exit 0) - all unchanged from before the refactor, confirming this
+touched only where the file list lives, not what gets built.
+
+**Post-review follow-up: two real bugs in `pump_task_loop()`, found by a
+requested code review, then fixed by removing the coroutine entirely.**
+Before merging, a code review pass (focused on the new estpico platform
+code specifically) surfaced two issues in the UART TX pump design that
+round 2's own review (above) had settled on:
+
+1. `est::spawn(pump_task_loop(), est::Priority::high)`'s `Priority::high`
+   never actually applied to the coroutine's own ongoing work.
+   `promise_type::initial_suspend()` returns `std::suspend_never`
+   (`est/src/future.cppm`), so calling `pump_task_loop()` runs its body
+   synchronously, on the caller's own stack, up to its first `co_await` -
+   *before* `est::spawn()` is even entered as a function call. `spawn()`'s
+   own `prio` argument only ever gets stamped onto the one `then_fast()`
+   completion continuation it registers on the already-built future
+   (`est/src/spawn.cppm`) - for a `while (true)` coroutine that never
+   completes, that continuation is structurally unreachable. The
+   coroutine's real resumption priority came from whatever
+   `current_priority()` happened to be at its call site inside
+   `enqueue_output()` instead - `Priority::normal`, the thread-local
+   default (`est/src/loop.cppm`), in every real call path - and then
+   self-propagated at that level forever (issue #31's inheritance
+   behavior), never touching `Priority::high` at all.
+2. The inner `while (!pump_some()) { co_await est::yield_execution(); }`
+   retry (only reachable when a single `enqueue_output()` call's text
+   exceeds the 64-byte ring in one pass) was a genuine poll, not a wait:
+   nothing in the design ever produced a "ring gained space" event -
+   `yield_execution()` just re-enqueues the coroutine and it rechecks
+   next turn, unconditionally, however many times it takes the real TX
+   interrupt to drain enough of the ring.
+
+The fix isn't a better-behaved retry: it's removing the coroutine's role
+in draining the ring at all. Making the *ISR* signal a real
+`est::binary_event`/wake the coroutine directly was considered and
+rejected - `est::loop`'s ready-queue and `est::counting_event`'s waiters
+list are plain, non-atomic `intrusive_list`s, mutated by ordinary
+mainline code with interrupts enabled; an ISR calling into either from
+inside `UART0_TX_Handler` could preempt mainline mid-mutation of the
+exact same list, a real data race this codebase's own "single-threaded,
+no atomics" stance (CLAUDE.md) doesn't cover and shouldn't be made to,
+for one platform-specific backend.
+
+Instead, `pump_some()` (renamed `refill_ring()`) becomes a pure "top the
+ring off from `pending_buffers`/`draining_buffer`, stop the moment it's
+full" function with no hardware/kick logic of its own, and
+`pump_uart_hardware()` (already the real `UART0_TX_Handler`, already
+called from mainline via `uart_tx_kick()`) calls it after every byte it
+pops - so the ring gets refilled by the same interrupt that just freed a
+slot in it, every time, with no coroutine involved in the loop at all.
+`enqueue_output()` drops to appending a buffer and kicking the hardware
+once; `est::spawn()`, `pump_wake_event`, `pump_task_started`, and
+`pump_task_loop()` are gone entirely - there's no persistent coroutine
+left for a priority argument to fail to reach, and no retry loop left to
+poll. The one new correctness obligation this creates -
+`pending_buffers`/`draining_buffer` are now touched by the real ISR too,
+not just mainline - is handled the same way every other ISR/mainline
+hazard in this file already is: `interrupt_guard` around
+`enqueue_output()`'s own `pending_buffers.enqueue()` call.
+`est::spsc_ring<T>`'s own lock-free index handoff needed no change - its
+"never called concurrently with itself" contract for `try_push()`/
+`try_pop()` holds regardless of which physical context calls either, and
+`interrupt_guard`/ISR-non-preemption already guarantee that.
+
+Verified end to end: the full mps2an385 QEMU test suite (1114 assertions,
+261 cases - a new case added specifically for this, a 96-byte message
+forcing several real ISR-driven ring refills, confirmed to print intact
+and complete near-instantly, not stalling on any retry) and
+`larson_scanner_mps2an385` (exit 0, same real-time behavior, confirmed
+unrelated to this change via a baseline comparison against the
+pre-fix code) - plus the full hosted pipeline (`default`/`ci`/`sanitize`
+presets, `clang-tidy`, the diff-coverage gate) and the wasm32 project,
+none of which this backend-specific change touches but all of which
+still pass since `est/tests/platform_tests.cpp` (the one shared file
+that gained the new long-message test case) is common to all of them.
+
+**`est::spawn()`'s Fn&& overload now actually changes the created task's
+priority, not just its completion report.** A follow-up to the previous
+entry's `Priority::high` finding: that bug was specific to
+`pump_task_loop()` (since removed), but the mechanism behind it - a
+`future<T>` overload's `prio` reaching only the one completion
+continuation `spawn()` itself registers, never the task's own synchronous
+prefix or later resumptions - is a real, general property of `spawn()`,
+not an estpico-only quirk. Raised directly: `spawn()` should take a
+callable rather than a `future<T>` for the version of the call meant to
+actually change a task's priority, since only `spawn()` itself - invoking
+the callable, not just receiving its already-run result - is ever in a
+position to raise `current_priority()` before that first synchronous
+prefix runs.
+
+Fixed by having the `Fn&&` overload wrap its call to `fn()` in
+`set_priority(prio)` (`est/src/spawn.cppm`): `fn()`'s return - typically
+a coroutine call - now runs its synchronous prefix under the raised
+priority, so its first suspension point gets `prio` stamped onto it
+directly (rather than whatever was ambient at the real call site), and
+every later `co_await` inherits it in turn (issue #31's own
+priority-propagation behavior). The `future<T>` overload is unchanged -
+structurally it can't do this, since by the time a caller has a
+`future<T>` to hand it, that prefix has already run - but its own doc
+comment now says so explicitly, alongside the `Fn&&` overload's, so the
+next reader doesn't have to rediscover the gap the hard way `estpico` did.
+`docs/wiki/Coroutines.md`'s own `est::spawn()` section updated to match -
+the callable overload was previously documented as pure "eager-call
+sugar," which is no longer the whole story.
+
+New test (`est/tests/spawn_tests.cpp`): a coroutine that records
+`current_priority()` both in its own synchronous prefix and again after a
+real `co_await est::yield_execution()` resumption, spawned via the
+`Fn&&` overload at `Priority::high` - both observations come back
+`Priority::high`, proving the raised priority survives an actual
+suspend/resume, not just the synchronous call. Verified end to end: the
+full hosted pipeline (`default`/`ci`/`sanitize` presets, `clang-tidy`,
+the diff-coverage gate - `spawn.cppm`/`spawn_tests.cpp` both at 100%
+diff coverage), the mps2an385 QEMU test suite (1116 assertions, 262
+cases) and firmware smoke test, and the wasm32 project - `spawn()` is
+core `est`, shared by every backend, so every target that links it needed
+re-verifying, not just the one estpico had originally surfaced the gap
+in.
+
+**Reworking the UART TX pump again: `refill_ring()` was doing a heap
+deallocation from ISR context.** Flagged directly: `pump_uart_hardware()`
+(the real `UART0_TX_Handler`) calling `refill_ring()`, which calls
+`draining_buffer.reset()` once a buffer is fully drained - a real
+deallocation (frees the `tx_buffer`'s own `std::string data`, then the
+node itself) through whatever general-purpose heap allocator
+`std::unique_ptr` uses here, from inside an ISR. Nothing documents that
+allocator as safe to reenter while mainline might already be
+mid-allocation/mid-free on the same heap - a genuine, silent
+heap-corruption hazard distinct from (and worse than) the non-atomic
+`intrusive_list` mutation hazard `interrupt_guard` already existed to
+rule out; masking interrupts around the *call* does nothing about the
+call itself being unsafe to make from an ISR in the first place. Missed
+in the previous round's own review of this exact design.
+
+Reworked to keep `pending_buffers`/`draining_buffer` strictly
+mainline-only again (matching round 2's original shape) - the real ISR
+(`pump_uart_hardware()`) goes back to only ever popping one byte and
+writing it to `UART0_DATA`, no refilling, no allocation, nothing beyond
+raw MMIO and `uart_tx_ring`'s own lock-free `try_pop()`. All the actual
+byte-shoveling work (`pump_some()`, restored to its round-2 shape) moves
+back to `pump_task_loop()`, a persistent coroutine `est::spawn()`'d once
+- now via the `Fn&&` overload specifically (the previous entry's own
+fix), so `Priority::high` actually reaches its ongoing work this time,
+not just a never-reached completion continuation.
+
+The part that actually changed from round 2: what happens when the ring
+fills before a buffer is fully queued. Round 2 retried via
+`co_await est::yield_execution()` - a real busy-poll, no actual "ring has
+space" signal backing it (this session's earlier finding). Signaling that
+from the ISR directly was considered and rejected - `est::loop`'s
+ready-queue and `est::counting_event`'s waiter list are exactly the kind
+of non-atomic structure an ISR can't safely touch either, the same class
+of hazard as the deallocation above, just at the coroutine layer instead
+of the allocator layer (issue #125 sketches what a real ISR-safe wake
+primitive would need). Replaced with a real, non-busy backoff instead:
+`co_await est::sleep_for(1ms * queued_buffer_count)`, `queued_buffer_count`
+being a plain mainline-only counter (`tx_buffer` isn't kept in anything
+with an O(1) `size()`) tracking how many buffers are currently
+backlogged. Not a precise wait - a deliberate heuristic, scaling the
+sleep with how much is queued rather than retrying at a fixed interval
+regardless of backlog size.
+
+Verified: the mps2an385 QEMU test suite (1116 assertions, 262 cases,
+including the existing 96-byte long-message case, still passing) and the
+`larson_scanner_mps2an385` firmware smoke test, plus the full hosted
+pipeline (`platform_tests.cpp`'s own long-message test is shared across
+backends).
+
+**A second, more serious bug found in the course of that verification,
+not yet fixed**: `pump_task_loop()` never terminates and is spawned
+exactly once, against whichever `est::loop` is current the first time
+it's needed - but nothing ever tells it to stop before that loop goes
+away. Confirmed with a throwaway instrumented build of
+`larson_scanner_mps2an385` (a `printdbg()` call injected into the first
+rendered frame, so a real message is enqueued against the program's one
+real loop): the message drains correctly in full, but the program then
+crashes on exit with `est::current_loop(): no loop is current`. Sequence:
+the coroutine finishes draining and goes back to
+`co_await pump_wake_event.wait()`, parked in `pump_wake_event`'s own
+`waiters_` list - not `est::loop`'s `ready_`/`pending_timers_`, so
+nothing drains it when the owning loop is destroyed normally at the end
+of `app::loop()`. `pump_wake_event` itself is a process-lifetime global,
+so it only gets destroyed later, at `std::exit()`'s static-destruction
+phase - by which point no loop is registered at all, and completing the
+still-parked coroutine's own `future_state<void>` (to abandon it) needs
+`current_loop()` to hand off its resume node. This is exactly the
+documented `future_state<T>` precondition
+("callers are responsible for not interleaving distinct est::loop
+registrations across the lifetime of a single future_state/promise/future
+chain" - its own doc comment, `est/src/future.cppm`), violated by a
+process-lifetime coroutine parked on a process-lifetime event outliving
+the one loop it was ever actually spawned against. The exact same
+`platform_tests.cpp` long-message test hit a narrower version of this
+too (a per-`TEST_CASE` loop, constructed and destroyed within one test,
+corrupting a *later* test's own printdbg() call) - fixed there by not
+constructing a loop in that shared test at all (this file's own updated
+comment on that test has the reasoning), which avoids triggering it but
+doesn't fix the underlying gap.
+
+Not fixed in this round - needs a real answer for "who tells the pump
+task to stop, and when," which this codebase doesn't have a hook for yet
+(`platform::interface` has no "the loop is about to go away" callback,
+and `platform_mps2an385`'s own destructor never runs in the actual
+`std::exit()`-based shutdown path `main.cpp`/`test_main.cpp` both use).
+Local commit only, not pushed - flagged for discussion before deciding
+which direction to take it.
+
+**Two corrections to the backoff/stop design, and a first (incomplete)
+attempt at the shutdown gap.** Two direct corrections to the previous
+entry's design:
+
+1. The backoff sleep should scale with `uart_tx_ring`'s own fixed
+   capacity, not the current backlog - `1ms * uart_tx_ring_capacity`
+   (~64ms: roughly how long the *whole* ring takes to drain via real
+   UART transmission, not tied to how much is actually queued), not
+   `1ms * queued_buffer_count`. Simpler too: `queued_buffer_count` (a
+   counter added purely to size the old formula) is gone entirely, along
+   with its increment/decrement in `enqueue_output()`/`pump_some()`.
+2. `pump_task_loop()` now takes an `est::stop_token` and races both of
+   its awaits against it (`est::with_stop(pump_wake_event.wait(), token)`,
+   `est::sleep_for(pump_backoff_delay, token)`), inside one `try`/`catch`
+   for `est::operation_cancelled` around the whole loop - a real, tested
+   way for the coroutine to actually exit instead of staying parked
+   forever, directly addressing the previous entry's crash. A new
+   `pump_stop_source()` (lazily-constructed, same `est::spsc_ring`-style
+   reason as `uart_tx_ring()`) backs it, with `estpico::
+   request_uart_tx_pump_stop()` exported as the public way to fire it.
+
+The "who calls it, and when" half is still open, and turned out
+harder than it looked. `est::future_state<T>::complete()` (reached from
+`est::promise<T>::set_value()`, which `request_stop()` calls) resolves
+`current_loop()` *unconditionally*, before it even checks whether
+anything is registered to hand off - so `request_stop()` itself asserts
+if called with no loop current, not just the coroutine it's meant to
+wake. `platform_mps2an385`'s own destructor - the first place this looked
+for a hook - turned out to be dead code for this purpose: both
+`main.cpp` and `test_main.cpp` call `std::exit()` rather than returning
+normally from `main()`, which skips local destructors entirely,
+confirmed by adding (then removing) a diagnostic `printdbg()` at the top
+of the destructor that never printed in either binary's own output.
+
+Tried calling `request_uart_tx_pump_stop()` from *inside* `main.cpp`'s
+own render callback instead - the one place a real loop is genuinely
+current - a few frames before requesting the loop itself stop (leaving
+room for the resulting wake/cancel cascade to actually run before
+`est::loop::stop()`, which only returns after finishing whichever single
+ready continuation is *currently* running, cuts it short). This didn't
+reliably fix the crash: it passed or failed depending on unrelated code
+changes nearby (an unrelated diagnostic `printdbg()` call flipped a
+consistently-reproducing failure to a consistently-reproducing pass, and
+neither a 5-frame nor a 20-frame margin changed that on its own) -
+meaning the actual mechanism still isn't understood, not that more
+margin would fix it. Pulled the whole attempt back out of `main.cpp`
+rather than ship something whose correctness depends on unrelated code
+nearby. `request_uart_tx_pump_stop()` itself stays exported as a real,
+correct building block - just not proven safe to call from any specific
+place in this codebase yet.
+
+Verified: mps2an385 QEMU test suite (1116 assertions, 262 cases) and
+`larson_scanner_mps2an385`'s own normal (non-instrumented) 200-frame run
+both still pass - this round's changes are additive/corrective to the
+pump task's own internal behavior, not a regression in anything already
+working. The shutdown crash itself remains open, same as the previous
+entry. Local commit only, not pushed - per the same instruction as
+before.
+
+**Code review pass before pushing: one real bug, one comment-placement
+fix.** Requested once the two local commits above were ready to go out.
+
+1. `enqueue_output()` set `pump_task_started = true` *before* calling
+   `est::spawn(...)`, not after. `spawn()`'s own argument evaluation can
+   throw (coroutine frame allocation, `pump_stop_source()`'s own lazy
+   construction, `pump_wake_event.wait()`'s waiter-node allocation) -
+   since `vprintdbg()` wraps the whole call in `catch (...)`, such a
+   throw is silently swallowed, but `pump_task_started` stayed latched
+   `true` regardless, so every *later* `enqueue_output()` call (loop
+   still current) would only ever append to `pending_buffers` and ring
+   an event nobody's waiting on - async debug output would silently and
+   permanently stop after one transient allocation failure, contradicting
+   this file's own stated "best-effort" contract. Fixed by moving the
+   flag write to *after* `spawn()` returns, so a throw leaves it `false`
+   and the next call retries.
+2. Two doc comments (`pump_stop_source()`'s and
+   `request_uart_tx_pump_stop()`'s) had drifted into narrating the
+   specific debugging session that produced them - "an attempt... was
+   tried and pulled back out," "confirmed... with an instrumented
+   build" - duplicating, in the source itself, exactly the story this
+   file's own PLAN.md entries already tell. Trimmed to state only what's
+   true of the code *now* (the precondition, why a destructor-based hook
+   doesn't work, that nothing calls the stop function yet), per CLAUDE.md's
+   own "comments reflect current state, not narrated history" rule -
+   the removed narrative isn't lost, it's already recorded above,
+   unchanged.
+
+Verified again: mps2an385 QEMU test suite (1116 assertions, 262 cases)
+and `larson_scanner_mps2an385`'s normal run both still pass; `clang-format`
+clean. Pushed.

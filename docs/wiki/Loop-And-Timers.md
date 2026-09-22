@@ -306,7 +306,7 @@ void run_one(detail::ready_node& node) {
   work, all of it — with nothing able to preempt it. Measuring and
   reporting a stall lives on `platform::interface` -
   `reset_loop_stall_detection()`/`detect_loop_stall(threshold)` — for the
-  same reason `now()`/`sleep_until()` are platform hooks rather than
+  same reason `uptime()`/`sleep_until()` are platform hooks rather than
   `est::loop` calling `std::chrono`/`std::this_thread` directly: "how do
   we know a callback ran long" is a policy a backend should get to answer
   for itself. `est::loop` only calls the two bracketing hooks and owns the
@@ -315,7 +315,7 @@ void run_one(detail::ready_node& node) {
   (see the `current_loop()` section above for why `interface` carries no
   default bodies or state of its own at all), so each concrete backend
   answers them itself. `hosted_stdcpp`'s own override just records
-  `now()` on reset and compares against it on detect, printing via
+  `uptime()` on reset and compares against it on detect, printing via
   `platform::printdbg()` if exceeded. A future backend could implement
   both to run a watchdog on a background thread instead, catching (and
   reporting) a stall in parallel while the callback is still running,
@@ -560,7 +560,7 @@ void run_impl() {
 `platform::instance().sleep_until()` is why a test doesn't have to actually
 wait real wall-clock time for a timer-driven test to complete: a fake
 platform overrides it to advance its own fake clock instantly instead of
-blocking (mirroring the same seam `now()`/`assert_failure()` already use —
+blocking (mirroring the same seam `uptime()`/`assert_failure()` already use —
 see `est/tests/loop_tests.cpp`'s `fake_platform`). `fire_ready_timers()`
 pops every timer whose deadline has passed, looks it up in `pending_timers_`
 to find its node, and calls `fire()` — which for a `sleep_for()`-created
@@ -628,7 +628,7 @@ off to a **fresh** node for the next period before returning:
 ```cpp
 void fire() override {
   if (ctrl_->cancelled) { return; }
-  const auto period_start = platform::instance().now(); // before fn_(), not after
+  const auto period_start = platform::instance().uptime(); // before fn_(), not after
   try {
     fn_();
   } catch (...) {
@@ -645,7 +645,7 @@ void fire() override {
 
 **Fixed-rate, not fixed-delay.** `period_start` is captured *before*
 `fn_()` runs, and the next deadline is computed from it, not from a
-`now()` read taken after `fn_()` returns - so a slow or variable-latency
+`uptime()` read taken after `fn_()` returns - so a slow or variable-latency
 `fn_()` doesn't push every later period further out by however long that
 call happened to take (the classic fixed-delay drift a naive
 `setTimeout()`-chain has). This is what a "periodic timer" means in
@@ -697,7 +697,7 @@ a `std::uniform_int_distribution` over `[-max_jitter, +max_jitter]`.
 Seeded once, at construction, from `platform::instance().get_random_seed()`
 (`:platform`) - the one place in this codebase that needs actual
 randomness, and the one new platform hook this feature added (`hosted_stdcpp`
-answers it via `std::random_device`, falling back to `now()`'s own bit
+answers it via `std::random_device`, falling back to `uptime()`'s own bit
 pattern if that throws; a future bare-metal backend would answer from
 whatever hardware entropy source it has). Not cryptographically secure,
 nor does it need to be - jitter only has to differ from the last draw,

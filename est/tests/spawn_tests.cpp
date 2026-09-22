@@ -13,11 +13,11 @@ namespace {
 // run_until_idle() call).
 class recording_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     current = std::max(current, deadline);
   }
 
@@ -38,10 +38,9 @@ public:
   }
 
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
-  mutable std::chrono::steady_clock::time_point current;
+  mutable est::platform::clock::time_point current;
   mutable int diagnostic_count = 0;
   mutable std::optional<std::string> last_diagnostic;
 };
@@ -80,6 +79,20 @@ auto suspending_coro(bool* completed) -> est::future<void> {
   using namespace std::chrono_literals;
   co_await est::sleep_for(10s);
   *completed = true;
+}
+
+// Records current_priority() twice: once in its own synchronous prefix
+// (before any co_await - promise_type::initial_suspend() is
+// std::suspend_never, est:future, so this runs on whatever stack called
+// the coroutine function) and once after resuming from a real suspension
+// point, to distinguish "the priority a spawn() call raised only lasted
+// for the synchronous prefix" from "it actually propagated through a
+// later co_await" (est:loop's own priority-inheritance behavior, issue
+// #31).
+auto priority_observing_coro(std::vector<est::Priority>* observed) -> est::future<void> {
+  observed->push_back(est::current_priority());
+  co_await est::yield_execution();
+  observed->push_back(est::current_priority());
 }
 
 // est::spawn()'s exception hook is thread_local (est/src/spawn.cppm's own
@@ -304,6 +317,32 @@ TEST_CASE("spawn() defaults its Priority to current_priority() at the call site"
   loop.run_until_idle();
 
   REQUIRE(observed == est::Priority::high);
+}
+
+TEST_CASE("spawn()'s Fn&& overload raises current_priority() for the call itself, propagating to "
+          "the created coroutine's later resumptions too",
+          "[spawn][priority][coroutine]") {
+  // The gap the future<T> overload's own doc comment now names directly:
+  // by the time a caller has a future<T> in hand, its synchronous prefix
+  // already ran at whatever priority was ambient, so passing prio to that
+  // overload can only ever affect the one-time completion report - never
+  // the coroutine's own ongoing work. This overload instead raises
+  // current_priority() around the call to fn(), so the coroutine's own
+  // first suspension point gets prio stamped onto it directly, and every
+  // later co_await inherits it in turn.
+  recording_platform fake;
+  const auto platform_guard = est::platform::override_instance(fake);
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  std::vector<est::Priority> observed;
+  est::spawn([&observed] { return priority_observing_coro(&observed); }, est::Priority::high);
+
+  REQUIRE(observed == std::vector{est::Priority::high}); // synchronous prefix already saw it
+
+  loop.run_until_idle(); // drains the yield_execution() resumption
+
+  REQUIRE(observed == std::vector{est::Priority::high, est::Priority::high});
 }
 
 TEST_CASE("spawn() lets an unobserved coroutine run to completion", "[spawn][coroutine]") {

@@ -6,12 +6,12 @@ import :platform;
 export namespace est {
 
 // A min-heap of pending one-shot deadlines, ordered by
-// platform::instance().now(). Templated on the allocator used for the
+// platform::instance().uptime(). Templated on the allocator used for the
 // underlying storage. Just the scheduling structure - est::loop owns one
 // and is what actually fires deadlines as continuations.
 template <class Allocator = std::allocator<std::byte>> class timer_queue {
 public:
-  using clock = std::chrono::steady_clock;
+  using clock = platform::clock;
   using time_point = clock::time_point;
   using duration = clock::duration;
   using id = std::size_t;
@@ -27,7 +27,7 @@ public:
   }
 
   auto schedule_after(duration delay) -> id {
-    return schedule_at(platform::instance().now() + delay);
+    return schedule_at(platform::instance().uptime() + delay);
   }
 
   // Returns false if `target` wasn't found (already fired, or invalid).

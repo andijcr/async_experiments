@@ -1,0 +1,208 @@
+diff --git a/src/catch2/benchmark/catch_clock.hpp b/src/catch2/benchmark/catch_clock.hpp
+index 4068c4d..7cfdca0 100644
+--- a/src/catch2/benchmark/catch_clock.hpp
++++ b/src/catch2/benchmark/catch_clock.hpp
+@@ -20,7 +20,24 @@ namespace Catch {
+         template <typename Clock>
+         using TimePoint = typename Clock::time_point;
+ 
++        // mps2an385: same steady_clock gap as catch_timer.cpp's own
++        // patch (this bare-metal libc++ build has no OS-provided
++        // monotonic clock) - a trivial stand-in Clock satisfying the
++        // named requirement (Rep/Period/duration/time_point/is_steady/
++        // now()), not a real one. Not used unless BENCHMARK() macros are
++        // actually exercised, which this project's own test suite doesn't.
++#if defined(CATCH_BAREMETAL_NO_MONOTONIC_CLOCK)
++        struct default_clock {
++            using rep = std::uint64_t;
++            using period = std::nano;
++            using duration = std::chrono::duration<rep, period>;
++            using time_point = std::chrono::time_point<default_clock>;
++            static constexpr bool is_steady = false;
++            static auto now() noexcept -> time_point { return time_point{}; }
++        };
++#else
+         using default_clock = std::chrono::steady_clock;
++#endif
+     } // namespace Benchmark
+ } // namespace Catch
+ 
+diff --git a/src/catch2/benchmark/detail/catch_stats.cpp b/src/catch2/benchmark/detail/catch_stats.cpp
+index e6de359..83f8f43 100644
+--- a/src/catch2/benchmark/detail/catch_stats.cpp
++++ b/src/catch2/benchmark/detail/catch_stats.cpp
+@@ -19,6 +19,7 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <numeric>
++#include <ctime>
+ #include <random>
+ 
+ 
+@@ -356,8 +357,12 @@ namespace Catch {
+ 
+ #if defined(CATCH_CONFIG_USE_ASYNC)
+                 auto Estimate = [=](double(*f)(double const*, double const*)) {
++                    #ifdef CATCH_BAREMETAL_NO_RANDOM_DEVICE
++                    auto seed = static_cast<unsigned>(std::time(nullptr));
++#else
+                     std::random_device rd;
+                     auto seed = rd();
++#endif
+                     return std::async(std::launch::async, [=] {
+                         SimplePcg32 rng( seed );
+                         auto resampled = resample(rng, n_resamples, first, last, f);
+@@ -372,8 +377,12 @@ namespace Catch {
+                 auto stddev_estimate = stddev_future.get();
+ #else
+                 auto Estimate = [=](double(*f)(double const* , double const*)) {
++                    #ifdef CATCH_BAREMETAL_NO_RANDOM_DEVICE
++                    auto seed = static_cast<unsigned>(std::time(nullptr));
++#else
+                     std::random_device rd;
+                     auto seed = rd();
++#endif
+                     SimplePcg32 rng( seed );
+                     auto resampled = resample(rng, n_resamples, first, last, f);
+                     return bootstrap(confidence_level, first, last, resampled, f);
+diff --git a/src/catch2/catch_config.cpp b/src/catch2/catch_config.cpp
+index 352c1f4..7eeb676 100644
+--- a/src/catch2/catch_config.cpp
++++ b/src/catch2/catch_config.cpp
+@@ -234,6 +234,7 @@ namespace Catch {
+             m_data.testsOrTags.push_back( bazelTestSpec );
+         }
+ 
++#ifndef CATCH_BAREMETAL_NO_FILESYSTEM
+         const auto bazelShardOptions = readBazelShardingOptions();
+         if ( bazelShardOptions ) {
+             std::ofstream f( bazelShardOptions->shardFilePath,
+@@ -244,6 +245,7 @@ namespace Catch {
+                 m_data.shardCount = bazelShardOptions->shardCount;
+             }
+         }
++#endif // CATCH_BAREMETAL_NO_FILESYSTEM
+     }
+ 
+ } // end namespace Catch
+diff --git a/src/catch2/catch_timer.cpp b/src/catch2/catch_timer.cpp
+index 5139665..3f0b5f1 100644
+--- a/src/catch2/catch_timer.cpp
++++ b/src/catch2/catch_timer.cpp
+@@ -7,13 +7,17 @@
+ // SPDX-License-Identifier: BSL-1.0
+ #include <catch2/catch_timer.hpp>
+ 
+-#include <chrono>
+-
+ namespace Catch {
+ 
+     namespace {
++        // mps2an385: this bare-metal libc++ build has no
++        // std::chrono::steady_clock (_LIBCPP_HAS_NO_MONOTONIC_CLOCK -
++        // freestanding targets have no OS-provided clock by default). A
++        // real backend would read a hardware timer here (SysTick, a
++        // CMSDK timer, ...); for this project's own test suite, timing information just
++        // isn't meaningful, so this always reports zero elapsed time.
+         static auto getCurrentNanosecondsSinceEpoch() -> uint64_t {
+-            return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++            return 0;
+         }
+     } // end unnamed namespace
+ 
+diff --git a/src/catch2/internal/catch_commandline.cpp b/src/catch2/internal/catch_commandline.cpp
+index 212f177..879a37a 100644
+--- a/src/catch2/internal/catch_commandline.cpp
++++ b/src/catch2/internal/catch_commandline.cpp
+@@ -38,6 +38,14 @@ namespace Catch {
+                 "Unrecognised warning option: '" + warning + '\'' );
+         };
+         auto const loadTestNamesFromFile = [&]( std::string const& filename ) {
++#ifdef CATCH_BAREMETAL_NO_FILESYSTEM
++                // mps2an385: no filesystem on this bare-metal
++                // target - only reached if a caller actually passes
++                // -f/--input-file, which this project's own test suite never does.
++                return ParserResult::runtimeError(
++                    "Loading test names from a file is not supported on this bare-metal target: '"
++                    + filename + '\'' );
++#else
+                 std::ifstream f( filename.c_str() );
+                 if( !f.is_open() )
+                     return ParserResult::runtimeError( "Unable to load input file: '" + filename + '\'' );
+@@ -57,6 +65,7 @@ namespace Catch {
+                     config.testsOrTags.erase( config.testsOrTags.end()-1 );
+ 
+                 return ParserResult::ok( ParseResultType::Matched );
++#endif // CATCH_BAREMETAL_NO_FILESYSTEM
+             };
+         auto const setTestOrder = [&]( std::string const& order ) {
+                 if( startsWith( "declared", order ) )
+diff --git a/src/catch2/internal/catch_istream.cpp b/src/catch2/internal/catch_istream.cpp
+index 2867ce7..46eb4ae 100644
+--- a/src/catch2/internal/catch_istream.cpp
++++ b/src/catch2/internal/catch_istream.cpp
+@@ -73,16 +73,31 @@ namespace Detail {
+         ///////////////////////////////////////////////////////////////////////////
+ 
+         class FileStream final : public IStream {
++#ifndef CATCH_BAREMETAL_NO_FILESYSTEM
+             std::ofstream m_ofs;
++#endif
+         public:
+             FileStream( std::string const& filename ) {
++#ifdef CATCH_BAREMETAL_NO_FILESYSTEM
++                // mps2an385: no filesystem on this bare-metal
++                // target - makeStream() below never actually reaches
++                // here (only for a real filename, which this project's own test suite never
++                // passes), kept only so the type still compiles.
++                (void)filename;
++                CATCH_ERROR( "File-backed streams are not supported on this bare-metal target" );
++#else
+                 m_ofs.open( filename.c_str() );
+                 CATCH_ENFORCE( !m_ofs.fail(), "Unable to open file: '" << filename << '\'' );
+                 m_ofs << std::unitbuf;
++#endif
+             }
+         public: // IStream
+             std::ostream& stream() override {
++#ifdef CATCH_BAREMETAL_NO_FILESYSTEM
++                CATCH_ERROR( "File-backed streams are not supported on this bare-metal target" );
++#else
+                 return m_ofs;
++#endif
+             }
+         };
+ 
+diff --git a/src/catch2/internal/catch_random_seed_generation.cpp b/src/catch2/internal/catch_random_seed_generation.cpp
+index fdc3fa1..037e172 100644
+--- a/src/catch2/internal/catch_random_seed_generation.cpp
++++ b/src/catch2/internal/catch_random_seed_generation.cpp
+@@ -12,7 +12,9 @@
+ #include <catch2/internal/catch_random_integer_helpers.hpp>
+ 
+ #include <ctime>
+-#include <random>
++#ifndef CATCH_BAREMETAL_NO_RANDOM_DEVICE
++#    include <random>
++#endif
+ 
+ namespace Catch {
+ 
+@@ -23,8 +25,17 @@ namespace Catch {
+ 
+         case GenerateFrom::Default:
+         case GenerateFrom::RandomDevice: {
++            // mps2an385: no std::random_device (no entropy source)
++            // on this bare-metal target - a real backend would want a
++            // hardware RNG here (est::platform::interface::get_random_seed()
++            // already exists as exactly this seam); fall back to
++            // time-based seeding for this project's own test suite.
++#ifdef CATCH_BAREMETAL_NO_RANDOM_DEVICE
++            return static_cast<std::uint32_t>( std::time( nullptr ) );
++#else
+             std::random_device rd;
+             return Detail::fillBitsFrom<std::uint32_t>( rd );
++#endif
+         }
+ 
+         default:

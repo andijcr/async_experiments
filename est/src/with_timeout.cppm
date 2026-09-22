@@ -125,7 +125,7 @@ private:
 export namespace est {
 
 // Races `operation` against a deadline timer (`timeout` from now,
-// est::platform::instance().now() - the same clock est::timer_queue
+// est::platform::instance().uptime() - the same clock est::timer_queue
 // itself is built on, matching sleep_for()'s own est:promise sugar over
 // sleep_until()): whichever completes first wins and is forwarded to the
 // returned future<T>. If `operation` wins, its value/exception is
@@ -172,7 +172,7 @@ template <class T>
   // Released (ownership transferred to loop's own pending_timers_) only on
   // the line right after a successful call.
   auto timer_node_guard = std::make_unique<detail::with_timeout_timer_node<T>>(state);
-  state->id = loop_ref.schedule_timer(*timer_node_guard, platform::instance().now() + timeout);
+  state->id = loop_ref.schedule_timer(*timer_node_guard, platform::instance().uptime() + timeout);
   timer_node_guard.release();
 
   detail::discard(std::move(operation).then_fast([state](future<T>& op) {

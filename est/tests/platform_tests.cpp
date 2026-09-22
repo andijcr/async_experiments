@@ -7,17 +7,17 @@ namespace {
 
 // A minimal, distinguishable-from-hosted_stdcpp stub - only used to prove
 // override_instance() actually retargets instance(), via a fixed,
-// recognizable now(). Never triggers assert_failure() in these tests.
+// recognizable uptime(). Never triggers assert_failure() in these tests.
 class stub_platform final : public est::platform::interface {
 public:
-  [[nodiscard]] auto now() const noexcept -> std::chrono::steady_clock::time_point override {
+  [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return epoch;
   }
 
   // Records the last deadline it was asked to sleep until, so a test can
   // confirm override_instance() actually retargets sleep_until() too -
   // never actually blocks.
-  void sleep_until(std::chrono::steady_clock::time_point deadline) const noexcept override {
+  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
     last_sleep_until = deadline;
   }
 
@@ -51,12 +51,11 @@ public:
   // shared default for these, so every concrete backend, this stub
   // included, must answer them itself.
   void reset_loop_stall_detection() noexcept override {}
-  void
-  detect_loop_stall(std::chrono::steady_clock::duration /*threshold*/) const noexcept override {}
+  void detect_loop_stall(est::platform::clock::duration /*threshold*/) const noexcept override {}
 
-  static constexpr std::chrono::steady_clock::time_point epoch{};
+  static constexpr est::platform::clock::time_point epoch{};
   static constexpr std::uint64_t random_seed = 0xC0FFEE;
-  mutable std::optional<std::chrono::steady_clock::time_point> last_sleep_until;
+  mutable std::optional<est::platform::clock::time_point> last_sleep_until;
   mutable std::optional<std::string> last_vprintdbg_message;
 };
 
@@ -69,7 +68,7 @@ TEST_CASE("override_instance retargets instance() and restores it when the guard
   {
     const auto guard = est::platform::override_instance(stub);
     REQUIRE(&est::platform::instance() == &stub);
-    REQUIRE(est::platform::instance().now() == stub_platform::epoch);
+    REQUIRE(est::platform::instance().uptime() == stub_platform::epoch);
   }
   REQUIRE(&est::platform::instance() == &original);
 }
@@ -113,8 +112,8 @@ TEST_CASE("nested override_instance guards restore the correct previous instance
 }
 
 TEST_CASE("hosted_stdcpp's clock is monotonically non-decreasing", "[platform]") {
-  const auto first = est::platform::instance().now();
-  const auto second = est::platform::instance().now();
+  const auto first = est::platform::instance().uptime();
+  const auto second = est::platform::instance().uptime();
   REQUIRE(second >= first);
 }
 
@@ -132,15 +131,42 @@ TEST_CASE("hosted_stdcpp's vprintdbg() writes via std::vprint_unicode without th
   SUCCEED("printdbg() returned without throwing");
 }
 
+TEST_CASE("vprintdbg() handles a message longer than any fixed-size internal buffer",
+          "[platform]") {
+  // 96 chars > estpico's own 64-byte uart_tx_ring capacity
+  // (estpico/src/platform_mps2an385.cppm). Deliberately *not* exercised
+  // with a real est::loop constructed here: estpico's pump_task_loop() is
+  // a process-lifetime coroutine, spawned once against whichever loop is
+  // current the first time it's needed and never re-spawned afterward
+  // (pump_task_started's own doc comment) - a short-lived, per-TEST_CASE
+  // loop constructed and destroyed here would bind that coroutine to a
+  // loop this one test case then tears down, corrupting every *later*
+  // test in this same binary that also calls printdbg() - a real, if
+  // narrow, "cross-loop binding hazard" worth its own follow-up rather
+  // than worked around in a shared, backend-agnostic test file.
+  // With no loop current, enqueue_output() instead takes its documented
+  // best-effort synchronous path (a single pump_some() call, own doc
+  // comment) - for a message this size on estpico specifically, that
+  // means only the first ring's worth actually reaches the wire, the
+  // rest silently dropped; verified separately, empirically, against a
+  // real whole-program loop (docs/PLAN.md's entry for this change).
+  // What this test actually guards: the oversized/truncated path itself
+  // doesn't throw, crash, or corrupt state - same bar the test above
+  // holds hosted_stdcpp's own vprintdbg() to.
+  const std::string long_value(96, 'x');
+  est::platform::printdbg("long message: {}", long_value);
+  SUCCEED("printdbg() returned without throwing");
+}
+
 TEST_CASE("hosted_stdcpp's sleep_until() returns once the deadline has passed", "[platform]") {
   // A tiny (1ms) real deadline, not a fake clock: this exercises
   // hosted_stdcpp::sleep_until()'s actual std::this_thread::sleep_until()
   // call - est::loop's own tests (est/tests/loop_tests.cpp) exclusively
   // use a fake, instant sleep_until() instead, which never touches this
   // real implementation at all.
-  const auto deadline = est::platform::instance().now() + std::chrono::milliseconds(1);
+  const auto deadline = est::platform::instance().uptime() + std::chrono::milliseconds(1);
   est::platform::instance().sleep_until(deadline);
-  REQUIRE(est::platform::instance().now() >= deadline);
+  REQUIRE(est::platform::instance().uptime() >= deadline);
 }
 
 // hosted_stdcpp::assert_failure()'s formatting isn't separately

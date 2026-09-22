@@ -73,6 +73,14 @@ public:
   // not special-cased here; loop()'s own drain_commands() is what
   // recognizes one and stops the loop, the same as every other command
   // kind is dispatched.
+  //
+  // EST_NO_THREADS (cmake/toolchain-mps2an385.cmake's own comment): a
+  // genuinely single-core, no-OS-threads target has nothing for
+  // yield() to hand off to - std::this_thread doesn't even exist there
+  // (freestanding libc++, no <thread>) - so the backoff hint itself is
+  // skipped, leaving a plain busy-spin (a caller on such a target only
+  // ever calls this from the loop thread itself, never contending with
+  // another thread for the ring buffer at all).
   void push_command(command cmd) noexcept {
     // A fresh copy each attempt, not std::move(cmd) - command is
     // trivially copyable, so this costs nothing extra, and it sidesteps
@@ -81,7 +89,9 @@ public:
     // (see est::spsc_ring<T>::try_push()'s own doc comment), but that's
     // not something the check can see across loop iterations.
     while (!commands_.try_push(command{cmd})) {
+#ifndef EST_NO_THREADS
       std::this_thread::yield();
+#endif
     }
     command_count_.store(++pushed_, std::memory_order_release);
   }

@@ -62,7 +62,7 @@ public:
     // not fixed-delay. Without this, a slow or variable-latency fn_()
     // would make the chain's real cadence drift away from `interval` by
     // however long each call took, compounding period over period.
-    const auto period_start = platform::instance().now();
+    const auto period_start = platform::instance().uptime();
     // __cpp_exceptions gate: same reasoning as future.cppm's own
     // concrete_continuation<Fn, U>::run() comment - fn_ genuinely can
     // throw when exceptions are enabled, but -fno-exceptions makes
@@ -178,7 +178,7 @@ schedule_periodic(loop::clock::duration interval, Fn fn, loop::clock::duration m
   // detail::periodic_timer_node<Fn>::fire()'s own re-arming call, just
   // above, for the identical hazard this protects against.
   auto node = std::make_unique<detail::periodic_timer_node<Fn>>(std::move(fn), interval, jit, ctrl);
-  loop_ref.schedule_timer(*node, platform::instance().now() + interval + first_offset);
+  loop_ref.schedule_timer(*node, platform::instance().uptime() + interval + first_offset);
   node.release();
   return periodic_timer_handle(std::move(ctrl));
 }

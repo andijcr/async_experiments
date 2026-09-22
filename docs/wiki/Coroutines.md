@@ -895,11 +895,28 @@ template <class Fn> void spawn(Fn&& fn, Priority prio = current_priority());
 continuation on `task` that reports an unhandled exception - the same
 `Priority prio = current_priority()` trailing, inheriting default
 `then()`/`then_fast()` themselves use (issue #31/#106), stamped on that
-same continuation. The callable overload just invokes `fn()` (eagerly, at
-the call site, not deferred) and forwards the resulting `future<T>` to the
-first overload - sugar for `spawn(some_coroutine(args...))` when writing
-`spawn([&] { return some_coroutine(args...); })` reads better at a given
-call site.
+same continuation.
+
+**The two overloads' `prio` mean different things.** `promise_type`'s
+`initial_suspend()` is `std::suspend_never` (above), so a coroutine's
+synchronous prefix - everything up to its own first `co_await` - runs
+immediately when it's called, before either overload ever sees the
+resulting `future<T>`; that prefix's own priority is already fixed by
+then. The `future<T>` overload's `prio` can only ever reach the one
+completion continuation it registers - for a task that runs indefinitely
+(a persistent event-driven loop, say, rather than one that completes
+promptly), that continuation is never reached, so `prio` has no
+observable effect on the task's own work at all. The callable overload
+closes that gap instead of just being eager-call sugar: it raises
+`current_priority()` around the call to `fn()` itself, so the coroutine's
+first suspension point gets `prio` stamped onto it directly, and every
+later `co_await` inherits it in turn (the same priority-propagation
+behavior issue #31 gives `then()`/`then_fast()` chains generally). Pass
+`spawn()` a callable - `spawn([&] { return some_coroutine(args...); },
+Priority::high)`, not `spawn(some_coroutine(args...), Priority::high)` -
+whenever the created task's own priority, not just its eventual
+unhandled-exception report, needs to be something other than whatever's
+already ambient at the call site.
 
 **No explicit `loop&` parameter.** A `then_fast()` continuation dispatches
 through whatever loop already owns `task`'s own `future_state` (established

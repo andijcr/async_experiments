@@ -255,7 +255,7 @@ export namespace est {
 class loop {
 public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
-  using clock = std::chrono::steady_clock;
+  using clock = platform::clock;
   using timer_id = timer_queue<allocator_type>::id;
 
   // One FIFO ready-queue per priority level (est::Priority, above) -
@@ -572,7 +572,7 @@ private:
   }
 
   void fire_ready_timers() {
-    const auto now = platform::instance().now();
+    const auto now = platform::instance().uptime();
     while (const auto id = timers_.pop_ready(now)) {
       const auto it = std::ranges::find(pending_timers_, *id, &pending_entry::id);
       check(it != pending_timers_.end(), "loop: fired timer id missing from pending_timers_");
