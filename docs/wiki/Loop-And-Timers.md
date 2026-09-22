@@ -919,21 +919,34 @@ over a monotonic write-counter bumped alongside every successful
 optimization for that shape, but not something `spsc_ring<T>` itself
 needs to know about either way.
 
-Every other test in `est/tests/spsc_ring_tests.cpp` simulates the
-producer by calling `try_push()` directly from the test body, single-
-threaded, matching this codebase's established convention
+Every test in `est/tests/spsc_ring_tests.cpp` simulates the producer by
+calling `try_push()` directly from the test body, single-threaded,
+matching this codebase's established convention
 (`external_event_tests.cpp`) - `spsc_ring<T>`'s own contract only
 requires `try_push()`/`try_pop()` never run concurrently with themselves,
 not that they run on genuinely different threads to be exercised
-correctly. One test is the exception: a real `std::jthread` producer
-racing a `schedule_periodic()`-driven consumer on the loop thread, using
-the real `platform::interface` (a real clock, a real blocking
-`sleep_until()`) rather than a fake one, so the two threads actually
-interleave over wall-clock time instead of the fake clock's
-instantaneous `sleep_until()` starving the producer of any window to
-run in. `spsc_ring<T>` is the one type in this codebase whose whole
-contract is a real cross-thread handoff, so it earns the one test that
-actually crosses threads.
+correctly. That's also what lets this file (unlike the two below) build
+and run on `estpico`'s bare-metal `mps2an385` target, which has no
+`<thread>` at all.
+
+Real concurrent access gets its own, separate coverage instead, one
+file per execution-context shape: `est/tests/spsc_ring_thread_tests.cpp`
+has a real `std::jthread` producer racing a `schedule_periodic()`-driven
+consumer on the loop thread, using the real `platform::interface` (a
+real clock, a real blocking `sleep_until()`) rather than a fake one, so
+the two threads actually interleave over wall-clock time instead of the
+fake clock's instantaneous `sleep_until()` starving the producer of any
+window to run in - only buildable where `<thread>` exists, so excluded
+from `mps2an385`. That target gets its own analogous coverage instead:
+`examples/multicolor_larson_scanner/mps2an385/tests/spsc_ring_isr_tests.cpp`
+races a real hardware interrupt (self-triggered via the NVIC's own
+Interrupt Set-Pending Register, not a real peripheral) against a
+mainline producer - the actual cross-context hazard this backend faces
+in production (`estpico::enqueue_output()`'s mainline producer racing
+`UART0_TX_Handler`'s ISR consumer, above). `spsc_ring<T>` is the one
+type in this codebase whose whole contract is a real cross-context
+handoff, so on every target that can express one at all, it earns a
+test that actually crosses it.
 
 ## `run()` vs. `run_until_idle()`, and `stop()`
 

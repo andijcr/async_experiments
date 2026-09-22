@@ -7,13 +7,14 @@
 # preset (CMakePresets.json, next to this file): `cmake --preset wasm32
 # -S examples/multicolor_larson_scanner/web -B build/wasm32`.
 #
-# Re-declares est/larson_scanner/larson_scanner_app as their own targets
-# here (FILE_SET pointing at the real, shared source files, not a copy)
-# rather than add_subdirectory()-ing their real CMakeLists.txt files: those
-# call est_set_warnings()/est_enable_coverage()/est_enable_sanitizers()
-# (cmake/CompilerWarnings.cmake and friends), which assume the hosted
-# toolchain's own compiler-rt/profiling/sanitizer runtimes - none of which
-# apply to a wasm32 cross-compile.
+# est/CMakeLists.txt is self-contained (issue #128) and gets
+# add_subdirectory()'d directly below. larson_scanner/larson_scanner_app
+# still get re-declared here (FILE_SET pointing at the real, shared source
+# files, not a copy) rather than add_subdirectory()-ing
+# examples/multicolor_larson_scanner/CMakeLists.txt itself: that file
+# calls est_set_warnings()/est_enable_coverage()/est_enable_sanitizers()
+# (cmake/CompilerWarnings.cmake and friends) unconditionally and also pulls
+# in estext::estext/tests, none of which apply to a wasm32 cross-compile.
 cmake_minimum_required(VERSION 4.2)
 project(larson_scanner_wasm LANGUAGES CXX)
 
@@ -24,23 +25,16 @@ set(CMAKE_CXX_MODULE_STD ON)
 
 set(EST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
-# --- est itself, cross-compiled for wasm32-wasip1-threads - same source
-# files est/CMakeLists.txt's own FILE_SET lists (cmake/EstSources.cmake,
-# the single shared list all three CMake projects needing an est target
-# include() rather than each hand-maintaining a copy), just no
+# --- est itself, cross-compiled for wasm32-wasip1-threads - the real
+# est/CMakeLists.txt, add_subdirectory()'d directly (issue #128): its own
 # est_set_warnings()/est_enable_coverage()/est_enable_sanitizers() calls
-# here (see this file's own top comment).
-include("${EST_ROOT}/cmake/EstSources.cmake")
-list(TRANSFORM EST_CXX_MODULE_SOURCES PREPEND "${EST_ROOT}/est/src/")
-
-add_library(est STATIC)
-target_sources(est
-  PUBLIC
-    FILE_SET CXX_MODULES
-    BASE_DIRS "${EST_ROOT}/est/src"
-    FILES ${EST_CXX_MODULE_SOURCES}
-)
-target_compile_features(est PUBLIC cxx_std_23)
+# are no-ops unless a caller has already include()-d
+# cmake/CompilerWarnings.cmake and friends, which this project
+# deliberately doesn't (see this file's own top comment). EST_BUILD_TESTS
+# OFF: est/tests/CMakeLists.txt assumes the hosted toolchain (FetchContent
+# for Catch2, real filesystem/threads), not this cross-compile.
+set(EST_BUILD_TESTS OFF)
+add_subdirectory("${EST_ROOT}/est" "${CMAKE_CURRENT_BINARY_DIR}/est")
 
 # --- estwasm: this build's own platform::interface backend ---
 add_library(estwasm STATIC)

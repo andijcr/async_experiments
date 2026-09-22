@@ -22,6 +22,7 @@ add_executable(est_tests
   event_tests.cpp
   external_event_tests.cpp
   spsc_ring_tests.cpp
+  spsc_ring_thread_tests.cpp
   timer_tests.cpp
   loop_tests.cpp
   jitter_tests.cpp

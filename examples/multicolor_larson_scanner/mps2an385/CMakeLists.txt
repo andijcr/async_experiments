@@ -6,10 +6,11 @@
 # -DMPS2AN385_TOOLCHAIN_ROOT=/path/to/LLVM-ET-Arm-<version>-Linux-x86_64
 # -S examples/multicolor_larson_scanner/mps2an385 -B build/mps2an385`.
 #
-# Re-declares est/larson_scanner/larson_scanner_app as their own targets
-# here (FILE_SET pointing at the real, shared source files, not a copy)
-# rather than add_subdirectory()-ing their real CMakeLists.txt files -
-# see web/CMakeLists.txt's own identical comment for why.
+# est/CMakeLists.txt is self-contained (issue #128) and gets
+# add_subdirectory()'d directly below. larson_scanner/larson_scanner_app
+# still get re-declared here (FILE_SET pointing at the real, shared source
+# files, not a copy) rather than add_subdirectory()-ing their real
+# CMakeLists.txt - see web/CMakeLists.txt's own identical comment for why.
 cmake_minimum_required(VERSION 4.4)
 project(larson_scanner_mps2an385 LANGUAGES C CXX)
 
@@ -20,23 +21,18 @@ set(CMAKE_CXX_MODULE_STD ON)
 
 set(EST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
-# --- est itself, cross-compiled for armv7m-none-eabi - same source
-# files est/CMakeLists.txt's own FILE_SET lists (cmake/EstSources.cmake,
-# the single shared list all three CMake projects needing an est target
-# include() rather than each hand-maintaining a copy), just no
+# --- est itself, cross-compiled for armv7m-none-eabi - the real
+# est/CMakeLists.txt, add_subdirectory()'d directly (issue #128): its own
 # est_set_warnings()/est_enable_coverage()/est_enable_sanitizers() calls
-# here (see this file's own top comment).
-include("${EST_ROOT}/cmake/EstSources.cmake")
-list(TRANSFORM EST_CXX_MODULE_SOURCES PREPEND "${EST_ROOT}/est/src/")
-
-add_library(est STATIC)
-target_sources(est
-  PUBLIC
-    FILE_SET CXX_MODULES
-    BASE_DIRS "${EST_ROOT}/est/src"
-    FILES ${EST_CXX_MODULE_SOURCES}
-)
-target_compile_features(est PUBLIC cxx_std_23)
+# are no-ops unless a caller has already include()-d
+# cmake/CompilerWarnings.cmake and friends, which this project
+# deliberately doesn't (see this file's own top comment). EST_BUILD_TESTS
+# OFF: est/tests/CMakeLists.txt assumes the hosted toolchain (FetchContent
+# for Catch2, real filesystem/threads), not this cross-compile - this
+# project's own tests/ (added below) reuses est/tests/'s source files
+# directly instead.
+set(EST_BUILD_TESTS OFF)
+add_subdirectory("${EST_ROOT}/est" "${CMAKE_CURRENT_BINARY_DIR}/est")
 
 # --- estpico: this build's own platform::interface backend ---
 add_library(estpico STATIC)
