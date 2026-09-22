@@ -78,6 +78,16 @@ void SysTick_Handler(void);
 void UART0_TX_Handler(void);  // IRQ1 - confirmed empirically, see that module's own comment
 void DualTimer_Handler(void); // IRQ10 - confirmed empirically, see that module's own comment
 
+// IRQ6 ("GPIO0" below) - nothing in this firmware ever asserts it for
+// real. tests/spsc_ring_isr_tests.cpp (est_mps2an385_tests only) is the
+// one thing that ever triggers it, by writing the NVIC's own
+// software-pend register directly, and only that test binary defines a
+// strong GPIO0_Handler that does anything. Every other build (this
+// firmware included) links this weak default - an alias for
+// Default_Handler above - so a spurious fire, if one ever happened,
+// behaves exactly like any other genuinely-unused IRQ line already does.
+void GPIO0_Handler(void) __attribute__((weak, alias("Default_Handler")));
+
 // picolibcpp.ld's .boot_flash output section collects .text.init.enter
 // (among others) at ORIGIN(boot_flash) - exactly where a Cortex-M
 // expects its vector table (word0 = initial SP, word1 = reset vector).
@@ -98,16 +108,16 @@ __attribute__((section(".text.init.enter"))) void (*const vector_table[16 + 11])
     0,               // reserved
     Default_Handler, // PendSV
     SysTick_Handler,
-    Default_Handler,  // IRQ0 - UART0 RX (unused)
-    UART0_TX_Handler, // IRQ1
-    Default_Handler,  // IRQ2 - UART1 RX (unused)
-    Default_Handler,  // IRQ3 - UART1 TX (unused)
-    Default_Handler,  // IRQ4 - UART2 RX (unused)
-    Default_Handler,  // IRQ5 - UART2 TX (unused)
-    Default_Handler,  // IRQ6 - GPIO0 (unused)
-    Default_Handler,  // IRQ7 - GPIO1 (unused)
-    Default_Handler,  // IRQ8 - GPIO2 (unused)
-    Default_Handler,  // IRQ9 - GPIO3 (unused)
+    Default_Handler,   // IRQ0 - UART0 RX (unused)
+    UART0_TX_Handler,  // IRQ1
+    Default_Handler,   // IRQ2 - UART1 RX (unused)
+    Default_Handler,   // IRQ3 - UART1 TX (unused)
+    Default_Handler,   // IRQ4 - UART2 RX (unused)
+    Default_Handler,   // IRQ5 - UART2 TX (unused)
+    GPIO0_Handler,     // IRQ6 - GPIO0 (weak default; overridden by the spsc_ring ISR test only)
+    Default_Handler,   // IRQ7 - GPIO1 (unused)
+    Default_Handler,   // IRQ8 - GPIO2 (unused)
+    Default_Handler,   // IRQ9 - GPIO3 (unused)
     DualTimer_Handler, // IRQ10
 };
 
@@ -127,7 +137,9 @@ static void semihost_exit(int code) {
   }
 }
 
-void _exit(int code) { semihost_exit(code); }
+void _exit(int code) {
+  semihost_exit(code);
+}
 
 // A thread_local with a non-trivial destructor (est/src/spawn.cppm's own
 // exception hook) unconditionally emits a call to this to register its

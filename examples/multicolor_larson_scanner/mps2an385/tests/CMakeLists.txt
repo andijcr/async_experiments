@@ -110,6 +110,11 @@ add_executable(est_mps2an385_tests
   "${EST_TESTS_DIR}/with_stop_tests.cpp"
   "${EST_TESTS_DIR}/with_timeout_tests.cpp"
   "${EST_TESTS_DIR}/spawn_tests.cpp"
+  # This project's own board-specific addition, not part of est/tests/'s
+  # backend-agnostic set above: a real ISR-driven producer/consumer test
+  # for spsc_ring<T>, using this board's actual NVIC - see its own top
+  # comment for the full design.
+  "${CMAKE_CURRENT_SOURCE_DIR}/spsc_ring_isr_tests.cpp"
 )
 target_link_libraries(est_mps2an385_tests PRIVATE est estpico Catch2Baremetal)
 target_link_options(est_mps2an385_tests PRIVATE

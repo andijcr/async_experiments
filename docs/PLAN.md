@@ -8452,3 +8452,63 @@ since). Run for real under `run_under_qemu.sh`: 1256 assertions, 273
 test cases, all passing - up from PR #124's original 1110/259, the
 delta being `spsc_ring_tests.cpp`'s own cases now actually running on
 real target hardware instead of being silently absent.
+
+**Follow-up: a real ISR-driven `spsc_ring` test on `mps2an385`.** The
+split above only recovered the single-call-stack logic coverage;
+`spsc_ring<T>`'s actual reason to exist - the atomic acquire/release
+protocol between two genuinely different execution contexts - still had
+no coverage on this target at all (`spsc_ring_thread_tests.cpp` needs
+real OS threads, which don't exist here). Added one: a real interrupt
+racing the mainline producer, not another single-threaded simulation.
+
+Rejected reusing `UART0_TX_Handler` directly - it's tied to real
+hardware timing/state (edge-latched on "a transmission just completed,"
+only fires after the first byte primes it), nothing this test needs.
+Rejected a second free-running hardware timer too - the only spare one
+(the SP804 dual-timer) is the exact peripheral `sleep_until()` already
+arms per call; running it periodic for this test's duration would
+contend with any other test in the same binary that happens to sleep.
+Landed on: self-triggering an otherwise-permanently-idle external
+interrupt line (IRQ6, "GPIO0" - startup.c's own vector table, never
+asserted by anything real on this board) directly via the NVIC's own
+Interrupt Set-Pending Register (`0xE000E200`, architectural SCS address,
+same on any Cortex-M3). This is a real ISR entry - genuine register
+save/restore, genuine interrupt arbitration - fully under test control,
+with no hardware contention.
+
+`startup.c` (shared with the real firmware, `larson_scanner_mps2an385`):
+repointed IRQ6's vector table slot from `Default_Handler` to a new
+`GPIO0_Handler`, declared `__attribute__((weak, alias("Default_Handler")))`
+so every build without a strong override - i.e. every build except the
+test binary - keeps today's behavior exactly. New
+`examples/multicolor_larson_scanner/mps2an385/tests/spsc_ring_isr_tests.cpp`
+(this project's own `tests/`, not `est/tests/` - it needs real NVIC
+registers, not backend-agnostic) defines the strong `GPIO0_Handler`:
+one `try_pop()` per firing, matching `UART0_TX_Handler`'s own "one unit
+of work per interrupt" shape. Mainline spins `try_push()` (matching
+`estpico::enqueue_output()`'s own retry-on-full shape) across 500 items
+against an 8-slot ring, firing the interrupt both on every full-retry
+and opportunistically every third iteration - the latter is what
+actually lands preemption mid-`try_push()`, not just between calls.
+
+The one thing worth getting right: the ISR-visible drained-items buffer
+is a fixed `std::array<int, N>` + `std::atomic<int>` index, not a
+`std::vector`. A vector's `push_back()` can reallocate, and heap
+(de)allocation from interrupt context is the exact hazard this
+codebase already hit and fixed for real in estpico's own UART TX pump
+(this file's own "ISR deallocation hazard" entry, above) - a
+fixed-capacity array sidesteps the question rather than leaning on a
+`reserve()` call never being exceeded. `std::atomic` (not a plain
+`int`) on the index is load-bearing too, for a different reason: the
+compiler has no visibility into an MMIO write meaning "an unrelated
+global might now change," so a plain int in the mainline polling loop
+could get hoisted out entirely.
+
+Verified inside the devenv container: `clang-format` clean on both
+changed/new files; `mps2an385` cross-compile (both the test binary and
+`larson_scanner_mps2an385` itself, confirming the shared `startup.c`
+change is safe) build cleanly; run for real under `run_under_qemu.sh` -
+274 test cases/1258 assertions (up from 273/1256), and
+`larson_scanner_mps2an385` itself still exits 0 under QEMU, confirming
+IRQ6's weak default behaves exactly as before everywhere except the one
+binary that overrides it.
