@@ -86,13 +86,16 @@ add_executable(est_mps2an385_tests
   "${EST_TESTS_DIR}/mutex_tests.cpp"
   "${EST_TESTS_DIR}/event_tests.cpp"
   "${EST_TESTS_DIR}/external_event_tests.cpp"
-  # spsc_ring_tests.cpp excluded: it spawns a real std::jthread producer to
-  # test spsc_ring<T> under genuine concurrent access - meaningless on a
-  # genuinely single-core, no-OS-threads target (EST_NO_THREADS,
-  # cmake/toolchain-mps2an385.cmake's own comment - <thread> doesn't even
-  # exist here), not something a workaround papers over. spsc_ring<T>
-  # itself is still exercised transitively (est::spawn/est::future use it
-  # internally), just not by its own dedicated concurrency test here.
+  "${EST_TESTS_DIR}/spsc_ring_tests.cpp"
+  # spsc_ring_thread_tests.cpp excluded (unlike spsc_ring_tests.cpp,
+  # above, which is pure single-call-stack logic): it spawns a real
+  # std::jthread producer to test spsc_ring<T> under genuine concurrent
+  # access - meaningless on a genuinely single-core, no-OS-threads target
+  # (EST_NO_THREADS, cmake/toolchain-mps2an385.cmake's own comment -
+  # <thread> doesn't even exist here), not something a workaround papers
+  # over. spsc_ring<T> itself is still exercised transitively
+  # (est::spawn/est::future use it internally, and spsc_ring_tests.cpp
+  # now runs here too), just not by a real-thread concurrency test.
   "${EST_TESTS_DIR}/timer_tests.cpp"
   "${EST_TESTS_DIR}/loop_tests.cpp"
   "${EST_TESTS_DIR}/jitter_tests.cpp"

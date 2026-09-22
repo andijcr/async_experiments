@@ -8418,3 +8418,37 @@ since they only ever consumed the list indirectly through
 `add_subdirectory(est)`, never by `include()`-ing the file themselves.
 Verified: `default` preset build+`ctest` (331/331) and `web`'s wasm32
 project build both still pass unchanged.
+
+**Follow-up: `spsc_ring_tests.cpp` on `mps2an385`.** The whole file was
+excluded from `est_mps2an385_tests` (PR #124's own list, above) solely
+because its last `TEST_CASE` spawns a real `std::jthread` producer -
+`<thread>` doesn't exist on this `EST_NO_THREADS` target. Every other
+case in that file is pure single-call-stack logic (FIFO order,
+wraparound, full/empty boundaries, move-only `T`, reject-on-full) that
+needs no threading at all, so excluding the entire file threw away real
+coverage of `spsc_ring<T>`'s own logic for no reason tied to those cases
+themselves.
+
+Split the one `std::jthread` test out into a new
+`est/tests/spsc_ring_thread_tests.cpp`, leaving `spsc_ring_tests.cpp`
+genuinely single-threaded throughout (its own header comment already
+claimed this; the jthread test at the end had made it false). Added the
+new file to `est/tests/CMakeLists.txt` (hosted build, unaffected -
+both files already ran there). Added `spsc_ring_tests.cpp` to
+`mps2an385/tests/CMakeLists.txt`'s `est_mps2an385_tests` sources;
+`spsc_ring_thread_tests.cpp` stays excluded there, with an updated
+comment explaining why (now pointing at the specific file, not the
+whole ring).
+
+Verified inside the devenv container: hosted `default` preset
+build+`ctest` (all 12 `spsc_ring`-tagged cases pass, split correctly
+across both files) and `clang-format`/`clang-tidy` clean on both new/
+changed files. `mps2an385`'s own cross-compile configure+build now
+succeeds cleanly through to a working `est_mps2an385_tests` binary
+(earlier session notes on this branch recorded a missing
+`libc++.modules.json` blocking Generate - not reproduced this time, the
+devenv image apparently gained the ARM sysroot's std-modules metadata
+since). Run for real under `run_under_qemu.sh`: 1256 assertions, 273
+test cases, all passing - up from PR #124's original 1110/259, the
+delta being `spsc_ring_tests.cpp`'s own cases now actually running on
+real target hardware instead of being silently absent.

@@ -9,7 +9,11 @@ import std;
 // established convention for the identical reason (est::spsc_ring<T>'s
 // own contract only requires try_push()/try_pop() never run
 // concurrently with themselves, not that they run on genuinely different
-// threads to be exercised correctly).
+// threads to be exercised correctly). The one test that does exercise a
+// real second thread lives in spsc_ring_thread_tests.cpp instead - kept
+// separate so this file (pure single-call-stack logic) can also run on
+// targets with no <thread> at all, such as mps2an385's no-OS-threads
+// build.
 //
 // Every check below compares the std::optional<T> try_pop() returns
 // directly against either a value or std::nullopt (optional's own
@@ -187,60 +191,4 @@ TEST_CASE("spsc_ring: drained by a real schedule_periodic() poll loop", "[spsc_r
 
   REQUIRE(drained == std::vector{10, 20, 30});
   REQUIRE(queue.try_pop() == std::nullopt);
-}
-
-TEST_CASE("spsc_ring: a real std::jthread producer and the loop-thread consumer stay correct",
-          "[spsc_ring]") {
-  using namespace std::chrono_literals;
-
-  // The one test in this file with a genuine second OS thread on the
-  // other side of try_push()/try_pop() rather than a single-threaded
-  // simulation (this file's own header comment above) - est::spsc_ring<T>
-  // is the one type in this codebase whose whole contract is a real
-  // cross-thread handoff, so it earns the one test that actually crosses
-  // threads, on top of (not instead of) the single-threaded coverage
-  // above. Uses the real platform::interface est/tests/test_main.cpp
-  // installs (std::this_thread::sleep_until, a real clock) rather than a
-  // fake one - a fake clock's sleep_until() doesn't actually block, which
-  // would starve the producer thread of any real wall-clock window to run
-  // in between the loop-thread's drain passes.
-  constexpr int item_count = 2000;
-  est::spsc_ring<int> ring(16); // small on purpose - forces real full/empty contention
-
-  est::loop loop;
-  const auto loop_guard = est::make_current_loop(loop);
-
-  // try_push() takes T&& (see its own doc comment in spsc_ring.cppm), so
-  // each call needs a prvalue - not `i` itself, a named loop variable and
-  // therefore an lvalue. This helper materializes one by an ordinary
-  // pass-by-value/return-by-value call, without the no-op cast or the
-  // no-op std::move() of an already-trivially-copyable int that
-  // clang-tidy flags either of as redundant.
-  auto as_prvalue = [](int value) { return value; };
-  std::jthread producer([&ring, as_prvalue] {
-    for (int i = 0; i < item_count; ++i) {
-      while (!ring.try_push(as_prvalue(i))) {
-        std::this_thread::yield(); // ring momentarily full - real cross-thread backpressure
-      }
-    }
-  });
-
-  std::vector<int> drained;
-  drained.reserve(item_count);
-  std::optional<est::periodic_timer_handle> handle;
-  handle = est::schedule_periodic(1ms, [&] {
-    while (const auto item = ring.try_pop()) {
-      drained.push_back(*item);
-    }
-    if (std::cmp_greater_equal(drained.size(), item_count)) {
-      handle->cancel();
-    }
-  });
-
-  loop.run_until_idle();
-  producer.join();
-
-  std::vector<int> expected(item_count);
-  std::ranges::iota(expected, 0);
-  REQUIRE(drained == expected);
 }
