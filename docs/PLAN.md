@@ -8361,3 +8361,48 @@ fix.** Requested once the two local commits above were ready to go out.
 Verified again: mps2an385 QEMU test suite (1116 assertions, 262 cases)
 and `larson_scanner_mps2an385`'s normal run both still pass; `clang-format`
 clean. Pushed.
+
+**Issue #128: `est/CMakeLists.txt` made self-contained, so the standalone
+cross-compile projects can `add_subdirectory()` it instead of
+hand-declaring their own `est` target.** Before this, `est/CMakeLists.txt`
+called `est_set_warnings()`/`est_enable_coverage()`/`est_enable_sanitizers()`
+unconditionally (functions only defined once the root `CMakeLists.txt` had
+already `include()`-d `cmake/CompilerWarnings.cmake` and friends) and read
+`EST_BUILD_TESTS` as a variable it never declared itself - both fine for
+the root build, which always sets those up first, but exactly why
+`examples/multicolor_larson_scanner/web` and `.../mps2an385` (each a fully
+separate CMake project - see their own top comments) couldn't
+`add_subdirectory()` the real file and instead hand-declared their own
+`add_library(est STATIC)` from `cmake/EstSources.cmake`'s shared file list
+(PR #124 round 4's own fix for the previous hazard, three hand-copied
+source lists - see that entry above).
+
+Fixed by making `est/CMakeLists.txt` self-contained: it now declares its
+own `option(EST_BUILD_TESTS ...)` and calls `enable_testing()` itself
+(harmless to call twice - the root's own call, needed for `examples/*/
+tests`, is unaffected), and the three warnings/coverage/sanitizers calls
+are each wrapped in `if(COMMAND est_set_warnings)` etc. - real, applied
+calls for the hosted build (root already `include()`-d those modules
+before `add_subdirectory(est)`), no-ops otherwise. `web/CMakeLists.txt`
+and `mps2an385/CMakeLists.txt` now `set(EST_BUILD_TESTS OFF)` (their own
+`tests/` reuses `est/tests/`'s source files directly instead -
+`est/tests/CMakeLists.txt`'s own `FetchContent`-based Catch2 assumes the
+hosted toolchain) then `add_subdirectory("${EST_ROOT}/est" ...)`, replacing
+their own hand-rolled `include(EstSources.cmake)` + `add_library(est
+STATIC)` block. `cmake/EstSources.cmake` itself is unchanged in shape,
+just now included solely from `est/CMakeLists.txt`.
+
+Verified inside the devenv container: a fresh `default` preset
+configure+build+`ctest` (331/331 tests) confirms the hosted build is
+unaffected - in particular that the guarded `est_set_warnings()` etc.
+calls still actually fire there (checked `compile_commands.json` for
+`est/src/loop.cppm`: still compiled with the full `-Wall -Wextra ...
+-Werror` set). A fresh `web`'s wasm32 project configure+build+smoke test
+passes with the new `add_subdirectory(est)` line in place of the old
+hand-rolled block. `mps2an385`'s own configure reaches CMake's Generate
+step (past all of `est/CMakeLists.txt` and its own `add_subdirectory(est)`
+call) before failing on a missing `libc++.modules.json` under
+`/opt/arm-none-eabi-sysroot/lib/` - reproduced identically against the
+unmodified `origin/main` version of `mps2an385/CMakeLists.txt` on the same
+image, confirming it's a stale/incomplete local devenv image (missing the
+ARM sysroot's own std-modules metadata), not something this change caused.
