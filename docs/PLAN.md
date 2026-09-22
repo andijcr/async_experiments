@@ -8139,3 +8139,46 @@ presets, `clang-tidy`, the diff-coverage gate) and the wasm32 project,
 none of which this backend-specific change touches but all of which
 still pass since `est/tests/platform_tests.cpp` (the one shared file
 that gained the new long-message test case) is common to all of them.
+
+**`est::spawn()`'s Fn&& overload now actually changes the created task's
+priority, not just its completion report.** A follow-up to the previous
+entry's `Priority::high` finding: that bug was specific to
+`pump_task_loop()` (since removed), but the mechanism behind it - a
+`future<T>` overload's `prio` reaching only the one completion
+continuation `spawn()` itself registers, never the task's own synchronous
+prefix or later resumptions - is a real, general property of `spawn()`,
+not an estpico-only quirk. Raised directly: `spawn()` should take a
+callable rather than a `future<T>` for the version of the call meant to
+actually change a task's priority, since only `spawn()` itself - invoking
+the callable, not just receiving its already-run result - is ever in a
+position to raise `current_priority()` before that first synchronous
+prefix runs.
+
+Fixed by having the `Fn&&` overload wrap its call to `fn()` in
+`set_priority(prio)` (`est/src/spawn.cppm`): `fn()`'s return - typically
+a coroutine call - now runs its synchronous prefix under the raised
+priority, so its first suspension point gets `prio` stamped onto it
+directly (rather than whatever was ambient at the real call site), and
+every later `co_await` inherits it in turn (issue #31's own
+priority-propagation behavior). The `future<T>` overload is unchanged -
+structurally it can't do this, since by the time a caller has a
+`future<T>` to hand it, that prefix has already run - but its own doc
+comment now says so explicitly, alongside the `Fn&&` overload's, so the
+next reader doesn't have to rediscover the gap the hard way `estpico` did.
+`docs/wiki/Coroutines.md`'s own `est::spawn()` section updated to match -
+the callable overload was previously documented as pure "eager-call
+sugar," which is no longer the whole story.
+
+New test (`est/tests/spawn_tests.cpp`): a coroutine that records
+`current_priority()` both in its own synchronous prefix and again after a
+real `co_await est::yield_execution()` resumption, spawned via the
+`Fn&&` overload at `Priority::high` - both observations come back
+`Priority::high`, proving the raised priority survives an actual
+suspend/resume, not just the synchronous call. Verified end to end: the
+full hosted pipeline (`default`/`ci`/`sanitize` presets, `clang-tidy`,
+the diff-coverage gate - `spawn.cppm`/`spawn_tests.cpp` both at 100%
+diff coverage), the mps2an385 QEMU test suite (1116 assertions, 262
+cases) and firmware smoke test, and the wasm32 project - `spawn()` is
+core `est`, shared by every backend, so every target that links it needed
+re-verifying, not just the one estpico had originally surfaced the gap
+in.
