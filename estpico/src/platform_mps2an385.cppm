@@ -227,18 +227,22 @@ void start_systick() noexcept {
 // --- Asynchronous, interrupt-driven UART TX (vprintdbg() only) ---
 //
 // One queued chunk of formatted output text - the est::intrusive_list<T>
-// "buffer manager" half of the design. Entirely mainline-only: both
-// enqueue_output() (below) and pump_some() (below, whether called
-// directly or from pump_task()'s own spawned coroutine) run on the
-// ordinary call stack - the TX ISR never touches pending_buffers or
-// draining_buffer at all, only uart_tx_ring itself. Heap-allocated via
-// std::make_unique (not est::current_allocator()): enqueue_output() can
-// run before any est::loop is current at all (a debug diagnostic emitted
-// while still bootstrapping, or est/tests/platform_tests.cpp's own
-// "vprintdbg() writes... without throwing" test, which exercises this
-// backend directly with no loop registered) - current_allocator() would
-// assert in exactly that case, the same reason has_current_loop() is
-// checked below rather than current_loop() called unconditionally.
+// "buffer manager" half of the design. Unlike uart_tx_ring (the one
+// *lock-free* ISR/mainline boundary), pending_buffers/draining_buffer are
+// plain, unguarded structures - touched from mainline in enqueue_output()
+// (below) and from the real TX interrupt in refill_ring() (below), so
+// every mainline touch is wrapped in interrupt_guard: the ISR always
+// finishes what it's doing without an intervening mainline mutation (it
+// can't be preempted by mainline in the first place), but the reverse
+// isn't true without masking - mainline enqueue()ing a node while the ISR
+// concurrently dequeue()s one is exactly the kind of interleaved,
+// non-atomic pointer update interrupt_guard exists to rule out. Heap
+// allocated via std::make_unique (not est::current_allocator()):
+// enqueue_output() can run before any est::loop is current at all (a
+// debug diagnostic emitted while still bootstrapping, or
+// est/tests/platform_tests.cpp's own "vprintdbg() writes... without
+// throwing" test, which exercises this backend directly with no loop
+// registered) - current_allocator() would assert in exactly that case.
 struct tx_buffer : est::intrusive_list_node {
   explicit tx_buffer(std::string text) noexcept : data(std::move(text)) {}
   std::string data;
@@ -251,22 +255,28 @@ inline est::intrusive_list<tx_buffer> pending_buffers;
 // pending_buffers itself since intrusive_list<T> only supports FIFO
 // enqueue/dequeue - a buffer only partially drained (larger than the
 // ring's current free space) needs somewhere to keep its own offset
-// between pump_some() calls.
+// between refill_ring() calls.
 // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
 inline std::unique_ptr<tx_buffer> draining_buffer;
 
 // The fixed-capacity queue the TX ISR actually drains, one byte per
 // completed-transmission interrupt - the one genuine ISR/mainline
-// boundary in this design. est::spsc_ring<T>'s own doc comment already
-// names "a future bare-metal interrupt handler" as a design target for
-// this exact shape (just with producer/consumer reversed from its own
-// doc wording there: here mainline/the pump task produces, the ISR
-// consumes). A function-local static, not a plain inline global: its
-// constructor allocates (via est::spsc_ring<T>'s own pmr allocator),
-// and deferring that until first use (well after main() has started,
-// once the heap is definitely live) avoids relying on global static
-// initialization order before main() the way systick_wrap_count (a
-// plain POD) never needed to.
+// boundary in this design, and est::spsc_ring<T>'s own doc comment
+// already names "a future bare-metal interrupt handler" as a design
+// target for this exact shape. Both try_push() (inside refill_ring(),
+// below) and try_pop() (inside pump_uart_hardware(), below) are now
+// reachable from either context - the real ISR directly, or mainline via
+// uart_tx_kick()'s interrupt_guard - but never concurrently with each
+// other (pump_uart_hardware()'s own doc comment has the reasoning), so
+// spsc_ring<T>'s "never called concurrently with itself" contract for
+// each of try_push()/try_pop() still holds; that's a stronger guarantee
+// than the strict single-producer/single-consumer split its own doc
+// comment illustrates, not a violation of it. A function-local static,
+// not a plain inline global: its constructor allocates (via
+// est::spsc_ring<T>'s own pmr allocator), and deferring that until first
+// use (well after main() has started, once the heap is definitely live)
+// avoids relying on global static initialization order before main() the
+// way systick_wrap_count (a plain POD) never needed to.
 constexpr std::size_t uart_tx_ring_capacity = 64;
 [[nodiscard]] auto uart_tx_ring() noexcept -> est::spsc_ring<char>& {
   // NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
@@ -274,22 +284,63 @@ constexpr std::size_t uart_tx_ring_capacity = 64;
   return ring;
 }
 
+// Pushes as many bytes as fit right now from draining_buffer (pulling a
+// fresh one from pending_buffers whenever it's null/exhausted) into
+// uart_tx_ring, stopping the moment the ring is full - there's always a
+// next byte-drained interrupt (or a later enqueue_output() kick) to
+// finish the job, so this never blocks/spins waiting for room. Called
+// from both contexts: the real TX interrupt (via pump_uart_hardware()
+// below, every time a byte's departure frees a ring slot) and mainline
+// (enqueue_output()'s uart_tx_kick() call, to prime a cold start) - every
+// mainline caller holds interrupt_guard (pump_uart_hardware()'s own doc
+// comment has the reasoning), and the ISR needs none of its own since it
+// can't be preempted by mainline in the first place. This is what makes
+// UART TX genuinely interrupt-driven end to end: once primed, the
+// pipeline (ISR pops a byte -> refills the ring -> the next interrupt
+// repeats it) runs to completion entirely on its own, with no mainline
+// coroutine polling or retrying to keep it moving.
+void refill_ring() noexcept {
+  while (true) {
+    if (!draining_buffer) {
+      draining_buffer.reset(pending_buffers.dequeue());
+      if (!draining_buffer) {
+        return; // genuinely caught up - nothing left to feed the ring
+      }
+    }
+    if (draining_buffer->offset >= draining_buffer->data.size()) {
+      draining_buffer.reset(); // fully queued - move on to the next buffer, if any
+      continue;
+    }
+    // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
+    if (!uart_tx_ring().try_push(char{draining_buffer->data[draining_buffer->offset]})) {
+      return; // ring full - the next TX-complete interrupt calls this again
+    }
+    ++draining_buffer->offset;
+  }
+}
+
 // Drains up to one byte from uart_tx_ring into UART0_DATA if the UART is
-// currently idle - called both from the real TX-complete interrupt
-// (UART0_TX_Handler, extern "C" below) and, wrapped in interrupt_guard,
-// from mainline (uart_tx_kick(), to prime a cold start: the interrupt
-// itself only ever fires on a completed transmission, never
-// spontaneously on an idle bus - this file's own UART0 register comment
-// above). Never runs concurrently with itself: the real ISR can't be
-// preempted by mainline code, and interrupt_guard blocks the reverse
-// direction - so despite the two call sites, uart_tx_ring only ever has
-// one logical consumer at a time, preserving est::spsc_ring<T>'s
-// single-consumer contract.
+// currently idle, then refills the ring from whatever's still buffered -
+// called both from the real TX-complete interrupt (UART0_TX_Handler,
+// extern "C" below) and, wrapped in interrupt_guard, from mainline
+// (uart_tx_kick(), to prime a cold start: the interrupt itself only ever
+// fires on a completed transmission, never spontaneously on an idle bus -
+// this file's own UART0 register comment above). Never runs concurrently
+// with itself: the real ISR can't be preempted by mainline code, and
+// interrupt_guard blocks the reverse direction - so despite the two call
+// sites, uart_tx_ring only ever has one logical consumer at a time,
+// preserving est::spsc_ring<T>'s single-consumer contract. refill_ring()
+// runs *after* the pop, not before: on a cold start (ring and hardware
+// both idle) the first call needs to fill the ring before there's
+// anything to pop and write - writing that first byte is what creates
+// the transmit-complete edge that makes the interrupt ever fire again
+// (this file's own UART0 register comment).
 void pump_uart_hardware() noexcept {
   mmio32(uart0_intstatus) = uart_intstatus_tx; // ack - harmless if nothing was pending
   if ((mmio32(uart0_state) & uart_state_tx_full) != 0U) {
     return; // already mid-transmission; the real interrupt drives the next byte
   }
+  refill_ring();
   if (const auto c = uart_tx_ring().try_pop()) {
     mmio32(uart0_data) = static_cast<std::uint32_t>(*c);
   }
@@ -300,109 +351,30 @@ void uart_tx_kick() noexcept {
   pump_uart_hardware();
 }
 
-// Pushes as many bytes as fit right now from draining_buffer (pulling a
-// fresh one from pending_buffers whenever it's null/exhausted) into
-// uart_tx_ring, then kicks the hardware. Returns true once genuinely
-// caught up (pending_buffers empty and draining_buffer consumed), false
-// if uart_tx_ring filled up first and there's more left for a later
-// call. Shared by three callers: enqueue_output()'s own no-loop-current
-// fallback, pump_task_loop()'s spawned, yielding loop, and
-// drain_uart_tx_synchronously()'s fatal-path flush (all below).
-[[nodiscard]] auto pump_some() noexcept -> bool {
-  while (true) {
-    if (!draining_buffer) {
-      draining_buffer.reset(pending_buffers.dequeue());
-      if (!draining_buffer) {
-        uart_tx_kick();
-        return true;
-      }
-    }
-    while (draining_buffer->offset < draining_buffer->data.size()) {
-      // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-      if (!uart_tx_ring().try_push(char{draining_buffer->data[draining_buffer->offset]})) {
-        uart_tx_kick();
-        return false;
-      }
-      ++draining_buffer->offset;
-    }
-    draining_buffer.reset(); // fully queued - move on to the next buffer, if any
-  }
-}
-
-// Rings once per enqueue_output() call while a loop is current - the
-// persistent pump_task_loop() below (est::spawn()'d exactly once, the
-// first time a loop becomes available) co_await-s this instead of being
-// re-spawned per backlog episode. automatic mode + max_count = 1
-// (est::binary_event) is the right shape for "wake up and check for
-// work," not a counted resource: several enqueue_output() calls while
-// the pump task is already busy just keep the single unit saturated
-// (set()'s own doc comment - a no-op past the first, harmless) rather
-// than queuing up N wakeups for M buffers pump_some() already drains
-// all of in one pass regardless of how many set() calls contributed to
-// the backlog. Constructible with no loop current at all (its own
-// constructor, est:sync.event) - safe as a plain module-level global,
-// like systick_wrap_count above, just not a POD this time.
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-inline est::binary_event<est::EventResetMode::automatic> pump_wake_event;
-
-// Mainline-only, no ISR access - no interrupt_guard needed. Only ever
-// transitions false -> true, once, in enqueue_output() below; nothing
-// ever needs to reset it back (pump_task_loop() never returns).
-// NOLINTNEXTLINE(cppcoreguidelines-avoid-non-const-global-variables)
-inline bool pump_task_started = false;
-
-// est::spawn()'d once, at Priority::high (not critical - urgent enough
-// to keep debug output flowing promptly, but never allowed to starve
-// Priority::critical work the way monopolizing the ready-queue would,
-// yield_execution()'s own doc comment) - not per backlog episode. Just
-// waits for pump_wake_event, drains everything pump_some() can reach
-// (yielding to est::loop between chunks rather than spinning), then
-// goes back to waiting - runs for the rest of the program once started.
-auto pump_task_loop() -> est::future<void> {
-  while (true) {
-    co_await pump_wake_event.wait();
-    while (!pump_some()) {
-      co_await est::yield_execution();
-    }
-  }
-}
-
 // vprintdbg()'s entry point: queues `text` for asynchronous UART output
 // instead of blocking the caller until every character has physically
 // transmitted (the old uart_write()-based vprintdbg() did exactly that -
 // fine for a rare, fatal assert_failure() message, but not for a debug
-// diagnostic that might fire from inside a hot continuation).
-//
-// With no loop current at all (has_current_loop(), est:util.current_loop)
-// - a debug diagnostic emitted while still bootstrapping, or
-// est/tests/platform_tests.cpp's own "vprintdbg() writes... without
-// throwing" test, which exercises this backend directly with no loop
-// registered - pump_task_loop() could never be spawned (est::spawn()
-// itself needs a loop) and pump_wake_event.set() would never be
-// consumed either, so this drains whatever fits synchronously right
-// now instead, matching interface::vprintdbg()'s own documented "must
-// swallow its own failures... best-effort" contract rather than queuing
-// text nothing will ever come back to send.
-//
-// Once a loop is current, every call defers to pump_task_loop() instead
-// of also trying a synchronous fast path here: pump_wake_event.set() is
-// safe to call even before the task has ever run (it only resolves
-// current_loop() once a waiter is actually queued, its own doc comment)
-// and pump_some() already handles "fits in one shot" - most messages -
-// exactly as well from inside the coroutine as it would inline here.
+// diagnostic that might fire from inside a hot continuation). No
+// est::loop/coroutine involvement at all, with or without one current:
+// enqueue_output() just appends the buffer and kicks the hardware once:
+// the real TX interrupt (refill_ring(), above) does every byte of actual
+// draining from then on, entirely on its own. This is also what makes a
+// call with no loop current at all safe (a debug diagnostic emitted
+// while still bootstrapping, or est/tests/platform_tests.cpp's own
+// "vprintdbg() writes... without throwing" test, which exercises this
+// backend directly with no loop registered) - nothing here ever touches
+// est::current_loop()/est::current_allocator().
 void enqueue_output(std::string text) {
   auto node = std::make_unique<tx_buffer>(std::move(text));
-  pending_buffers.enqueue(*node);
+  {
+    // pending_buffers is now touched by the real TX interrupt too
+    // (refill_ring(), above) - see tx_buffer's own doc comment.
+    const interrupt_guard guard;
+    pending_buffers.enqueue(*node);
+  }
   node.release();
-  if (!est::has_current_loop()) {
-    (void)pump_some(); // caught-up/not caught-up both mean the same thing here: best effort
-    return;
-  }
-  if (!pump_task_started) {
-    pump_task_started = true;
-    est::spawn(pump_task_loop(), est::Priority::high);
-  }
-  pump_wake_event.set();
+  uart_tx_kick(); // primes the hardware if it was idle; a harmless no-op otherwise
 }
 
 // assert_failure()'s own preamble: flushes anything still queued in
@@ -413,18 +385,21 @@ void enqueue_output(std::string text) {
 // per-iteration): about to terminate() anyway, so there's no cost to
 // paying for it, and holding it makes this function the ring's sole
 // popper for its entire duration - no race possible against the real
-// ISR, which pump_some()/uart_tx_kick()'s own per-call guards only
-// prevent one call at a time against.
+// ISR, which pump_uart_hardware()/uart_tx_kick()'s own per-call guards
+// only prevent one call at a time against. Alternates refill_ring() with
+// a direct pop+write (rather than calling pump_uart_hardware() itself)
+// since interrupts are masked here for the whole loop - nothing will
+// ever fire to drive that pairing on its own, so this does it by hand
+// until both the ring and every buffered message are empty.
 void drain_uart_tx_synchronously() noexcept {
   const interrupt_guard guard;
-  while (!pump_some()) {
-  }
   while (true) {
+    refill_ring();
     while ((mmio32(uart0_state) & uart_state_tx_full) != 0U) {
     } // safe under the mask - see uart_putc()'s own identical reasoning above
     const auto c = uart_tx_ring().try_pop();
     if (!c) {
-      break;
+      break; // ring empty and refill_ring() found nothing more buffered either
     }
     mmio32(uart0_data) = static_cast<std::uint32_t>(*c);
   }

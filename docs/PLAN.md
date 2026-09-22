@@ -8065,3 +8065,77 @@ tests), `web`'s wasm32 project (smoke test still passing), and
 `mps2an385` (1113 assertions/260 cases under QEMU, `larson_scanner`
 still exit 0) - all unchanged from before the refactor, confirming this
 touched only where the file list lives, not what gets built.
+
+**Post-review follow-up: two real bugs in `pump_task_loop()`, found by a
+requested code review, then fixed by removing the coroutine entirely.**
+Before merging, a code review pass (focused on the new estpico platform
+code specifically) surfaced two issues in the UART TX pump design that
+round 2's own review (above) had settled on:
+
+1. `est::spawn(pump_task_loop(), est::Priority::high)`'s `Priority::high`
+   never actually applied to the coroutine's own ongoing work.
+   `promise_type::initial_suspend()` returns `std::suspend_never`
+   (`est/src/future.cppm`), so calling `pump_task_loop()` runs its body
+   synchronously, on the caller's own stack, up to its first `co_await` -
+   *before* `est::spawn()` is even entered as a function call. `spawn()`'s
+   own `prio` argument only ever gets stamped onto the one `then_fast()`
+   completion continuation it registers on the already-built future
+   (`est/src/spawn.cppm`) - for a `while (true)` coroutine that never
+   completes, that continuation is structurally unreachable. The
+   coroutine's real resumption priority came from whatever
+   `current_priority()` happened to be at its call site inside
+   `enqueue_output()` instead - `Priority::normal`, the thread-local
+   default (`est/src/loop.cppm`), in every real call path - and then
+   self-propagated at that level forever (issue #31's inheritance
+   behavior), never touching `Priority::high` at all.
+2. The inner `while (!pump_some()) { co_await est::yield_execution(); }`
+   retry (only reachable when a single `enqueue_output()` call's text
+   exceeds the 64-byte ring in one pass) was a genuine poll, not a wait:
+   nothing in the design ever produced a "ring gained space" event -
+   `yield_execution()` just re-enqueues the coroutine and it rechecks
+   next turn, unconditionally, however many times it takes the real TX
+   interrupt to drain enough of the ring.
+
+The fix isn't a better-behaved retry: it's removing the coroutine's role
+in draining the ring at all. Making the *ISR* signal a real
+`est::binary_event`/wake the coroutine directly was considered and
+rejected - `est::loop`'s ready-queue and `est::counting_event`'s waiters
+list are plain, non-atomic `intrusive_list`s, mutated by ordinary
+mainline code with interrupts enabled; an ISR calling into either from
+inside `UART0_TX_Handler` could preempt mainline mid-mutation of the
+exact same list, a real data race this codebase's own "single-threaded,
+no atomics" stance (CLAUDE.md) doesn't cover and shouldn't be made to,
+for one platform-specific backend.
+
+Instead, `pump_some()` (renamed `refill_ring()`) becomes a pure "top the
+ring off from `pending_buffers`/`draining_buffer`, stop the moment it's
+full" function with no hardware/kick logic of its own, and
+`pump_uart_hardware()` (already the real `UART0_TX_Handler`, already
+called from mainline via `uart_tx_kick()`) calls it after every byte it
+pops - so the ring gets refilled by the same interrupt that just freed a
+slot in it, every time, with no coroutine involved in the loop at all.
+`enqueue_output()` drops to appending a buffer and kicking the hardware
+once; `est::spawn()`, `pump_wake_event`, `pump_task_started`, and
+`pump_task_loop()` are gone entirely - there's no persistent coroutine
+left for a priority argument to fail to reach, and no retry loop left to
+poll. The one new correctness obligation this creates -
+`pending_buffers`/`draining_buffer` are now touched by the real ISR too,
+not just mainline - is handled the same way every other ISR/mainline
+hazard in this file already is: `interrupt_guard` around
+`enqueue_output()`'s own `pending_buffers.enqueue()` call.
+`est::spsc_ring<T>`'s own lock-free index handoff needed no change - its
+"never called concurrently with itself" contract for `try_push()`/
+`try_pop()` holds regardless of which physical context calls either, and
+`interrupt_guard`/ISR-non-preemption already guarantee that.
+
+Verified end to end: the full mps2an385 QEMU test suite (1114 assertions,
+261 cases - a new case added specifically for this, a 96-byte message
+forcing several real ISR-driven ring refills, confirmed to print intact
+and complete near-instantly, not stalling on any retry) and
+`larson_scanner_mps2an385` (exit 0, same real-time behavior, confirmed
+unrelated to this change via a baseline comparison against the
+pre-fix code) - plus the full hosted pipeline (`default`/`ci`/`sanitize`
+presets, `clang-tidy`, the diff-coverage gate) and the wasm32 project,
+none of which this backend-specific change touches but all of which
+still pass since `est/tests/platform_tests.cpp` (the one shared file
+that gained the new long-message test case) is common to all of them.

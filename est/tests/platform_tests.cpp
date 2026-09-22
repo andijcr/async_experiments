@@ -131,6 +131,21 @@ TEST_CASE("hosted_stdcpp's vprintdbg() writes via std::vprint_unicode without th
   SUCCEED("printdbg() returned without throwing");
 }
 
+TEST_CASE("vprintdbg() handles a message longer than any fixed-size internal buffer",
+          "[platform]") {
+  // 96 chars > estpico's own 64-byte uart_tx_ring capacity
+  // (estpico/src/platform_mps2an385.cppm) - the one backend where a
+  // message this long exercises more than a single refill of that ring
+  // (several real TX-complete interrupts draining and refilling it in
+  // turn, entirely on their own) rather than fitting in one shot.
+  // Backend-agnostic like the test above: hosted_stdcpp/estwasm have no
+  // such bound and just format and write the whole thing in one call
+  // either way.
+  const std::string long_value(96, 'x');
+  est::platform::printdbg("long message: {}", long_value);
+  SUCCEED("printdbg() returned without throwing");
+}
+
 TEST_CASE("hosted_stdcpp's sleep_until() returns once the deadline has passed", "[platform]") {
   // A tiny (1ms) real deadline, not a fake clock: this exercises
   // hosted_stdcpp::sleep_until()'s actual std::this_thread::sleep_until()
