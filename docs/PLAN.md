@@ -8406,3 +8406,15 @@ call) before failing on a missing `libc++.modules.json` under
 unmodified `origin/main` version of `mps2an385/CMakeLists.txt` on the same
 image, confirming it's a stale/incomplete local devenv image (missing the
 ARM sysroot's own std-modules metadata), not something this change caused.
+
+**Follow-up (PR #129 review):** the reviewer asked whether
+`cmake/EstSources.cmake` was still needed, now that it's `include()`-d
+from exactly one place. It wasn't - the separate-file split existed
+solely to share one list across three hand-rolled `add_library(est
+STATIC)` declarations, a need issue #128 above already removed. Inlined
+`EST_CXX_MODULE_SOURCES` directly into `est/CMakeLists.txt` and deleted
+`cmake/EstSources.cmake`; the two standalone projects are unaffected,
+since they only ever consumed the list indirectly through
+`add_subdirectory(est)`, never by `include()`-ing the file themselves.
+Verified: `default` preset build+`ctest` (331/331) and `web`'s wasm32
+project build both still pass unchanged.

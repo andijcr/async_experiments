@@ -13,7 +13,39 @@ if(EST_BUILD_TESTS)
   enable_testing()
 endif()
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/../cmake/EstSources.cmake")
+# The canonical list of est's own CXX_MODULES source files - this file
+# is the single source of truth for what belongs in the `est` target's
+# FILE_SET, no longer shared via a separate cmake/EstSources.cmake now
+# that the two standalone cross-compile projects (examples/
+# multicolor_larson_scanner/web, .../mps2an385) add_subdirectory() this
+# file directly instead of hand-declaring their own add_library(est
+# STATIC) (issue #128).
+set(EST_CXX_MODULE_SOURCES
+  est.cppm
+  util/intrusive_list.cppm
+  util/scope_exit.cppm
+  util/shared_ptr.cppm
+  platform/platform.cppm
+  check.cppm
+  util/jitter.cppm
+  sync/mutex.cppm
+  sync/event.cppm
+  sync/external_event.cppm
+  sync/spsc_ring.cppm
+  sync/stop_token.cppm
+  timer.cppm
+  loop.cppm
+  util/current_loop.cppm
+  timer_periodic.cppm
+  future.cppm
+  promise.cppm
+  when_all.cppm
+  when_any.cppm
+  when_any_succeeds.cppm
+  with_stop.cppm
+  with_timeout.cppm
+  spawn.cppm
+)
 list(TRANSFORM EST_CXX_MODULE_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/src/")
 
 add_library(est STATIC)
