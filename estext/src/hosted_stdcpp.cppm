@@ -40,14 +40,39 @@ public:
     return detail::to_platform_clock(std::chrono::steady_clock::now());
   }
 
-  // std::this_thread::sleep_until() needs a real std::chrono clock (one
-  // with its own working now(), used internally to retry past spurious
-  // wakeups - std::chrono::steady_clock::now() itself, not this backend's
-  // own uptime()) - est::platform::clock deliberately isn't one (its own
-  // doc comment), so this converts back to the real steady_clock this
-  // backend actually sources every value from.
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
-    std::this_thread::sleep_until(detail::to_steady_clock(deadline));
+  // A condition_variable wait, not a plain std::this_thread::sleep_until():
+  // wake()/wake_all() below need a real way to unblock this early, which a
+  // bare sleep has no hook for at all. wait_until() needs a real
+  // std::chrono clock (one with its own working now(), used internally to
+  // retry past spurious wakeups - std::chrono::steady_clock::now() itself,
+  // not this backend's own uptime()) - est::platform::clock deliberately
+  // isn't one (its own doc comment), so this converts back to the real
+  // steady_clock this backend actually sources every value from.
+  //
+  // The predicate overload (not a bare wait_until()) is what makes this
+  // genuinely level-triggered rather than edge-triggered: a wake() call
+  // that lands *before* this method is even entered (this thread hadn't
+  // reached the lock yet) still sets woken_, so the predicate is already
+  // true the first time it's checked - no missed-wakeup race between
+  // "check the flag" and "start waiting," the classic condition_variable
+  // hazard the predicate overload exists to close.
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
+    std::unique_lock lock(wake_mutex_);
+    wake_cv_.wait_until(lock, detail::to_steady_clock(deadline), [this] { return woken_; });
+    woken_ = false;
+  }
+
+  // hosted_stdcpp only ever drives one loop per instance, so `id` (a
+  // future multi-loop target's own concern - issue #125) is irrelevant
+  // here; wake() and wake_all() are identical.
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override { wake_all(); }
+
+  void wake_all() noexcept override {
+    {
+      const std::scoped_lock lock(wake_mutex_);
+      woken_ = true;
+    }
+    wake_cv_.notify_all();
   }
 
   // std::random_device itself can throw (implementation-defined, if no
@@ -138,6 +163,9 @@ public:
 
 private:
   est::platform::clock::time_point stall_start_;
+  std::mutex wake_mutex_;
+  std::condition_variable wake_cv_;
+  bool woken_ = false;
 };
 
 } // namespace estext

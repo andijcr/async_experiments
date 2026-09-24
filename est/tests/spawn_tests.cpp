@@ -17,9 +17,12 @@ public:
     return current;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 42; }
 

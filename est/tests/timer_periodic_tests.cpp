@@ -32,18 +32,21 @@ private:
   }
 };
 
-// A fake platform with a controllable clock whose sleep_until() advances
-// that same fake clock instead of actually blocking - identical in shape
-// to est/tests/loop_tests.cpp's own fake_platform.
+// A fake platform with a controllable clock whose interruptible_sleep_until()
+// advances that same fake clock instead of actually blocking - identical in
+// shape to est/tests/loop_tests.cpp's own fake_platform.
 class fake_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   // A fixed seed: these tests assert jitter stays within its documented
   // bounds, never that any particular sequence of offsets occurs -

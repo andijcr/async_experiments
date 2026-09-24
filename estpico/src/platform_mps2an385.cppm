@@ -15,7 +15,7 @@ import std;
 // hardware - CMSDK APB UART0 (0x40004000, confirmed via `info mtree` in
 // Findings 1-2 of issue #123) for output, the Cortex-M3 core's own SysTick
 // timer for uptime()/get_random_seed(), and a second CMSDK APB dual-timer
-// (0x40002000) sleep_until() arms per call to back a real `wfi` low-power
+// (0x40002000) interruptible_sleep_until() arms per call to back a real `wfi` low-power
 // wait - never through ARM semihosting (`bkpt 0xab`), with one deliberate
 // exception: terminate()'s exit-code
 // report. That's the only place this backend still talks to whatever's
@@ -548,13 +548,13 @@ void start_uart_tx_interrupt() noexcept {
 // interrupt (whose CTRL enable and NVIC enable both happen once, up
 // front, since it free-runs from then on), the dual-timer's own
 // countdown is armed fresh by arm_dualtimer_oneshot() below on every
-// sleep_until() call, not started here.
+// interruptible_sleep_until() call, not started here.
 void start_dualtimer_irq() noexcept {
   mmio32(nvic_iser0) = 1U << dualtimer_irqn;
 }
 
 // Arms Timer1 for a single interrupt roughly `remaining` from now, then
-// halts (ONESHOT) - sleep_until() below WFIs right after calling this,
+// halts (ONESHOT) - interruptible_sleep_until() below WFIs right after calling this,
 // so this is what actually wakes it back up at (approximately) the
 // right time instead of leaving WFI to wait for SysTick's own ~671ms
 // wrap or an unrelated UART interrupt. Disables and re-acks before
@@ -577,7 +577,7 @@ void arm_dualtimer_oneshot(est::platform::clock::duration remaining) noexcept {
   // A 0-tick countdown may never fire (SP804-style semantics don't
   // define what happens from an already-elapsed load) - round up to 1
   // rather than risk WFI never waking at all. The upper clamp is purely
-  // defensive: sleep_until()'s own real deadlines are milliseconds, many
+  // defensive: interruptible_sleep_until()'s own real deadlines are milliseconds, many
   // orders of magnitude under the ~171s a 32-bit counter at 25MHz holds.
   if (ticks == 0U) {
     ticks = 1U;
@@ -658,7 +658,7 @@ extern "C" void UART0_TX_Handler() noexcept { // NOLINT(readability-identifier-n
 // module's own dual-timer register comment above). Only job is to ack
 // (so ONESHOT mode's single fire doesn't storm the same way an unacked
 // UART TX interrupt did) and, by virtue of being serviced at all, wake
-// sleep_until()'s own `wfi` - nothing else needs to happen here.
+// interruptible_sleep_until()'s own `wfi` - nothing else needs to happen here.
 extern "C" void DualTimer_Handler() noexcept { // NOLINT(readability-identifier-naming)
   estpico::detail::mmio32(estpico::detail::t1_intclr) = 1U;
 }
@@ -681,27 +681,41 @@ public:
   // Cortex-M mechanism) halts the CPU until the next interrupt, backed by
   // detail::arm_dualtimer_oneshot() so that "next interrupt" is
   // (approximately) the actual deadline, not whatever unrelated interrupt
-  // happens to fire next. WFI can wake on *any* enabled interrupt though
-  // (SysTick's own ~671ms wrap, a UART TX completion, ...), so this still
-  // rechecks uptime() against `deadline` in a loop rather than trusting a
-  // single wake - re-arming the dual-timer with the freshly recomputed
-  // remaining time each time it loops. A deadline already in the past
-  // returns immediately without ever touching the timer at all.
+  // happens to fire next. A deadline already in the past returns
+  // immediately without ever touching the timer at all.
+  //
+  // Exactly one wfi, not a retry loop: WFI can wake on *any* enabled
+  // interrupt (SysTick's own ~671ms wrap, a UART TX completion, ...), and
+  // under interruptible_sleep_until()'s own contract (platform.cppm) that's
+  // fine to expose directly rather than hide - est::loop::run_impl()
+  // (est:loop) already re-checks uptime() against `deadline` itself and
+  // calls this again if it hasn't passed, so retrying here too would just
+  // duplicate that loop. This is also what actually makes wake() below
+  // meaningful without this backend needing to implement it as anything
+  // but a no-op: any real hardware interrupt already unblocks wfi for
+  // free, whatever caused it.
   //
   // Not SysTick-based: arm_dualtimer_oneshot()'s own doc comment has the
   // reasoning (SysTick's reload is load-bearing for uptime()'s own tick
   // accounting; a second, independent timer avoids desynchronizing the
   // clock to align a wakeup to an arbitrary deadline).
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
-    while (true) {
-      const auto current = uptime();
-      if (current >= deadline) {
-        return;
-      }
-      detail::arm_dualtimer_oneshot(deadline - current);
-      __asm__ volatile("wfi");
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
+    const auto current = uptime();
+    if (current >= deadline) {
+      return;
     }
+    detail::arm_dualtimer_oneshot(deadline - current);
+    __asm__ volatile("wfi");
   }
+
+  // Genuine no-ops: on this single-core, no-RTOS target, any real
+  // hardware interrupt already unblocks a currently-executing wfi for
+  // free (interruptible_sleep_until()'s own doc comment above) - there is
+  // no separate "please wake up" signal to deliver, and `id` has nothing
+  // to disambiguate (this backend only ever drives the one loop on this
+  // one core).
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   // No semihosting randomness operation exists (ARM semihosting's SYS_*
   // set has no equivalent to hosted_stdcpp's std::random_device), and

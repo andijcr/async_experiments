@@ -16,11 +16,13 @@ FetchContent_MakeAvailable(Catch2)
 add_executable(est_tests
   test_main.cpp
   platform_tests.cpp
+  platform_thread_tests.cpp
   check_tests.cpp
   intrusive_list_tests.cpp
   mutex_tests.cpp
   event_tests.cpp
   external_event_tests.cpp
+  external_event_thread_tests.cpp
   spsc_ring_tests.cpp
   spsc_ring_thread_tests.cpp
   timer_tests.cpp

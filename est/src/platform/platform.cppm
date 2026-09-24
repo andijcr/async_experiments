@@ -111,14 +111,64 @@ public:
 
   [[nodiscard]] virtual auto uptime() const noexcept -> clock::time_point = 0;
 
-  // Blocks the calling thread until `deadline`, or returns immediately if
-  // it has already passed - est::loop's answer to "how do I wait for the
-  // next timer" without a busy-loop, same reasoning as uptime()/
-  // assert_failure() being platform hooks: a test fake overrides this to
-  // advance its own fake clock instead of actually blocking, so a loop
-  // test exercising real timer-driven wakeups runs instantly instead of
-  // for real wall-clock seconds (est/tests/loop_tests.cpp).
-  virtual void sleep_until(clock::time_point deadline) const noexcept = 0;
+  // Blocks the calling thread until `deadline`, *or may return earlier -
+  // for any reason, including none at all*. est::loop's answer to "how do
+  // I wait for the next timer" without a busy-loop, same reasoning as
+  // uptime()/assert_failure() being platform hooks: a test fake overrides
+  // this to advance its own fake clock instead of actually blocking, so a
+  // loop test exercising real timer-driven wakeups runs instantly instead
+  // of for real wall-clock seconds (est/tests/loop_tests.cpp).
+  //
+  // Not just "blocks until deadline": a caller (est::loop::run_impl(),
+  // est:loop) must always re-check uptime() against `deadline` after this
+  // returns, never assume it passed just because the call did. This is
+  // what lets wake()/wake_all() below actually matter - a backend that
+  // can distinguish "deadline reached" from "something else happened"
+  // (wake() was called, or any other backend-specific reason to
+  // reconsider) returns early for the latter, and est::loop reacts by
+  // polling its own registered external sources before deciding what to
+  // do next. A backend with no early-wake capability at all is still
+  // correct simply by never returning before `deadline` - the same
+  // behavior every backend already had under the old, stricter contract.
+  // Non-const, unlike uptime()/get_random_seed() below: a backend that
+  // actually implements early-wake needs real mutable state of its own
+  // (hosted_stdcpp: a condition_variable + predicate) to block on, the
+  // same reason reset_loop_stall_detection() below isn't const either.
+  virtual void interruptible_sleep_until(clock::time_point deadline) noexcept = 0;
+
+  // An opaque, backend-defined identifier for one specific loop reachable
+  // through this platform - meaning entirely up to the backend (a core
+  // index on a multi-core bare-metal target, a slot in a small
+  // thread-to-condition_variable table on a hosted backend with several
+  // loop-driving threads, ...). est::loop itself just carries one and
+  // hands it back; est::platform never interprets it. A backend that only
+  // ever drives one loop per instance (every backend today) is free to
+  // ignore whatever value it's given entirely.
+  enum class WakeId : int {};
+
+  // Best-effort: if some other context (this thread, another thread, an
+  // ISR) is currently blocked inside this backend's own
+  // interruptible_sleep_until() for the loop `id` names, unblock it now.
+  // Always safe to call from any context that can call anything at all -
+  // exactly as unconstrained as est::external_event<T>'s own atomic store
+  // already is - and a no-op is always a valid implementation (worst
+  // case, latency degrades to "wait out the current deadline," the same
+  // bound est::external_event<T> already had before this existed).
+  // Dispatched via whichever platform::instance() the *calling* context
+  // resolves (thread-local) - deliberately not routed through any
+  // captured pointer to a specific remote backend object: each backend
+  // instance is responsible for knowing how to reach its own siblings
+  // (however its own hardware/OS actually allows that), not for another
+  // instance to reach into it directly. See docs/PLAN.md's issue #125
+  // entry for the full reasoning, including why an earlier version of
+  // this design (a captured pointer, no id) didn't generalize to more
+  // than one loop.
+  virtual void wake(WakeId id) noexcept = 0;
+
+  // Wakes every loop this backend instance is responsible for. Semantics
+  // deliberately unspecified beyond "best-effort, always safe to call" -
+  // no concrete caller needs precise behavior here yet (issue #125).
+  virtual void wake_all() noexcept = 0;
 
   // Returns a fresh, best-effort-random seed value for anything in est
   // that needs one (est::jitter, :util.jitter, the only caller today) -

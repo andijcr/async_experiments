@@ -19,7 +19,7 @@ graph BT
   spsc_ring[":sync.spsc_ring<br/>spsc_ring&lt;T&gt;"]
   mutex[":sync.mutex<br/>mutex, mutex::lock, mutex::lock_guard"]
   timer[":timer<br/>timer_queue&lt;Allocator&gt;"]
-  loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node"]
+  loop[":loop<br/>est::loop, detail::ready_node, detail::timer_node, detail::external_source"]
   current_loop[":util.current_loop<br/>make_current_loop(loop&amp;), current_loop()"]
   jitter[":util.jitter<br/>jitter"]
   timer_periodic[":timer.periodic<br/>schedule_periodic(), periodic_timer_handle"]
@@ -40,6 +40,9 @@ graph BT
   event --> current_loop
   external_event --> future
   external_event --> event
+  external_event --> loop
+  external_event --> platform
+  external_event --> check
   spsc_ring --> check
   mutex --> future
   mutex --> promise
@@ -125,15 +128,23 @@ block shared across a periodic chain's nodes — deliberately *not*
 `:future`/`:promise`: nothing about `schedule_periodic()` is awaited, so
 it has no reason to depend on either.
 
-`:sync.external_event` depends only on `:sync.event` (its internal
-`est::binary_event<EventResetMode::manual>`) and `:future` (to spell out
+`:sync.external_event` depends on `:sync.event` (its internal
+`est::binary_event<EventResetMode::manual>`), `:future` (to spell out
 `wait()`'s own `future<void>` return type in its own file - `:sync.event`
 imports `:future` too, but as a plain, non-exported `import`, which
 doesn't make the name visible to a third partition merely importing
-`:sync.event`). Notably *not* `:platform`: unlike `:util.jitter`,
-`external_event<T>` never calls `platform::instance()` itself - the
-`std::atomic<T>&` it bridges is entirely caller-supplied, with no
-platform hook of its own needed anywhere.
+`:sync.event`), `:loop`, `:platform`, and `:check` - the last three added
+for the opt-in loop-registration constructor (issue #125): a caller that
+still just constructs `external_event<T>` from a bare `std::atomic<T>&`
+and drives `poll()` itself (`schedule_periodic()`, or by hand) never
+touches any of the three. `:loop` isn't a new *transitive* dependency -
+`:sync.event` already reaches it - just now a direct one, for
+`loop::register_external()`/`unregister_external()`/`notify_external()`.
+`external_notifier::notify()` is the one place `platform::instance()`
+gets called from this partition (`wake()`, dispatched deliberately via
+whichever instance the *calling* context resolves - see that class's own
+doc comment for why); `external_event<T>` itself, and the base
+constructor's own `std::atomic<T>&`, still never touch a platform hook.
 
 `:sync.spsc_ring` depends only on `:check` (a positive-`capacity`
 precondition) - genuinely standalone among the `:sync.*` family: no
@@ -349,8 +360,9 @@ every individual test file.
   in practice.
 - **`est::platform` is the one runtime-polymorphic seam.** Everything that
   differs between a hosted-Linux program, a browser's WebAssembly sandbox, and
-  a bare-metal ARM target — the monotonic clock (`uptime()`), how to wait for a deadline
-  (`sleep_until()`), what happens when a precondition check fails
+  a bare-metal ARM target — the monotonic clock (`uptime()`), how to wait for a
+  deadline, possibly interrupted early (`interruptible_sleep_until()`/
+  `wake()`/`wake_all()`), what happens when a precondition check fails
   (`assert_failure()`) — goes through `est::platform::interface`, a virtual
   base swapped via a single global pointer (`instance()`/
   `override_instance()`). Everything else in the framework is templates and

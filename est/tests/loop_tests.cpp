@@ -32,7 +32,7 @@ private:
   }
 };
 
-// A fake platform with a controllable clock whose sleep_until() advances
+// A fake platform with a controllable clock whose interruptible_sleep_until() advances
 // that same fake clock instead of actually blocking - the seam
 // est::loop's own timer-driven tests need to run instantly rather than
 // for real wall-clock seconds, extending the uptime()-only fake_platform
@@ -43,9 +43,14 @@ public:
     return current;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  // No-ops: nothing in these tests exercises est::loop's registered-
+  // external-source polling, so nothing ever calls wake()/wake_all() here.
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   // A fixed, deterministic value: nothing in these tests exercises
   // est::jitter, and a fixed seed keeps anything that indirectly does
@@ -88,9 +93,13 @@ public:
     return result;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  // No-ops - see fake_platform's own identical overrides, above, for why.
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   // A fixed, deterministic value - see fake_platform's own identical
   // override, above, for why.
@@ -795,7 +804,7 @@ TEST_CASE("sleep_for(delay, stop_token): request_stop() before the deadline reso
     // A deliberately huge delay: if loop::cancel_timer() weren't actually
     // removing this timer's own registration, run_until_idle() below would
     // have nothing left to do except sleep all the way to this deadline -
-    // fake_platform::sleep_until() advancing `current` that far is exactly
+    // fake_platform::interruptible_sleep_until() advancing `current` that far is exactly
     // what the assertion below would catch.
     auto fut = est::sleep_for(1000s, source.get_token());
     REQUIRE_FALSE(fut.ready());
@@ -808,7 +817,7 @@ TEST_CASE("sleep_for(delay, stop_token): request_stop() before the deadline reso
     REQUIRE_THROWS_AS(fut.get(), est::operation_cancelled);
     // The fake clock never had to advance - nothing left pending once the
     // timer was cancelled, so run_until_idle() returned without ever
-    // calling platform::instance().sleep_until().
+    // calling platform::instance().interruptible_sleep_until().
     REQUIRE(fake.current == decltype(fake.current){});
   }
   // The cancelled timer node (detail::sleep_stop_timer_node, est:with_stop)

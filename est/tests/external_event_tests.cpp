@@ -9,7 +9,11 @@ import std;
 // test in this codebase. est::external_event<T>'s own poll() is the only
 // thing that ever reads that atomic; everything else here just checks
 // the resulting est::future<void>/value()/reset() behavior, the same way
-// est/tests/event_tests.cpp checks est::binary_event<Mode> directly.
+// est/tests/event_tests.cpp checks est::binary_event<Mode> directly. The
+// one test that does exercise a real second thread lives in
+// external_event_thread_tests.cpp instead - kept separate so this file
+// (pure single-call-stack logic) can also run on targets with no
+// <thread> at all, such as mps2an385's no-OS-threads build.
 
 TEST_CASE("external_event: poll() with no change from source is a no-op", "[external_event]") {
   est::loop loop;
@@ -141,9 +145,11 @@ TEST_CASE("external_event: bridged into a real schedule_periodic() poll loop", "
     [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
       return current;
     }
-    void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+    void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
       current = std::max(current, deadline);
     }
+    void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+    void wake_all() noexcept override {}
     [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 7; }
     [[noreturn]] void assert_failure(std::string_view /*message*/,
                                      std::source_location /*location*/) const noexcept override {
@@ -204,4 +210,93 @@ TEST_CASE("external_event: bridged into a real schedule_periodic() poll loop", "
 
   REQUIRE(consumer.ready());
   REQUIRE(observed == 99);
+}
+
+TEST_CASE("external_event: the loop-registering constructor polls without a caller-driven timer",
+          "[external_event]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::atomic<int> source{0};
+  est::external_event<int> bridge{source, loop};
+
+  auto fut = bridge.wait();
+  REQUIRE_FALSE(fut.ready());
+
+  // No bridge.poll() call anywhere below - notifier().notify() is what
+  // makes the loop pick this up on its own, at its own dispatch
+  // checkpoint (issue #125's whole point).
+  source.store(1, std::memory_order_release);
+  bridge.notifier().notify();
+  loop.run_until_idle();
+
+  REQUIRE(fut.ready());
+  REQUIRE(bridge.value() == 1);
+}
+
+TEST_CASE("external_event: notifier().notify() with nothing actually changed is a harmless no-op",
+          "[external_event]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::atomic<int> source{42};
+  est::external_event<int> bridge{source, loop};
+  auto notifier = bridge.notifier();
+
+  auto fut = bridge.wait();
+  notifier.notify(); // source_ never actually wrote a new value
+  loop.run_until_idle();
+
+  REQUIRE_FALSE(fut.ready());
+}
+
+TEST_CASE("external_event: unregisters from the loop when destroyed", "[external_event]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::atomic<int> source1{0};
+  std::atomic<int> source2{0};
+  // Stays alive for the whole test - its own notifier() is what triggers
+  // the real registry walk below.
+  est::external_event<int> bridge2{source2, loop};
+
+  {
+    est::external_event<int> bridge1{source1, loop};
+    (void)bridge1; // registered, then immediately destroyed below
+  }
+
+  // poll_external_if_pending() (est:loop) only walks the registered-
+  // source list when the shared flag is actually set - without this,
+  // bridge1's own destruction going unnoticed wouldn't be exercised at
+  // all. If ~external_event() hadn't unregistered bridge1, this walk
+  // would poll a dangling pointer - a real use-after-free the sanitize
+  // preset (ASan) would catch, not just a logical assertion.
+  source2.store(1, std::memory_order_release);
+  bridge2.notifier().notify();
+  loop.run_until_idle();
+
+  REQUIRE(bridge2.value() == 1);
+}
+
+TEST_CASE("external_event: multiple loop-registered sources all get polled off one notify",
+          "[external_event]") {
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::atomic<int> source1{0};
+  std::atomic<int> source2{0};
+  est::external_event<int> bridge1{source1, loop};
+  est::external_event<int> bridge2{source2, loop};
+
+  auto fut1 = bridge1.wait();
+  auto fut2 = bridge2.wait();
+
+  // Both sources change; only bridge1's own notifier() ever fires - the
+  // shared flag/registry walk (not a per-source signal) is what's
+  // actually responsible for bridge2 getting polled too.
+  source1.store(1, std::memory_order_release);
+  source2.store(2, std::memory_order_release);
+  bridge1.notifier().notify();
+  loop.run_until_idle();
+
+  REQUIRE(fut1.ready());
+  REQUIRE(fut2.ready());
+  REQUIRE(bridge1.value() == 1);
+  REQUIRE(bridge2.value() == 2);
 }

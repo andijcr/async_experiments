@@ -718,19 +718,22 @@ never touched anywhere in this class except inside `poll()`.
 ```cpp
 template <class T>
   requires std::equality_comparable<T>
-class external_event {
+class external_event : private detail::external_source {
 public:
   explicit external_event(std::atomic<T>& source) noexcept;
+  external_event(std::atomic<T>& source, loop& owner);   // opt-in loop registration - see below
 
-  void poll() noexcept;                       // loop-thread only, never suspends
-  [[nodiscard]] auto wait() -> future<void>;   // delegates to the internal binary_event
-  void reset() noexcept;                       // re-arms for the next change
+  void poll() noexcept override;               // loop-thread only, never suspends
+  [[nodiscard]] auto wait() -> future<void>;    // delegates to the internal binary_event
+  void reset() noexcept;                        // re-arms for the next change
   [[nodiscard]] auto value() const noexcept -> T;
+  [[nodiscard]] auto notifier() const noexcept -> external_notifier;   // loop-registered instances only
 
 private:
   std::atomic<T>* source_;
   T last_seen_;
   binary_event<EventResetMode::manual> event_;
+  loop* owner_ = nullptr;
 };
 ```
 
@@ -759,9 +762,8 @@ happens before the consumer calls `reset()` is folded into the value
 manual` primitive in this codebase (`counting_event<manual>`,
 `binary_event<manual>`) rather than inventing new semantics.
 
-**Deliberately not started/owned by this class** - a caller wires
-`poll()` into `schedule_periodic()` explicitly, rather than
-`external_event<T>` starting a periodic timer of its own:
+**Two ways to drive `poll()`.** A caller can still wire it into
+`schedule_periodic()` explicitly, the original (issue #74) design:
 
 ```cpp
 std::atomic<int> reading{0};             // written by another thread/ISR
@@ -776,6 +778,89 @@ entirely, and keeps `external_event<T>` trivially unit-testable without
 any real second thread: a test just assigns directly to the
 `std::atomic<T>` it constructs the bridge over, single-threaded, matching
 every other test in this codebase (`est/tests/external_event_tests.cpp`).
+It also pays a real, up-to-one-poll-interval latency tax and needs an
+already-running (or newly-added) periodic timer to bridge with.
+
+The second constructor (issue #125) removes that tax by registering
+directly with a `loop`, letting it call `poll()` at its own dispatch
+checkpoints instead:
+
+```cpp
+std::atomic<int> reading{0};
+est::external_event<int> bridge{reading, loop};
+auto notifier = bridge.notifier();       // handed to the external writer
+
+// external context (an ISR, or a real std::jthread):
+reading.store(new_value, std::memory_order_release);
+notifier.notify();
+
+// loop thread, as before:
+co_await bridge.wait();
+```
+
+`bridge` implements `detail::external_source` (`est:loop`) for exactly
+this purpose - `register_external()`/`unregister_external()` (called
+from the constructor/destructor) add and remove a raw observer pointer
+into `loop`'s own registry, and `est::loop` never allocates or owns it
+(the same reasoning `est::mutex`/`est::counting_event<Mode>`'s own
+"loop must outlive me" precondition already has elsewhere - see this
+page's own "structural hazard" section above). `notifier()` fails a
+`check()` on an instance built with the base constructor - there's no
+`loop&` to hand a notifier a reference to.
+
+`external_notifier` is a tiny, copyable handle safe to call from any
+context that can call anything at all - an ISR, a real second thread.
+`notify()` does exactly two things: `loop::notify_external()` (a single
+`std::atomic<bool>` store - see "The shared pending-external flag"
+below) and `platform::instance().wake(owner.id())`, resolved fresh
+*wherever `notify()` actually runs* - deliberately not through a pointer
+captured back when `notifier()` was constructed. That distinction
+matters: `platform::instance()` is `thread_local`
+([Global Lookup Codegen](Global-Lookup-Codegen.md)), so a real producer
+thread calling `notify()` needs its *own* `platform::interface`
+installed first (typically the same backend object the loop thread
+itself uses, via `platform::override_instance()`) - the same
+requirement any thread driving an `est::loop` already has. An ISR
+doesn't need this on a single-core bare-metal target: it shares the
+loop thread's own TLS block by construction, confirmed empirically
+against `estpico`.
+
+### The shared pending-external flag, and `interruptible_sleep_until()`
+
+`est::loop` checks *one* `std::atomic<bool>` (`pending_external_`) at the
+top of every `drain_ready()` iteration - cheap enough to do unconditionally,
+whether or not anything is registered. Only when that flag is observed set
+does it walk the registered-source list and call `poll()` on each one
+(`loop::poll_external_if_pending()`). This is deliberately coarser than
+"which source changed" - a false wake just costs each *other* registered
+source one wasted `poll()` call, negligible against the alternative (a
+per-source dirty bit, or polling every source on every single ready node
+regardless of whether the flag is set).
+
+This one check site covers both of what used to be two separate
+concerns: draining the ready-queue while the loop is busy, and waking up
+from an idle block. `run_impl()`'s own `for (;;)` loop calls
+`drain_ready()` immediately after `platform::instance().interruptible_sleep_until()`/
+`fire_ready_timers()` return, so an external wake that arrived while the
+loop was blocked is picked up there without a second, separate call.
+
+`platform::interface::sleep_until()` was renamed to
+`interruptible_sleep_until()` as part of this design, with a changed
+contract: it *may* return before `deadline`, for any reason including
+none - a caller must always re-check `uptime()` against `deadline`, never
+assume it passed just because the call returned. `platform::interface::
+wake(WakeId)`/`wake_all()` are the paired hooks a backend implements to
+make early return meaningful: `hosted_stdcpp` uses a real
+`condition_variable`, `estwasm` reuses the same `Atomics.wait()`/
+`Atomics.notify()` primitive it already had, and `estpico` needs nothing
+extra at all - a real hardware interrupt already unblocks a bare-metal
+`wfi` for free, so its `wake()`/`wake_all()` are genuine no-ops. `WakeId`
+is an opaque, backend-defined value (a core index on a future multi-core
+bare-metal target; irrelevant on every backend that exists today, each
+of which only ever drives one loop per instance) - see `docs/PLAN.md`'s
+issue #125 entry for the full reasoning, including why an earlier
+version of this design routed `wake()` through a captured pointer
+instead, and why that didn't generalize.
 
 ## A stream instead of a value: `est::spsc_ring<T>` (`:sync.spsc_ring`)
 

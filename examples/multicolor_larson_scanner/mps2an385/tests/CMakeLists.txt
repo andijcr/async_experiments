@@ -81,11 +81,22 @@ add_executable(est_mps2an385_tests
   "${CMAKE_CURRENT_SOURCE_DIR}/../src/startup.c"
   "${CMAKE_CURRENT_SOURCE_DIR}/../src/test_main.cpp"
   "${EST_TESTS_DIR}/platform_tests.cpp"
+  # platform_thread_tests.cpp excluded, same reasoning as
+  # spsc_ring_thread_tests.cpp below: a real std::jthread, meaningless on
+  # this EST_NO_THREADS target.
   "${EST_TESTS_DIR}/check_tests.cpp"
   "${EST_TESTS_DIR}/intrusive_list_tests.cpp"
   "${EST_TESTS_DIR}/mutex_tests.cpp"
   "${EST_TESTS_DIR}/event_tests.cpp"
   "${EST_TESTS_DIR}/external_event_tests.cpp"
+  # external_event_thread_tests.cpp excluded, same reasoning as
+  # spsc_ring_thread_tests.cpp below: a real std::jthread, meaningless on
+  # this EST_NO_THREADS target. The ISR-driven analog of that same test
+  # is spsc_ring_isr_tests.cpp's own concern (a real interrupt racing
+  # mainline), not this file's - est::external_event<T>'s own atomic
+  # boundary works identically from either an ISR or a real thread, so
+  # spsc_ring_isr_tests.cpp's coverage of that boundary is not duplicated
+  # here.
   "${EST_TESTS_DIR}/spsc_ring_tests.cpp"
   # spsc_ring_thread_tests.cpp excluded (unlike spsc_ring_tests.cpp,
   # above, which is pure single-call-stack logic): it spawns a real
