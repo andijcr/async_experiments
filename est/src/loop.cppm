@@ -458,18 +458,26 @@ public:
   void notify_external() noexcept { pending_external_.store(true, std::memory_order_release); }
 
   // Runs until both the ready-queue and the timer queue are empty - for
-  // tests/examples that shouldn't block forever.
-  void run_until_idle() { run_impl(); }
+  // tests/examples that shouldn't block forever. Returns on that
+  // condition even with a live external-source registration
+  // (register_external() above) still outstanding: "idle" here means
+  // nothing to do *right now*, not "nothing could ever wake this loop
+  // again" - a registered source firing later is exactly the kind of
+  // thing a caller reaching for this method (rather than run()) doesn't
+  // want to block on.
+  void run_until_idle() { run_impl(/*wait_for_external=*/false); }
 
   // The real service loop: drains ready continuations, sleeps until the
-  // next timer deadline, repeats. Currently behaves identically to
-  // run_until_idle() - the difference (blocking indefinitely, kept alive
-  // by a live I/O reactor with more external wakeup sources than timers)
-  // only becomes real once I/O support exists; until then nothing could
-  // ever wake a fully idle loop back up anyway, so returning is the only
-  // sane behavior for both. stop() lets a caller request an even earlier
-  // exit, before the loop would otherwise go idle on its own.
-  void run() { run_impl(); }
+  // next timer deadline (or, with no timer pending but at least one
+  // registered external source - register_external() above - sleeps
+  // with no deadline at all, relying on that source's own notify()/
+  // wake() to interrupt it early), repeats. Genuinely can outlive every
+  // timer now, kept alive by a registered est::external_event<T>
+  // exactly the way this doc comment used to describe as a future
+  // capability - the two methods' behavior now actually differs.
+  // stop() lets a caller request an even earlier exit, before the loop
+  // would otherwise go idle (or block indefinitely) on its own.
+  void run() { run_impl(/*wait_for_external=*/true); }
 
   // Asks run()/run_until_idle() to return after finishing whichever
   // ready continuation it's currently draining, rather than continuing to
@@ -552,7 +560,23 @@ private:
   // Nested pumping isn't a supported use case; this is a debug-checked
   // precondition (est:check) rather than real reentrant-stop()
   // bookkeeping.
-  void run_impl() {
+  // `wait_for_external`: run_until_idle() passes false (its own
+  // documented "nothing to do right now" exit condition never depends
+  // on a registered source that might fire *later*); run() passes true
+  // (its whole point is staying alive for exactly that). With no timer
+  // pending but a registered source and wait_for_external, sleeps with
+  // clock::time_point::max() as the deadline - not a real deadline at
+  // all, just "block until interrupted," relying on
+  // interruptible_sleep_until()'s own contract (may return early for
+  // any reason - platform.cppm) and a registered source's own
+  // notifier().notify() -> wake() to actually interrupt it. Safe across
+  // every backend: hosted_stdcpp's condition_variable::wait_until() and
+  // estwasm's Atomics.wait() both accept an effectively-unbounded
+  // deadline directly; estpico's own arm_dualtimer_oneshot() already
+  // clamps an oversized duration to its 32-bit counter's own max
+  // (~171s) and retries - self-correcting, not a hang, just an
+  // occasional harmless extra wfi if nothing else wakes it first.
+  void run_impl(bool wait_for_external) {
     check(!running_, "est::loop::run()/run_until_idle() called reentrantly");
     running_ = true;
     scope_exit const not_running_guard{[this]() noexcept { running_ = false; }};
@@ -563,10 +587,10 @@ private:
         return;
       }
       const auto deadline = timers_.next_deadline();
-      if (!deadline) {
-        return; // nothing ready, nothing pending - idle, nothing left to do
+      if (!deadline && (!wait_for_external || external_sources_.empty())) {
+        return; // nothing ready, nothing pending, nothing worth waiting on - idle
       }
-      platform::instance().interruptible_sleep_until(*deadline);
+      platform::instance().interruptible_sleep_until(deadline.value_or(clock::time_point::max()));
       fire_ready_timers();
     }
   }

@@ -20,6 +20,17 @@ TEST_CASE("external_event: a real std::jthread producer notifies the loop via no
   // interruptible_sleep_until()) rather than a fake one - a fake clock's
   // sleep never really blocks, so it could never prove wake() actually
   // interrupts a genuinely in-progress wait.
+  //
+  // No floor timer needed: loop::run() (unlike run_until_idle()) now
+  // stays alive on a registered external source alone, even with
+  // nothing else pending (loop.cppm's own run()/run_impl() doc
+  // comments) - this test's whole point is exercising exactly that
+  // path, not working around its earlier absence. The consumer
+  // coroutine below calls loop.stop() once the event resolves; without
+  // that, run() would have no other reason to ever return (bridge stays
+  // registered for the rest of this scope) - the same "no reason left
+  // to wait" state schedule_periodic()-based tests reach via
+  // handle->cancel() instead.
   using namespace std::chrono_literals;
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
@@ -27,31 +38,18 @@ TEST_CASE("external_event: a real std::jthread producer notifies the loop via no
   est::external_event<int> bridge{source, loop};
   auto notifier = bridge.notifier();
 
-  est::stop_source floor_stop;
-  // A real pending timer, deliberately far past this test's own realistic
-  // runtime: without something scheduled, run_impl() would see "nothing
-  // ready, nothing pending" and return immediately, never actually
-  // reaching interruptible_sleep_until() at all - defeating the whole
-  // point of this test. Cancelled by the consumer coroutine below once
-  // the external event resolves - left uncancelled, run_impl() would
-  // just go right back to sleeping out its own remaining deadline once
-  // the external event resolves (fire_ready_timers() only fires timers
-  // actually due), so the early wake() would only shorten the *first*
-  // sleep call rather than this test's overall runtime.
-  auto floor = est::sleep_for(10s, floor_stop.get_token());
-
   int observed = -1;
   // NOLINTBEGIN(cppcoreguidelines-avoid-reference-coroutine-parameters)
   auto consumer_fn = [](est::external_event<int>& bridge_ref,
                         int& observed_ref,
-                        est::stop_source& floor_stop_ref) -> est::future<void> {
+                        est::loop& loop_ref) -> est::future<void> {
     co_await bridge_ref.wait();
     observed_ref = bridge_ref.value();
-    floor_stop_ref.request_stop();
+    loop_ref.stop();
     co_return;
   };
   // NOLINTEND(cppcoreguidelines-avoid-reference-coroutine-parameters)
-  auto consumer = consumer_fn(bridge, observed, floor_stop);
+  auto consumer = consumer_fn(bridge, observed, loop);
 
   // notifier.notify() calls platform::instance().wake() (external_event.cppm's
   // own doc comment on external_notifier explains why that one call is
@@ -81,9 +79,9 @@ TEST_CASE("external_event: a real std::jthread producer notifies the loop via no
 
   REQUIRE(consumer.ready());
   REQUIRE(observed == 42);
-  REQUIRE(floor.ready());
-  REQUIRE(floor.ready_with_failure());
-  // The real proof this was a genuine early wake, not the 10s floor
-  // simply having elapsed on its own: comfortably under it.
+  // The real proof this was a genuine wake rather than a hang that
+  // happened to resolve some other way: comfortably under a generous
+  // bound, with nothing else in this test that could otherwise have
+  // unblocked run().
   REQUIRE(elapsed < 1s);
 }

@@ -8665,3 +8665,61 @@ passes (`env.js_wake` present in the import-section check).
 274/1258), and `larson_scanner_mps2an385` itself still exits 0,
 confirming the renamed/simplified `interruptible_sleep_until()` and the
 new no-op `wake()`/`wake_all()` don't change real firmware behavior.
+
+### Follow-up: `loop::run()` ignored registered external sources entirely
+
+PR #130's own code review (requested alongside opening the PR) caught a
+real bug in the above: `loop::run_impl()`'s exit condition was
+`if (!deadline) { return; }` - a fully idle loop (no ready entries, no
+pending timer) returned immediately regardless of whether an
+`external_event<T>` was registered on it. A loop with nothing but a
+registered external source and no timer therefore never blocked at
+all - `run()` returned instantly instead of waiting to be woken, which
+is exactly the case the whole feature exists for. The review also
+flagged the stale doc comment on `run()` claiming nothing could ever
+wake a fully idle loop back up - no longer true once a registered
+source exists. The review's own evidence was this session's first
+cross-thread test needing a 10s floor timer just to keep `run()` alive
+long enough for the producer thread to fire - a workaround for the bug,
+not a legitimate part of the test.
+
+Fix: `run_until_idle()` and `run()` no longer share one undifferentiated
+exit condition. `run_impl()` gained a `bool wait_for_external`
+parameter - `run_until_idle()` passes `false` (its own documented
+"nothing to do *right now*" contract is unchanged: a registered-but-quiet
+source must never make it block); `run()` passes `true`. The exit
+condition became `if (!deadline && (!wait_for_external ||
+external_sources_.empty())) { return; }` - `run()` now genuinely stays
+alive on a registered external source alone, with no timer pending at
+all. The sleep call itself now passes
+`deadline.value_or(clock::time_point::max())` so it can block
+"indefinitely" (interrupted only by `wake()`/`wake_all()`, or a
+backend-specific spurious wake) when there's no real timer but
+`wait_for_external` requires staying alive - verified `clock::time_point::max()`
+is handled safely by all three backends (`hosted_stdcpp`'s
+`condition_variable::wait_until()`, `estwasm`'s `Atomics.wait()` with an
+enormous timeout, and `estpico`'s own dual-timer 32-bit-tick clamp to
+~171s, which just retries harmlessly).
+
+This changed one existing test's own correctness requirement: the
+cross-thread `external_event` test's floor-timer-plus-`stop_token`
+approach would now deadlock (cancelling the floor timer no longer ends
+`run()` while the source stays registered) - rewritten to have the
+consumer coroutine call `loop.stop()` once the event resolves instead,
+which is what actually ends `run()` now that it can genuinely outlive
+every timer. A new regression test locks in the other half of the fix
+directly: `run_until_idle()` with a registered-but-never-notified source
+still returns promptly rather than hanging.
+
+Re-verified the entire pipeline in the devenv container after the fix:
+`clang-format` clean; `default` preset build+`ctest` (339/339, no
+hangs); `sanitize` preset build+`ctest` (282/282); `ci` preset
+build+`clang-tidy` (clean on every file this change touches; the only
+`clang-tidy` errors are pre-existing ones on `estwasm`/`estpico`-only
+sources the `ci` preset doesn't build, unrelated to this change)+`ctest`
+(339/339)+coverage gate (92%, `loop.cppm` and `external_event.cppm`
+both 100% on their new-code diff); `web`'s wasm32 build+smoke test
+(`env.js_wake` present, worker loop ticks, cross-instance shared memory
+visible); `mps2an385`'s cross-compile build+QEMU run (280 test
+cases/1271 assertions, up from 279/1270) and `larson_scanner_mps2an385`
+still exits 0 under QEMU.

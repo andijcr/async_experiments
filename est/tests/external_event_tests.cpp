@@ -300,3 +300,23 @@ TEST_CASE("external_event: multiple loop-registered sources all get polled off o
   REQUIRE(bridge1.value() == 1);
   REQUIRE(bridge2.value() == 2);
 }
+
+TEST_CASE(
+    "external_event: run_until_idle() returns promptly even with a registered source that never "
+    "fires",
+    "[external_event]") {
+  // Locks in the distinction loop::run_impl()'s own `wait_for_external`
+  // parameter (est:loop) exists for: a registered-but-quiet source must
+  // never make run_until_idle() block - its own documented contract is
+  // "nothing to do *right now*," not "nothing could ever wake this loop
+  // again." Only run() (est/tests/external_event_thread_tests.cpp's own
+  // cross-thread test) is meant to stay alive on a registered source
+  // alone. If this test ever hangs, that distinction broke.
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+  std::atomic<int> source{0};
+  est::external_event<int> bridge{source, loop}; // registered, never notified
+
+  loop.run_until_idle();
+  SUCCEED("run_until_idle() returned without blocking on the registered-but-quiet source");
+}

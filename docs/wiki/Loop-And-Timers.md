@@ -1035,15 +1035,23 @@ test that actually crosses it.
 
 ## `run()` vs. `run_until_idle()`, and `stop()`
 
-Both currently do exactly the same thing — drain ready work, sleep until the
-next deadline, repeat, until idle (no ready work and no pending timers) or
-`stop()` is called. The difference the design anticipates (`run()` blocking
-indefinitely, kept alive by a live I/O reactor with more wakeup sources than
-timers) only becomes real once I/O support exists. Until then nothing
-could ever wake a fully idle loop back up anyway (no I/O,
-single-threaded), so returning is the only sane behavior for either
-name. This is documented as a stated fact in the code rather than left
-implicit.
+Both drain ready work and sleep until the next deadline, repeat, until
+`stop()` is called — but they now genuinely diverge on when "idle" ends
+the loop, because a registered `external_event<T>` (see "Bridging
+external writers" above) gives a loop a real reason to stay alive with
+no timer pending at all. `run_impl()` takes a `bool wait_for_external`:
+`run_until_idle()` passes `false` — its contract stays "return as soon
+as there's nothing to do *right now*," unaffected by any registered
+source that just hasn't fired yet, matching every existing caller's
+expectations. `run()` passes `true` — it now only returns when there is
+neither a pending timer *nor* any registered external source at all
+(`external_sources_.empty()`); with a source registered, `run()` blocks
+on `interruptible_sleep_until(clock::time_point::max())` (interrupted
+only by `wake()`/`wake_all()`, or a harmless backend-specific spurious
+wake) rather than returning immediately. This is the real difference the
+two names always implied; it just needed a genuine wakeup source other
+than a timer to become observable, and `external_event<T>`'s loop
+registration is the first thing in this codebase that provides one.
 
 `stop()` sets a flag checked after every continuation and every ready-queue
 drain pass — it's how a caller asks the loop to return early, before it
