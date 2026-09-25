@@ -34,7 +34,7 @@ export namespace est::platform {
 
 // A framework-owned vocabulary clock, deliberately not
 // std::chrono::steady_clock itself: no variant of the ARM bare-metal
-// toolchain estpico builds against (arm-none-eabi's own prebuilt libc++)
+// toolchain estmsp builds against (arm-none-eabi's own prebuilt libc++)
 // provides it at all - every one is built with
 // _LIBCPP_HAS_NO_MONOTONIC_CLOCK, which removes std::chrono::steady_clock's
 // class declaration entirely, not just its implementation, so there's no
@@ -51,7 +51,7 @@ export namespace est::platform {
 // dispatch to whichever backend is installed), and each backend's own
 // uptime() override is free to source the value however it likes (real
 // std::chrono::steady_clock::now() for hosted_stdcpp, a JS import for
-// platform_wasm, a hardware timer for estpico) - clock itself is purely a
+// platform_wasm, a hardware timer for estmsp) - clock itself is purely a
 // vocabulary type identifying "the time_point/duration platform::interface
 // speaks in," not a working clock any code calls into on its own. The name
 // deliberately isn't now(): every implementation of this method returns a

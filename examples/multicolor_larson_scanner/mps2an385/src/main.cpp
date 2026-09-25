@@ -1,5 +1,5 @@
 import est;
-import estpico;
+import estmsp;
 import larson_scanner;
 import larson_scanner_app;
 import std;
@@ -50,7 +50,7 @@ constexpr float led_on_threshold = 0.3F;
 } // namespace
 
 auto main() -> int {
-  estpico::platform_mps2an385 platform_instance;
+  estmsp::platform_mps2an385 platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
 
   // width == 8: this board has exactly 8 real LEDs (mps2-scc, issue #123

@@ -34,17 +34,17 @@ set(EST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 set(EST_BUILD_TESTS OFF)
 add_subdirectory("${EST_ROOT}/est" "${CMAKE_CURRENT_BINARY_DIR}/est")
 
-# --- estpico: this build's own platform::interface backend ---
-add_library(estpico STATIC)
-target_sources(estpico
+# --- estmsp: this build's own platform::interface backend ---
+add_library(estmsp STATIC)
+target_sources(estmsp
   PUBLIC
     FILE_SET CXX_MODULES
-    BASE_DIRS "${EST_ROOT}/estpico/src"
+    BASE_DIRS "${EST_ROOT}/estmsp/src"
     FILES
-      "${EST_ROOT}/estpico/src/platform_mps2an385.cppm"
+      "${EST_ROOT}/estmsp/src/platform_mps2an385.cppm"
 )
-target_compile_features(estpico PUBLIC cxx_std_23)
-target_link_libraries(estpico PUBLIC est)
+target_compile_features(estmsp PUBLIC cxx_std_23)
+target_link_libraries(estmsp PUBLIC est)
 
 # --- larson_scanner / larson_scanner_app: unmodified, reused straight
 # from the terminal example's own sources - matching web/CMakeLists.txt's
@@ -74,7 +74,7 @@ target_link_libraries(larson_scanner_app PUBLIC est larson_scanner)
 # table (src/startup.c) plus src/link.ld (INCLUDE picolibcpp.ld - see
 # that file's own top comment) instead of any hosted CRT.
 add_executable(larson_scanner_mps2an385 src/startup.c src/main.cpp)
-target_link_libraries(larson_scanner_mps2an385 PRIVATE est estpico larson_scanner larson_scanner_app)
+target_link_libraries(larson_scanner_mps2an385 PRIVATE est estmsp larson_scanner larson_scanner_app)
 target_link_options(larson_scanner_mps2an385 PRIVATE
   "-T${CMAKE_CURRENT_SOURCE_DIR}/src/link.ld")
 set_target_properties(larson_scanner_mps2an385 PROPERTIES LINK_DEPENDS

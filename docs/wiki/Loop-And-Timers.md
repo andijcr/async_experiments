@@ -859,7 +859,7 @@ itself uses, via `platform::override_instance()`) - the same
 requirement any thread driving an `est::loop` already has. An ISR
 doesn't need this on a single-core bare-metal target: it shares the
 loop thread's own TLS block by construction, confirmed empirically
-against `estpico`.
+against `estmsp`.
 
 ### The shared pending-external flag, and `interruptible_sleep_until()`
 
@@ -891,7 +891,7 @@ assume it passed just because the call returned. `platform::interface::
 wake(WakeId)`/`wake_all()` are the paired hooks a backend implements to
 make early return meaningful: `hosted_stdcpp` uses a real
 `condition_variable`, `estwasm` reuses the same `Atomics.wait()`/
-`Atomics.notify()` primitive it already had, and `estpico` needs nothing
+`Atomics.notify()` primitive it already had, and `estmsp` needs nothing
 extra at all - a real hardware interrupt already unblocks a bare-metal
 `wfi` for free, so its `wake()`/`wake_all()` are genuine no-ops. `WakeId`
 is an opaque, backend-defined value (a core index on a future multi-core
@@ -1050,7 +1050,7 @@ matching this codebase's established convention
 requires `try_push()`/`try_pop()` never run concurrently with themselves,
 not that they run on genuinely different threads to be exercised
 correctly. That's also what lets this file (unlike the two below) build
-and run on `estpico`'s bare-metal `mps2an385` target, which has no
+and run on `estmsp`'s bare-metal `mps2an385` target, which has no
 `<thread>` at all.
 
 Real concurrent access gets its own, separate coverage instead, one
@@ -1066,7 +1066,7 @@ from `mps2an385`. That target gets its own analogous coverage instead:
 races a real hardware interrupt (self-triggered via the NVIC's own
 Interrupt Set-Pending Register, not a real peripheral) against a
 mainline producer - the actual cross-context hazard this backend faces
-in production (`estpico::enqueue_output()`'s mainline producer racing
+in production (`estmsp::enqueue_output()`'s mainline producer racing
 `UART0_TX_Handler`'s ISR consumer, above). `spsc_ring<T>` is the one
 type in this codebase whose whole contract is a real cross-context
 handoff, so on every target that can express one at all, it earns a

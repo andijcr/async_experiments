@@ -1,15 +1,16 @@
-export module estpico;
+export module estmsp;
 
 import est;
 import std;
 
-// estpico: a fourth est::platform::interface backend, a wholly separate
+// estmsp: a fourth est::platform::interface backend, a wholly separate
 // module from est/estext/estwasm (mirroring their own split - see
 // estwasm/src/platform_wasm.cppm's top comment). The "bare metal" here is
 // QEMU's mps2-an385 machine (an emulated ARM MPS2 FPGA image, single
 // Cortex-M3, not real hardware and not a Raspberry Pi Pico/RP2040 - see
-// docs/PLAN.md's estpico entry for why the target changed and why the
-// module kept its original name).
+// docs/PLAN.md's estpico entry for why the target changed, and its later
+// rename entry for why the module (originally `estpico`) is named `estmsp`
+// now).
 //
 // Every method below routes through a real, memory-mapped piece of
 // hardware - CMSDK APB UART0 (0x40004000, confirmed via `info mtree` in
@@ -37,7 +38,7 @@ import std;
 // uart_write() every character - see enqueue_output()'s own doc comment
 // for the full design and why assert_failure() deliberately does *not*
 // use it.
-namespace estpico::detail {
+namespace estmsp::detail {
 
 constexpr std::uint32_t uart0_base = 0x40004000U;
 constexpr std::uint32_t uart0_data = uart0_base + 0x00U;
@@ -112,7 +113,7 @@ static_assert(1'000'000'000ULL % dualtimer_hz == 0, "must divide 1e9 evenly for 
 // coroutines interleaved at a co_await" case est::mutex exists for
 // (CLAUDE.md's "single-threaded, no atomics... don't add locking/atomics
 // speculatively" doesn't cover this - it isn't speculative here).
-// estpico::detail-local, not part of est itself: this is a
+// estmsp::detail-local, not part of est itself: this is a
 // platform-specific hazard, not a framework-wide one. Safe to nest (the
 // inner guard's destructor restores "still masked," not "unmasked") -
 // several call sites below rely on that rather than each having to know
@@ -627,7 +628,7 @@ constexpr std::uint32_t adp_stopped_application_exit = 0x20026U;
   }
 }
 
-} // namespace estpico::detail
+} // namespace estmsp::detail
 
 // startup.c's own vector table (a C translation unit) references this by
 // name at slot 15 (SysTick) instead of Default_Handler - extern "C" gives
@@ -642,7 +643,7 @@ extern "C" void SysTick_Handler() noexcept { // NOLINT(readability-identifier-na
   // plain read/add/write instead, still one indivisible operation from
   // this single-core ISR's own point of view (nothing else ever writes
   // this variable).
-  estpico::detail::systick_wrap_count = estpico::detail::systick_wrap_count + 1U;
+  estmsp::detail::systick_wrap_count = estmsp::detail::systick_wrap_count + 1U;
 }
 
 // startup.c's own vector table references this by name too, at slot
@@ -650,7 +651,7 @@ extern "C" void SysTick_Handler() noexcept { // NOLINT(readability-identifier-na
 // module's own UART0 register comment above), the same extern "C"
 // linkage split SysTick_Handler above already has.
 extern "C" void UART0_TX_Handler() noexcept { // NOLINT(readability-identifier-naming)
-  estpico::detail::pump_uart_hardware();
+  estmsp::detail::pump_uart_hardware();
 }
 
 // startup.c's own vector table references this at slot 16+10 (IRQ10 -
@@ -660,10 +661,10 @@ extern "C" void UART0_TX_Handler() noexcept { // NOLINT(readability-identifier-n
 // UART TX interrupt did) and, by virtue of being serviced at all, wake
 // interruptible_sleep_until()'s own `wfi` - nothing else needs to happen here.
 extern "C" void DualTimer_Handler() noexcept { // NOLINT(readability-identifier-naming)
-  estpico::detail::mmio32(estpico::detail::t1_intclr) = 1U;
+  estmsp::detail::mmio32(estmsp::detail::t1_intclr) = 1U;
 }
 
-export namespace estpico {
+export namespace estmsp {
 
 class platform_mps2an385 final : public est::platform::interface {
 public:
@@ -780,7 +781,7 @@ public:
     const auto elapsed = uptime() - stall_start_;
     if (elapsed > threshold) {
       est::platform::printdbg(
-          "estpico: a continuation took {}ms (> {}ms threshold) to run",
+          "estmsp: a continuation took {}ms (> {}ms threshold) to run",
           std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(),
           std::chrono::duration_cast<std::chrono::milliseconds>(threshold).count());
     }
@@ -804,4 +805,4 @@ inline void request_uart_tx_pump_stop() noexcept {
   detail::pump_stop_source().request_stop();
 }
 
-} // namespace estpico
+} // namespace estmsp
