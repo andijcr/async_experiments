@@ -256,11 +256,23 @@ void enqueue_ready(detail::ready_node& node) noexcept {
 `run_until_idle()`/`run()` drain the whole `ready_queues` array via
 `drain_ready()`, delegating the actual "which level next" decision to
 `scheduler_` (a `std::function<detail::ready_node*(ready_queues&)>` - see
-below):
+below). Two checks run at the top of every iteration before that:
+`poll_external_if_pending()` (a registered `external_event<T>` may have
+changed - see "Bridging external writers" below) and
+`poll_timers_if_due()` (a pending timer's deadline may have already
+passed - see "Timers" below); both only ever append a newly-ready
+continuation to `ready_`, the same way `enqueue_ready()` itself does,
+never run one inline ahead of whatever a level's queue already holds:
 
 ```cpp
 void drain_ready() {
-  while (auto* node = scheduler_(ready_)) {
+  for (;;) {
+    poll_external_if_pending();
+    poll_timers_if_due();
+    auto* node = scheduler_(ready_);
+    if (node == nullptr) {
+      return;
+    }
     run_one(*node);
     if (stop_requested_) {
       return;
@@ -540,33 +552,52 @@ ever happened, but compiles away entirely under `NDEBUG` — the ordering
 above is what makes the desync unreachable in the first place, not just
 debug-detected.
 
-`run_impl()`'s main loop sleeps for exactly as long as the *next* deadline,
-then fires everything that's ready:
+`run_impl()`'s main loop sleeps for exactly as long as the *next* deadline
+(or indefinitely, kept alive only by a registered external source - see
+"`run()` vs. `run_until_idle()`" below), then loops back to `drain_ready()`:
 
 ```cpp
-void run_impl() {
+void run_impl(bool wait_for_external) {
   ...
   for (;;) {
     drain_ready();
     if (stop_requested_) { return; }
     const auto deadline = timers_.next_deadline();
-    if (!deadline) { return; }                        // idle - nothing left to do
-    platform::instance().sleep_until(*deadline);
-    fire_ready_timers();
+    if (!deadline && (!wait_for_external || external_sources_.empty())) {
+      return; // nothing ready, nothing pending, nothing worth waiting on
+    }
+    platform::instance().interruptible_sleep_until(deadline.value_or(clock::time_point::max()));
   }
 }
 ```
 
-`platform::instance().sleep_until()` is why a test doesn't have to actually
-wait real wall-clock time for a timer-driven test to complete: a fake
-platform overrides it to advance its own fake clock instantly instead of
-blocking (mirroring the same seam `uptime()`/`assert_failure()` already use —
-see `est/tests/loop_tests.cpp`'s `fake_platform`). `fire_ready_timers()`
-pops every timer whose deadline has passed, looks it up in `pending_timers_`
-to find its node, and calls `fire()` — which for a `sleep_for()`-created
-node just does `prom.set_value()`, which in turn triggers `future_state<
-void>::complete()`, which enqueues *its* continuations onto the same
-ready-queue `drain_ready()` will pick up on the loop's next iteration.
+`platform::instance().interruptible_sleep_until()` is why a test doesn't
+have to actually wait real wall-clock time for a timer-driven test to
+complete: a fake platform overrides it to advance its own fake clock
+instantly instead of blocking (mirroring the same seam `uptime()`/
+`assert_failure()` already use — see `est/tests/loop_tests.cpp`'s
+`fake_platform`). There's no explicit `fire_ready_timers()` call here any
+more, unlike an earlier version of this loop: `drain_ready()`'s own
+`poll_timers_if_due()` (above) is unconditionally the first thing its
+loop does on the very next iteration, so whatever just woke this sleep
+gets picked up there instead - one call site for firing timers, not two.
+`fire_ready_timers()` itself is unchanged: it pops every timer whose
+deadline has passed, looks it up in `pending_timers_` to find its node,
+and calls `fire()` — which for a `sleep_for()`-created node just does
+`prom.set_value()`, which in turn triggers `future_state<void>::
+complete()`, which enqueues *its* continuations onto the same ready-queue
+`drain_ready()`'s own loop is already mid-iteration on, so they're picked
+up without waiting for a separate pass.
+
+Because `poll_timers_if_due()` runs every `drain_ready()` iteration, not
+just once `ready_` finally empties, a due timer no longer waits behind an
+arbitrarily long (or self-replenishing) chain of ready-queue work the way
+it used to: a continuation that keeps re-enqueuing more ready work used
+to starve `fire_ready_timers()` of ever running at all, since it was only
+ever reached *after* `drain_ready()` returned. Firing a timer mid-drain
+only ever appends its continuation to `ready_`, exactly like an external
+source's own `poll()` call already does - it never preempts whatever that
+priority level's queue already holds, just joins the back of it.
 
 ### `cancel_timer()`: pulling a still-pending registration out early
 

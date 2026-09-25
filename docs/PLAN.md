@@ -8723,3 +8723,89 @@ both 100% on their new-code diff); `web`'s wasm32 build+smoke test
 visible); `mps2an385`'s cross-compile build+QEMU run (280 test
 cases/1271 assertions, up from 279/1270) and `larson_scanner_mps2an385`
 still exits 0 under QEMU.
+
+### Follow-up: `drain_ready()` could starve a due timer behind a long ready-queue chain
+
+A design conversation right after the above landed noticed a second,
+distinct gap in the same area: `drain_ready()`'s own `for(;;)` loop never
+returns until `ready_` is completely empty, and `fire_ready_timers()` was
+only ever called *after* that - once from `run_impl()`, right after
+`interruptible_sleep_until()`. A chain of continuations that keeps
+re-enqueuing more ready work (each one's own `.then()` landing on an
+already-fulfilled future, itself re-registering another) therefore kept
+`drain_ready()` from ever returning, which kept a due timer - even one
+already past its deadline - from ever getting a chance to fire, for
+however long that chain took to finally run dry. Unlike the `run()`/
+`run_until_idle()` gap above (a loop that should stay blocked, but
+returned instead), this was a loop that stays *busy*, never idle, so it
+never even reaches the sleep/deadline check at all.
+
+Two designs were discussed for fixing it. The first - proposed by the
+user - has the platform itself arm a real out-of-band alarm for the next
+timer deadline (a background OS thread on hosted/wasm; the hardware timer
+interrupt already driving `estpico`'s `wfi` reused directly, unconditionally,
+on bare metal) and have it call `notify_external()`/`wake()`, the exact
+mechanism issue #125 built for a genuinely external producer (another
+thread, an ISR) that can't otherwise touch loop state. That's elegant on
+`estpico` specifically - the interrupt already fires regardless of what
+the CPU is doing, so its ISR could call `notify_external()` for free, no
+new thread, no rearming logic beyond what the timer hardware already
+does. But on hosted/wasm it isn't free: nothing fires "for free" while
+the CPU stays busy, so it would need a real background thread/worker
+whose only job is "sleep until the next deadline, then notify" -
+rearmed on every `schedule_timer()`/`cancel_timer()` call that changes
+the earliest deadline - real synchronization machinery, cutting against
+this codebase's stated single-threaded-except-`external_event<T>`'s-one-
+deliberate-exception design (`CLAUDE.md`), to solve a problem that's
+purely "the busy loop needs to glance at a heap-top comparison it
+already owns." Recorded as issue #131 for the record rather than
+built - worth reconsidering specifically for `estpico`, where the
+hardware-interrupt version is nearly free, but not worth the
+per-backend thread/rearming cost everywhere else just for this.
+
+The version actually implemented: a new `loop::poll_timers_if_due()`,
+checked at the top of every `drain_ready()` iteration right alongside
+the already-existing `poll_external_if_pending()` - the same checkpoint,
+extended to cover both a registered external source and a due timer.
+`timers_.empty()` guards it (a plain size check, no `platform::instance()`
+call at all) so it costs nothing when no timer is outstanding; once one
+is, it calls the existing `fire_ready_timers()` (unchanged internally -
+still just `now = uptime()` then drains everything already due),
+appending any newly-fired timer's continuation onto `ready_` the exact
+same way `poll_external_if_pending()`'s own `poll()` calls already do -
+never running it inline ahead of whatever a priority level's queue
+already holds, just joining the back of it. This bounds worst-case timer
+latency to one ready-node's worth of delay instead of an unbounded (or
+outright unreachable, for a truly infinite chain) wait, without giving a
+due timer any special priority over already-enqueued ready work.
+`run_impl()`'s own `fire_ready_timers()` call after
+`interruptible_sleep_until()` became redundant once this landed -
+removed, so timer-firing now has exactly one call site instead of two,
+the "uniformity" the design conversation was originally chasing.
+
+Verified this doesn't disturb `yield_execution()`'s own "already-ready
+work runs first" guarantee (`est/tests/loop_tests.cpp`), which turned out
+to be moot to begin with: `yield_execution()` was refactored at some
+earlier point to re-enter `ready_` directly via its own
+`promise_resume_node<void>` rather than through a zero-duration
+`sleep_for(0)` (issue #45's original shape) - it never touches `timers_`
+at all any more, so that test's own comment (still describing the old,
+`pending_timers_`-based implementation) was stale; fixed in passing.
+Added a real regression test instead:
+"a long chain of self-re-enqueuing ready work doesn't starve a due
+timer" - a `fake_platform` (a clock that only advances via
+`interruptible_sleep_until()`, so a `sleep_for(0s)` timer's deadline
+stays "due" for as long as a 500-round self-re-enqueuing `.then()` chain
+keeps `ready_` non-empty) proves the timer's own continuation runs at
+tick 2, not tick 500 - confirmed to actually fail against the pre-fix
+code first (`500 < 500`, i.e. the timer only fired after the entire
+chain had already drained), then pass against the fix.
+
+Re-verified the full pipeline again in the devenv container:
+`clang-format` clean; `default` preset build+`ctest` (340/340);
+`sanitize` preset build+`ctest` (283/283); `ci` preset
+build+`clang-tidy` (clean on both changed files)+`ctest` (340/340)+
+coverage gate (93%, `loop.cppm` 100% on its new-code diff); `web`'s
+wasm32 build+smoke test; `mps2an385`'s cross-compile build+QEMU run
+(281 test cases/1275 assertions, up from 280/1271) and
+`larson_scanner_mps2an385` still exits 0 under QEMU.

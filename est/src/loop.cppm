@@ -591,19 +591,37 @@ private:
         return; // nothing ready, nothing pending, nothing worth waiting on - idle
       }
       platform::instance().interruptible_sleep_until(deadline.value_or(clock::time_point::max()));
-      fire_ready_timers();
+      // No fire_ready_timers() call here - drain_ready()'s own
+      // poll_timers_if_due(), below, is unconditionally the first thing
+      // its loop does, so the timer(s) that just woke this sleep are
+      // picked up there instead, the same way an early external wake
+      // already was even before this change.
     }
   }
 
-  // poll_external_if_pending() is checked at the top of every iteration,
-  // not as a separate step after interruptible_sleep_until() above - this
-  // one call site already covers both: drain_ready() is unconditionally
-  // re-entered as the very first thing run_impl()'s own loop does once
-  // interruptible_sleep_until()/fire_ready_timers() return, so an early
-  // wake is picked up here without a second, separate check.
+  // poll_external_if_pending()/poll_timers_if_due() are both checked at
+  // the top of every iteration, not as separate steps after
+  // interruptible_sleep_until() above - one shared checkpoint covers
+  // both a registered external source and a due timer, whether the loop
+  // just woke from a real sleep or is mid-drain of a long or
+  // self-replenishing ready-queue chain. That second case is exactly
+  // what poll_timers_if_due() (below) exists for: without a per-iteration
+  // timer check, a chain of continuations that keeps re-enqueuing more
+  // ready work keeps this for(;;) loop from ever returning, and a timer
+  // due partway through would never get a chance to fire (its own
+  // deadline read here, below) until the chain finally ran dry - starving
+  // it for however long that takes, unboundedly for a chain that never
+  // does. Checking every iteration bounds that to one ready-node's worth
+  // of delay instead, matching how a registered external source is
+  // already treated, without giving a due timer any special priority
+  // over already-enqueued ready work: firing it here only appends its
+  // continuation to ready_ (fire_ready_timers() below, same as
+  // poll_external_if_pending()'s own poll() calls do) - it never runs
+  // inline ahead of whatever this level's queue already holds.
   void drain_ready() {
     for (;;) {
       poll_external_if_pending();
+      poll_timers_if_due();
       auto* node = scheduler_(ready_);
       if (node == nullptr) {
         return;
@@ -630,6 +648,31 @@ private:
     }
     for (auto* source : external_sources_) {
       source->poll();
+    }
+  }
+
+  // Checked whether or not anything is pending, same as
+  // poll_external_if_pending() above - free (no platform::instance() call
+  // at all) in the common case nothing is scheduled, since timers_.empty()
+  // is a plain size check. Only once at least one timer is outstanding
+  // does this pay for fire_ready_timers()'s own uptime() read, once per
+  // ready-queue iteration rather than once per sleep/wake cycle - the
+  // deliberate cost of closing the starvation gap drain_ready()'s own
+  // doc comment above describes. No new state needed for this, unlike
+  // pending_external_: unlike an external source (which needs an
+  // atomic flag precisely because it can be touched from a context that
+  // can't safely walk external_sources_/enqueue_ready() itself - another
+  // thread, an ISR), a due timer is purely a fact about timers_ (loop-
+  // owned, loop-thread-only) crossed with the platform clock - both
+  // already synchronously readable from right here, no notify()/wake()
+  // indirection required. fire_ready_timers() itself only ever appends
+  // newly-due timers' continuations onto ready_ (never runs one inline),
+  // so calling it mid-drain never lets a timer jump ahead of whatever
+  // this level's queue already holds - it only ever joins the back of it,
+  // the same as an external source's own poll() already does.
+  void poll_timers_if_due() {
+    if (!timers_.empty()) {
+      fire_ready_timers();
     }
   }
 
