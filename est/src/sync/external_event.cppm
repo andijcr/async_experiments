@@ -4,7 +4,6 @@ import std;
 import :check;
 import :future;
 import :loop;
-import :platform;
 import :sync.event;
 
 export namespace est {
@@ -27,9 +26,10 @@ export namespace est {
 // time, sidesteps the question entirely rather than depending on
 // whichever platform::instance() the *calling* context happens to
 // resolve. notify() itself only ever touches loop::notify_external()
-// (a single atomic store) and platform::instance().wake() (resolved
-// fresh, deliberately, wherever notify() actually runs - see wake()'s
-// own doc comment in platform.cppm for why that one *is* meant to be
+// (est:loop) - which itself does the atomic store *and* the
+// platform::instance().wake() call, resolved fresh, deliberately,
+// wherever notify_external() actually runs (see wake()'s own doc
+// comment in platform.cppm for why that one *is* meant to be
 // thread-local-dispatched) - both already documented safe to call from
 // any context that can call anything at all.
 //
@@ -49,10 +49,7 @@ export namespace est {
 // docs/PLAN.md's issue #125 entry), so nothing extra is needed.
 class external_notifier {
 public:
-  void notify() const noexcept {
-    owner_->notify_external();
-    platform::instance().wake(owner_->id());
-  }
+  void notify() const noexcept { owner_->notify_external(); }
 
 private:
   template <class T>

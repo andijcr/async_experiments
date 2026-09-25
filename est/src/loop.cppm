@@ -449,13 +449,27 @@ public:
     std::erase(external_sources_, &source);
   }
 
-  // Flags "at least one registered external_source may have changed" -
-  // called by est::external_notifier (est:sync.external_event), safe
-  // from any context that can touch a std::atomic<bool> at all
-  // (mainline, another thread, an ISR). Never blocks, never itself walks
-  // external_sources_ - poll_external_if_pending() below does that, on
-  // the loop thread only, the next time drain_ready() checks.
-  void notify_external() noexcept { pending_external_.store(true, std::memory_order_release); }
+  // Flags "at least one registered external_source may have changed" and
+  // pokes the platform in case this loop is currently blocked in
+  // interruptible_sleep_until() - called by est::external_notifier
+  // (est:sync.external_event), safe from any context that can call
+  // anything at all (mainline, another thread, an ISR): the atomic store
+  // is safe by construction, and platform::instance().wake() is
+  // documented safe from any context too (its own doc comment,
+  // platform.cppm) - deliberately resolved fresh here, on whichever
+  // thread/core is actually calling notify_external(), not through a
+  // captured pointer (docs/PLAN.md's issue #125 entry has the full
+  // reasoning for why that dispatch has to work this way). Waking a loop
+  // that isn't currently sleeping is a harmless no-op, not a hazard -
+  // the same "may wake early for any reason" contract every other
+  // wake()/interruptible_sleep_until() caller already tolerates. Never
+  // blocks, never itself walks external_sources_ -
+  // poll_external_if_pending() below does that, on the loop thread only,
+  // the next time drain_ready() checks.
+  void notify_external() noexcept {
+    pending_external_.store(true, std::memory_order_release);
+    platform::instance().wake(id_);
+  }
 
   // Runs until both the ready-queue and the timer queue are empty - for
   // tests/examples that shouldn't block forever. Returns on that

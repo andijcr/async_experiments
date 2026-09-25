@@ -841,12 +841,17 @@ page's own "structural hazard" section above). `notifier()` fails a
 
 `external_notifier` is a tiny, copyable handle safe to call from any
 context that can call anything at all - an ISR, a real second thread.
-`notify()` does exactly two things: `loop::notify_external()` (a single
-`std::atomic<bool>` store - see "The shared pending-external flag"
-below) and `platform::instance().wake(owner.id())`, resolved fresh
-*wherever `notify()` actually runs* - deliberately not through a pointer
-captured back when `notifier()` was constructed. That distinction
-matters: `platform::instance()` is `thread_local`
+`notify()` forwards straight to `loop::notify_external()`, which itself
+does two things: the `std::atomic<bool>` store (see "The shared
+pending-external flag" below) and `platform::instance().wake(id_)`,
+resolved fresh *wherever `notify_external()` actually runs* -
+deliberately not through a pointer captured back when `notifier()` was
+constructed. (Those two calls used to live split across
+`external_notifier::notify()` and `loop::notify_external()`
+separately - consolidated into the one method once it became clear
+`notify_external()` had exactly one caller and gained nothing from the
+split.) That thread-local-dispatch distinction still matters the same
+way: `platform::instance()` is `thread_local`
 ([Global Lookup Codegen](Global-Lookup-Codegen.md)), so a real producer
 thread calling `notify()` needs its *own* `platform::interface`
 installed first (typically the same backend object the loop thread
@@ -871,9 +876,12 @@ regardless of whether the flag is set).
 This one check site covers both of what used to be two separate
 concerns: draining the ready-queue while the loop is busy, and waking up
 from an idle block. `run_impl()`'s own `for (;;)` loop calls
-`drain_ready()` immediately after `platform::instance().interruptible_sleep_until()`/
-`fire_ready_timers()` return, so an external wake that arrived while the
-loop was blocked is picked up there without a second, separate call.
+`drain_ready()` immediately after `platform::instance().interruptible_sleep_until()`
+returns, so an external wake that arrived while the loop was blocked is
+picked up there without a second, separate call - the same checkpoint
+also covers a due timer now (`poll_timers_if_due()`, "Timers" above),
+so `drain_ready()` is the one place both get noticed, whether the loop
+just woke from a real sleep or is mid-drain of a long ready-queue chain.
 
 `platform::interface::sleep_until()` was renamed to
 `interruptible_sleep_until()` as part of this design, with a changed

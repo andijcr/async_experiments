@@ -8809,3 +8809,29 @@ coverage gate (93%, `loop.cppm` 100% on its new-code diff); `web`'s
 wasm32 build+smoke test; `mps2an385`'s cross-compile build+QEMU run
 (281 test cases/1275 assertions, up from 280/1271) and
 `larson_scanner_mps2an385` still exits 0 under QEMU.
+
+### Follow-up: fold `wake()` into `notify_external()` itself (PR #130 review comment)
+
+A PR review comment on `est/src/sync/external_event.cppm:53` (`external_notifier::notify()`)
+pointed out that `loop::notify_external()` could just call `wake()`
+internally, instead of `external_notifier::notify()` making both calls
+itself. Checked: `notify_external()` had exactly one call site in the
+whole codebase (`external_notifier::notify()`), so the split bought
+nothing - `platform::instance().wake(id_)` still resolves on whichever
+thread actually calls `notify_external()` either way, since a member
+function call doesn't itself hop threads; only where the call
+*originates* (docs/PLAN.md's issue #125 entry) determines that. Folded
+`platform::instance().wake(id_)` into `notify_external()` itself
+(`est/src/loop.cppm`); `external_notifier::notify()` (`est:sync.external_event`)
+is now a one-line forward. Dropped `:platform`'s now-unused import from
+`external_event.cppm` as part of the same change. No behavioral change
+for any existing caller - `notify_external()` now unconditionally does
+what its only caller always immediately followed it up with anyway.
+
+Verified the full pipeline again: `clang-format` clean; `default`
+preset build+`ctest` (340/340); `sanitize` preset build+`ctest`
+(283/283); `ci` preset build+`clang-tidy` (clean on both changed
+files)+`ctest` (340/340)+coverage gate (93%, both changed files 100%
+on their new-code diff); `web`'s wasm32 build+smoke test; `mps2an385`'s
+cross-compile build+QEMU run (281 test cases/1275 assertions,
+unchanged) and `larson_scanner_mps2an385` still exits 0 under QEMU.
