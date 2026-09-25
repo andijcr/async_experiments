@@ -69,7 +69,7 @@ void Default_Handler(void) {
   }
 }
 
-// Defined in estpico's own platform_mps2an385.cppm (extern "C", so these
+// Defined in estmsp's own platform_mps2an385.cppm (extern "C", so these
 // declarations and those definitions agree on linkage) - this backend's
 // own clock/UART-TX state belongs to that module, not to this file, the
 // same split _exit()/gettimeofday() below already have with
@@ -161,7 +161,7 @@ int __cxa_thread_atexit(void (*destructor)(void*), void* object, void* dso_symbo
 // __libcpp_verbose_abort() (libc++.a) wants a real FILE* stderr from
 // picolibc's stdio to fprintf a diagnostic before aborting - not wired
 // up in this project (no stdio backend at all, est's own platform
-// diagnostics go through estpico's UART writer instead), just enough of
+// diagnostics go through estmsp's UART writer instead), just enough of
 // a symbol to link; never actually dereferenced unless verbose_abort's
 // own path runs.
 void* stderr = (void*)0;

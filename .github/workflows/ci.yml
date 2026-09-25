@@ -99,7 +99,7 @@ jobs:
           ${{ env.DEVENV_IMAGE }}
           cmake --build --preset ci
 
-      # estwasm/estpico aren't included here (unlike the clang-format check
+      # estwasm/estmsp aren't included here (unlike the clang-format check
       # above), and examples/multicolor_larson_scanner/web and .../mps2an385
       # are explicitly pruned: all are only ever compiled under their own
       # cross-toolchain (the "wasm"/"mps2an385" jobs below), which each
@@ -107,7 +107,7 @@ jobs:
       # clang-tidy -p build/ci can't use - the hosted build's own database
       # has no entry for them at all (a bare `find est examples` would
       # otherwise reach wasm_exports.cpp/main.cpp, since they're nested
-      # under examples/, and fail hard on `import estwasm`/`import estpico`
+      # under examples/, and fail hard on `import estwasm`/`import estmsp`
       # never resolving). Left as a known, documented gap (docs/PLAN.md's
       # "Issue #99"/"Issue #123" entries) rather than papering over it with
       # a synthetic host-compiled stand-in target.

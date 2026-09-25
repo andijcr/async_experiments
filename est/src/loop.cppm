@@ -586,7 +586,7 @@ private:
   // notifier().notify() -> wake() to actually interrupt it. Safe across
   // every backend: hosted_stdcpp's condition_variable::wait_until() and
   // estwasm's Atomics.wait() both accept an effectively-unbounded
-  // deadline directly; estpico's own arm_dualtimer_oneshot() already
+  // deadline directly; estmsp's own arm_dualtimer_oneshot() already
   // clamps an oversized duration to its 32-bit counter's own max
   // (~171s) and retries - self-correcting, not a hang, just an
   // occasional harmless extra wfi if nothing else wakes it first.

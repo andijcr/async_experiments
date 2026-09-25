@@ -8835,3 +8835,38 @@ files)+`ctest` (340/340)+coverage gate (93%, both changed files 100%
 on their new-code diff); `web`'s wasm32 build+smoke test; `mps2an385`'s
 cross-compile build+QEMU run (281 test cases/1275 assertions,
 unchanged) and `larson_scanner_mps2an385` still exits 0 under QEMU.
+
+### Follow-up: renaming `estpico` to `estmsp`
+
+The Issue #123 entry above already flagged `estpico`'s name as "a
+cosmetic mismatch, not a functional one" once the target moved from a
+Raspberry Pi Pico/RP2040 to QEMU's `mps2-an385` (a Cortex-M3 on an
+emulated ARM MPS2 FPGA image) - kept as-is at the time rather than
+churning the rename mid-implementation. Revisited now: renamed the
+module/directory/namespace/CMake target from `estpico` to `estmsp`,
+matching the board family (`mps2an385`) instead of a chip this backend
+never actually targeted. `estmsp/src/platform_mps2an385.cppm` keeps its
+filename (already named for the board, not the module, the same
+pattern `estwasm/src/platform_wasm.cppm` and `estext/src/hosted_stdcpp.cppm`
+already follow) - only the module/namespace/directory/CMake-target name
+changed. Updated every call site: `examples/multicolor_larson_scanner/
+mps2an385/{CMakeLists.txt,src/main.cpp,src/startup.c,src/test_main.cpp,
+tests/CMakeLists.txt,tests/spsc_ring_isr_tests.cpp}`, `est/src/loop.cppm`
+and `est/src/platform/platform.cppm`'s own doc comments, `est/tests/
+platform_tests.cpp`, `.github/workflows/ci.yml`'s comments, and
+`docs/wiki/Architecture.md`/`docs/wiki/Loop-And-Timers.md`. Left this
+entry and every earlier `estpico` reference above untouched, per this
+file's own "narrates history, not current state" rule - only
+`estmsp/src/platform_mps2an385.cppm`'s own top comment got a forward
+pointer added (to this entry, alongside the still-accurate pointer to
+the original Issue #123 one) so a reader lands here instead of assuming
+the module was never renamed.
+
+Not independently re-verified against the pinned devenv toolchain in
+this pass (no working `docker` daemon available in this environment) -
+this is a pure identifier rename (module/namespace/target name only, no
+logic touched), and every call site was found via `git grep estpico`
+across the whole tracked tree with none left outside historical
+`docs/PLAN.md` narration and the one intentional back-reference above;
+still, the `mps2an385`/`sanitize`/`ci`/`web` pipeline this project
+normally runs before merging should be run for real before this lands.

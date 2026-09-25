@@ -287,7 +287,7 @@ this exact same shape, each its own similarly separate module, never
 touching `estext`: `estwasm` (`estwasm/src/platform_wasm.cppm`, a
 browser's WebAssembly sandbox - routes through `import_module("env")` JS
 imports instead of `std::chrono`/`std::this_thread`/`std::cerr`) and
-`estpico` (`estpico/src/platform_mps2an385.cppm`, QEMU's mps2-an385
+`estmsp` (`estmsp/src/platform_mps2an385.cppm`, QEMU's mps2-an385
 bare-metal ARM machine - routes through the Cortex-M3 core's own SysTick
 timer and a UART peripheral instead; ARM semihosting is kept only for
 reporting a process exit code to whatever's running it, not for anything
@@ -298,7 +298,7 @@ thing every backend module depends on, never the reverse.
 `std::this_thread`, `std::cerr`) `est` itself has no business depending
 on is why it can't be one of `est`'s own partitions in the first place -
 `est` stays usable on a bare-metal target that has none of those (proven
-by `estpico`: no variant of the ARM toolchain it builds against even
+by `estmsp`: no variant of the ARM toolchain it builds against even
 provides `std::chrono::steady_clock` at all -
 `est::platform::clock`, `platform.cppm`'s own doc comment, is the
 framework-owned vocabulary type that made that possible without
@@ -338,16 +338,16 @@ every individual test file.
   plain `int`, and `est::loop` is driven from exactly one call stack. This
   isn't an oversight to fix later; it's a deliberate scope boundary — real
   interrupt-context protection gets added when a backend that actually
-  needs it exists, not speculatively. `estpico` is that case now: its
+  needs it exists, not speculatively. `estmsp` is that case now: its
   SysTick-driven clock is read from mainline/loop code and written from a
   real interrupt handler, and its UART TX is likewise driven by a real
   interrupt (`vprintdbg()`'s own output queues through
   `est::intrusive_list<T>`/`est::spsc_ring<char>`, drained a byte at a
-  time by the TX-complete interrupt), so `estpico::detail::interrupt_guard`
+  time by the TX-complete interrupt), so `estmsp::detail::interrupt_guard`
   (a short `PRIMASK` mask/restore) genuinely guards state an ISR can
   preempt at any point - a different, real hazard from the single-core
   "two coroutines interleaving at a `co_await`" case below, scoped to
-  `estpico` itself rather than added to `est` generally. `est::mutex::lock()`
+  `estmsp` itself rather than added to `est` generally. `est::mutex::lock()`
   *is* real
   protection against that other, still-single-threaded hazard though
   ([Coroutines](Coroutines.md)): two coroutines interleaving at a

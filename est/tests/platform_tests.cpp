@@ -154,9 +154,9 @@ TEST_CASE("hosted_stdcpp's vprintdbg() writes via std::vprint_unicode without th
 
 TEST_CASE("vprintdbg() handles a message longer than any fixed-size internal buffer",
           "[platform]") {
-  // 96 chars > estpico's own 64-byte uart_tx_ring capacity
-  // (estpico/src/platform_mps2an385.cppm). Deliberately *not* exercised
-  // with a real est::loop constructed here: estpico's pump_task_loop() is
+  // 96 chars > estmsp's own 64-byte uart_tx_ring capacity
+  // (estmsp/src/platform_mps2an385.cppm). Deliberately *not* exercised
+  // with a real est::loop constructed here: estmsp's pump_task_loop() is
   // a process-lifetime coroutine, spawned once against whichever loop is
   // current the first time it's needed and never re-spawned afterward
   // (pump_task_started's own doc comment) - a short-lived, per-TEST_CASE
@@ -167,7 +167,7 @@ TEST_CASE("vprintdbg() handles a message longer than any fixed-size internal buf
   // than worked around in a shared, backend-agnostic test file.
   // With no loop current, enqueue_output() instead takes its documented
   // best-effort synchronous path (a single pump_some() call, own doc
-  // comment) - for a message this size on estpico specifically, that
+  // comment) - for a message this size on estmsp specifically, that
   // means only the first ring's worth actually reaches the wire, the
   // rest silently dropped; verified separately, empirically, against a
   // real whole-program loop (docs/PLAN.md's entry for this change).

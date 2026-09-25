@@ -73,7 +73,7 @@ target_compile_definitions(Catch2Baremetal PUBLIC
 target_compile_options(Catch2Baremetal PRIVATE -Wno-unknown-warning-option -Wno-c2y-extensions)
 
 # --- est's own real test suite, reused unmodified from est/tests/ - only
-# test_main.cpp differs (installs estpico::platform_mps2an385 instead of
+# test_main.cpp differs (installs estmsp::platform_mps2an385 instead of
 # estext::hosted_stdcpp; see src/test_main.cpp's own top comment) -
 # everything else here is genuinely backend-agnostic.
 set(EST_TESTS_DIR "${EST_ROOT}/est/tests")
@@ -127,7 +127,7 @@ add_executable(est_mps2an385_tests
   # comment for the full design.
   "${CMAKE_CURRENT_SOURCE_DIR}/spsc_ring_isr_tests.cpp"
 )
-target_link_libraries(est_mps2an385_tests PRIVATE est estpico Catch2Baremetal)
+target_link_libraries(est_mps2an385_tests PRIVATE est estmsp Catch2Baremetal)
 target_link_options(est_mps2an385_tests PRIVATE
   "-T${CMAKE_CURRENT_SOURCE_DIR}/../src/link.ld")
 set_target_properties(est_mps2an385_tests PROPERTIES LINK_DEPENDS

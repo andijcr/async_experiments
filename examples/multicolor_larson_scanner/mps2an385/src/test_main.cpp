@@ -1,12 +1,12 @@
 import est;
-import estpico;
+import estmsp;
 import std;
 
 #define CATCH_CONFIG_RUNNER
 #include <catch2/catch_session.hpp>
 
 // This board's own equivalent of est/tests/test_main.cpp - only this file
-// differs (installing estpico::platform_mps2an385 instead of
+// differs (installing estmsp::platform_mps2an385 instead of
 // estext::hosted_stdcpp); every other test_*.cpp reused from est/tests/
 // is genuinely backend-agnostic (just `import est;`/`import std;` plus
 // Catch2 macros).
@@ -24,10 +24,10 @@ constexpr std::uint32_t uart0_state = uart0_base + 0x04U;
 // CATCH_CONFIG_NOSTDOUT (tests/CMakeLists.txt's own comment) means Catch2
 // itself defines no Catch::cout()/cerr()/clog() at all - the embedding
 // program is expected to supply them. This target has no real stdout
-// (no OS, no stdio backend - estpico's own vprintdbg() writes through
+// (no OS, no stdio backend - estmsp's own vprintdbg() writes through
 // the identical UART0 register pair for the same reason), so this
 // redirects Catch2's own console reporter output through it directly -
-// separate from estpico's own private UART writer (est::platform::
+// separate from estmsp's own private UART writer (est::platform::
 // interface's own diagnostic channel) since Catch2's output is a much
 // higher-volume, unrelated stream that has nothing to do with
 // est::platform::printdbg().
@@ -80,9 +80,9 @@ auto clog() -> std::ostream& {
 // is what actually calls the semihosting SYS_EXIT_EXTENDED that gives
 // this process a real, checkable exit code.
 auto main() -> int {
-  // estpico::platform_mps2an385's own constructor enables UART0 TX - it
+  // estmsp::platform_mps2an385's own constructor enables UART0 TX - it
   // runs before anything below could write through g_uart_stream.
-  estpico::platform_mps2an385 platform_instance;
+  estmsp::platform_mps2an385 platform_instance;
   const auto platform_guard = est::platform::override_instance(platform_instance);
   const std::array<const char*, 1> argv{"est_mps2an385_tests"};
   const int result = Catch::Session().run(1, argv.data());

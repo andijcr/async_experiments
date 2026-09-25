@@ -13,7 +13,7 @@ import std;
 // project's own tests/, not est/tests/, since it needs real NVIC
 // registers - not backend-agnostic.
 //
-// Mirrors the real production shape (estpico::enqueue_output()'s
+// Mirrors the real production shape (estmsp::enqueue_output()'s
 // mainline producer racing UART0_TX_Handler's ISR consumer,
 // platform_mps2an385.cppm) rather than reusing that same UART0 TX
 // interrupt directly: UART0 TX is tied to real hardware timing/state
@@ -51,7 +51,7 @@ constexpr int isr_test_item_count = 500;
 // everything else stays single-threaded" shape (its own header
 // comment). A std::vector's push_back() could reallocate, and heap
 // (de)allocation from interrupt context is exactly the hazard this
-// codebase already hit and fixed for real in estpico's UART TX pump
+// codebase already hit and fixed for real in estmsp's UART TX pump
 // (docs/PLAN.md's ISR-deallocation-bug entry) - a fixed array sidesteps
 // the question entirely instead of relying on a reserve() call never
 // being exceeded. drained_count is std::atomic (not plain int) so the
@@ -108,7 +108,7 @@ TEST_CASE("spsc_ring: a real ISR consumer racing the mainline producer stays cor
     while (!ring.try_push(as_prvalue(i))) {
       // Ring momentarily full: fire the consumer for real instead of
       // spinning blind - matches the real production backpressure shape
-      // (estpico::enqueue_output()'s own retry loop).
+      // (estmsp::enqueue_output()'s own retry loop).
       mmio32(nvic_ispr0) = 1U << gpio0_irqn;
     }
     // Also fire opportunistically on the happy path, not just when
