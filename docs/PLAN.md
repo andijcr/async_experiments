@@ -8998,20 +8998,31 @@ whole "boot2 checksum region + real vector table" story Issue #123's
 own entry flagged as this target's structurally new requirement,
 solved by vendoring `pico-sdk` rather than hand-deriving it.
 
-**Verification caveat, stated plainly**: this session has no working
-`docker` daemon (same gap the `estpico`→`estmsp` rename entry above
-already flagged), so none of the above was run inside the actual pinned
-devenv image. Instead, this image's exact pinned Clang 22.1.8 and CMake
-4.4.0 were installed directly onto this session's own host container
-(mirroring `docker/Dockerfile`'s own steps - same `apt.llvm.org`
-package, same libc++.modules.json symlink workaround, same CMake
-release tarball) and the ARM toolchain/sysroot extracted the same way
-`docker/Dockerfile` now does. This is real evidence the approach works
-against the actual pinned compiler/CMake versions, not a simulation -
-but the real devenv image itself (and therefore the exact
-`docker/Dockerfile` diff added here) has not yet been rebuilt and
-re-verified end-to-end in this pass; that should happen before this
-lands.
+**Verification caveat, stated plainly**: the toolchain spike above was
+first verified by installing this image's exact pinned Clang 22.1.8/
+CMake 4.4.0 directly onto this session's own host container (no working
+`docker` daemon at the time - same gap the `estpico`→`estmsp` rename
+entry above already flagged), mirroring `docker/Dockerfile`'s own steps.
+Once a working `docker` daemon turned out to be available after all
+(just not started), the same build was re-run for real inside a genuine
+container from this project's own `est-devenv:latest` image lineage
+(Clang 22.1.8/CMake 4.4.0 confirmed identical) - `est`, including
+`import std;`, configured and linked cleanly as a real `armv6m` static
+library there too, bind-mounting the host-fetched ARM sysroot rather
+than rebuilding the image (this session's own outbound-HTTPS
+containment blocks fresh `wget`/`git clone` calls from *inside* a
+`docker build`, and working around that by baking this session's own
+proxy credentials into a build layer is out of bounds - reported as a
+real constraint, not routed around). That cached image itself predates
+`docker/Dockerfile`'s own existing armv7m sysroot block (a pre-existing,
+unrelated gap - `/opt/arm-none-eabi-sysroot` doesn't exist in it at
+all, so `mps2an385` can't be regression-checked against it either), so
+the actual `docker/Dockerfile` diff this PR adds - the new armv6m
+`wget`/`tar` extraction - still hasn't been exercised by a real `docker
+build` end to end. That should happen in an environment with real
+outbound network access before this lands, but the toolchain mechanics
+it feeds are now verified against the real pinned compiler/CMake twice
+over, not just simulated.
 
 Remaining work, not yet started: `estrp2040/src/platform_rp2040.cppm`
 (the real `platform::interface` backend: `TIMER`/`ALARM`-backed
