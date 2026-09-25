@@ -1,0 +1,3 @@
+[submodule "examples/rp2040/third_party/pico-sdk"]
+	path = examples/rp2040/third_party/pico-sdk
+	url = https://github.com/raspberrypi/pico-sdk.git

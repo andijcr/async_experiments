@@ -8870,3 +8870,154 @@ across the whole tracked tree with none left outside historical
 `docs/PLAN.md` narration and the one intentional back-reference above;
 still, the `mps2an385`/`sanitize`/`ci`/`web` pipeline this project
 normally runs before merging should be run for real before this lands.
+
+## `estrp2040`, a fifth `platform::interface` backend for real Raspberry Pi Pico (RP2040) hardware
+
+A new request, distinct from Issue #123/`estmsp` above: a
+`platform::interface` backend for *real* RP2040 silicon (not QEMU),
+plus a `pico-sdk`-style Arduino-`Serial`-like USB CDC class with a
+future-returning interface, and a reusable "framework `main()`" that a
+separate future project builds against by supplying only
+`est::future<void> app()`. Two rounds of clarifying questions settled
+the shape: `app()` resolves `est::current_loop()` rather than taking a
+`loop&` parameter (matching every other example in this repo); Serial
+is USB CDC, not a hardware UART; CI runs the third-party
+`matgla/Renode_RP2040` model (its own README confirms no USB emulation,
+so the CDC path itself gets no CI execution coverage, an accepted gap);
+core0 only for this PR, core1 deferred. A first plan draft scoped
+hand-rolling boot2/clock-bring-up/a minimal TinyUSB header subset from
+scratch (the same shape Issue #123's own abandoned RP2040 attempt would
+have needed); the user corrected this early - **vendor the real
+`pico-sdk` and use it directly** - which turned out to be the single
+biggest simplification available: `pico-sdk` ships boot2
+(`src/rp2_common/boot_stage2`), clock/reset bring-up, real hardware
+register/struct headers, and its own TinyUSB integration
+(`pico_stdio_usb`/`tinyusb_device`) already.
+
+Vendored `raspberrypi/pico-sdk` as a pinned submodule
+(`examples/rp2040/third_party/pico-sdk`, tag `2.3.1`) with only its
+`lib/tinyusb` nested submodule initialized (the wireless-only ones -
+`cyw43-driver`/`lwip`/`mbedtls`/`btstack` - are for Pico W, not this
+board, and skipped). `pico-sdk` has real (if under-documented) official
+Clang support: `cmake/preload/toolchains/pico_arm_cortex_m0plus_clang.cmake`
+targets `armv6m-none-eabi` directly - a prior web-research pass (before
+any of this was tried against a real build) had turned up an old forum
+claim that `pico-sdk`'s Clang path only ever worked against
+`LLVM-embedded-toolchain-for-Arm` v14.0.0 specifically; empirically
+false against the current `pico-sdk` (2.3.1) and this repo's own
+pinned v19.1.5 release - that claim was stale.
+
+Getting there needed four real, non-obvious fixes on top of `pico-sdk`'s
+own toolchain file, each confirmed by making the actual failure happen
+and then go away, not theorized in advance:
+
+- **Sysroot layout, not just a sysroot path.** `pico_arm_clang_common.cmake`'s
+  own header search (`find_path(_CLANG_HEADERS_DIR ...)`) runs under
+  `CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY` with `CMAKE_FIND_ROOT_PATH`
+  set to the *compiler's* own directory - an explicit
+  `PICO_COMPILER_SYSROOT` pointed at a sysroot living anywhere else
+  fails that search silently (`find_path` just returns not-found, no
+  useful diagnostic). Fix: lay the vendored ARM toolchain out the same
+  way ARM's own release tarball does - `<root>/bin/{clang,clang++,...}`
+  next to `<root>/lib/clang-runtimes/arm-none-eabi/<variant>` - so the
+  root-path-prefixed search actually lands inside it. `docker/Dockerfile`'s
+  new `/opt/rp2040-toolchain` block follows this shape (symlinks to
+  this image's own pinned Clang under `bin/`, the extracted
+  `armv6m_soft_nofp_exn_rtti` variant under
+  `lib/clang-runtimes/arm-none-eabi/`), unlike the flat extraction the
+  existing `armv7m_soft_nofp_exn_rtti` block uses (that one never goes
+  through this particular search path, since `mps2an385` doesn't use
+  `pico-sdk`'s toolchain file at all).
+- **`-nostdinc++` + explicit sysroot `-isystem`.** `pico-sdk`'s own
+  toolchain file relies on `--sysroot` alone; this image's
+  Debian-packaged `libc++-${LLVM_VERSION}-dev` bakes an absolute
+  `/usr/lib/llvm-${LLVM_VERSION}/include/c++/v1` search path into Clang
+  regardless of `--sysroot`, so without this, `<stdbool.h>` (pulled in
+  via picolibc's own headers) resolved to the *system* libc++'s
+  `__config` instead of the sysroot's own, failing with `"No thread
+  API"` (the system libc++ build assumes a hosted target). Same root
+  cause `toolchain-mps2an385.cmake`'s own `-nostdinc++` already
+  documents for armv7m.
+- **`-fuse-ld=lld`.** `pico-sdk`'s toolchain file leaves linker
+  selection to Clang's default, which on this image resolves to GNU
+  `ld` (bfd) - it doesn't understand the `armelf` emulation Clang
+  requests for this target (`"unrecognised emulation mode: armelf"`).
+- **`--rtlib=compiler-rt --unwindlib=libunwind`.** Without steering
+  Clang away from its GCC-style default runtime, the final link failed
+  with `"unable to find library -lgcc"` - this sysroot ships
+  `clang_rt.builtins`/`libunwind`, not `libgcc`, same as every other
+  bare-metal target in this repo.
+- **`CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY`.** Needed for the
+  same reason `toolchain-mps2an385.cmake` already sets it: a full
+  EXECUTABLE-type ABI-detection try_compile needs a working crt0/linker
+  script, which only exists once a target actually links against
+  `pico-sdk`'s own `pico_standard_link` (a per-target INTERFACE
+  library) - the generic compiler-identification try_compile CMake
+  runs as part of `project()` fails otherwise (`"undefined symbol:
+  __data_start"` from picolibc's `crt0.o`). Confirmed this only bites
+  when `cmake_minimum_required(VERSION 4.4)` is in effect (needed for
+  `import std;`) - an older `cmake_minimum_required` trusts a lesser
+  compile-only probe instead and never hits it, which is why a first,
+  narrower spike missed this before the real `est`-linking project
+  surfaced it.
+
+One more real, `est`-specific issue once `import std;` entered the
+picture: `CMAKE_CXX_STDLIB_MODULES_JSON` was left unset, so CMake
+defaulted to discovering the *system* Clang's own `libc++.modules.json`
+and compiling *that* `std.cppm` - newer than this sysroot's own
+libc++ (its `__config` reports `_LIBCPP_VERSION 190105`, i.e. this ARM
+release bundles LLVM 19.1.5's libc++, two majors behind this image's
+pinned Clang). The system `std.cppm` unconditionally includes
+`<flat_map>`, added to libc++ upstream after 19.1.5 - missing from this
+sysroot outright. Tried papering over just the missing headers with an
+extra fallback `-isystem`; that made it worse, not better (the newer
+`<flat_map>` header transitively re-pulls other newer headers whose
+private ABI macros don't match what the older sysroot's `__config`
+already defined - a real incompatibility, not just a missing file). The
+actual fix, already established by `toolchain-mps2an385.cmake`'s
+identical line and simply missed on a first pass here: point
+`CMAKE_CXX_STDLIB_MODULES_JSON` at *this sysroot's own*
+`lib/libc++.modules.json`, which resolves to `std.cppm`/headers
+generated against the exact same 19.1.5 snapshot the sysroot's compiled
+libraries are - the version question disappears rather than needing a
+workaround, the same way any other cross-compile in this repo already
+works.
+
+With all of that in `cmake/toolchain-rp2040.cmake`, a minimal
+`examples/rp2040/CMakeLists.txt` (`pico_sdk_init()` before `project()`,
+then `add_subdirectory(est)` the same way `mps2an385/CMakeLists.txt`
+already does) built and linked `est` itself - the real module set,
+including `import std;` - as a genuine `armv6m`/ARM static library
+(confirmed via `readelf`, not assumed). A minimal `pico_stdlib`+
+`hardware_timer` executable spike (kept out of the repo, `/tmp`-only)
+also confirmed `pico-sdk`'s own boot2/linker-script machinery produces
+the right real memory layout with zero hand-written boot2/linker code:
+`.boot2` at `0x10000000` sized exactly `0x100` bytes, `.text` starting
+at `0x10000100` immediately after, RAM sections at `0x20000000` - the
+whole "boot2 checksum region + real vector table" story Issue #123's
+own entry flagged as this target's structurally new requirement,
+solved by vendoring `pico-sdk` rather than hand-deriving it.
+
+**Verification caveat, stated plainly**: this session has no working
+`docker` daemon (same gap the `estpico`→`estmsp` rename entry above
+already flagged), so none of the above was run inside the actual pinned
+devenv image. Instead, this image's exact pinned Clang 22.1.8 and CMake
+4.4.0 were installed directly onto this session's own host container
+(mirroring `docker/Dockerfile`'s own steps - same `apt.llvm.org`
+package, same libc++.modules.json symlink workaround, same CMake
+release tarball) and the ARM toolchain/sysroot extracted the same way
+`docker/Dockerfile` now does. This is real evidence the approach works
+against the actual pinned compiler/CMake versions, not a simulation -
+but the real devenv image itself (and therefore the exact
+`docker/Dockerfile` diff added here) has not yet been rebuilt and
+re-verified end-to-end in this pass; that should happen before this
+lands.
+
+Remaining work, not yet started: `estrp2040/src/platform_rp2040.cppm`
+(the real `platform::interface` backend: `TIMER`/`ALARM`-backed
+`uptime()`/`interruptible_sleep_until()`/`wake()`, UART0-backed
+`vprintdbg()`/`assert_failure()`), the Renode CI spike (third-party
+`matgla/Renode_RP2040` model, marked "WIP and Frozen" upstream - real
+risk), the USB CDC `est::pico::Serial` class and its TinyUSB glue, the
+`examples/rp2040` demo app/tests/CI job, and docs
+(`docs/wiki/Architecture.md`).

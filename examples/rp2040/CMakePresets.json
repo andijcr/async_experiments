@@ -1,0 +1,14 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 4, "minor": 4, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "rp2040",
+      "displayName": "armv6m-none-eabi (Raspberry Pi Pico / RP2040 bare-metal build)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/rp2040",
+      "toolchainFile": "${sourceDir}/../../cmake/toolchain-rp2040.cmake"
+    }
+  ],
+  "buildPresets": [{ "name": "rp2040", "configurePreset": "rp2040" }]
+}

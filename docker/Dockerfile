@@ -171,6 +171,40 @@ RUN mkdir -p /opt/arm-none-eabi-sysroot \
     && rm -f /tmp/arm-toolchain.tar.xz \
     && chmod -R a+rX /opt/arm-none-eabi-sysroot
 
+# --- Pinned ARM bare-metal sysroot, for examples/rp2040's real Raspberry
+# Pi Pico (RP2040) build (cmake/toolchain-rp2040.cmake) - same release/
+# mechanism as the armv7m block above, just RP2040's own real core
+# (Cortex-M0+, armv6m) instead of mps2an385's QEMU-modeled Cortex-M3.
+# Deliberately laid out to mirror the *same relative path* pico-sdk's own
+# official Clang toolchain file
+# (third_party/pico-sdk/cmake/preload/toolchains/util/
+# pico_arm_clang_common.cmake) expects a compiler+sysroot pair to share -
+# `<toolchain_root>/bin/<compiler>` next to
+# `<toolchain_root>/lib/clang-runtimes/arm-none-eabi/<variant>` - rather
+# than the flat extraction the armv7m block above uses: that file's own
+# CMAKE_FIND_ROOT_PATH-based header search (CMAKE_FIND_ROOT_PATH_MODE_
+# INCLUDE ONLY) only finds a sysroot placed under the same root as the
+# compiler binaries it discovers (confirmed empirically - a flat
+# extraction elsewhere silently fails that search with no useful error).
+# `bin/` holds symlinks to this image's own pinned Clang ${LLVM_VERSION}
+# (never ARM's own bundled compiler, same reasoning the armv7m block's
+# own comment gives) so pico-sdk's `pico_find_compiler()` resolves it via
+# `PICO_TOOLCHAIN_PATH=/opt/rp2040-toolchain` without needing this image's
+# own unversioned `clang`/`clang++` `update-alternatives` links touched.
+ARG RP2040_TOOLCHAIN_VARIANT=armv6m_soft_nofp_exn_rtti
+RUN mkdir -p /opt/rp2040-toolchain/bin \
+    /opt/rp2040-toolchain/lib/clang-runtimes/arm-none-eabi \
+    && for tool in clang clang++ llvm-objcopy llvm-objdump; do \
+        ln -s "/usr/bin/${tool}-${LLVM_VERSION}" "/opt/rp2040-toolchain/bin/${tool}"; \
+    done \
+    && wget --inet4-only -O /tmp/rp2040-arm-toolchain.tar.xz \
+        "https://github.com/ARM-software/LLVM-embedded-toolchain-for-Arm/releases/download/release-${ARM_TOOLCHAIN_VERSION}/LLVM-ET-Arm-${ARM_TOOLCHAIN_VERSION}-Linux-x86_64.tar.xz" \
+    && tar xJf /tmp/rp2040-arm-toolchain.tar.xz \
+        -C /opt/rp2040-toolchain/lib/clang-runtimes/arm-none-eabi --strip-components=5 \
+        "LLVM-ET-Arm-${ARM_TOOLCHAIN_VERSION}-Linux-x86_64/lib/clang-runtimes/arm-none-eabi/${RP2040_TOOLCHAIN_VARIANT}" \
+    && rm -f /tmp/rp2040-arm-toolchain.tar.xz \
+    && chmod -R a+rX /opt/rp2040-toolchain
+
 # --- Non-root user for local bind-mount ergonomics ---
 RUN groupadd --gid "${USER_GID}" est \
     && useradd --uid "${USER_UID}" --gid "${USER_GID}" --create-home --shell /bin/bash est
