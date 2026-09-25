@@ -22,6 +22,9 @@ export function makeEnvShim(memoryRef, waitBuffer, label) {
       const timeout = Math.max(0, deadlineMs - performance.now());
       Atomics.wait(waitView, 0, 0, timeout);
     },
+    js_wake() {
+      Atomics.notify(waitView, 0);
+    },
     js_random_u32() {
       const buf = new Uint32Array(1);
       crypto.getRandomValues(buf);

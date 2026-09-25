@@ -8,17 +8,20 @@ import std;
 namespace {
 
 // Mirrors est/tests/spsc_ring_tests.cpp's own local fake_platform:
-// sleep_until() fast-forwards a fake clock instead of actually blocking,
-// so a schedule_periodic()-driven test below runs instantly and
-// deterministically rather than depending on real wall-clock timing.
+// interruptible_sleep_until() fast-forwards a fake clock instead of
+// actually blocking, so a schedule_periodic()-driven test below runs
+// instantly and deterministically rather than depending on real
+// wall-clock timing.
 class fake_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
   [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 7; }
   [[noreturn]] void assert_failure(std::string_view /*message*/,
                                    std::source_location /*location*/) const noexcept override {
@@ -90,7 +93,7 @@ TEST_CASE("app: push_command() reaches the drain loop from a real std::jthread p
   // this is the one test in this file with a genuine second OS thread on
   // the producer side of push_command(), the same reasoning
   // est/tests/spsc_ring_tests.cpp's own real-jthread test gives for doing
-  // the identical thing: a fake clock's sleep_until() doesn't actually
+  // the identical thing: a fake clock's interruptible_sleep_until() doesn't actually
   // block, which would starve the producer thread of any real wall-clock
   // window to run in.
   larson_scanner::app_config config{

@@ -47,9 +47,19 @@ __attribute__((import_module("env"), import_name("js_now_ms"))) auto js_now_ms()
 // the JS glue owns - only valid from a Worker thread, never the main/UI
 // thread, per the browser's own Atomics.wait() restriction) until
 // `deadline_ms` (same epoch/units as js_now_ms()'s own return value) is
-// reached, or returns immediately if it's already passed.
+// reached, or returns immediately if it's already passed - or, since
+// this reuses that same SharedArrayBuffer for js_wake() below,
+// potentially earlier still.
 __attribute__((import_module("env"), import_name("js_sleep_until_ms"))) void
 js_sleep_until_ms(double deadline_ms);
+
+// Atomics.notify on the identical SharedArrayBuffer location
+// js_sleep_until_ms() above waits on - real, OS-level interruption of a
+// currently-blocked Atomics.wait, not a poll. Safe to call from any
+// agent sharing that buffer (another Worker, the main thread) at any
+// time, including when nothing is currently waiting (Atomics.notify with
+// no waiters is a documented no-op, not an error).
+__attribute__((import_module("env"), import_name("js_wake"))) void js_wake();
 
 // One 32-bit draw of best-effort randomness (crypto.getRandomValues()-
 // backed on the JS side, not Math.random() - matching hosted_stdcpp's own
@@ -108,9 +118,17 @@ public:
   // thread's own instantiation of the same compiled module never calls
   // est::loop::run() at all (docs/PLAN.md's Issue #99 entry), so it never
   // reaches this method regardless.
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     detail::js_sleep_until_ms(detail::time_point_to_ms(deadline));
   }
+
+  // Only one loop is ever reachable through a given platform_wasm
+  // instance (each Worker installs its own), so `id` is irrelevant here
+  // the same way it is for hosted_stdcpp - wake() and wake_all() are
+  // identical.
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override { wake_all(); }
+
+  void wake_all() noexcept override { detail::js_wake(); }
 
   [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override {
     return (static_cast<std::uint64_t>(detail::js_random_u32()) << 32U) | detail::js_random_u32();

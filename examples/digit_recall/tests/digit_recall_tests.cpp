@@ -32,19 +32,22 @@ private:
   }
 };
 
-// A fake platform with a controllable clock whose sleep_until() advances
-// that same fake clock instantly instead of blocking - mirrors est/tests/
-// loop_tests.cpp's own fake_platform, letting a round's own timeout
-// (real wall-clock seconds otherwise) resolve instantly in a test.
+// A fake platform with a controllable clock whose interruptible_sleep_until()
+// advances that same fake clock instantly instead of blocking - mirrors
+// est/tests/loop_tests.cpp's own fake_platform, letting a round's own
+// timeout (real wall-clock seconds otherwise) resolve instantly in a test.
 class fake_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 42; }
 
@@ -104,7 +107,7 @@ TEST_CASE("play_round(): a correct answer arriving before the deadline resolves 
     // A deliberately huge base_unit: if the round's own timer weren't
     // actually cancelled, run_until_idle() below would have nothing left
     // to do except sleep all the way to this far-off deadline -
-    // fake_platform::sleep_until() advancing `current` that far is
+    // fake_platform::interruptible_sleep_until() advancing `current` that far is
     // exactly what the assertion below would catch (mirrors est/tests/
     // loop_tests.cpp's own token-aware sleep_for() cancellation test).
     auto outcome_fut = digit_recall::play_round(

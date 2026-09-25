@@ -19,10 +19,18 @@ export function makeEnvShim(memoryRef, waitBuffer, label) {
     js_sleep_until_ms(deadlineMs) {
       const timeout = Math.max(0, deadlineMs - performance.now());
       // Atomics.wait is Worker-only - throws TypeError on the main
-      // thread. That's deliberate: platform_wasm::sleep_until() is only
-      // ever called from the Worker's own est::loop::run(), never from
-      // the main thread's instantiation.
+      // thread. That's deliberate: platform_wasm::interruptible_sleep_until()
+      // is only ever called from the Worker's own est::loop::run(), never
+      // from the main thread's instantiation.
       Atomics.wait(waitView, 0, 0, timeout);
+    },
+    js_wake() {
+      // Atomics.notify on the identical index js_sleep_until_ms() above
+      // waits on - never touches the value there (still always 0, per
+      // this file's own top comment), only wakes whatever's currently
+      // blocked. A no-op if nothing is waiting - not an error, callable
+      // from the main thread or another Worker at any time.
+      Atomics.notify(waitView, 0);
     },
     js_random_u32() {
       const buf = new Uint32Array(1);

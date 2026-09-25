@@ -103,18 +103,18 @@ constructs one, and `platform::override_instance()`s it
 
 | Concept | File |
 |---|---|
-| Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`, `get_random_seed()`) | `est/src/platform/platform.cppm` |
+| Platform seam (`platform::interface`, `instance()`/`override_instance()`, `printdbg`, `get_random_seed()`, `interruptible_sleep_until()`, `wake()`/`wake_all()`, `WakeId`) | `est/src/platform/platform.cppm` |
 | `hosted_stdcpp` (the one concrete `platform::interface` - a separate module, `estext`, not part of `est`) | `estext/src/hosted_stdcpp.cppm` |
 | `est::check()` | `est/src/check.cppm` |
 | `est::jitter` | `est/src/util/jitter.cppm` |
 | `est::shared_ptr<T>`, `est::ref_counted`, `detail::shared_ptr_common<Derived, Pointer, T>`, `detail::shared_ptr_control_block<T>` | `est/src/util/shared_ptr.cppm` |
 | `est::intrusive_list_node`, `est::intrusive_list<T>` | `est/src/util/intrusive_list.cppm` |
 | `est::counting_event<Mode>`, `est::binary_event<Mode>`, `est::one_shot_event<Mode>`, `EventResetMode` | `est/src/sync/event.cppm` |
-| `est::external_event<T>` | `est/src/sync/external_event.cppm` |
+| `est::external_event<T>`, `est::external_notifier` | `est/src/sync/external_event.cppm` |
 | `est::spsc_ring<T>` | `est/src/sync/spsc_ring.cppm` |
 | `est::mutex`, `mutex::lock_guard` (built on `est::binary_event<EventResetMode::automatic>`) | `est/src/sync/mutex.cppm` |
 | `est::timer_queue<Allocator>` | `est/src/timer.cppm` |
-| `est::loop` (incl. `timer_id`/`cancel_timer()`/`set_spawn_exception_hook()`), `ready_node`, `timer_node`, `detail::abandoned_exception`, `est::Priority`, `current_priority()`/`set_priority()` | `est/src/loop.cppm` |
+| `est::loop` (incl. `timer_id`/`cancel_timer()`/`set_spawn_exception_hook()`, `WakeId`/`register_external()`/`unregister_external()`/`notify_external()`), `ready_node`, `timer_node`, `detail::external_source`, `detail::abandoned_exception`, `est::Priority`, `current_priority()`/`set_priority()` | `est/src/loop.cppm` |
 | `est::current_loop()`, `est::current_allocator()`, `est::make_current_loop()`, `est::has_current_loop()` | `est/src/util/current_loop.cppm` |
 | `est::schedule_periodic()`, `est::periodic_timer_handle`, `detail::periodic_timer_node<Fn>` | `est/src/timer_periodic.cppm` |
 | `est::future_state<T>`, `est::future<T>` (incl. `clone()`; `[[nodiscard]]`, issue #58), `est::detail::discard()`, `continuation_node<T>`, `future<T>::promise_type`, coroutine awaiters | `est/src/future.cppm` |

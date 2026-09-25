@@ -32,7 +32,7 @@ private:
   }
 };
 
-// A fake platform with a controllable clock whose sleep_until() advances
+// A fake platform with a controllable clock whose interruptible_sleep_until() advances
 // that same fake clock instead of actually blocking - the seam
 // est::loop's own timer-driven tests need to run instantly rather than
 // for real wall-clock seconds, extending the uptime()-only fake_platform
@@ -43,9 +43,14 @@ public:
     return current;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  // No-ops: nothing in these tests exercises est::loop's registered-
+  // external-source polling, so nothing ever calls wake()/wake_all() here.
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   // A fixed, deterministic value: nothing in these tests exercises
   // est::jitter, and a fixed seed keeps anything that indirectly does
@@ -88,9 +93,13 @@ public:
     return result;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  // No-ops - see fake_platform's own identical overrides, above, for why.
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   // A fixed, deterministic value - see fake_platform's own identical
   // override, above, for why.
@@ -280,12 +289,14 @@ TEST_CASE("yield_execution() resolves once run_until_idle() drains it", "[loop]"
 }
 
 TEST_CASE("yield_execution() lets already-ready work run first", "[loop]") {
-  // Issue #45: yield_execution() is sugar over a zero-duration sleep_for()
-  // (est:promise) specifically so it lands in pending_timers_ rather than
-  // ready_ - run_impl() (est:loop) always fully drains ready_ before ever
-  // checking pending_timers_, so anything already ready when
-  // yield_execution() is called runs first, however many rounds that
-  // takes (drain_ready() loops until ready_ is empty, not just once).
+  // yield_execution() (est:promise) re-enters ready_ directly via its own
+  // detail::promise_resume_node<void>, at current_priority() - not via
+  // pending_timers_ (a zero-duration sleep_for(), issue #45's original
+  // shape, since replaced - see yield_execution()'s own doc comment) -
+  // so this is really a same-priority-level FIFO ordering test: the
+  // already-ready continuation below is enqueued first (its future is
+  // already fulfilled when .then() registers it), so it drains before
+  // yield_execution()'s own node even though both land in ready_[normal].
   est::loop loop;
   const auto loop_guard = est::make_current_loop(loop);
   std::vector<int> order;
@@ -409,6 +420,57 @@ TEST_CASE("multiple pending timers all fire, earliest deadline first", "[loop]")
 
   loop.run_until_idle();
   REQUIRE(order == std::vector{1, 2, 3});
+}
+
+TEST_CASE("a long chain of self-re-enqueuing ready work doesn't starve a due timer", "[loop]") {
+  // Regression test for the starvation drain_ready()'s own
+  // poll_timers_if_due() (est:loop) closes: before that existed,
+  // drain_ready() only ever checked pending_timers_ once ready_ finally
+  // emptied - so a chain of continuations that keeps re-enqueuing more
+  // ready work kept a due timer waiting for however long that chain
+  // took, however long that is. Fails under the pre-fix code (the timer
+  // fires only after all chain_length rounds have already run, so
+  // timer_fired_at_tick == chain_length there, not partway through).
+  using namespace std::chrono_literals;
+  fake_platform fake;
+  const auto guard = est::platform::override_instance(fake);
+
+  est::loop loop;
+  const auto loop_guard = est::make_current_loop(loop);
+
+  constexpr int chain_length = 500;
+  int chain_ticks = 0;
+  int timer_fired_at_tick = -1;
+
+  // Each round resolves a fresh already-ready future<void> and
+  // immediately registers another continuation on it - which
+  // enqueue_ready()s right there, since the future is already fulfilled
+  // (same mechanism the "a then() continuation only runs once the loop
+  // drains, never inline" test above exercises once) - keeping ready_
+  // non-empty for chain_length rounds straight.
+  std::function<void()> step;
+  step = [&] {
+    ++chain_ticks;
+    if (chain_ticks >= chain_length) {
+      return;
+    }
+    static_cast<void>(est::make_ready_future<void>().then([&](est::future<void>&) { step(); }));
+  };
+
+  // fake_platform's own clock never auto-advances on its own (only
+  // interruptible_sleep_until() moves it), so this 0s deadline is
+  // already due the moment drain_ready() first gets a chance to check
+  // it, and stays due for as long as the chain above keeps running.
+  auto timer_fut = est::sleep_for(0s).then([&] { timer_fired_at_tick = chain_ticks; });
+
+  step(); // seeds the chain
+
+  loop.run_until_idle();
+
+  REQUIRE(chain_ticks == chain_length);
+  REQUIRE(timer_fut.ready());
+  REQUIRE(timer_fired_at_tick >= 0);
+  REQUIRE(timer_fired_at_tick < chain_length);
 }
 
 TEST_CASE("higher-priority ready work drains before lower-priority work, regardless of enqueue "
@@ -795,7 +857,7 @@ TEST_CASE("sleep_for(delay, stop_token): request_stop() before the deadline reso
     // A deliberately huge delay: if loop::cancel_timer() weren't actually
     // removing this timer's own registration, run_until_idle() below would
     // have nothing left to do except sleep all the way to this deadline -
-    // fake_platform::sleep_until() advancing `current` that far is exactly
+    // fake_platform::interruptible_sleep_until() advancing `current` that far is exactly
     // what the assertion below would catch.
     auto fut = est::sleep_for(1000s, source.get_token());
     REQUIRE_FALSE(fut.ready());
@@ -808,7 +870,7 @@ TEST_CASE("sleep_for(delay, stop_token): request_stop() before the deadline reso
     REQUIRE_THROWS_AS(fut.get(), est::operation_cancelled);
     // The fake clock never had to advance - nothing left pending once the
     // timer was cancelled, so run_until_idle() returned without ever
-    // calling platform::instance().sleep_until().
+    // calling platform::instance().interruptible_sleep_until().
     REQUIRE(fake.current == decltype(fake.current){});
   }
   // The cancelled timer node (detail::sleep_stop_timer_node, est:with_stop)

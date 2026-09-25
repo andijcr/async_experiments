@@ -146,9 +146,11 @@ TEST_CASE("spsc_ring: drained by a real schedule_periodic() poll loop", "[spsc_r
     [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
       return current;
     }
-    void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+    void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
       current = std::max(current, deadline);
     }
+    void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+    void wake_all() noexcept override {}
     [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 11; }
     [[noreturn]] void assert_failure(std::string_view /*message*/,
                                      std::source_location /*location*/) const noexcept override {

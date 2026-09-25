@@ -256,11 +256,23 @@ void enqueue_ready(detail::ready_node& node) noexcept {
 `run_until_idle()`/`run()` drain the whole `ready_queues` array via
 `drain_ready()`, delegating the actual "which level next" decision to
 `scheduler_` (a `std::function<detail::ready_node*(ready_queues&)>` - see
-below):
+below). Two checks run at the top of every iteration before that:
+`poll_external_if_pending()` (a registered `external_event<T>` may have
+changed - see "Bridging external writers" below) and
+`poll_timers_if_due()` (a pending timer's deadline may have already
+passed - see "Timers" below); both only ever append a newly-ready
+continuation to `ready_`, the same way `enqueue_ready()` itself does,
+never run one inline ahead of whatever a level's queue already holds:
 
 ```cpp
 void drain_ready() {
-  while (auto* node = scheduler_(ready_)) {
+  for (;;) {
+    poll_external_if_pending();
+    poll_timers_if_due();
+    auto* node = scheduler_(ready_);
+    if (node == nullptr) {
+      return;
+    }
     run_one(*node);
     if (stop_requested_) {
       return;
@@ -540,33 +552,52 @@ ever happened, but compiles away entirely under `NDEBUG` — the ordering
 above is what makes the desync unreachable in the first place, not just
 debug-detected.
 
-`run_impl()`'s main loop sleeps for exactly as long as the *next* deadline,
-then fires everything that's ready:
+`run_impl()`'s main loop sleeps for exactly as long as the *next* deadline
+(or indefinitely, kept alive only by a registered external source - see
+"`run()` vs. `run_until_idle()`" below), then loops back to `drain_ready()`:
 
 ```cpp
-void run_impl() {
+void run_impl(bool wait_for_external) {
   ...
   for (;;) {
     drain_ready();
     if (stop_requested_) { return; }
     const auto deadline = timers_.next_deadline();
-    if (!deadline) { return; }                        // idle - nothing left to do
-    platform::instance().sleep_until(*deadline);
-    fire_ready_timers();
+    if (!deadline && (!wait_for_external || external_sources_.empty())) {
+      return; // nothing ready, nothing pending, nothing worth waiting on
+    }
+    platform::instance().interruptible_sleep_until(deadline.value_or(clock::time_point::max()));
   }
 }
 ```
 
-`platform::instance().sleep_until()` is why a test doesn't have to actually
-wait real wall-clock time for a timer-driven test to complete: a fake
-platform overrides it to advance its own fake clock instantly instead of
-blocking (mirroring the same seam `uptime()`/`assert_failure()` already use —
-see `est/tests/loop_tests.cpp`'s `fake_platform`). `fire_ready_timers()`
-pops every timer whose deadline has passed, looks it up in `pending_timers_`
-to find its node, and calls `fire()` — which for a `sleep_for()`-created
-node just does `prom.set_value()`, which in turn triggers `future_state<
-void>::complete()`, which enqueues *its* continuations onto the same
-ready-queue `drain_ready()` will pick up on the loop's next iteration.
+`platform::instance().interruptible_sleep_until()` is why a test doesn't
+have to actually wait real wall-clock time for a timer-driven test to
+complete: a fake platform overrides it to advance its own fake clock
+instantly instead of blocking (mirroring the same seam `uptime()`/
+`assert_failure()` already use — see `est/tests/loop_tests.cpp`'s
+`fake_platform`). There's no explicit `fire_ready_timers()` call here any
+more, unlike an earlier version of this loop: `drain_ready()`'s own
+`poll_timers_if_due()` (above) is unconditionally the first thing its
+loop does on the very next iteration, so whatever just woke this sleep
+gets picked up there instead - one call site for firing timers, not two.
+`fire_ready_timers()` itself is unchanged: it pops every timer whose
+deadline has passed, looks it up in `pending_timers_` to find its node,
+and calls `fire()` — which for a `sleep_for()`-created node just does
+`prom.set_value()`, which in turn triggers `future_state<void>::
+complete()`, which enqueues *its* continuations onto the same ready-queue
+`drain_ready()`'s own loop is already mid-iteration on, so they're picked
+up without waiting for a separate pass.
+
+Because `poll_timers_if_due()` runs every `drain_ready()` iteration, not
+just once `ready_` finally empties, a due timer no longer waits behind an
+arbitrarily long (or self-replenishing) chain of ready-queue work the way
+it used to: a continuation that keeps re-enqueuing more ready work used
+to starve `fire_ready_timers()` of ever running at all, since it was only
+ever reached *after* `drain_ready()` returned. Firing a timer mid-drain
+only ever appends its continuation to `ready_`, exactly like an external
+source's own `poll()` call already does - it never preempts whatever that
+priority level's queue already holds, just joins the back of it.
 
 ### `cancel_timer()`: pulling a still-pending registration out early
 
@@ -718,19 +749,22 @@ never touched anywhere in this class except inside `poll()`.
 ```cpp
 template <class T>
   requires std::equality_comparable<T>
-class external_event {
+class external_event : private detail::external_source {
 public:
   explicit external_event(std::atomic<T>& source) noexcept;
+  external_event(std::atomic<T>& source, loop& owner);   // opt-in loop registration - see below
 
-  void poll() noexcept;                       // loop-thread only, never suspends
-  [[nodiscard]] auto wait() -> future<void>;   // delegates to the internal binary_event
-  void reset() noexcept;                       // re-arms for the next change
+  void poll() noexcept override;               // loop-thread only, never suspends
+  [[nodiscard]] auto wait() -> future<void>;    // delegates to the internal binary_event
+  void reset() noexcept;                        // re-arms for the next change
   [[nodiscard]] auto value() const noexcept -> T;
+  [[nodiscard]] auto notifier() const noexcept -> external_notifier;   // loop-registered instances only
 
 private:
   std::atomic<T>* source_;
   T last_seen_;
   binary_event<EventResetMode::manual> event_;
+  loop* owner_ = nullptr;
 };
 ```
 
@@ -759,9 +793,8 @@ happens before the consumer calls `reset()` is folded into the value
 manual` primitive in this codebase (`counting_event<manual>`,
 `binary_event<manual>`) rather than inventing new semantics.
 
-**Deliberately not started/owned by this class** - a caller wires
-`poll()` into `schedule_periodic()` explicitly, rather than
-`external_event<T>` starting a periodic timer of its own:
+**Two ways to drive `poll()`.** A caller can still wire it into
+`schedule_periodic()` explicitly, the original (issue #74) design:
 
 ```cpp
 std::atomic<int> reading{0};             // written by another thread/ISR
@@ -776,6 +809,97 @@ entirely, and keeps `external_event<T>` trivially unit-testable without
 any real second thread: a test just assigns directly to the
 `std::atomic<T>` it constructs the bridge over, single-threaded, matching
 every other test in this codebase (`est/tests/external_event_tests.cpp`).
+It also pays a real, up-to-one-poll-interval latency tax and needs an
+already-running (or newly-added) periodic timer to bridge with.
+
+The second constructor (issue #125) removes that tax by registering
+directly with a `loop`, letting it call `poll()` at its own dispatch
+checkpoints instead:
+
+```cpp
+std::atomic<int> reading{0};
+est::external_event<int> bridge{reading, loop};
+auto notifier = bridge.notifier();       // handed to the external writer
+
+// external context (an ISR, or a real std::jthread):
+reading.store(new_value, std::memory_order_release);
+notifier.notify();
+
+// loop thread, as before:
+co_await bridge.wait();
+```
+
+`bridge` implements `detail::external_source` (`est:loop`) for exactly
+this purpose - `register_external()`/`unregister_external()` (called
+from the constructor/destructor) add and remove a raw observer pointer
+into `loop`'s own registry, and `est::loop` never allocates or owns it
+(the same reasoning `est::mutex`/`est::counting_event<Mode>`'s own
+"loop must outlive me" precondition already has elsewhere - see this
+page's own "structural hazard" section above). `notifier()` fails a
+`check()` on an instance built with the base constructor - there's no
+`loop&` to hand a notifier a reference to.
+
+`external_notifier` is a tiny, copyable handle safe to call from any
+context that can call anything at all - an ISR, a real second thread.
+`notify()` forwards straight to `loop::notify_external()`, which itself
+does two things: the `std::atomic<bool>` store (see "The shared
+pending-external flag" below) and `platform::instance().wake(id_)`,
+resolved fresh *wherever `notify_external()` actually runs* -
+deliberately not through a pointer captured back when `notifier()` was
+constructed. (Those two calls used to live split across
+`external_notifier::notify()` and `loop::notify_external()`
+separately - consolidated into the one method once it became clear
+`notify_external()` had exactly one caller and gained nothing from the
+split.) That thread-local-dispatch distinction still matters the same
+way: `platform::instance()` is `thread_local`
+([Global Lookup Codegen](Global-Lookup-Codegen.md)), so a real producer
+thread calling `notify()` needs its *own* `platform::interface`
+installed first (typically the same backend object the loop thread
+itself uses, via `platform::override_instance()`) - the same
+requirement any thread driving an `est::loop` already has. An ISR
+doesn't need this on a single-core bare-metal target: it shares the
+loop thread's own TLS block by construction, confirmed empirically
+against `estpico`.
+
+### The shared pending-external flag, and `interruptible_sleep_until()`
+
+`est::loop` checks *one* `std::atomic<bool>` (`pending_external_`) at the
+top of every `drain_ready()` iteration - cheap enough to do unconditionally,
+whether or not anything is registered. Only when that flag is observed set
+does it walk the registered-source list and call `poll()` on each one
+(`loop::poll_external_if_pending()`). This is deliberately coarser than
+"which source changed" - a false wake just costs each *other* registered
+source one wasted `poll()` call, negligible against the alternative (a
+per-source dirty bit, or polling every source on every single ready node
+regardless of whether the flag is set).
+
+This one check site covers both of what used to be two separate
+concerns: draining the ready-queue while the loop is busy, and waking up
+from an idle block. `run_impl()`'s own `for (;;)` loop calls
+`drain_ready()` immediately after `platform::instance().interruptible_sleep_until()`
+returns, so an external wake that arrived while the loop was blocked is
+picked up there without a second, separate call - the same checkpoint
+also covers a due timer now (`poll_timers_if_due()`, "Timers" above),
+so `drain_ready()` is the one place both get noticed, whether the loop
+just woke from a real sleep or is mid-drain of a long ready-queue chain.
+
+`platform::interface::sleep_until()` was renamed to
+`interruptible_sleep_until()` as part of this design, with a changed
+contract: it *may* return before `deadline`, for any reason including
+none - a caller must always re-check `uptime()` against `deadline`, never
+assume it passed just because the call returned. `platform::interface::
+wake(WakeId)`/`wake_all()` are the paired hooks a backend implements to
+make early return meaningful: `hosted_stdcpp` uses a real
+`condition_variable`, `estwasm` reuses the same `Atomics.wait()`/
+`Atomics.notify()` primitive it already had, and `estpico` needs nothing
+extra at all - a real hardware interrupt already unblocks a bare-metal
+`wfi` for free, so its `wake()`/`wake_all()` are genuine no-ops. `WakeId`
+is an opaque, backend-defined value (a core index on a future multi-core
+bare-metal target; irrelevant on every backend that exists today, each
+of which only ever drives one loop per instance) - see `docs/PLAN.md`'s
+issue #125 entry for the full reasoning, including why an earlier
+version of this design routed `wake()` through a captured pointer
+instead, and why that didn't generalize.
 
 ## A stream instead of a value: `est::spsc_ring<T>` (`:sync.spsc_ring`)
 
@@ -950,15 +1074,23 @@ test that actually crosses it.
 
 ## `run()` vs. `run_until_idle()`, and `stop()`
 
-Both currently do exactly the same thing — drain ready work, sleep until the
-next deadline, repeat, until idle (no ready work and no pending timers) or
-`stop()` is called. The difference the design anticipates (`run()` blocking
-indefinitely, kept alive by a live I/O reactor with more wakeup sources than
-timers) only becomes real once I/O support exists. Until then nothing
-could ever wake a fully idle loop back up anyway (no I/O,
-single-threaded), so returning is the only sane behavior for either
-name. This is documented as a stated fact in the code rather than left
-implicit.
+Both drain ready work and sleep until the next deadline, repeat, until
+`stop()` is called — but they now genuinely diverge on when "idle" ends
+the loop, because a registered `external_event<T>` (see "Bridging
+external writers" above) gives a loop a real reason to stay alive with
+no timer pending at all. `run_impl()` takes a `bool wait_for_external`:
+`run_until_idle()` passes `false` — its contract stays "return as soon
+as there's nothing to do *right now*," unaffected by any registered
+source that just hasn't fired yet, matching every existing caller's
+expectations. `run()` passes `true` — it now only returns when there is
+neither a pending timer *nor* any registered external source at all
+(`external_sources_.empty()`); with a source registered, `run()` blocks
+on `interruptible_sleep_until(clock::time_point::max())` (interrupted
+only by `wake()`/`wake_all()`, or a harmless backend-specific spurious
+wake) rather than returning immediately. This is the real difference the
+two names always implied; it just needed a genuine wakeup source other
+than a timer to become observable, and `external_event<T>`'s loop
+registration is the first thing in this codebase that provides one.
 
 `stop()` sets a flag checked after every continuation and every ready-queue
 drain pass — it's how a caller asks the loop to return early, before it

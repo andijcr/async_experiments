@@ -73,7 +73,8 @@ extern "C" void boot(std::uint32_t width, float initial_speed, float initial_dec
       });
   g_app = &scanner_app;
 
-  scanner_app.loop(); // blocks forever - Atomics.wait, via platform_wasm::sleep_until()
+  scanner_app
+      .loop(); // blocks forever - Atomics.wait, via platform_wasm::interruptible_sleep_until()
 }
 
 // Main-thread-side entry point: real C++, running on the main thread's

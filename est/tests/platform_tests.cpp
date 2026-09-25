@@ -15,11 +15,17 @@ public:
   }
 
   // Records the last deadline it was asked to sleep until, so a test can
-  // confirm override_instance() actually retargets sleep_until() too -
-  // never actually blocks.
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  // confirm override_instance() actually retargets interruptible_sleep_until()
+  // too - never actually blocks.
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     last_sleep_until = deadline;
   }
+
+  // Records the last id wake() was called with, and whether wake_all()
+  // was ever called - same "prove override_instance() retargets this
+  // too" purpose as last_sleep_until above.
+  void wake(est::platform::interface::WakeId id) noexcept override { last_wake_id = id; }
+  void wake_all() noexcept override { wake_all_called = true; }
 
   // A fixed, distinguishable value, same spirit as epoch above - a test
   // can confirm override_instance() retargets this too.
@@ -57,6 +63,8 @@ public:
   static constexpr std::uint64_t random_seed = 0xC0FFEE;
   mutable std::optional<est::platform::clock::time_point> last_sleep_until;
   mutable std::optional<std::string> last_vprintdbg_message;
+  mutable std::optional<est::platform::interface::WakeId> last_wake_id;
+  mutable bool wake_all_called = false;
 };
 
 } // namespace
@@ -73,13 +81,26 @@ TEST_CASE("override_instance retargets instance() and restores it when the guard
   REQUIRE(&est::platform::instance() == &original);
 }
 
-TEST_CASE("sleep_until() dispatches through the currently overridden instance", "[platform]") {
+TEST_CASE("interruptible_sleep_until() dispatches through the currently overridden instance",
+          "[platform]") {
   stub_platform stub;
   const auto guard = est::platform::override_instance(stub);
   using namespace std::chrono_literals;
   const auto deadline = stub_platform::epoch + 5s;
-  est::platform::instance().sleep_until(deadline);
+  est::platform::instance().interruptible_sleep_until(deadline);
   REQUIRE(stub.last_sleep_until == deadline);
+}
+
+TEST_CASE("wake()/wake_all() dispatch through the currently overridden instance", "[platform]") {
+  stub_platform stub;
+  const auto guard = est::platform::override_instance(stub);
+  constexpr est::platform::interface::WakeId id{7};
+  est::platform::instance().wake(id);
+  REQUIRE(stub.last_wake_id == id);
+  REQUIRE_FALSE(stub.wake_all_called);
+
+  est::platform::instance().wake_all();
+  REQUIRE(stub.wake_all_called);
 }
 
 TEST_CASE("get_random_seed() dispatches through the currently overridden instance", "[platform]") {
@@ -158,16 +179,23 @@ TEST_CASE("vprintdbg() handles a message longer than any fixed-size internal buf
   SUCCEED("printdbg() returned without throwing");
 }
 
-TEST_CASE("hosted_stdcpp's sleep_until() returns once the deadline has passed", "[platform]") {
+TEST_CASE("hosted_stdcpp's interruptible_sleep_until() returns once the deadline has passed",
+          "[platform]") {
   // A tiny (1ms) real deadline, not a fake clock: this exercises
-  // hosted_stdcpp::sleep_until()'s actual std::this_thread::sleep_until()
-  // call - est::loop's own tests (est/tests/loop_tests.cpp) exclusively
-  // use a fake, instant sleep_until() instead, which never touches this
-  // real implementation at all.
+  // hosted_stdcpp::interruptible_sleep_until()'s actual condition_variable
+  // wait - est::loop's own tests (est/tests/loop_tests.cpp) exclusively
+  // use a fake, instant interruptible_sleep_until() instead, which never
+  // touches this real implementation at all.
   const auto deadline = est::platform::instance().uptime() + std::chrono::milliseconds(1);
-  est::platform::instance().sleep_until(deadline);
+  est::platform::instance().interruptible_sleep_until(deadline);
   REQUIRE(est::platform::instance().uptime() >= deadline);
 }
+
+// A real, second-thread test proving wake() actually interrupts a
+// currently-blocked interruptible_sleep_until() lives in
+// platform_thread_tests.cpp instead - kept separate so this file (no
+// real threading needed by anything else here) can also run on targets
+// with no <thread> at all, such as mps2an385's no-OS-threads build.
 
 // hosted_stdcpp::assert_failure()'s formatting isn't separately
 // unit-tested: it's inlined directly into the [[noreturn]]/std::abort()

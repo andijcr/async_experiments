@@ -185,6 +185,31 @@ public:
   virtual void abandon() noexcept {}
 };
 
+// A registered source of external change - est::external_event<T>'s own
+// opt-in loop-registration (est:sync.external_event) is the one thing
+// that implements this today. Type-erased the same way ready_node/
+// timer_node above are, but deliberately simpler: loop never owns or
+// deletes one of these (register_external()/unregister_external() below
+// just add/remove a raw observer pointer), since the registrant's own
+// lifetime is managed entirely by whoever constructed it - unlike
+// ready_node/timer_node, which loop itself allocates/frees via
+// est::current_allocator().
+class external_source {
+public:
+  external_source() = default;
+  external_source(const external_source&) = delete;
+  auto operator=(const external_source&) -> external_source& = delete;
+  external_source(external_source&&) = delete;
+  auto operator=(external_source&&) -> external_source& = delete;
+  virtual ~external_source() = default;
+
+  // Loop-thread only, exactly like est::external_event<T>::poll()'s own
+  // existing contract (est:sync.external_event) - called from
+  // loop::poll_external_if_pending() below, never from any other
+  // context.
+  virtual void poll() noexcept = 0;
+};
+
 // The "this node never ran/fired - complete it however abandon() does
 // that, then free it" pattern every drain-without-running call site
 // needs: loop::drain_pending() (below, for both containers it drains),
@@ -257,6 +282,7 @@ public:
   using allocator_type = std::pmr::polymorphic_allocator<std::byte>;
   using clock = platform::clock;
   using timer_id = timer_queue<allocator_type>::id;
+  using WakeId = platform::interface::WakeId;
 
   // One FIFO ready-queue per priority level (est::Priority, above) -
   // scheduler_type (below) picks which of these a given drain pass pops
@@ -306,9 +332,17 @@ public:
     return nullptr;
   }
 
-  explicit loop(allocator_type allocator = {}, scheduler_type scheduler = eager_scheduler)
-      : allocator_(allocator), scheduler_(std::move(scheduler)), timers_(allocator),
-        pending_timers_(allocator) {}
+  // `id` is meaningless on every backend today (each one only ever drives
+  // a single loop per platform::interface instance, so wake()/wake_all()
+  // don't need to tell loops apart yet) - it exists now so a future
+  // multi-loop target (issue #125: one loop per core, cores waking each
+  // other) doesn't need an interface-breaking change later. A caller not
+  // planning to be woken across threads/cores never needs to touch it.
+  explicit loop(allocator_type allocator = {},
+                scheduler_type scheduler = eager_scheduler,
+                WakeId id = WakeId{0})
+      : allocator_(allocator), scheduler_(std::move(scheduler)), id_(id), timers_(allocator),
+        pending_timers_(allocator), external_sources_(allocator) {}
   loop(const loop&) = delete;
   auto operator=(const loop&) -> loop& = delete;
   loop(loop&&) = delete;
@@ -393,19 +427,71 @@ public:
     return true;
   }
 
+  [[nodiscard]] auto id() const noexcept -> WakeId { return id_; }
+
+  // Registers `source` to have its poll() called the next time this loop
+  // notices notify_external() was called since the last check
+  // (poll_external_if_pending() below) - est::external_event<T>'s own
+  // opt-in loop-registration constructor (est:sync.external_event) is
+  // the only caller today. Unregister via unregister_external() below
+  // before `source` is destroyed; est::external_event<T>'s own
+  // destructor does this - the same "loop must outlive me" precondition
+  // every other loop-adjacent type already carries, not a new hazard
+  // class.
+  void register_external(detail::external_source& source) { external_sources_.push_back(&source); }
+
+  // Removes a prior register_external() registration. Tolerates `source`
+  // not being found (already removed, or never registered) rather than
+  // asserting - a caller unregistering from its own destructor has no
+  // cheap way to already know whether registration happened, the same
+  // reasoning cancel_timer() above tolerates an already-fired id.
+  void unregister_external(detail::external_source& source) noexcept {
+    std::erase(external_sources_, &source);
+  }
+
+  // Flags "at least one registered external_source may have changed" and
+  // pokes the platform in case this loop is currently blocked in
+  // interruptible_sleep_until() - called by est::external_notifier
+  // (est:sync.external_event), safe from any context that can call
+  // anything at all (mainline, another thread, an ISR): the atomic store
+  // is safe by construction, and platform::instance().wake() is
+  // documented safe from any context too (its own doc comment,
+  // platform.cppm) - deliberately resolved fresh here, on whichever
+  // thread/core is actually calling notify_external(), not through a
+  // captured pointer (docs/PLAN.md's issue #125 entry has the full
+  // reasoning for why that dispatch has to work this way). Waking a loop
+  // that isn't currently sleeping is a harmless no-op, not a hazard -
+  // the same "may wake early for any reason" contract every other
+  // wake()/interruptible_sleep_until() caller already tolerates. Never
+  // blocks, never itself walks external_sources_ -
+  // poll_external_if_pending() below does that, on the loop thread only,
+  // the next time drain_ready() checks.
+  void notify_external() noexcept {
+    pending_external_.store(true, std::memory_order_release);
+    platform::instance().wake(id_);
+  }
+
   // Runs until both the ready-queue and the timer queue are empty - for
-  // tests/examples that shouldn't block forever.
-  void run_until_idle() { run_impl(); }
+  // tests/examples that shouldn't block forever. Returns on that
+  // condition even with a live external-source registration
+  // (register_external() above) still outstanding: "idle" here means
+  // nothing to do *right now*, not "nothing could ever wake this loop
+  // again" - a registered source firing later is exactly the kind of
+  // thing a caller reaching for this method (rather than run()) doesn't
+  // want to block on.
+  void run_until_idle() { run_impl(/*wait_for_external=*/false); }
 
   // The real service loop: drains ready continuations, sleeps until the
-  // next timer deadline, repeats. Currently behaves identically to
-  // run_until_idle() - the difference (blocking indefinitely, kept alive
-  // by a live I/O reactor with more external wakeup sources than timers)
-  // only becomes real once I/O support exists; until then nothing could
-  // ever wake a fully idle loop back up anyway, so returning is the only
-  // sane behavior for both. stop() lets a caller request an even earlier
-  // exit, before the loop would otherwise go idle on its own.
-  void run() { run_impl(); }
+  // next timer deadline (or, with no timer pending but at least one
+  // registered external source - register_external() above - sleeps
+  // with no deadline at all, relying on that source's own notify()/
+  // wake() to interrupt it early), repeats. Genuinely can outlive every
+  // timer now, kept alive by a registered est::external_event<T>
+  // exactly the way this doc comment used to describe as a future
+  // capability - the two methods' behavior now actually differs.
+  // stop() lets a caller request an even earlier exit, before the loop
+  // would otherwise go idle (or block indefinitely) on its own.
+  void run() { run_impl(/*wait_for_external=*/true); }
 
   // Asks run()/run_until_idle() to return after finishing whichever
   // ready continuation it's currently draining, rather than continuing to
@@ -488,7 +574,23 @@ private:
   // Nested pumping isn't a supported use case; this is a debug-checked
   // precondition (est:check) rather than real reentrant-stop()
   // bookkeeping.
-  void run_impl() {
+  // `wait_for_external`: run_until_idle() passes false (its own
+  // documented "nothing to do right now" exit condition never depends
+  // on a registered source that might fire *later*); run() passes true
+  // (its whole point is staying alive for exactly that). With no timer
+  // pending but a registered source and wait_for_external, sleeps with
+  // clock::time_point::max() as the deadline - not a real deadline at
+  // all, just "block until interrupted," relying on
+  // interruptible_sleep_until()'s own contract (may return early for
+  // any reason - platform.cppm) and a registered source's own
+  // notifier().notify() -> wake() to actually interrupt it. Safe across
+  // every backend: hosted_stdcpp's condition_variable::wait_until() and
+  // estwasm's Atomics.wait() both accept an effectively-unbounded
+  // deadline directly; estpico's own arm_dualtimer_oneshot() already
+  // clamps an oversized duration to its 32-bit counter's own max
+  // (~171s) and retries - self-correcting, not a hang, just an
+  // occasional harmless extra wfi if nothing else wakes it first.
+  void run_impl(bool wait_for_external) {
     check(!running_, "est::loop::run()/run_until_idle() called reentrantly");
     running_ = true;
     scope_exit const not_running_guard{[this]() noexcept { running_ = false; }};
@@ -499,20 +601,92 @@ private:
         return;
       }
       const auto deadline = timers_.next_deadline();
-      if (!deadline) {
-        return; // nothing ready, nothing pending - idle, nothing left to do
+      if (!deadline && (!wait_for_external || external_sources_.empty())) {
+        return; // nothing ready, nothing pending, nothing worth waiting on - idle
       }
-      platform::instance().sleep_until(*deadline);
-      fire_ready_timers();
+      platform::instance().interruptible_sleep_until(deadline.value_or(clock::time_point::max()));
+      // No fire_ready_timers() call here - drain_ready()'s own
+      // poll_timers_if_due(), below, is unconditionally the first thing
+      // its loop does, so the timer(s) that just woke this sleep are
+      // picked up there instead, the same way an early external wake
+      // already was even before this change.
     }
   }
 
+  // poll_external_if_pending()/poll_timers_if_due() are both checked at
+  // the top of every iteration, not as separate steps after
+  // interruptible_sleep_until() above - one shared checkpoint covers
+  // both a registered external source and a due timer, whether the loop
+  // just woke from a real sleep or is mid-drain of a long or
+  // self-replenishing ready-queue chain. That second case is exactly
+  // what poll_timers_if_due() (below) exists for: without a per-iteration
+  // timer check, a chain of continuations that keeps re-enqueuing more
+  // ready work keeps this for(;;) loop from ever returning, and a timer
+  // due partway through would never get a chance to fire (its own
+  // deadline read here, below) until the chain finally ran dry - starving
+  // it for however long that takes, unboundedly for a chain that never
+  // does. Checking every iteration bounds that to one ready-node's worth
+  // of delay instead, matching how a registered external source is
+  // already treated, without giving a due timer any special priority
+  // over already-enqueued ready work: firing it here only appends its
+  // continuation to ready_ (fire_ready_timers() below, same as
+  // poll_external_if_pending()'s own poll() calls do) - it never runs
+  // inline ahead of whatever this level's queue already holds.
   void drain_ready() {
-    while (auto* node = scheduler_(ready_)) {
+    for (;;) {
+      poll_external_if_pending();
+      poll_timers_if_due();
+      auto* node = scheduler_(ready_);
+      if (node == nullptr) {
+        return;
+      }
       run_one(*node);
       if (stop_requested_) {
         return;
       }
+    }
+  }
+
+  // One atomic exchange, checked whether or not anything is registered -
+  // effectively free in the common case nothing external is happening
+  // (issue #125's own "cost when unused" question). Only pays for the
+  // O(external_sources_.size()) walk once the flag was actually observed
+  // set. Plain range-for, not index-based: poll()'s own contract only
+  // ever calls binary_event::set() (est:sync.event), which itself only
+  // ever calls loop::enqueue_ready() - never runs a woken continuation
+  // inline - so nothing a poll() call does can reentrantly mutate
+  // external_sources_ during this walk.
+  void poll_external_if_pending() noexcept {
+    if (!pending_external_.exchange(false, std::memory_order_acquire)) {
+      return;
+    }
+    for (auto* source : external_sources_) {
+      source->poll();
+    }
+  }
+
+  // Checked whether or not anything is pending, same as
+  // poll_external_if_pending() above - free (no platform::instance() call
+  // at all) in the common case nothing is scheduled, since timers_.empty()
+  // is a plain size check. Only once at least one timer is outstanding
+  // does this pay for fire_ready_timers()'s own uptime() read, once per
+  // ready-queue iteration rather than once per sleep/wake cycle - the
+  // deliberate cost of closing the starvation gap drain_ready()'s own
+  // doc comment above describes. No new state needed for this, unlike
+  // pending_external_: unlike an external source (which needs an
+  // atomic flag precisely because it can be touched from a context that
+  // can't safely walk external_sources_/enqueue_ready() itself - another
+  // thread, an ISR), a due timer is purely a fact about timers_ (loop-
+  // owned, loop-thread-only) crossed with the platform clock - both
+  // already synchronously readable from right here, no notify()/wake()
+  // indirection required. fire_ready_timers() itself only ever appends
+  // newly-due timers' continuations onto ready_ (never runs one inline),
+  // so calling it mid-drain never lets a timer jump ahead of whatever
+  // this level's queue already holds - it only ever joins the back of it,
+  // the same as an external source's own poll() already does.
+  void poll_timers_if_due() {
+    if (!timers_.empty()) {
+      fire_ready_timers();
     }
   }
 
@@ -587,11 +761,14 @@ private:
 
   allocator_type allocator_;
   scheduler_type scheduler_;
+  WakeId id_;
   ready_queues ready_;
   timer_queue<allocator_type> timers_;
   std::pmr::vector<pending_entry> pending_timers_;
   bool stop_requested_ = false;
   bool running_ = false;
+  std::atomic<bool> pending_external_{false};
+  std::pmr::vector<detail::external_source*> external_sources_;
 };
 
 } // namespace est

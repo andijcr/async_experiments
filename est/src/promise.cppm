@@ -271,8 +271,8 @@ export namespace est {
 // detail::promise_resume_node<void> rather than going through sleep_for(0): it
 // has no real deadline to track, so there's no reason to pay for a
 // timer_queue heap insert/pop, pending_timers_'s own linear search+erase
-// on fire, or the platform::sleep_until() call run_impl() makes before
-// it ever checks pending_timers_.
+// on fire, or the platform::interruptible_sleep_until() call run_impl()
+// makes before it ever checks pending_timers_.
 [[nodiscard]] inline auto yield_execution() -> future<void> {
   auto& loop_ref = current_loop();
   auto [prom, fut] = detail::make_promise_future_impl<void>(current_allocator());

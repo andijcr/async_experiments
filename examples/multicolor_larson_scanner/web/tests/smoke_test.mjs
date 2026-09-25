@@ -41,6 +41,7 @@ const EXPECTED_IMPORTS = new Set([
   'env.memory',
   'env.js_now_ms',
   'env.js_sleep_until_ms',
+  'env.js_wake',
   'env.js_random_u32',
   'env.js_report',
   'env.js_worker_ready',

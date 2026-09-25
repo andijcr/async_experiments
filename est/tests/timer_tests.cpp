@@ -15,11 +15,14 @@ public:
   }
 
   // A no-op: these tests exercise est::timer_queue directly and never
-  // drive an est::loop, so sleep_until() is never actually called - every
-  // est::platform::interface implementation must still provide one.
-  // See est/tests/loop_tests.cpp's own fake_platform for an
+  // drive an est::loop, so interruptible_sleep_until() is never actually
+  // called - every est::platform::interface implementation must still
+  // provide one. See est/tests/loop_tests.cpp's own fake_platform for an
   // implementation that actually advances a fake clock instead.
-  void sleep_until(est::platform::clock::time_point /*deadline*/) const noexcept override {}
+  void interruptible_sleep_until(est::platform::clock::time_point /*deadline*/) noexcept override {}
+
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   // A fixed, deterministic value: nothing in these tests exercises
   // est::jitter.

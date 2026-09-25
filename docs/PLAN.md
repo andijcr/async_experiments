@@ -8512,3 +8512,326 @@ change is safe) build cleanly; run for real under `run_under_qemu.sh` -
 `larson_scanner_mps2an385` itself still exits 0 under QEMU, confirming
 IRQ6's weak default behaves exactly as before everywhere except the one
 binary that overrides it.
+
+## Issue #125: `est::external_event<T>` gets a real loop-registration path
+
+Implements the design settled through discussion on issue #125 itself
+(posted there as a comment before this entry - see that thread for the
+full back-and-forth, including two rejected earlier versions of the
+`wake()` dispatch mechanism). Summary here; the issue comment has the
+complete reasoning.
+
+**No new type.** The issue's own original "proposed direction" floated a
+working name, `est::isr_event<T>`, for a primitive that would let
+`est::loop` poll external sources at its own dispatch points instead of
+needing a caller-supplied `schedule_periodic()` timer. Building it
+turned out not to need a new type at all: `est::external_event<T>`
+already had the right shape (one atomic as the sole external-write
+boundary, a loop-thread-only `poll()`); the only real gap was a way for
+the loop to call `poll()` on its own. Extended `external_event<T>`
+instead - a second, opt-in constructor, fully additive; the original
+`schedule_periodic()`-driven style keeps working unchanged for any
+caller that doesn't want the loop coupling.
+
+**`platform::interface::sleep_until()` → `interruptible_sleep_until()`.**
+Not just a rename - a contract change. The old contract ("blocks until
+`deadline`") is why `platform_mps2an385::sleep_until()` had to hide its
+own "wfi can wake on any interrupt, recheck and rearm" retry loop
+*inside* the backend (PR #124) - the caller (`est::loop::run_impl()`)
+never got to see an early wake, so it had no way to react to one. New
+contract: may return before `deadline`, for any reason including none;
+the caller must always re-check `uptime()` against `deadline`, never
+assume it passed just because the call returned. This let the retry
+loop move out of every backend and into `run_impl()`'s own existing
+`for (;;)`, which already loops - `platform_mps2an385`'s own
+implementation actually got *simpler* as a result (one `wfi` and a
+return, no internal loop needed any more).
+
+**`platform::interface::wake(WakeId)` / `wake_all()`** are the paired
+new hooks, one genuine design iteration recorded here because getting
+it right mattered: the first version dispatched `wake()` via
+`platform::instance()` *at notify time*, called from whatever external
+context (an ISR, another thread) was doing the notifying - broken for a
+real cross-thread producer, since `platform::instance()` is
+`thread_local` and a producer's own thread resolves a different object
+entirely (or none). The fix that actually generalizes: `wake(id)` is
+dispatched via `platform::instance()` resolved *fresh, on whichever
+thread/core is actually calling* - reframing what it means from "reach
+into a specific remote object" to "ask my own local backend to get loop
+`id` woken, however that's done here." Each backend instance is then
+responsible for reaching its own siblings using whatever its own
+hardware/OS offers: a core index on a future multi-core bare-metal
+target (RP2040 was the concrete case that settled this - two cores,
+each able to wake the other, real interrupts also in the mix), a small
+thread-to-condition_variable table on a hosted backend with several
+loop-driving threads. `WakeId`'s meaning is deliberately
+backend-defined, not standardized by `est::platform` itself - every
+backend that exists today only ever drives one loop per instance, so
+each just ignores it.
+
+Per-backend `wake()`/`wake_all()`:
+- **`hosted_stdcpp`**: real `condition_variable` + predicate (not a
+  plain `wait_until()`) - the predicate overload is what makes this
+  level-triggered rather than edge-triggered, closing the classic
+  "wake() lands before wait() is even entered" missed-wakeup race.
+- **`estwasm`**: a new `js_wake()` import, `Atomics.notify()` on the
+  identical `SharedArrayBuffer` location `js_sleep_until_ms()` already
+  waits on via `Atomics.wait()` - a natural fit, no new mechanism
+  needed browser-side. `env_shim.js`/`tests/shim.mjs` both updated;
+  `tests/smoke_test.mjs`'s own import-section allowlist updated to
+  expect `env.js_wake`.
+- **`estpico`**: genuine no-ops - real hardware interrupts already
+  unblock a bare-metal `wfi` for free.
+
+**`est::loop`** gained: a `WakeId id_` (constructor parameter, default
+`WakeId{0}`, meaningless until a multi-loop-per-backend-instance target
+exists); `detail::external_source` (an abstract `poll()`, type-erased
+the same way `ready_node`/`timer_node` already are, but never owned or
+deleted by `loop` - the registrant's own lifetime is managed entirely
+by whoever constructed it); `register_external()`/`unregister_external()`
+(add/remove a raw observer pointer); `notify_external()` (sets one
+`std::atomic<bool> pending_external_`, safe from any context);
+`poll_external_if_pending()` (checked at the top of every
+`drain_ready()` iteration - one atomic exchange, cheap enough to do
+unconditionally; only walks the registered-source list when the flag
+was actually observed set). One check site, not two: `drain_ready()` is
+unconditionally re-entered as the first thing `run_impl()`'s own loop
+does once `interruptible_sleep_until()`/`fire_ready_timers()` return, so
+it already covers both of the issue's own originally-proposed
+checkpoints ("before draining the next ready entry" and "right after
+waking from the timer sleep") without a second, separate call.
+
+**`est::external_event<T>`**: new `external_event(std::atomic<T>&
+source, loop& owner)` constructor - registers via
+`loop::register_external()`, unregisters in `~external_event()` (the
+same "loop must outlive me" precondition every other loop-adjacent type
+in this codebase already carries, not a new hazard class). New
+`notifier() -> external_notifier` (only valid on a loop-registered
+instance - `check()`'s failure otherwise). `external_notifier` is a
+tiny, copyable handle - `{loop* owner_;}` - safe to call from any
+context: `notify()` does `owner_->notify_external()` then
+`platform::instance().wake(owner_->id())`. Real, non-obvious
+precondition worth recording: since that `wake()` call is
+thread-local-dispatched, a genuinely separate producer thread calling
+`notify()` needs its own `platform::interface` installed first
+(typically the identical backend object the loop thread itself uses,
+via `platform::override_instance()`) - the same requirement any thread
+driving an `est::loop` already has. Not an issue on `estpico`'s
+single-core bare-metal target calling `notify()` from an ISR instead:
+mainline and the ISR share the identical TLS block by construction
+(`Reset_Handler()` calls `_set_tls()` exactly once; ARM interrupt entry
+never touches the thread-pointer register), confirmed empirically while
+debugging exactly this precondition surfacing as a real `SIGSEGV` in
+this session's own first draft of the cross-thread test below (the
+producer thread had no backend installed on its own TLS slot).
+
+**Tests**: `est/tests/platform_tests.cpp` gained a `wake()`/`wake_all()`
+dispatch test (mirroring every other per-method dispatch test already
+in that file) and a real cross-thread test (a second `std::jthread`
+blocked in `interruptible_sleep_until()`, woken early by `wake_all()`).
+`est/tests/external_event_tests.cpp` gained four new single-threaded
+cases (loop-registering constructor polls without a caller-driven
+timer; `notify()` with nothing actually changed is a harmless no-op;
+unregisters on destruction - proven via a second live source forcing a
+real registry walk, a genuine use-after-free the sanitize preset would
+catch if `~external_event()` didn't unregister; multiple registered
+sources all get polled off one shared flag) plus one real cross-thread
+test (a `std::jthread` producer, `notifier()`, and a `stop_token`-cancelled
+floor timer proving a genuine early wake - `elapsed < 1s` against a 10s
+floor, not just "eventually resolved").
+
+Both new cross-thread tests broke `mps2an385`'s build the same way
+`spsc_ring_tests.cpp` originally did (issue #128's own follow-up,
+above): `std::jthread`/`std::this_thread`/`std::chrono::steady_clock`
+don't exist under `EST_NO_THREADS`. Same fix, same pattern: split each
+into its own file (`platform_thread_tests.cpp`,
+`external_event_thread_tests.cpp`), added to `est/tests/CMakeLists.txt`
+(hosted, unaffected) and excluded from
+`mps2an385/tests/CMakeLists.txt` (with the same reasoning comment
+`spsc_ring_thread_tests.cpp`'s own exclusion already has) - the rest of
+`platform_tests.cpp`/`external_event_tests.cpp`, none of which need
+real threads, now also run for real on `mps2an385`.
+
+Verified inside the devenv container: `clang-format`/`clang-tidy`
+clean; `default` preset build+`ctest` (338/338); `sanitize` preset
+build+`ctest` (281/281, including the destroyed-source use-after-free
+proof above - a real bug this exact test would have caught, had
+`~external_event()` not unregistered); `ci` preset build+`ctest`
+(338/338) + new-code coverage gate (90%, all touched production files
+at 100%). `web`'s wasm32 project build+`node tests/smoke_test.mjs`
+passes (`env.js_wake` present in the import-section check).
+`mps2an385`'s own cross-compile builds cleanly and runs for real under
+`run_under_qemu.sh`: 279 test cases/1270 assertions (up from
+274/1258), and `larson_scanner_mps2an385` itself still exits 0,
+confirming the renamed/simplified `interruptible_sleep_until()` and the
+new no-op `wake()`/`wake_all()` don't change real firmware behavior.
+
+### Follow-up: `loop::run()` ignored registered external sources entirely
+
+PR #130's own code review (requested alongside opening the PR) caught a
+real bug in the above: `loop::run_impl()`'s exit condition was
+`if (!deadline) { return; }` - a fully idle loop (no ready entries, no
+pending timer) returned immediately regardless of whether an
+`external_event<T>` was registered on it. A loop with nothing but a
+registered external source and no timer therefore never blocked at
+all - `run()` returned instantly instead of waiting to be woken, which
+is exactly the case the whole feature exists for. The review also
+flagged the stale doc comment on `run()` claiming nothing could ever
+wake a fully idle loop back up - no longer true once a registered
+source exists. The review's own evidence was this session's first
+cross-thread test needing a 10s floor timer just to keep `run()` alive
+long enough for the producer thread to fire - a workaround for the bug,
+not a legitimate part of the test.
+
+Fix: `run_until_idle()` and `run()` no longer share one undifferentiated
+exit condition. `run_impl()` gained a `bool wait_for_external`
+parameter - `run_until_idle()` passes `false` (its own documented
+"nothing to do *right now*" contract is unchanged: a registered-but-quiet
+source must never make it block); `run()` passes `true`. The exit
+condition became `if (!deadline && (!wait_for_external ||
+external_sources_.empty())) { return; }` - `run()` now genuinely stays
+alive on a registered external source alone, with no timer pending at
+all. The sleep call itself now passes
+`deadline.value_or(clock::time_point::max())` so it can block
+"indefinitely" (interrupted only by `wake()`/`wake_all()`, or a
+backend-specific spurious wake) when there's no real timer but
+`wait_for_external` requires staying alive - verified `clock::time_point::max()`
+is handled safely by all three backends (`hosted_stdcpp`'s
+`condition_variable::wait_until()`, `estwasm`'s `Atomics.wait()` with an
+enormous timeout, and `estpico`'s own dual-timer 32-bit-tick clamp to
+~171s, which just retries harmlessly).
+
+This changed one existing test's own correctness requirement: the
+cross-thread `external_event` test's floor-timer-plus-`stop_token`
+approach would now deadlock (cancelling the floor timer no longer ends
+`run()` while the source stays registered) - rewritten to have the
+consumer coroutine call `loop.stop()` once the event resolves instead,
+which is what actually ends `run()` now that it can genuinely outlive
+every timer. A new regression test locks in the other half of the fix
+directly: `run_until_idle()` with a registered-but-never-notified source
+still returns promptly rather than hanging.
+
+Re-verified the entire pipeline in the devenv container after the fix:
+`clang-format` clean; `default` preset build+`ctest` (339/339, no
+hangs); `sanitize` preset build+`ctest` (282/282); `ci` preset
+build+`clang-tidy` (clean on every file this change touches; the only
+`clang-tidy` errors are pre-existing ones on `estwasm`/`estpico`-only
+sources the `ci` preset doesn't build, unrelated to this change)+`ctest`
+(339/339)+coverage gate (92%, `loop.cppm` and `external_event.cppm`
+both 100% on their new-code diff); `web`'s wasm32 build+smoke test
+(`env.js_wake` present, worker loop ticks, cross-instance shared memory
+visible); `mps2an385`'s cross-compile build+QEMU run (280 test
+cases/1271 assertions, up from 279/1270) and `larson_scanner_mps2an385`
+still exits 0 under QEMU.
+
+### Follow-up: `drain_ready()` could starve a due timer behind a long ready-queue chain
+
+A design conversation right after the above landed noticed a second,
+distinct gap in the same area: `drain_ready()`'s own `for(;;)` loop never
+returns until `ready_` is completely empty, and `fire_ready_timers()` was
+only ever called *after* that - once from `run_impl()`, right after
+`interruptible_sleep_until()`. A chain of continuations that keeps
+re-enqueuing more ready work (each one's own `.then()` landing on an
+already-fulfilled future, itself re-registering another) therefore kept
+`drain_ready()` from ever returning, which kept a due timer - even one
+already past its deadline - from ever getting a chance to fire, for
+however long that chain took to finally run dry. Unlike the `run()`/
+`run_until_idle()` gap above (a loop that should stay blocked, but
+returned instead), this was a loop that stays *busy*, never idle, so it
+never even reaches the sleep/deadline check at all.
+
+Two designs were discussed for fixing it. The first - proposed by the
+user - has the platform itself arm a real out-of-band alarm for the next
+timer deadline (a background OS thread on hosted/wasm; the hardware timer
+interrupt already driving `estpico`'s `wfi` reused directly, unconditionally,
+on bare metal) and have it call `notify_external()`/`wake()`, the exact
+mechanism issue #125 built for a genuinely external producer (another
+thread, an ISR) that can't otherwise touch loop state. That's elegant on
+`estpico` specifically - the interrupt already fires regardless of what
+the CPU is doing, so its ISR could call `notify_external()` for free, no
+new thread, no rearming logic beyond what the timer hardware already
+does. But on hosted/wasm it isn't free: nothing fires "for free" while
+the CPU stays busy, so it would need a real background thread/worker
+whose only job is "sleep until the next deadline, then notify" -
+rearmed on every `schedule_timer()`/`cancel_timer()` call that changes
+the earliest deadline - real synchronization machinery, cutting against
+this codebase's stated single-threaded-except-`external_event<T>`'s-one-
+deliberate-exception design (`CLAUDE.md`), to solve a problem that's
+purely "the busy loop needs to glance at a heap-top comparison it
+already owns." Recorded as issue #131 for the record rather than
+built - worth reconsidering specifically for `estpico`, where the
+hardware-interrupt version is nearly free, but not worth the
+per-backend thread/rearming cost everywhere else just for this.
+
+The version actually implemented: a new `loop::poll_timers_if_due()`,
+checked at the top of every `drain_ready()` iteration right alongside
+the already-existing `poll_external_if_pending()` - the same checkpoint,
+extended to cover both a registered external source and a due timer.
+`timers_.empty()` guards it (a plain size check, no `platform::instance()`
+call at all) so it costs nothing when no timer is outstanding; once one
+is, it calls the existing `fire_ready_timers()` (unchanged internally -
+still just `now = uptime()` then drains everything already due),
+appending any newly-fired timer's continuation onto `ready_` the exact
+same way `poll_external_if_pending()`'s own `poll()` calls already do -
+never running it inline ahead of whatever a priority level's queue
+already holds, just joining the back of it. This bounds worst-case timer
+latency to one ready-node's worth of delay instead of an unbounded (or
+outright unreachable, for a truly infinite chain) wait, without giving a
+due timer any special priority over already-enqueued ready work.
+`run_impl()`'s own `fire_ready_timers()` call after
+`interruptible_sleep_until()` became redundant once this landed -
+removed, so timer-firing now has exactly one call site instead of two,
+the "uniformity" the design conversation was originally chasing.
+
+Verified this doesn't disturb `yield_execution()`'s own "already-ready
+work runs first" guarantee (`est/tests/loop_tests.cpp`), which turned out
+to be moot to begin with: `yield_execution()` was refactored at some
+earlier point to re-enter `ready_` directly via its own
+`promise_resume_node<void>` rather than through a zero-duration
+`sleep_for(0)` (issue #45's original shape) - it never touches `timers_`
+at all any more, so that test's own comment (still describing the old,
+`pending_timers_`-based implementation) was stale; fixed in passing.
+Added a real regression test instead:
+"a long chain of self-re-enqueuing ready work doesn't starve a due
+timer" - a `fake_platform` (a clock that only advances via
+`interruptible_sleep_until()`, so a `sleep_for(0s)` timer's deadline
+stays "due" for as long as a 500-round self-re-enqueuing `.then()` chain
+keeps `ready_` non-empty) proves the timer's own continuation runs at
+tick 2, not tick 500 - confirmed to actually fail against the pre-fix
+code first (`500 < 500`, i.e. the timer only fired after the entire
+chain had already drained), then pass against the fix.
+
+Re-verified the full pipeline again in the devenv container:
+`clang-format` clean; `default` preset build+`ctest` (340/340);
+`sanitize` preset build+`ctest` (283/283); `ci` preset
+build+`clang-tidy` (clean on both changed files)+`ctest` (340/340)+
+coverage gate (93%, `loop.cppm` 100% on its new-code diff); `web`'s
+wasm32 build+smoke test; `mps2an385`'s cross-compile build+QEMU run
+(281 test cases/1275 assertions, up from 280/1271) and
+`larson_scanner_mps2an385` still exits 0 under QEMU.
+
+### Follow-up: fold `wake()` into `notify_external()` itself (PR #130 review comment)
+
+A PR review comment on `est/src/sync/external_event.cppm:53` (`external_notifier::notify()`)
+pointed out that `loop::notify_external()` could just call `wake()`
+internally, instead of `external_notifier::notify()` making both calls
+itself. Checked: `notify_external()` had exactly one call site in the
+whole codebase (`external_notifier::notify()`), so the split bought
+nothing - `platform::instance().wake(id_)` still resolves on whichever
+thread actually calls `notify_external()` either way, since a member
+function call doesn't itself hop threads; only where the call
+*originates* (docs/PLAN.md's issue #125 entry) determines that. Folded
+`platform::instance().wake(id_)` into `notify_external()` itself
+(`est/src/loop.cppm`); `external_notifier::notify()` (`est:sync.external_event`)
+is now a one-line forward. Dropped `:platform`'s now-unused import from
+`external_event.cppm` as part of the same change. No behavioral change
+for any existing caller - `notify_external()` now unconditionally does
+what its only caller always immediately followed it up with anyway.
+
+Verified the full pipeline again: `clang-format` clean; `default`
+preset build+`ctest` (340/340); `sanitize` preset build+`ctest`
+(283/283); `ci` preset build+`clang-tidy` (clean on both changed
+files)+`ctest` (340/340)+coverage gate (93%, both changed files 100%
+on their new-code diff); `web`'s wasm32 build+smoke test; `mps2an385`'s
+cross-compile build+QEMU run (281 test cases/1275 assertions,
+unchanged) and `larson_scanner_mps2an385` still exits 0 under QEMU.

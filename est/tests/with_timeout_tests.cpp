@@ -33,18 +33,21 @@ private:
 };
 
 // Same fake platform as est/tests/loop_tests.cpp's own - a controllable
-// clock whose sleep_until() actually advances `current` (rather than
-// blocking for real), so a pending timer's deadline can be reached
-// synchronously within a single run_until_idle() call.
+// clock whose interruptible_sleep_until() actually advances `current`
+// (rather than blocking for real), so a pending timer's deadline can be
+// reached synchronously within a single run_until_idle() call.
 class fake_platform final : public est::platform::interface {
 public:
   [[nodiscard]] auto uptime() const noexcept -> est::platform::clock::time_point override {
     return current;
   }
 
-  void sleep_until(est::platform::clock::time_point deadline) const noexcept override {
+  void interruptible_sleep_until(est::platform::clock::time_point deadline) noexcept override {
     current = std::max(current, deadline);
   }
+
+  void wake(est::platform::interface::WakeId /*id*/) noexcept override {}
+  void wake_all() noexcept override {}
 
   [[nodiscard]] auto get_random_seed() const noexcept -> std::uint64_t override { return 42; }
 
@@ -147,7 +150,7 @@ TEST_CASE("with_timeout(): the operation winning eagerly cancels the deadline ti
     // A deliberately huge timeout: if the deadline timer weren't actually
     // cancelled when `operation` wins, run_until_idle() below would have
     // nothing left to do except sleep all the way to this deadline -
-    // fake_platform::sleep_until() advancing `current` that far is exactly
+    // fake_platform::interruptible_sleep_until() advancing `current` that far is exactly
     // what the assertion below would catch.
     auto fut = est::with_timeout(std::move(operation), 1000s);
     prom.set_value(42);
