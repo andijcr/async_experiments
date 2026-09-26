@@ -151,6 +151,37 @@ foreach(TYPE IN ITEMS EXE SHARED MODULE)
     " -L${PICO_COMPILER_SYSROOT}/lib -lc++ -lc++abi -lunwind -lc -lclang_rt.builtins -lm")
 endforeach()
 
+# --allow-multiple-definition: pico-sdk's own pico_clib_interface
+# (linked transitively by pico_stdlib, needed for pico_atomic/pico_sync/
+# hardware_irq symbols any real-sized binary ends up needing) always
+# compiles cxa_guard.c into every consuming target directly - a plain,
+# hard object, not something lazily pulled from an archive - which
+# unconditionally defines __cxa_guard_acquire/__cxa_guard_release/
+# __cxa_guard_abort (the Itanium ABI's thread-safe-static-init guard
+# functions). This sysroot's own libc++abi.a *also* defines all three,
+# and unlike the earlier _set_tls/__aeabi_read_tp collision
+# (examples/rp2040/CMakeLists.txt's own comment), neither is `__weak` -
+# a real, hard duplicate the moment anything reachable actually has a
+# dynamic-init function-local static needing a guard (Catch2's own
+# internal registry singletons; est::detail::uart_tx_ring()'s own static
+# est::spsc_ring<char>) - confirmed empirically to depend on exactly
+# that, not on optimization level: examples/rp2040/src/main.cpp's own
+# demo binary links the identical pico_stdlib but never triggers this,
+# since nothing in that much smaller program happens to need a guard at
+# all (lld's own duplicate-symbol check only fires once something
+# actually has an undefined reference forcing both definitions to be
+# pulled in - unreferenced ones are simply never resolved, --gc-sections
+# or not). Both implementations are independently correct guard-variable
+# protocols (compare-and-swap on a small state machine) and this backend
+# is core0-only regardless, so which one wins is not a correctness
+# question here - --allow-multiple-definition keeps the *first* one lld
+# encounters (pico-sdk's own cxa_guard.c.o, always listed before the
+# `-lc++abi` on the actual command line) and only warns about the rest,
+# rather than erroring outright.
+foreach(TYPE IN ITEMS EXE SHARED MODULE)
+  string(APPEND CMAKE_${TYPE}_LINKER_FLAGS_INIT " -Wl,--allow-multiple-definition")
+endforeach()
+
 # -DEST_NO_THREADS: same reasoning as toolchain-mps2an385.cmake's own
 # identical macro - this picolibc-based sysroot has no OS thread creation
 # primitive either.

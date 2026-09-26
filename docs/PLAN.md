@@ -9264,3 +9264,116 @@ Remaining work: task priority now returns to the Renode CI spike (no
 USB emulation available there regardless, per the plan's own accepted
 gap), `examples/rp2040/tests/` (reusing `est/tests/*.cpp`, once Renode is
 wired), the `rp2040` CI job, and `docs/wiki/Architecture.md`.
+
+### Follow-up: Renode CI spike - real execution attempted, a genuine
+### model-level blocker found; falling back to build-only CI
+
+Ran the spike this plan's own "Sequencing" section scoped as step 5,
+for real rather than by inspection: installed Renode 1.16.1 itself (the
+`.deb` release specifically - the "portable" `.tar.gz` releases, both
+Mono- and .NET-based, turned out to bundle every managed assembly into
+one self-contained executable with no loose `.dll`s at all, which
+`matgla/Renode_RP2040`'s own `Peripherals.csproj` needs as individual
+`HintPath` references; the `.deb` unpacks to the classic
+`/opt/renode/bin/*.dll` layout that file's own hardcoded default
+`RenodePath` expects - a real, if narrow, packaging-format
+incompatibility, not a bug in the model repo itself), installed the
+.NET 8 SDK (`dotnet-sdk-8.0` via `apt`, this host's own package, not
+baked into the shared devenv image - Renode itself is a wholly separate
+toolchain from this repo's pinned Clang, same "CI-time only" precedent
+`qemu-system-arm` already has for `mps2an385`), and built
+`matgla/Renode_RP2040`'s own `Peripherals.dll` against it
+(`dotnet build emulation/Peripherals.csproj -c Release`, 0 errors).
+
+The model repo's own README is considerably more capable than this
+plan's original research found (that research was accurate for an
+older revision - UART/DMA/GPIO+interrupts/I2C/watchdog/resets are now
+`✓` "fully supported", not the "IRQ and DMA not yet supported" state an
+earlier page capture showed) - and, critically, `boards/
+initialize_raspberry_pico.resc` loads a **real 16KB RP2040 mask boot ROM
+image** (`bootroms/rp2040/b2.elf`) at address `0x0` before anything else
+runs: this model doesn't shortcut boot the way QEMU's `mps2-an385`
+machine does for `estmsp` (direct ELF entry-point load, no boot ROM in
+the loop at all) - it genuinely re-executes the same real, silicon boot
+sequence a physical Pico would (boot ROM reads flash over the emulated
+QSPI/SSI controller, validates `boot2`'s checksum, jumps in) - a real,
+meaningfully more faithful test of this project's own boot2/flash image
+than the plan anticipated needing to prove.
+
+**Real execution result**: both `rp2040_demo.elf` (the framework
+main()/demo app image) and `est_rp2040_tests.elf` (a new
+`examples/rp2040/tests/` target, `est/tests/*.cpp` reused unmodified
+except for `test_main.cpp` - same "only test_main.cpp differs" shape
+`mps2an385/tests/`'s own entry already established, `Catch2Baremetal`'s
+own patch copied rather than cross-referenced per this project's
+existing "no reaching into a sibling project's tree" convention) boot
+the real boot ROM successfully, which begins probing flash over the
+emulated QSPI/SSI controller (`xip_ssi.xip_flash`, a `SPI.W25QXX`
+model) exactly as real hardware would - and then crashes, identically
+in both firmwares (same instruction offsets inside the boot ROM, same
+garbage register/memory values, same final abort:
+`CPU abort: Trying to execute code outside RAM or ROM`), during that
+flash-probing sequence, before either firmware's own `main()` (or even
+`crt0`) ever runs. Ruled out two real alternative explanations before
+concluding this: (1) **not a stack-overflow artifact** - the crash
+predates any of our own code executing at all, and is bit-for-bit
+identical whether `PICO_STACK_SIZE` is left at pico-sdk's own default
+(`0x800`, tiny - real, and worth keeping fixed regardless, below) or
+doubled to `0x1000` (RP2040's own dedicated 4KB `SCRATCH_Y` bank is the
+hard ceiling for this specific memory region - confirmed by a link
+error the one time `0x2000` was tried: "section '.stack_dummy' will not
+fit in region 'SCRATCH_Y': overflowed by 4096 bytes"); (2) **not
+specific to this project's own (large, TinyUSB+Catch2-laden) test
+binary** - the much smaller, simpler demo firmware hits the exact same
+crash at the exact same point. This points at a genuine incompatibility
+between this specific Clang-built boot2/flash image and the model's own
+QSPI/SSI flash-command emulation (`xip_ssi.xip_flash: Unhandled
+operation`/`Transmission finished in unexpected state: RecognizeOperation`
+warnings immediately precede every crash) - not a bug in `est`,
+`estrp2040`, or this project's own build. Root-causing it further would
+mean debugging either this Clang-compiled `boot2`'s own QSPI command
+sequence against the model's `SPI.W25QXX` state machine, or the model's
+own (third-party, upstream-marked "WIP and Frozen") flash emulation
+itself - genuinely open-ended work, not a bounded fix, and exactly the
+risk this plan's own "Sequencing" section flagged going in ("If this
+doesn't pan out (real risk, given 'frozen' upstream), fall back to
+build-only CI and say so plainly rather than forcing it").
+
+**Decision, per that same flagged contingency**: falling back to
+build-only CI for `examples/rp2040` (cross-compile success only, no
+execution) rather than forcing Renode integration further. Real,
+lasting value kept from this spike regardless of the boot blocker:
+`examples/rp2040/tests/` (a genuine, buildable `est_rp2040_tests`
+target reusing `est/tests/*.cpp`, one real `-fexceptions`-adjacent
+finding fixed along the way - `est::checks_enabled`
+(`est/src/check.cppm`) is `#ifdef NDEBUG`-gated, and pico-sdk defaults
+`CMAKE_BUILD_TYPE` to `Release` (`-DNDEBUG`) at its own `pico_sdk_init.cmake`
+`include()` time if left unset, silently compiling away every
+`est::check()` in this project's own build - fixed by setting
+`CMAKE_BUILD_TYPE "Debug"` explicitly *before* that `include()`, not
+merely before `project()`), one more real linker-level finding fixed
+(`pico_clib_interface`'s own `cxa_guard.c` unconditionally, hard-object
+defines `__cxa_guard_acquire`/`_release`/`_abort` - not `__weak`, unlike
+the earlier `_set_tls`/`__aeabi_read_tp` collision - duplicating this
+sysroot's own `libc++abi.a` the moment anything reachable actually has
+a dynamic-init function-local static needing a guard (Catch2's own
+registry singletons; `est::detail::uart_tx_ring()`'s own static
+`spsc_ring<char>`) - confirmed to depend on exactly that, not
+optimization level (the demo binary links the identical `pico_stdlib`
+but never triggers it); fixed with `-Wl,--allow-multiple-definition` in
+`cmake/toolchain-rp2040.cmake`, safe here since both implementations are
+independently correct single-core guard-variable protocols), and
+`PICO_STACK_SIZE=0x1000` for this target (doubled from pico-sdk's own
+tiny `0x800` default, matching `mps2an385`'s own already-doubled
+`__stack_size` for this identical Catch2+est suite) - a real, worthwhile
+fix kept even though it didn't turn out to be this crash's own cause.
+`external_event_tests.cpp` stays excluded from this target, unrelated
+to any of the above: a real, narrow Clang-modules name-lookup bug
+specific to this `armv6m_soft_nofp_exn_rtti` sysroot slice (not seen on
+`armv7m_soft_nofp_exn_rtti`/hosted/`wasm32`), tracked as its own
+follow-up rather than chased further here.
+
+Remaining work: wire `examples/rp2040` into `.github/workflows/ci.yml`
+as a build-only job (matching this entry's own decision - cross-compile
+success for `rp2040_demo`/`est_rp2040_tests`, no execution step), and
+`docs/wiki/Architecture.md`.

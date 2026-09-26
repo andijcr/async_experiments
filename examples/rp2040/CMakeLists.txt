@@ -12,6 +12,18 @@
 # mps2an385/CMakeLists.txt already establishes for a from-scratch target.
 cmake_minimum_required(VERSION 4.4)
 
+# Must run before pico_sdk_init.cmake's own include() below, not merely
+# before project(): that file defaults CMAKE_BUILD_TYPE to "Release"
+# (-DNDEBUG) itself, at include() time, if unset - which silently
+# compiles away every est::check() in this project's own est library
+# (est::checks_enabled, est/src/check.cppm, is `#ifdef NDEBUG` gated) -
+# wrong for a test binary whose whole job is exercising those checks
+# (est/tests/check_tests.cpp's own STATIC_REQUIRE(est::checks_enabled)
+# fails to compile outright under NDEBUG). Matches mps2an385's own build
+# (no CMAKE_BUILD_TYPE set there either, since its toolchain file never
+# opts into one).
+set(CMAKE_BUILD_TYPE "Debug" CACHE STRING "Build type" FORCE)
+
 set(PICO_SDK_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third_party/pico-sdk" CACHE PATH "")
 include(${PICO_SDK_PATH}/pico_sdk_init.cmake)
 
@@ -146,3 +158,7 @@ target_link_libraries(app_demo PUBLIC est estrp2040)
 add_executable(rp2040_demo src/main.cpp src/usb_descriptors.c)
 target_link_libraries(rp2040_demo PRIVATE est estrp2040 app_demo pico_stdlib)
 pico_add_extra_outputs(rp2040_demo)
+
+# --- est's own test suite, reused unmodified under Renode - see
+# tests/CMakeLists.txt's own top comment.
+add_subdirectory(tests)
