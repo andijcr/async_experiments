@@ -9458,3 +9458,14 @@ this CI job's own first real run did).
 Fix pushed; `mps2an385`/`wasm` on this same run were already green
 (this bug was genuinely isolated to the new job, not a regression
 elsewhere). Watching for the re-run.
+
+A second, independent failure surfaced on that same first run: `gate`'s
+own `clang-tidy check` step - `find est examples \( -path ".../web" -o
+-path ".../mps2an385" \) -prune -o ...` - had never been updated to
+also prune `examples/rp2040`, so it swept up
+`examples/rp2040/src/app_demo.cppm`/`main.cpp`/`tests/test_main.cpp`
+too and ran them through `clang-tidy -p build/ci` (the *hosted*
+compile database), which has no idea `import estrp2040;`/`#include
+"hardware/uart.h"` exist - failed exactly as the existing comment
+already predicts for `estwasm`/`estmsp` in the identical situation.
+Fixed by adding `-o -path "*/rp2040"` to the same prune expression.
