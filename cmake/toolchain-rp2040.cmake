@@ -126,10 +126,49 @@ foreach(TYPE IN ITEMS EXE SHARED MODULE)
   string(APPEND CMAKE_${TYPE}_LINKER_FLAGS_INIT " --rtlib=compiler-rt --unwindlib=libunwind")
 endforeach()
 
+# Explicit -lc++/-lc++abi/-lunwind: pico-sdk's own toolchain file passes
+# -nostdlib at link time (its own set_flags.cmake comment: avoiding
+# picolibc's default crt0/exit machinery, which this board's own boot2/
+# vector table replaces) - that also disables Clang's usual *automatic*
+# linking of whatever runtime a target's own flags imply, the same
+# "nothing implicit, everything explicit" shape
+# toolchain-mps2an385.cmake's own -nostdlib block already documents.
+# libc++/libc++abi/libunwind's own exception-handling runtime symbols
+# (`operator new`, `__cxa_throw`, `typeinfo`/vtable for
+# std::runtime_error, ...) never had anywhere to come from until this -
+# confirmed empirically once PICO_CXX_ENABLE_EXCEPTIONS=1
+# (examples/rp2040/CMakeLists.txt) started actually emitting code that
+# needs them. `-lc` explicitly listed too, *after* -lc++abi/-lunwind,
+# matching toolchain-mps2an385.cmake's own exact ordering - Clang's
+# baremetal driver logic auto-appends an implicit "-lc" of its own at
+# the very end of the real invoked command regardless, but that's *too
+# late* for libc++abi.a's own need for a handful of plain libc symbols
+# (__cxa_thread_atexit, confirmed empirically) that a single left-to-right
+# linker pass won't go back for - an explicit, correctly-ordered "-lc"
+# here resolves them at the point they're actually needed.
+foreach(TYPE IN ITEMS EXE SHARED MODULE)
+  string(APPEND CMAKE_${TYPE}_LINKER_FLAGS_INIT
+    " -L${PICO_COMPILER_SYSROOT}/lib -lc++ -lc++abi -lunwind -lc -lclang_rt.builtins -lm")
+endforeach()
+
 # -DEST_NO_THREADS: same reasoning as toolchain-mps2an385.cmake's own
 # identical macro - this picolibc-based sysroot has no OS thread creation
 # primitive either.
 string(APPEND CMAKE_CXX_FLAGS_INIT " -DEST_NO_THREADS")
+
+# Real exceptions/RTTI: unlike toolchain-mps2an385.cmake, this does *not*
+# add -fexceptions/-frtti here - pico-sdk's own C++ targets link an
+# INTERFACE library (pico_cxx_options) that appends its *own*
+# -fno-exceptions/-fno-rtti (unless PICO_CXX_ENABLE_EXCEPTIONS/
+# PICO_CXX_ENABLE_RTTI are set before pico_sdk_init(), examples/rp2040/
+# CMakeLists.txt's own job) *after* whatever this toolchain file sets in
+# CMAKE_CXX_FLAGS_INIT on the actual command line - confirmed empirically
+# (an earlier attempt to add -fexceptions -frtti here lost outright:
+# `-fexceptions -frtti ... -fno-exceptions -fno-rtti`, last flag wins for
+# Clang). est genuinely needs real exceptions/RTTI (future<T>'s own
+# exception propagation, est::check(), platform_rp2040.cppm's own
+# unguarded try/catch in pump_task_loop()) - the *only* place that can
+# actually win is pico-sdk's own sanctioned opt-in, not this file.
 
 # Same per-CMake-release activation UUID as the other toolchain files -
 # see toolchain-hosted-linux.cmake's own comment. Needed for `est`'s own

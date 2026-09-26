@@ -9152,3 +9152,115 @@ Remaining work, not yet started: the Renode CI spike (third-party
 `matgla/Renode_RP2040` model, marked "WIP and Frozen" upstream - real
 risk), the `examples/rp2040` demo app (USB CDC echo)/tests/CI job, and
 docs (`docs/wiki/Architecture.md`).
+
+### Follow-up: framework `main()` + demo `app()` - a real, flashable image
+
+Wired the pieces above into an actual firmware image: `examples/rp2040/
+src/main.cpp` (installs `platform_rp2040`, constructs an `est::loop`,
+calls the project-supplied `app()`, `loop.run()`s forever - no
+`std::exit()`/return-code concept the way `estmsp`'s own `main.cpp` has,
+since real hardware has no host to report to) and `examples/rp2040/src/
+app_demo.cppm` (`app()`: a minimal USB CDC echo built on
+`estrp2040::Serial`, standing in for the future separate project that
+would supply its own), plus `usb_descriptors.c` (VID/PID `0xCafe`/
+`0x4001` - TinyUSB's own well-known example values, not a real assigned
+identity - single CDC interface, deliberately *not* part of `estrp2040`
+itself, same "mechanism vs. product identity" split `Serial`'s own doc
+comment already argues for `tusb_config.h` vs. descriptors).
+
+Getting this to actually *link* surfaced four more real, non-obvious
+pico-sdk/Clang incompatibilities beyond the earlier spikes, each found
+and fixed one at a time against a real build:
+
+- pico-sdk's own `pico_cxx_options` INTERFACE library appends
+  `-fno-exceptions -fno-rtti` to every C++ target by default (a
+  reasonable embedded default for typical users who don't need either) -
+  and that flag wins over anything `cmake/toolchain-rp2040.cmake` itself
+  tries to set, since CMake places `CMAKE_CXX_FLAGS_INIT`-derived flags
+  *earlier* on the actual command line than a target's own
+  `target_compile_options()` (confirmed by inspecting the real invoked
+  command: `-fexceptions -frtti ... -fno-exceptions -fno-rtti`, and for
+  Clang's boolean toggle flags the *last* one on the line wins). `est`
+  genuinely needs both (`future<T>`'s exception propagation, `est::check()`,
+  `platform_rp2040.cppm`'s own `try`/`catch` in `pump_task_loop()`) - fixed
+  via pico-sdk's own sanctioned override,
+  `set(PICO_CXX_ENABLE_EXCEPTIONS 1 CACHE BOOL "")` /
+  `set(PICO_CXX_ENABLE_RTTI 1 CACHE BOOL "")`, set in `examples/rp2040/
+  CMakeLists.txt` *before* `pico_sdk_init()` (the one place early enough
+  to actually win).
+- Once exceptions actually started emitting code that needs them, the
+  link failed outright on undefined `operator new`/`__cxa_throw`/
+  `typeinfo` for `std::runtime_error`, etc. - pico-sdk's own toolchain
+  file passes `-nostdlib` (avoiding picolibc's default crt0/exit
+  machinery, since this board's own boot2/vector table replaces it),
+  which also disables Clang's *automatic* linking of whatever runtime a
+  target's flags imply. Fixed by appending an explicit, correctly
+  ordered `-lc++ -lc++abi -lunwind -lc -lclang_rt.builtins -lm` to the
+  toolchain file's own linker flags (single-pass linker: order matters,
+  matching `toolchain-mps2an385.cmake`'s own established ordering for the
+  identical `-nostdlib` situation there).
+- `duplicate symbol: _set_tls`/`__aeabi_read_tp` - pico-sdk's default
+  `pico_thread_local` ("per_thread" mode) defines both as *strong*
+  symbols for its own per-core TLS emulation, which collides outright
+  with this specific ARM LLVM-embedded-toolchain-for-Arm sysroot's
+  picolibc, which (unlike the arm-none-eabi-gcc+newlib toolchains
+  pico-sdk is normally tested against) already implements the same
+  primitives itself. Investigated `pico_thread_local`'s own source
+  directly: "global" mode's `__aeabi_read_tp` is declared `__weak`
+  (letting picolibc's own definition win with no conflict) - fixed via
+  `set(PICO_DEFAULT_THREAD_LOCAL_IMPL "global" CACHE STRING "")`, also
+  the semantically correct choice regardless of the symbol collision
+  (this backend is core0-only, so there's no second execution context
+  for real per-thread storage to ever distinguish). "global" mode's own
+  `_set_tls` is *still* unconditionally strong though, gated by a
+  separate macro (`pico/thread_local.h`'s own doc comment) - fixed with
+  `add_compile_definitions(PICO_THREAD_LOCAL_PROVIDE_SET_TLS=0)`.
+- `undefined symbol: __cxa_thread_atexit` - genuinely absent from this
+  entire sysroot (confirmed via `llvm-nm --defined-only` across
+  `libc.a`/`libc++.a`/`libc++abi.a`/`libunwind.a`), needed the moment
+  anything reachable calls `est::spawn()` (which `platform_rp2040.cppm`'s
+  own TX-pump machinery does), since that pulls in `est::detail::
+  spawn_exception_hook_storage` - a `thread_local std::function`
+  (`est/src/spawn.cppm`) with a non-trivial destructor, which the
+  compiler registers via this Itanium ABI call. `__cxa_atexit`
+  (identical signature, *program*-exit rather than *thread*-exit
+  semantics) *is* present, and the two are equivalent in practice here:
+  core0 never "exits" as a thread short of the board losing power, at
+  which point neither callback would run anyway. Fixed with a tiny
+  forwarding shim (`estrp2040/src/cxa_thread_atexit_shim.c`, a plain C
+  source, not part of the module's `FILE_SET CXX_MODULES` list) - the
+  same workaround several other bare-metal C++ runtimes missing a real
+  `__cxa_thread_atexit` already use for the identical reason, not a hack
+  specific to this project.
+
+With all four fixed, `rp2040_demo.elf`/`.uf2` now build and link
+successfully end-to-end inside the real `est-devenv:latest` container -
+a real, flashable (not yet hardware-verified - still a manual,
+user-only step) firmware image. `clang-format` clean on all four new
+files; `clang-tidy` against a real `compile_commands.json` found two
+genuine issues in this session's own code (as opposed to the already-
+documented TinyUSB third-party-header noise the shared `.clang-tidy`
+config's `HeaderFilterRegex` gap produces): `app_demo.cppm` calling
+`Serial`'s `static` `read()`/`write()` through an instance
+(`readability-static-accessed-through-instance` - fixed by calling them
+through the class name, `estrp2040::Serial::read(...)`, keeping the
+`Serial` instance only for its constructor's USB-start side effect) and
+`main()` itself flagged by `bugprone-exception-escape` (a coroutine's
+frame is allocated - and can throw, e.g. `bad_alloc` - before its first
+suspension point, so calling `app()` can throw before `main()` ever gets
+a `future<void>` to attach a continuation to; unrecoverable on this
+target regardless, so terminating via the noexcept violation is the
+correct fail-fast outcome, same reasoning as `platform_rp2040.cppm`'s own
+existing `NOLINT`s for this check). One clang-tidy operational pitfall
+hit along the way, not a code issue: running `clang-tidy` directly
+against a build directory whose module BMIs were stale (built from
+before a source edit, since `clang-tidy` doesn't drive the same
+incremental-rebuild dependency graph `ninja` does) produced nonsensical
+diagnostic locations (a finding attributed to text inside an unrelated
+comment) - resolved by rebuilding via `cmake --build` first, then
+re-running `clang-tidy` against the now-current BMIs.
+
+Remaining work: task priority now returns to the Renode CI spike (no
+USB emulation available there regardless, per the plan's own accepted
+gap), `examples/rp2040/tests/` (reusing `est/tests/*.cpp`, once Renode is
+wired), the `rp2040` CI job, and `docs/wiki/Architecture.md`.
