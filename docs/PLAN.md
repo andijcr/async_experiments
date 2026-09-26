@@ -9428,3 +9428,33 @@ Remaining work: confirm the new job's real first run on GitHub Actions
 once pushed (in particular, whether the Dockerfile's own RP2040 sysroot
 block builds cleanly on a real runner - genuinely unverified until
 then), and `docs/wiki/Architecture.md`.
+
+### Follow-up: `rp2040` CI job's real first run - a genuine Dockerfile bug
+
+The previous entry's own flagged unknown resolved on the first real
+run: the devenv image itself built fine (Clang/CMake/pico-sdk detection
+all succeeded), but `configure (rp2040)` failed outright -
+`CMake Error ... Failed to load C++ standard library modules metadata
+... File not found: .../armv6m_soft_nofp_exn_rtti/lib/
+libc++.modules.json`. Root cause: `docker/Dockerfile`'s RP2040 sysroot
+block copied its `--strip-components=5` from the armv7m block right
+above it without adjusting for the different destination shape - the
+armv7m block's own flat `-C /opt/arm-none-eabi-sysroot` destination is
+deliberately meant to *become* the variant's own root (stripping the
+variant name away is correct there), but the RP2040 block's own `-C
+.../arm-none-eabi` destination is the variant's *parent* - pico-sdk's
+own toolchain file needs `${RP2040_TOOLCHAIN_VARIANT}` to still exist
+as a real subdirectory underneath. Fixed to `--strip-components=4`;
+confirmed against the real release tarball's own file listing (`tar
+tJf` on a freshly downloaded copy) and a real, standalone extraction
+with the corrected count - both agree with what an earlier,
+separately-populated toolchain checkout already had on disk (which is
+why every previous verification in this plan's own "Renode CI spike"/
+"framework main()" entries never caught this: they all built against
+that already-correct checkout, bind-mounted in rather than produced by
+a real `docker build`, which had never actually run end-to-end until
+this CI job's own first real run did).
+
+Fix pushed; `mps2an385`/`wasm` on this same run were already green
+(this bug was genuinely isolated to the new job, not a regression
+elsewhere). Watching for the re-run.
