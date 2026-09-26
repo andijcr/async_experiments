@@ -9083,8 +9083,72 @@ member-initializer list the check can see; `bugprone-exception-escape` -
 throw in that function, and a failure there is unrecoverable on this
 target regardless) - both clean now.
 
+### Follow-up: USB CDC toolchain spike + `estrp2040::Serial`
+
+Before writing the Serial class itself, spiked whether pico-sdk's own
+vendored TinyUSB (`lib/tinyusb`, MIT, the nested submodule initialized
+back in the very first entry above) actually builds and links against
+this toolchain at all - genuinely untested until now. A scratch project
+linking `tinyusb_device` plus a minimal CDC descriptor set (device/
+configuration/string callbacks, `tusb_config.h` enabling `CFG_TUD_CDC`)
+built and linked cleanly on the first real attempt: TinyUSB's own class
+sources, RP2040's own DCD driver (`dcd_rp2040.c`), and pico-sdk's own
+RP2040 USB-enumeration silicon-errata workaround
+(`rp2040_usb_device_enumeration.c`) all compiled without needing any
+further toolchain changes beyond what the earlier spikes already
+established. This resolves the plan's last real open toolchain
+question.
+
+Wrote `estrp2040::Serial` (`estrp2040/src/serial.cppm`, a module
+*partition* of `estrp2040` - re-exported from `platform_rp2040.cppm` via
+`export import :serial;`, the same primary-interface/partition split
+`est.cppm` itself already uses) - architecturally simpler than
+`platform_rp2040.cppm`'s own async UART TX driver: TinyUSB owns the real
+USB core interrupt itself and does all protocol handling from
+`tud_task()`, which this class drives via `est::schedule_periodic()`
+(1ms, TinyUSB's own recommended polling latency) rather than a
+hand-written ISR - so `tud_cdc_rx_cb()`/`tud_cdc_tx_complete_cb()`
+always run from mainline (inside that periodic callback), never real
+interrupt context. No `interrupt_guard`, no separate ISR-safe ring
+buffer needed: TinyUSB's own internal CDC FIFOs are the only buffering
+on top of. `read()`/`write()` end up `static` (not virtual, just plain
+member functions Serial happens to have none of): USB CDC is
+structurally one hardware resource, so there's no real per-instance
+state - calling them through a `Serial` object still reads like
+Arduino's own `Serial.read()`/`.write()`, which is the whole point of
+the class's naming.
+
+USB device/configuration/string descriptors (VID/PID, product strings)
+are deliberately *not* part of this module - product identity, not
+mechanism, so left for the consuming application to supply
+(`tud_descriptor_*_cb()`), the same "platform module owns the mechanism,
+the application image owns the product specifics" split `estmsp` already
+has between itself and `startup.c`/`link.ld`. `tusb_config.h` (what
+classes/buffer sizes this module needs - `CFG_TUD_CDC`, RX/TX FIFO
+sizes) *is* owned by `estrp2040` itself, unlike the descriptors: that's
+fixed by `Serial`'s own design, not something a consuming project should
+need to know to even compile against it.
+
+Verified the same way as `platform_rp2040.cppm`: real build inside
+`est-devenv:latest`, `clang-format` clean, `clang-tidy` clean against a
+real `compile_commands.json` (three real findings fixed - `Serial`'s own
+deliberately-Arduino-style capitalization needs a `NOLINT`; `read()`/
+`write()` becoming `static`, above, is a real simplification, not a
+suppression; raw pointer arithmetic in `write()`'s own retry loop
+replaced with `std::span::subspan()`). One repo-hygiene finding along
+the way, not fixed here: this project's root `.clang-tidy`'s
+`HeaderFilterRegex` (`(^|/)(est|examples)/`) matches
+`examples/rp2040/third_party/pico-sdk` (vendored third-party code living
+under `examples/`) as if it were project-owned code, producing
+thousands of false positives from TinyUSB's own headers when run with
+default settings - worked around here with an explicit, narrower
+`--header-filter` for this manual check rather than editing the shared
+root config; a real fix (if this project's own CI ever starts linting
+`estrp2040`/`estmsp`/etc. at all - see the immediately preceding
+`platform_rp2040.cppm` entry's own finding that it currently doesn't)
+would need to exclude `third_party` paths specifically.
+
 Remaining work, not yet started: the Renode CI spike (third-party
 `matgla/Renode_RP2040` model, marked "WIP and Frozen" upstream - real
-risk), the USB CDC `est::pico::Serial` class and its TinyUSB glue, the
-`examples/rp2040` demo app/tests/CI job, and docs
-(`docs/wiki/Architecture.md`).
+risk), the `examples/rp2040` demo app (USB CDC echo)/tests/CI job, and
+docs (`docs/wiki/Architecture.md`).

@@ -9,6 +9,8 @@ module;
 
 export module estrp2040;
 
+export import :serial;
+
 import est;
 import std;
 

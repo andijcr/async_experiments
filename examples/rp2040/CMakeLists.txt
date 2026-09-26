@@ -46,6 +46,13 @@ add_subdirectory("${EST_ROOT}/est" "${CMAKE_CURRENT_BINARY_DIR}/est")
 # library targets (real clock/reset bring-up already done by pico-sdk's
 # own runtime_init(), run automatically before main()) rather than
 # hand-poked MMIO registers - see platform_rp2040.cppm's own top comment.
+# Also provides estrp2040::Serial (serial.cppm, a module partition of the
+# same `estrp2040` module), the USB CDC class - built on pico-sdk's own
+# vendored tinyusb_device; PUBLIC include of this module's own src/ dir
+# is what makes tusb_config.h visible both to this compile and to
+# whatever executable ultimately links tinyusb_device's own sources in
+# (see tusb_config.h's own top comment for why this module, not the
+# consuming example, owns it).
 add_library(estrp2040 STATIC)
 target_sources(estrp2040
   PUBLIC
@@ -53,6 +60,9 @@ target_sources(estrp2040
     BASE_DIRS "${EST_ROOT}/estrp2040/src"
     FILES
       "${EST_ROOT}/estrp2040/src/platform_rp2040.cppm"
+      "${EST_ROOT}/estrp2040/src/serial.cppm"
 )
 target_compile_features(estrp2040 PUBLIC cxx_std_23)
-target_link_libraries(estrp2040 PUBLIC est hardware_timer hardware_uart hardware_gpio hardware_irq)
+target_include_directories(estrp2040 PUBLIC "${EST_ROOT}/estrp2040/src")
+target_link_libraries(estrp2040 PUBLIC
+  est hardware_timer hardware_uart hardware_gpio hardware_irq tinyusb_device)
