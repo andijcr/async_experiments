@@ -9377,3 +9377,54 @@ Remaining work: wire `examples/rp2040` into `.github/workflows/ci.yml`
 as a build-only job (matching this entry's own decision - cross-compile
 success for `rp2040_demo`/`est_rp2040_tests`, no execution step), and
 `docs/wiki/Architecture.md`.
+
+### Follow-up: `rp2040` CI job (build-only) + firmware artifact uploads
+
+Wired `examples/rp2040` into `.github/workflows/ci.yml` as a new,
+independent `rp2040` job - same "fully separate CMake project" shape
+`wasm`/`mps2an385` already establish, cross-compile only per the
+previous entry's own decision (no Renode execution step). One real
+wrinkle beyond that shape: `pico-sdk`'s own further submodules
+(`lib/cyw43-driver`/`lwip`/`mbedtls`/`btstack` - wireless-radio support
+this backend never touches) were initialized locally by hand when
+first vendoring `pico-sdk`, and *which* of a submodule's own nested
+submodules are "active" lives only in a checkout's local `.git/config`
+(`git submodule init <path>`'s real effect) - never in tracked history,
+so a fresh CI checkout has no record of that narrower choice at all.
+`actions/checkout@v4`'s `submodules: recursive` has no per-submodule
+granularity (it would fetch every one of `pico-sdk`'s submodules
+regardless) - fixed with an explicit step doing the identical narrow
+`git submodule update --init` twice (outer `pico-sdk`, then its own
+`lib/tinyusb`) instead.
+
+Verified for real: a from-scratch `rm -rf build && cmake --preset
+rp2040 && cmake --build --preset rp2040` inside the real
+`est-devenv:latest` container (the exact commands the new CI steps
+run) produces both `rp2040_demo.{elf,uf2}` and
+`tests/est_rp2040_tests.{elf,uf2}` cleanly - the same real build this
+plan's own "Renode CI spike" entry already exercised, just confirmed
+once more from an empty build directory the way CI's own runner
+would see it. The Dockerfile's own `/opt/rp2040-toolchain` block
+(vendored back when the toolchain spike first landed) still has
+*not* been verified via a real `docker build` in this environment -
+attempting one here reproduces the exact same pre-existing network-
+containment gap this project's own git history already documents for
+this Dockerfile (`apt.llvm.org`'s certificate isn't trusted by this
+sandboxed session's own build-time network path, failing at the very
+first `wget`, unrelated to anything RP2040-specific) - real
+verification of that block only happens once this PR's own `rp2040` CI
+job actually runs on a GitHub-hosted runner, which doesn't go through
+this session's proxy at all.
+
+The user asked to keep `est_rp2040_tests` specifically (to run on real
+hardware themselves) even though it can't be exercised in CI - both
+`rp2040_demo.uf2`/`.elf` and `est_rp2040_tests.uf2`/`.elf` are uploaded
+as two separate `actions/upload-artifact@v4` artifacts (`.uf2` for
+drag-and-drop flashing, `.elf` for `gdb`/`openocd` symbols) -
+`if-no-files-found: error` on both, so a build that silently produced
+no output fails loudly rather than uploading an empty artifact.
+
+Remaining work: confirm the new job's real first run on GitHub Actions
+once pushed (in particular, whether the Dockerfile's own RP2040 sysroot
+block builds cleanly on a real runner - genuinely unverified until
+then), and `docs/wiki/Architecture.md`.

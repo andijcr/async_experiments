@@ -270,3 +270,95 @@ jobs:
         run: >
           examples/multicolor_larson_scanner/mps2an385/run_under_qemu.sh
           examples/multicolor_larson_scanner/mps2an385/build/mps2an385/larson_scanner_mps2an385
+
+  # Independent of every job above, same "fully separate CMake project"
+  # shape as "wasm"/"mps2an385" - real Raspberry Pi Pico (RP2040)
+  # hardware, targeting armv6m-none-eabi (cmake/toolchain-rp2040.cmake's
+  # own top comment). Build-only, deliberately: unlike mps2an385, there
+  # is no execution step here - docs/PLAN.md's own "Renode CI spike"
+  # entry has the full story (both rp2040_demo and est_rp2040_tests boot
+  # a real, Renode-emulated RP2040 mask boot ROM successfully, which then
+  # crashes probing flash over the emulated QSPI/SSI controller before
+  # either ever reaches main() - a genuine incompatibility between this
+  # Clang-built boot2/flash image and that third-party, upstream-marked
+  # "WIP and Frozen" peripheral model, not a bug in this project's own
+  # code). A cross-compile success here is still a real, meaningful
+  # signal (the same "does the whole toolchain/module/pico-sdk chain
+  # still link" check every other job's build step already is) - the
+  # .uf2/.elf outputs uploaded below are for the user's own manual
+  # verification on real hardware, standing in for the execution
+  # coverage this job itself can't provide.
+  rp2040:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # pico-sdk's own further submodules (lib/cyw43-driver/lwip/mbedtls/
+      # btstack - all wireless-radio support this backend never touches)
+      # are deliberately left uninitialized: `actions/checkout@v4`'s
+      # `submodules: recursive` has no per-submodule granularity, so it
+      # would fetch all of them regardless. Which submodules are
+      # "active" lives in a checkout's own local `.git/config` (`git
+      # submodule init <path>`'s real effect), never in tracked history -
+      # a fresh checkout has to redo this same narrow init every run,
+      # the same as it was done once, by hand, when first vendoring
+      # pico-sdk (docs/PLAN.md's own entry for that).
+      - name: init pico-sdk + tinyusb submodules only
+        run: |
+          git submodule update --init examples/rp2040/third_party/pico-sdk
+          git -C examples/rp2040/third_party/pico-sdk submodule update --init lib/tinyusb
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: build devenv image (local only, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: false
+          load: true
+          tags: ${{ env.DEVENV_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: configure (rp2040)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace/examples/rp2040
+          ${{ env.DEVENV_IMAGE }}
+          cmake --preset rp2040
+
+      # Builds every target the rp2040 preset knows about: rp2040_demo
+      # (the framework main()/demo app image) and est_rp2040_tests
+      # (est/tests/*.cpp reused unmodified, examples/rp2040/tests/'s own
+      # top comment) - both real, flashable firmware images, not just
+      # a single smoke-test binary.
+      - name: build (rp2040)
+        run: >
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp
+          -v ${{ github.workspace }}:/workspace -w /workspace/examples/rp2040
+          ${{ env.DEVENV_IMAGE }}
+          cmake --build --preset rp2040
+
+      # .uf2 (drag-and-drop flashing) + .elf (gdb/openocd symbols) for
+      # each image - the real deliverable this job's own build-only
+      # nature can't otherwise produce: manual verification on real
+      # hardware, standing in for the Renode execution coverage this
+      # backend doesn't have (this job's own top comment).
+      - name: upload rp2040_demo firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: rp2040_demo
+          path: |
+            examples/rp2040/build/rp2040/rp2040_demo.uf2
+            examples/rp2040/build/rp2040/rp2040_demo.elf
+          if-no-files-found: error
+
+      - name: upload est_rp2040_tests firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: est_rp2040_tests
+          path: |
+            examples/rp2040/build/rp2040/tests/est_rp2040_tests.uf2
+            examples/rp2040/build/rp2040/tests/est_rp2040_tests.elf
+          if-no-files-found: error
