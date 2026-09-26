@@ -40,3 +40,19 @@ set(EST_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 # mps2an385/CMakeLists.txt's own identical block.
 set(EST_BUILD_TESTS OFF)
 add_subdirectory("${EST_ROOT}/est" "${CMAKE_CURRENT_BINARY_DIR}/est")
+
+# --- estrp2040: this build's own platform::interface backend, built on
+# pico-sdk's own hardware_timer/hardware_uart/hardware_gpio/hardware_irq
+# library targets (real clock/reset bring-up already done by pico-sdk's
+# own runtime_init(), run automatically before main()) rather than
+# hand-poked MMIO registers - see platform_rp2040.cppm's own top comment.
+add_library(estrp2040 STATIC)
+target_sources(estrp2040
+  PUBLIC
+    FILE_SET CXX_MODULES
+    BASE_DIRS "${EST_ROOT}/estrp2040/src"
+    FILES
+      "${EST_ROOT}/estrp2040/src/platform_rp2040.cppm"
+)
+target_compile_features(estrp2040 PUBLIC cxx_std_23)
+target_link_libraries(estrp2040 PUBLIC est hardware_timer hardware_uart hardware_gpio hardware_irq)

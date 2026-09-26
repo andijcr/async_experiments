@@ -9024,10 +9024,66 @@ outbound network access before this lands, but the toolchain mechanics
 it feeds are now verified against the real pinned compiler/CMake twice
 over, not just simulated.
 
-Remaining work, not yet started: `estrp2040/src/platform_rp2040.cppm`
-(the real `platform::interface` backend: `TIMER`/`ALARM`-backed
-`uptime()`/`interruptible_sleep_until()`/`wake()`, UART0-backed
-`vprintdbg()`/`assert_failure()`), the Renode CI spike (third-party
+### Follow-up: `platform_rp2040.cppm` itself
+
+Wrote the actual `est::platform::interface` backend
+(`estrp2040/src/platform_rp2040.cppm`), built entirely on pico-sdk's own
+`hardware_timer`/`hardware_uart`/`hardware_gpio`/`hardware_irq` library
+targets rather than hand-poked MMIO - a global module fragment
+(`module;` before `export module estrp2040;`) textually `#include`s
+those C headers, the standard way to pair a C++20 module with a
+non-modularized library (nothing else in this codebase needed that
+pattern before, since every other module either has no third-party C
+dependency or only needs `import std;`).
+
+`uptime()`/`get_random_seed()` are just `time_us_64()` - RP2040's TIMER
+is already a genuine free-running 64-bit microsecond counter, no
+wrap-counting ISR needed at all (simpler than `estmsp`'s own
+`systick_wrap_count` scheme, whose 24-bit SysTick actually does wrap
+every ~671ms). `interruptible_sleep_until()` claims one of TIMER's 4
+hardware ALARM comparators via pico-sdk's `hardware_alarm_*` API, which
+registers its own IRQ dispatch - no hand-written vector-table wiring
+needed, unlike `estmsp`'s own dual-timer approach.
+
+The one place this genuinely wasn't a straight port of `estmsp`'s async
+UART TX design: RP2040's UART0 is a real PL011 (not CMSDK's UART), and
+PL011's TX interrupt is *level*-triggered on "FIFO fill below
+threshold," not edge-triggered on "one transmission just completed" the
+way CMSDK's is. Leaving it permanently unmasked the way `estmsp` does
+would storm the instant the ring runs dry (the level condition stays
+true forever with nothing left to send - confirmed by reasoning through
+the PL011 datasheet's own interrupt semantics before writing any code,
+not discovered by a real storm the way `estmsp`'s own UART/dual-timer
+IRQ semantics were, per issue #123's methodology). `pump_uart_hardware()`
+masks the TX interrupt itself the instant it drains the ring;
+`uart_tx_kick()` (every mainline refill path) re-enables it before
+kicking. No semihosting-based `terminate()` either: unlike `estmsp`
+(QEMU-only, whose `terminate()` exists purely to report a checkable exit
+code to CI), this backend targets real, unattended hardware with no
+debug host guaranteed attached - `assert_failure()` halts by masking
+interrupts and looping on `wfi` forever after reporting its message.
+
+Wired into `examples/rp2040/CMakeLists.txt` as a new `estrp2040` static
+library (`hardware_timer`/`hardware_uart`/`hardware_gpio`/`hardware_irq`
+linked publicly, mirroring `estmsp`'s own declaration shape in
+`mps2an385/CMakeLists.txt`). Verified for real this time, not just
+mirrored from a host install: a working `docker` daemon turned out to
+be available after all (just not started - see the entry above), so
+this was built, `clang-format`-checked, and `clang-tidy`-checked
+(against a real `compile_commands.json` for this target specifically -
+running `clang-tidy` with none, as a first attempt did, produces
+false-positive noise, e.g. "method can be made static" for a real
+`override` of a pure-virtual `interface` method, since it can't resolve
+`import est;` at all without one) inside a genuine `est-devenv:latest`
+container. Two real `clang-tidy` findings surfaced and got fixed with
+narrow, explained `NOLINT`s (`cppcoreguidelines-pro-type-member-init` -
+`saved_primask_` is written by inline asm's own output operand, not a
+member-initializer list the check can see; `bugprone-exception-escape` -
+`est::spsc_ring<char>`'s one-time constructor is the only thing that can
+throw in that function, and a failure there is unrecoverable on this
+target regardless) - both clean now.
+
+Remaining work, not yet started: the Renode CI spike (third-party
 `matgla/Renode_RP2040` model, marked "WIP and Frozen" upstream - real
 risk), the USB CDC `est::pico::Serial` class and its TinyUSB glue, the
 `examples/rp2040` demo app/tests/CI job, and docs
