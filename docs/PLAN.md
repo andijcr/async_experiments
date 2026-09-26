@@ -8870,3 +8870,602 @@ across the whole tracked tree with none left outside historical
 `docs/PLAN.md` narration and the one intentional back-reference above;
 still, the `mps2an385`/`sanitize`/`ci`/`web` pipeline this project
 normally runs before merging should be run for real before this lands.
+
+## `estrp2040`, a fifth `platform::interface` backend for real Raspberry Pi Pico (RP2040) hardware
+
+A new request, distinct from Issue #123/`estmsp` above: a
+`platform::interface` backend for *real* RP2040 silicon (not QEMU),
+plus a `pico-sdk`-style Arduino-`Serial`-like USB CDC class with a
+future-returning interface, and a reusable "framework `main()`" that a
+separate future project builds against by supplying only
+`est::future<void> app()`. Two rounds of clarifying questions settled
+the shape: `app()` resolves `est::current_loop()` rather than taking a
+`loop&` parameter (matching every other example in this repo); Serial
+is USB CDC, not a hardware UART; CI runs the third-party
+`matgla/Renode_RP2040` model (its own README confirms no USB emulation,
+so the CDC path itself gets no CI execution coverage, an accepted gap);
+core0 only for this PR, core1 deferred. A first plan draft scoped
+hand-rolling boot2/clock-bring-up/a minimal TinyUSB header subset from
+scratch (the same shape Issue #123's own abandoned RP2040 attempt would
+have needed); the user corrected this early - **vendor the real
+`pico-sdk` and use it directly** - which turned out to be the single
+biggest simplification available: `pico-sdk` ships boot2
+(`src/rp2_common/boot_stage2`), clock/reset bring-up, real hardware
+register/struct headers, and its own TinyUSB integration
+(`pico_stdio_usb`/`tinyusb_device`) already.
+
+Vendored `raspberrypi/pico-sdk` as a pinned submodule
+(`examples/rp2040/third_party/pico-sdk`, tag `2.3.1`) with only its
+`lib/tinyusb` nested submodule initialized (the wireless-only ones -
+`cyw43-driver`/`lwip`/`mbedtls`/`btstack` - are for Pico W, not this
+board, and skipped). `pico-sdk` has real (if under-documented) official
+Clang support: `cmake/preload/toolchains/pico_arm_cortex_m0plus_clang.cmake`
+targets `armv6m-none-eabi` directly - a prior web-research pass (before
+any of this was tried against a real build) had turned up an old forum
+claim that `pico-sdk`'s Clang path only ever worked against
+`LLVM-embedded-toolchain-for-Arm` v14.0.0 specifically; empirically
+false against the current `pico-sdk` (2.3.1) and this repo's own
+pinned v19.1.5 release - that claim was stale.
+
+Getting there needed four real, non-obvious fixes on top of `pico-sdk`'s
+own toolchain file, each confirmed by making the actual failure happen
+and then go away, not theorized in advance:
+
+- **Sysroot layout, not just a sysroot path.** `pico_arm_clang_common.cmake`'s
+  own header search (`find_path(_CLANG_HEADERS_DIR ...)`) runs under
+  `CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY` with `CMAKE_FIND_ROOT_PATH`
+  set to the *compiler's* own directory - an explicit
+  `PICO_COMPILER_SYSROOT` pointed at a sysroot living anywhere else
+  fails that search silently (`find_path` just returns not-found, no
+  useful diagnostic). Fix: lay the vendored ARM toolchain out the same
+  way ARM's own release tarball does - `<root>/bin/{clang,clang++,...}`
+  next to `<root>/lib/clang-runtimes/arm-none-eabi/<variant>` - so the
+  root-path-prefixed search actually lands inside it. `docker/Dockerfile`'s
+  new `/opt/rp2040-toolchain` block follows this shape (symlinks to
+  this image's own pinned Clang under `bin/`, the extracted
+  `armv6m_soft_nofp_exn_rtti` variant under
+  `lib/clang-runtimes/arm-none-eabi/`), unlike the flat extraction the
+  existing `armv7m_soft_nofp_exn_rtti` block uses (that one never goes
+  through this particular search path, since `mps2an385` doesn't use
+  `pico-sdk`'s toolchain file at all).
+- **`-nostdinc++` + explicit sysroot `-isystem`.** `pico-sdk`'s own
+  toolchain file relies on `--sysroot` alone; this image's
+  Debian-packaged `libc++-${LLVM_VERSION}-dev` bakes an absolute
+  `/usr/lib/llvm-${LLVM_VERSION}/include/c++/v1` search path into Clang
+  regardless of `--sysroot`, so without this, `<stdbool.h>` (pulled in
+  via picolibc's own headers) resolved to the *system* libc++'s
+  `__config` instead of the sysroot's own, failing with `"No thread
+  API"` (the system libc++ build assumes a hosted target). Same root
+  cause `toolchain-mps2an385.cmake`'s own `-nostdinc++` already
+  documents for armv7m.
+- **`-fuse-ld=lld`.** `pico-sdk`'s toolchain file leaves linker
+  selection to Clang's default, which on this image resolves to GNU
+  `ld` (bfd) - it doesn't understand the `armelf` emulation Clang
+  requests for this target (`"unrecognised emulation mode: armelf"`).
+- **`--rtlib=compiler-rt --unwindlib=libunwind`.** Without steering
+  Clang away from its GCC-style default runtime, the final link failed
+  with `"unable to find library -lgcc"` - this sysroot ships
+  `clang_rt.builtins`/`libunwind`, not `libgcc`, same as every other
+  bare-metal target in this repo.
+- **`CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY`.** Needed for the
+  same reason `toolchain-mps2an385.cmake` already sets it: a full
+  EXECUTABLE-type ABI-detection try_compile needs a working crt0/linker
+  script, which only exists once a target actually links against
+  `pico-sdk`'s own `pico_standard_link` (a per-target INTERFACE
+  library) - the generic compiler-identification try_compile CMake
+  runs as part of `project()` fails otherwise (`"undefined symbol:
+  __data_start"` from picolibc's `crt0.o`). Confirmed this only bites
+  when `cmake_minimum_required(VERSION 4.4)` is in effect (needed for
+  `import std;`) - an older `cmake_minimum_required` trusts a lesser
+  compile-only probe instead and never hits it, which is why a first,
+  narrower spike missed this before the real `est`-linking project
+  surfaced it.
+
+One more real, `est`-specific issue once `import std;` entered the
+picture: `CMAKE_CXX_STDLIB_MODULES_JSON` was left unset, so CMake
+defaulted to discovering the *system* Clang's own `libc++.modules.json`
+and compiling *that* `std.cppm` - newer than this sysroot's own
+libc++ (its `__config` reports `_LIBCPP_VERSION 190105`, i.e. this ARM
+release bundles LLVM 19.1.5's libc++, two majors behind this image's
+pinned Clang). The system `std.cppm` unconditionally includes
+`<flat_map>`, added to libc++ upstream after 19.1.5 - missing from this
+sysroot outright. Tried papering over just the missing headers with an
+extra fallback `-isystem`; that made it worse, not better (the newer
+`<flat_map>` header transitively re-pulls other newer headers whose
+private ABI macros don't match what the older sysroot's `__config`
+already defined - a real incompatibility, not just a missing file). The
+actual fix, already established by `toolchain-mps2an385.cmake`'s
+identical line and simply missed on a first pass here: point
+`CMAKE_CXX_STDLIB_MODULES_JSON` at *this sysroot's own*
+`lib/libc++.modules.json`, which resolves to `std.cppm`/headers
+generated against the exact same 19.1.5 snapshot the sysroot's compiled
+libraries are - the version question disappears rather than needing a
+workaround, the same way any other cross-compile in this repo already
+works.
+
+With all of that in `cmake/toolchain-rp2040.cmake`, a minimal
+`examples/rp2040/CMakeLists.txt` (`pico_sdk_init()` before `project()`,
+then `add_subdirectory(est)` the same way `mps2an385/CMakeLists.txt`
+already does) built and linked `est` itself - the real module set,
+including `import std;` - as a genuine `armv6m`/ARM static library
+(confirmed via `readelf`, not assumed). A minimal `pico_stdlib`+
+`hardware_timer` executable spike (kept out of the repo, `/tmp`-only)
+also confirmed `pico-sdk`'s own boot2/linker-script machinery produces
+the right real memory layout with zero hand-written boot2/linker code:
+`.boot2` at `0x10000000` sized exactly `0x100` bytes, `.text` starting
+at `0x10000100` immediately after, RAM sections at `0x20000000` - the
+whole "boot2 checksum region + real vector table" story Issue #123's
+own entry flagged as this target's structurally new requirement,
+solved by vendoring `pico-sdk` rather than hand-deriving it.
+
+**Verification caveat, stated plainly**: the toolchain spike above was
+first verified by installing this image's exact pinned Clang 22.1.8/
+CMake 4.4.0 directly onto this session's own host container (no working
+`docker` daemon at the time - same gap the `estpico`→`estmsp` rename
+entry above already flagged), mirroring `docker/Dockerfile`'s own steps.
+Once a working `docker` daemon turned out to be available after all
+(just not started), the same build was re-run for real inside a genuine
+container from this project's own `est-devenv:latest` image lineage
+(Clang 22.1.8/CMake 4.4.0 confirmed identical) - `est`, including
+`import std;`, configured and linked cleanly as a real `armv6m` static
+library there too, bind-mounting the host-fetched ARM sysroot rather
+than rebuilding the image (this session's own outbound-HTTPS
+containment blocks fresh `wget`/`git clone` calls from *inside* a
+`docker build`, and working around that by baking this session's own
+proxy credentials into a build layer is out of bounds - reported as a
+real constraint, not routed around). That cached image itself predates
+`docker/Dockerfile`'s own existing armv7m sysroot block (a pre-existing,
+unrelated gap - `/opt/arm-none-eabi-sysroot` doesn't exist in it at
+all, so `mps2an385` can't be regression-checked against it either), so
+the actual `docker/Dockerfile` diff this PR adds - the new armv6m
+`wget`/`tar` extraction - still hasn't been exercised by a real `docker
+build` end to end. That should happen in an environment with real
+outbound network access before this lands, but the toolchain mechanics
+it feeds are now verified against the real pinned compiler/CMake twice
+over, not just simulated.
+
+### Follow-up: `platform_rp2040.cppm` itself
+
+Wrote the actual `est::platform::interface` backend
+(`estrp2040/src/platform_rp2040.cppm`), built entirely on pico-sdk's own
+`hardware_timer`/`hardware_uart`/`hardware_gpio`/`hardware_irq` library
+targets rather than hand-poked MMIO - a global module fragment
+(`module;` before `export module estrp2040;`) textually `#include`s
+those C headers, the standard way to pair a C++20 module with a
+non-modularized library (nothing else in this codebase needed that
+pattern before, since every other module either has no third-party C
+dependency or only needs `import std;`).
+
+`uptime()`/`get_random_seed()` are just `time_us_64()` - RP2040's TIMER
+is already a genuine free-running 64-bit microsecond counter, no
+wrap-counting ISR needed at all (simpler than `estmsp`'s own
+`systick_wrap_count` scheme, whose 24-bit SysTick actually does wrap
+every ~671ms). `interruptible_sleep_until()` claims one of TIMER's 4
+hardware ALARM comparators via pico-sdk's `hardware_alarm_*` API, which
+registers its own IRQ dispatch - no hand-written vector-table wiring
+needed, unlike `estmsp`'s own dual-timer approach.
+
+The one place this genuinely wasn't a straight port of `estmsp`'s async
+UART TX design: RP2040's UART0 is a real PL011 (not CMSDK's UART), and
+PL011's TX interrupt is *level*-triggered on "FIFO fill below
+threshold," not edge-triggered on "one transmission just completed" the
+way CMSDK's is. Leaving it permanently unmasked the way `estmsp` does
+would storm the instant the ring runs dry (the level condition stays
+true forever with nothing left to send - confirmed by reasoning through
+the PL011 datasheet's own interrupt semantics before writing any code,
+not discovered by a real storm the way `estmsp`'s own UART/dual-timer
+IRQ semantics were, per issue #123's methodology). `pump_uart_hardware()`
+masks the TX interrupt itself the instant it drains the ring;
+`uart_tx_kick()` (every mainline refill path) re-enables it before
+kicking. No semihosting-based `terminate()` either: unlike `estmsp`
+(QEMU-only, whose `terminate()` exists purely to report a checkable exit
+code to CI), this backend targets real, unattended hardware with no
+debug host guaranteed attached - `assert_failure()` halts by masking
+interrupts and looping on `wfi` forever after reporting its message.
+
+Wired into `examples/rp2040/CMakeLists.txt` as a new `estrp2040` static
+library (`hardware_timer`/`hardware_uart`/`hardware_gpio`/`hardware_irq`
+linked publicly, mirroring `estmsp`'s own declaration shape in
+`mps2an385/CMakeLists.txt`). Verified for real this time, not just
+mirrored from a host install: a working `docker` daemon turned out to
+be available after all (just not started - see the entry above), so
+this was built, `clang-format`-checked, and `clang-tidy`-checked
+(against a real `compile_commands.json` for this target specifically -
+running `clang-tidy` with none, as a first attempt did, produces
+false-positive noise, e.g. "method can be made static" for a real
+`override` of a pure-virtual `interface` method, since it can't resolve
+`import est;` at all without one) inside a genuine `est-devenv:latest`
+container. Two real `clang-tidy` findings surfaced and got fixed with
+narrow, explained `NOLINT`s (`cppcoreguidelines-pro-type-member-init` -
+`saved_primask_` is written by inline asm's own output operand, not a
+member-initializer list the check can see; `bugprone-exception-escape` -
+`est::spsc_ring<char>`'s one-time constructor is the only thing that can
+throw in that function, and a failure there is unrecoverable on this
+target regardless) - both clean now.
+
+### Follow-up: USB CDC toolchain spike + `estrp2040::Serial`
+
+Before writing the Serial class itself, spiked whether pico-sdk's own
+vendored TinyUSB (`lib/tinyusb`, MIT, the nested submodule initialized
+back in the very first entry above) actually builds and links against
+this toolchain at all - genuinely untested until now. A scratch project
+linking `tinyusb_device` plus a minimal CDC descriptor set (device/
+configuration/string callbacks, `tusb_config.h` enabling `CFG_TUD_CDC`)
+built and linked cleanly on the first real attempt: TinyUSB's own class
+sources, RP2040's own DCD driver (`dcd_rp2040.c`), and pico-sdk's own
+RP2040 USB-enumeration silicon-errata workaround
+(`rp2040_usb_device_enumeration.c`) all compiled without needing any
+further toolchain changes beyond what the earlier spikes already
+established. This resolves the plan's last real open toolchain
+question.
+
+Wrote `estrp2040::Serial` (`estrp2040/src/serial.cppm`, a module
+*partition* of `estrp2040` - re-exported from `platform_rp2040.cppm` via
+`export import :serial;`, the same primary-interface/partition split
+`est.cppm` itself already uses) - architecturally simpler than
+`platform_rp2040.cppm`'s own async UART TX driver: TinyUSB owns the real
+USB core interrupt itself and does all protocol handling from
+`tud_task()`, which this class drives via `est::schedule_periodic()`
+(1ms, TinyUSB's own recommended polling latency) rather than a
+hand-written ISR - so `tud_cdc_rx_cb()`/`tud_cdc_tx_complete_cb()`
+always run from mainline (inside that periodic callback), never real
+interrupt context. No `interrupt_guard`, no separate ISR-safe ring
+buffer needed: TinyUSB's own internal CDC FIFOs are the only buffering
+on top of. `read()`/`write()` end up `static` (not virtual, just plain
+member functions Serial happens to have none of): USB CDC is
+structurally one hardware resource, so there's no real per-instance
+state - calling them through a `Serial` object still reads like
+Arduino's own `Serial.read()`/`.write()`, which is the whole point of
+the class's naming.
+
+USB device/configuration/string descriptors (VID/PID, product strings)
+are deliberately *not* part of this module - product identity, not
+mechanism, so left for the consuming application to supply
+(`tud_descriptor_*_cb()`), the same "platform module owns the mechanism,
+the application image owns the product specifics" split `estmsp` already
+has between itself and `startup.c`/`link.ld`. `tusb_config.h` (what
+classes/buffer sizes this module needs - `CFG_TUD_CDC`, RX/TX FIFO
+sizes) *is* owned by `estrp2040` itself, unlike the descriptors: that's
+fixed by `Serial`'s own design, not something a consuming project should
+need to know to even compile against it.
+
+Verified the same way as `platform_rp2040.cppm`: real build inside
+`est-devenv:latest`, `clang-format` clean, `clang-tidy` clean against a
+real `compile_commands.json` (three real findings fixed - `Serial`'s own
+deliberately-Arduino-style capitalization needs a `NOLINT`; `read()`/
+`write()` becoming `static`, above, is a real simplification, not a
+suppression; raw pointer arithmetic in `write()`'s own retry loop
+replaced with `std::span::subspan()`). One repo-hygiene finding along
+the way, not fixed here: this project's root `.clang-tidy`'s
+`HeaderFilterRegex` (`(^|/)(est|examples)/`) matches
+`examples/rp2040/third_party/pico-sdk` (vendored third-party code living
+under `examples/`) as if it were project-owned code, producing
+thousands of false positives from TinyUSB's own headers when run with
+default settings - worked around here with an explicit, narrower
+`--header-filter` for this manual check rather than editing the shared
+root config; a real fix (if this project's own CI ever starts linting
+`estrp2040`/`estmsp`/etc. at all - see the immediately preceding
+`platform_rp2040.cppm` entry's own finding that it currently doesn't)
+would need to exclude `third_party` paths specifically.
+
+Remaining work, not yet started: the Renode CI spike (third-party
+`matgla/Renode_RP2040` model, marked "WIP and Frozen" upstream - real
+risk), the `examples/rp2040` demo app (USB CDC echo)/tests/CI job, and
+docs (`docs/wiki/Architecture.md`).
+
+### Follow-up: framework `main()` + demo `app()` - a real, flashable image
+
+Wired the pieces above into an actual firmware image: `examples/rp2040/
+src/main.cpp` (installs `platform_rp2040`, constructs an `est::loop`,
+calls the project-supplied `app()`, `loop.run()`s forever - no
+`std::exit()`/return-code concept the way `estmsp`'s own `main.cpp` has,
+since real hardware has no host to report to) and `examples/rp2040/src/
+app_demo.cppm` (`app()`: a minimal USB CDC echo built on
+`estrp2040::Serial`, standing in for the future separate project that
+would supply its own), plus `usb_descriptors.c` (VID/PID `0xCafe`/
+`0x4001` - TinyUSB's own well-known example values, not a real assigned
+identity - single CDC interface, deliberately *not* part of `estrp2040`
+itself, same "mechanism vs. product identity" split `Serial`'s own doc
+comment already argues for `tusb_config.h` vs. descriptors).
+
+Getting this to actually *link* surfaced four more real, non-obvious
+pico-sdk/Clang incompatibilities beyond the earlier spikes, each found
+and fixed one at a time against a real build:
+
+- pico-sdk's own `pico_cxx_options` INTERFACE library appends
+  `-fno-exceptions -fno-rtti` to every C++ target by default (a
+  reasonable embedded default for typical users who don't need either) -
+  and that flag wins over anything `cmake/toolchain-rp2040.cmake` itself
+  tries to set, since CMake places `CMAKE_CXX_FLAGS_INIT`-derived flags
+  *earlier* on the actual command line than a target's own
+  `target_compile_options()` (confirmed by inspecting the real invoked
+  command: `-fexceptions -frtti ... -fno-exceptions -fno-rtti`, and for
+  Clang's boolean toggle flags the *last* one on the line wins). `est`
+  genuinely needs both (`future<T>`'s exception propagation, `est::check()`,
+  `platform_rp2040.cppm`'s own `try`/`catch` in `pump_task_loop()`) - fixed
+  via pico-sdk's own sanctioned override,
+  `set(PICO_CXX_ENABLE_EXCEPTIONS 1 CACHE BOOL "")` /
+  `set(PICO_CXX_ENABLE_RTTI 1 CACHE BOOL "")`, set in `examples/rp2040/
+  CMakeLists.txt` *before* `pico_sdk_init()` (the one place early enough
+  to actually win).
+- Once exceptions actually started emitting code that needs them, the
+  link failed outright on undefined `operator new`/`__cxa_throw`/
+  `typeinfo` for `std::runtime_error`, etc. - pico-sdk's own toolchain
+  file passes `-nostdlib` (avoiding picolibc's default crt0/exit
+  machinery, since this board's own boot2/vector table replaces it),
+  which also disables Clang's *automatic* linking of whatever runtime a
+  target's flags imply. Fixed by appending an explicit, correctly
+  ordered `-lc++ -lc++abi -lunwind -lc -lclang_rt.builtins -lm` to the
+  toolchain file's own linker flags (single-pass linker: order matters,
+  matching `toolchain-mps2an385.cmake`'s own established ordering for the
+  identical `-nostdlib` situation there).
+- `duplicate symbol: _set_tls`/`__aeabi_read_tp` - pico-sdk's default
+  `pico_thread_local` ("per_thread" mode) defines both as *strong*
+  symbols for its own per-core TLS emulation, which collides outright
+  with this specific ARM LLVM-embedded-toolchain-for-Arm sysroot's
+  picolibc, which (unlike the arm-none-eabi-gcc+newlib toolchains
+  pico-sdk is normally tested against) already implements the same
+  primitives itself. Investigated `pico_thread_local`'s own source
+  directly: "global" mode's `__aeabi_read_tp` is declared `__weak`
+  (letting picolibc's own definition win with no conflict) - fixed via
+  `set(PICO_DEFAULT_THREAD_LOCAL_IMPL "global" CACHE STRING "")`, also
+  the semantically correct choice regardless of the symbol collision
+  (this backend is core0-only, so there's no second execution context
+  for real per-thread storage to ever distinguish). "global" mode's own
+  `_set_tls` is *still* unconditionally strong though, gated by a
+  separate macro (`pico/thread_local.h`'s own doc comment) - fixed with
+  `add_compile_definitions(PICO_THREAD_LOCAL_PROVIDE_SET_TLS=0)`.
+- `undefined symbol: __cxa_thread_atexit` - genuinely absent from this
+  entire sysroot (confirmed via `llvm-nm --defined-only` across
+  `libc.a`/`libc++.a`/`libc++abi.a`/`libunwind.a`), needed the moment
+  anything reachable calls `est::spawn()` (which `platform_rp2040.cppm`'s
+  own TX-pump machinery does), since that pulls in `est::detail::
+  spawn_exception_hook_storage` - a `thread_local std::function`
+  (`est/src/spawn.cppm`) with a non-trivial destructor, which the
+  compiler registers via this Itanium ABI call. `__cxa_atexit`
+  (identical signature, *program*-exit rather than *thread*-exit
+  semantics) *is* present, and the two are equivalent in practice here:
+  core0 never "exits" as a thread short of the board losing power, at
+  which point neither callback would run anyway. Fixed with a tiny
+  forwarding shim (`estrp2040/src/cxa_thread_atexit_shim.c`, a plain C
+  source, not part of the module's `FILE_SET CXX_MODULES` list) - the
+  same workaround several other bare-metal C++ runtimes missing a real
+  `__cxa_thread_atexit` already use for the identical reason, not a hack
+  specific to this project.
+
+With all four fixed, `rp2040_demo.elf`/`.uf2` now build and link
+successfully end-to-end inside the real `est-devenv:latest` container -
+a real, flashable (not yet hardware-verified - still a manual,
+user-only step) firmware image. `clang-format` clean on all four new
+files; `clang-tidy` against a real `compile_commands.json` found two
+genuine issues in this session's own code (as opposed to the already-
+documented TinyUSB third-party-header noise the shared `.clang-tidy`
+config's `HeaderFilterRegex` gap produces): `app_demo.cppm` calling
+`Serial`'s `static` `read()`/`write()` through an instance
+(`readability-static-accessed-through-instance` - fixed by calling them
+through the class name, `estrp2040::Serial::read(...)`, keeping the
+`Serial` instance only for its constructor's USB-start side effect) and
+`main()` itself flagged by `bugprone-exception-escape` (a coroutine's
+frame is allocated - and can throw, e.g. `bad_alloc` - before its first
+suspension point, so calling `app()` can throw before `main()` ever gets
+a `future<void>` to attach a continuation to; unrecoverable on this
+target regardless, so terminating via the noexcept violation is the
+correct fail-fast outcome, same reasoning as `platform_rp2040.cppm`'s own
+existing `NOLINT`s for this check). One clang-tidy operational pitfall
+hit along the way, not a code issue: running `clang-tidy` directly
+against a build directory whose module BMIs were stale (built from
+before a source edit, since `clang-tidy` doesn't drive the same
+incremental-rebuild dependency graph `ninja` does) produced nonsensical
+diagnostic locations (a finding attributed to text inside an unrelated
+comment) - resolved by rebuilding via `cmake --build` first, then
+re-running `clang-tidy` against the now-current BMIs.
+
+Remaining work: task priority now returns to the Renode CI spike (no
+USB emulation available there regardless, per the plan's own accepted
+gap), `examples/rp2040/tests/` (reusing `est/tests/*.cpp`, once Renode is
+wired), the `rp2040` CI job, and `docs/wiki/Architecture.md`.
+
+### Follow-up: Renode CI spike - real execution attempted, a genuine
+### model-level blocker found; falling back to build-only CI
+
+Ran the spike this plan's own "Sequencing" section scoped as step 5,
+for real rather than by inspection: installed Renode 1.16.1 itself (the
+`.deb` release specifically - the "portable" `.tar.gz` releases, both
+Mono- and .NET-based, turned out to bundle every managed assembly into
+one self-contained executable with no loose `.dll`s at all, which
+`matgla/Renode_RP2040`'s own `Peripherals.csproj` needs as individual
+`HintPath` references; the `.deb` unpacks to the classic
+`/opt/renode/bin/*.dll` layout that file's own hardcoded default
+`RenodePath` expects - a real, if narrow, packaging-format
+incompatibility, not a bug in the model repo itself), installed the
+.NET 8 SDK (`dotnet-sdk-8.0` via `apt`, this host's own package, not
+baked into the shared devenv image - Renode itself is a wholly separate
+toolchain from this repo's pinned Clang, same "CI-time only" precedent
+`qemu-system-arm` already has for `mps2an385`), and built
+`matgla/Renode_RP2040`'s own `Peripherals.dll` against it
+(`dotnet build emulation/Peripherals.csproj -c Release`, 0 errors).
+
+The model repo's own README is considerably more capable than this
+plan's original research found (that research was accurate for an
+older revision - UART/DMA/GPIO+interrupts/I2C/watchdog/resets are now
+`✓` "fully supported", not the "IRQ and DMA not yet supported" state an
+earlier page capture showed) - and, critically, `boards/
+initialize_raspberry_pico.resc` loads a **real 16KB RP2040 mask boot ROM
+image** (`bootroms/rp2040/b2.elf`) at address `0x0` before anything else
+runs: this model doesn't shortcut boot the way QEMU's `mps2-an385`
+machine does for `estmsp` (direct ELF entry-point load, no boot ROM in
+the loop at all) - it genuinely re-executes the same real, silicon boot
+sequence a physical Pico would (boot ROM reads flash over the emulated
+QSPI/SSI controller, validates `boot2`'s checksum, jumps in) - a real,
+meaningfully more faithful test of this project's own boot2/flash image
+than the plan anticipated needing to prove.
+
+**Real execution result**: both `rp2040_demo.elf` (the framework
+main()/demo app image) and `est_rp2040_tests.elf` (a new
+`examples/rp2040/tests/` target, `est/tests/*.cpp` reused unmodified
+except for `test_main.cpp` - same "only test_main.cpp differs" shape
+`mps2an385/tests/`'s own entry already established, `Catch2Baremetal`'s
+own patch copied rather than cross-referenced per this project's
+existing "no reaching into a sibling project's tree" convention) boot
+the real boot ROM successfully, which begins probing flash over the
+emulated QSPI/SSI controller (`xip_ssi.xip_flash`, a `SPI.W25QXX`
+model) exactly as real hardware would - and then crashes, identically
+in both firmwares (same instruction offsets inside the boot ROM, same
+garbage register/memory values, same final abort:
+`CPU abort: Trying to execute code outside RAM or ROM`), during that
+flash-probing sequence, before either firmware's own `main()` (or even
+`crt0`) ever runs. Ruled out two real alternative explanations before
+concluding this: (1) **not a stack-overflow artifact** - the crash
+predates any of our own code executing at all, and is bit-for-bit
+identical whether `PICO_STACK_SIZE` is left at pico-sdk's own default
+(`0x800`, tiny - real, and worth keeping fixed regardless, below) or
+doubled to `0x1000` (RP2040's own dedicated 4KB `SCRATCH_Y` bank is the
+hard ceiling for this specific memory region - confirmed by a link
+error the one time `0x2000` was tried: "section '.stack_dummy' will not
+fit in region 'SCRATCH_Y': overflowed by 4096 bytes"); (2) **not
+specific to this project's own (large, TinyUSB+Catch2-laden) test
+binary** - the much smaller, simpler demo firmware hits the exact same
+crash at the exact same point. This points at a genuine incompatibility
+between this specific Clang-built boot2/flash image and the model's own
+QSPI/SSI flash-command emulation (`xip_ssi.xip_flash: Unhandled
+operation`/`Transmission finished in unexpected state: RecognizeOperation`
+warnings immediately precede every crash) - not a bug in `est`,
+`estrp2040`, or this project's own build. Root-causing it further would
+mean debugging either this Clang-compiled `boot2`'s own QSPI command
+sequence against the model's `SPI.W25QXX` state machine, or the model's
+own (third-party, upstream-marked "WIP and Frozen") flash emulation
+itself - genuinely open-ended work, not a bounded fix, and exactly the
+risk this plan's own "Sequencing" section flagged going in ("If this
+doesn't pan out (real risk, given 'frozen' upstream), fall back to
+build-only CI and say so plainly rather than forcing it").
+
+**Decision, per that same flagged contingency**: falling back to
+build-only CI for `examples/rp2040` (cross-compile success only, no
+execution) rather than forcing Renode integration further. Real,
+lasting value kept from this spike regardless of the boot blocker:
+`examples/rp2040/tests/` (a genuine, buildable `est_rp2040_tests`
+target reusing `est/tests/*.cpp`, one real `-fexceptions`-adjacent
+finding fixed along the way - `est::checks_enabled`
+(`est/src/check.cppm`) is `#ifdef NDEBUG`-gated, and pico-sdk defaults
+`CMAKE_BUILD_TYPE` to `Release` (`-DNDEBUG`) at its own `pico_sdk_init.cmake`
+`include()` time if left unset, silently compiling away every
+`est::check()` in this project's own build - fixed by setting
+`CMAKE_BUILD_TYPE "Debug"` explicitly *before* that `include()`, not
+merely before `project()`), one more real linker-level finding fixed
+(`pico_clib_interface`'s own `cxa_guard.c` unconditionally, hard-object
+defines `__cxa_guard_acquire`/`_release`/`_abort` - not `__weak`, unlike
+the earlier `_set_tls`/`__aeabi_read_tp` collision - duplicating this
+sysroot's own `libc++abi.a` the moment anything reachable actually has
+a dynamic-init function-local static needing a guard (Catch2's own
+registry singletons; `est::detail::uart_tx_ring()`'s own static
+`spsc_ring<char>`) - confirmed to depend on exactly that, not
+optimization level (the demo binary links the identical `pico_stdlib`
+but never triggers it); fixed with `-Wl,--allow-multiple-definition` in
+`cmake/toolchain-rp2040.cmake`, safe here since both implementations are
+independently correct single-core guard-variable protocols), and
+`PICO_STACK_SIZE=0x1000` for this target (doubled from pico-sdk's own
+tiny `0x800` default, matching `mps2an385`'s own already-doubled
+`__stack_size` for this identical Catch2+est suite) - a real, worthwhile
+fix kept even though it didn't turn out to be this crash's own cause.
+`external_event_tests.cpp` stays excluded from this target, unrelated
+to any of the above: a real, narrow Clang-modules name-lookup bug
+specific to this `armv6m_soft_nofp_exn_rtti` sysroot slice (not seen on
+`armv7m_soft_nofp_exn_rtti`/hosted/`wasm32`), tracked as its own
+follow-up rather than chased further here.
+
+Remaining work: wire `examples/rp2040` into `.github/workflows/ci.yml`
+as a build-only job (matching this entry's own decision - cross-compile
+success for `rp2040_demo`/`est_rp2040_tests`, no execution step), and
+`docs/wiki/Architecture.md`.
+
+### Follow-up: `rp2040` CI job (build-only) + firmware artifact uploads
+
+Wired `examples/rp2040` into `.github/workflows/ci.yml` as a new,
+independent `rp2040` job - same "fully separate CMake project" shape
+`wasm`/`mps2an385` already establish, cross-compile only per the
+previous entry's own decision (no Renode execution step). One real
+wrinkle beyond that shape: `pico-sdk`'s own further submodules
+(`lib/cyw43-driver`/`lwip`/`mbedtls`/`btstack` - wireless-radio support
+this backend never touches) were initialized locally by hand when
+first vendoring `pico-sdk`, and *which* of a submodule's own nested
+submodules are "active" lives only in a checkout's local `.git/config`
+(`git submodule init <path>`'s real effect) - never in tracked history,
+so a fresh CI checkout has no record of that narrower choice at all.
+`actions/checkout@v4`'s `submodules: recursive` has no per-submodule
+granularity (it would fetch every one of `pico-sdk`'s submodules
+regardless) - fixed with an explicit step doing the identical narrow
+`git submodule update --init` twice (outer `pico-sdk`, then its own
+`lib/tinyusb`) instead.
+
+Verified for real: a from-scratch `rm -rf build && cmake --preset
+rp2040 && cmake --build --preset rp2040` inside the real
+`est-devenv:latest` container (the exact commands the new CI steps
+run) produces both `rp2040_demo.{elf,uf2}` and
+`tests/est_rp2040_tests.{elf,uf2}` cleanly - the same real build this
+plan's own "Renode CI spike" entry already exercised, just confirmed
+once more from an empty build directory the way CI's own runner
+would see it. The Dockerfile's own `/opt/rp2040-toolchain` block
+(vendored back when the toolchain spike first landed) still has
+*not* been verified via a real `docker build` in this environment -
+attempting one here reproduces the exact same pre-existing network-
+containment gap this project's own git history already documents for
+this Dockerfile (`apt.llvm.org`'s certificate isn't trusted by this
+sandboxed session's own build-time network path, failing at the very
+first `wget`, unrelated to anything RP2040-specific) - real
+verification of that block only happens once this PR's own `rp2040` CI
+job actually runs on a GitHub-hosted runner, which doesn't go through
+this session's proxy at all.
+
+The user asked to keep `est_rp2040_tests` specifically (to run on real
+hardware themselves) even though it can't be exercised in CI - both
+`rp2040_demo.uf2`/`.elf` and `est_rp2040_tests.uf2`/`.elf` are uploaded
+as two separate `actions/upload-artifact@v4` artifacts (`.uf2` for
+drag-and-drop flashing, `.elf` for `gdb`/`openocd` symbols) -
+`if-no-files-found: error` on both, so a build that silently produced
+no output fails loudly rather than uploading an empty artifact.
+
+Remaining work: confirm the new job's real first run on GitHub Actions
+once pushed (in particular, whether the Dockerfile's own RP2040 sysroot
+block builds cleanly on a real runner - genuinely unverified until
+then), and `docs/wiki/Architecture.md`.
+
+### Follow-up: `rp2040` CI job's real first run - a genuine Dockerfile bug
+
+The previous entry's own flagged unknown resolved on the first real
+run: the devenv image itself built fine (Clang/CMake/pico-sdk detection
+all succeeded), but `configure (rp2040)` failed outright -
+`CMake Error ... Failed to load C++ standard library modules metadata
+... File not found: .../armv6m_soft_nofp_exn_rtti/lib/
+libc++.modules.json`. Root cause: `docker/Dockerfile`'s RP2040 sysroot
+block copied its `--strip-components=5` from the armv7m block right
+above it without adjusting for the different destination shape - the
+armv7m block's own flat `-C /opt/arm-none-eabi-sysroot` destination is
+deliberately meant to *become* the variant's own root (stripping the
+variant name away is correct there), but the RP2040 block's own `-C
+.../arm-none-eabi` destination is the variant's *parent* - pico-sdk's
+own toolchain file needs `${RP2040_TOOLCHAIN_VARIANT}` to still exist
+as a real subdirectory underneath. Fixed to `--strip-components=4`;
+confirmed against the real release tarball's own file listing (`tar
+tJf` on a freshly downloaded copy) and a real, standalone extraction
+with the corrected count - both agree with what an earlier,
+separately-populated toolchain checkout already had on disk (which is
+why every previous verification in this plan's own "Renode CI spike"/
+"framework main()" entries never caught this: they all built against
+that already-correct checkout, bind-mounted in rather than produced by
+a real `docker build`, which had never actually run end-to-end until
+this CI job's own first real run did).
+
+Fix pushed; `mps2an385`/`wasm` on this same run were already green
+(this bug was genuinely isolated to the new job, not a regression
+elsewhere). Watching for the re-run.
+
+A second, independent failure surfaced on that same first run: `gate`'s
+own `clang-tidy check` step - `find est examples \( -path ".../web" -o
+-path ".../mps2an385" \) -prune -o ...` - had never been updated to
+also prune `examples/rp2040`, so it swept up
+`examples/rp2040/src/app_demo.cppm`/`main.cpp`/`tests/test_main.cpp`
+too and ran them through `clang-tidy -p build/ci` (the *hosted*
+compile database), which has no idea `import estrp2040;`/`#include
+"hardware/uart.h"` exist - failed exactly as the existing comment
+already predicts for `estwasm`/`estmsp` in the identical situation.
+Fixed by adding `-o -path "*/rp2040"` to the same prune expression.
